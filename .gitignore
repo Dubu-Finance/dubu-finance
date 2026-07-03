@@ -1,0 +1,27 @@
+# Vendored third-party repos — reference material only, NEVER commit these.
+# context/codes/ contains private repositories belonging to other organisations
+# (igneous-labs prop-s / prop-s-offchain) plus OKX's public routers. None of it is ours
+# to redistribute, and the private ones must not end up in this project's history.
+context/codes/
+
+# Secrets
+.env
+.env.*
+!.env.example
+*.key
+keystore/
+
+# Build output
+contracts/cache/
+contracts/out/
+contracts/broadcast/
+engine/target/
+node_modules/
+
+# forge-std was installed with `forge init --no-git`, so it is a plain clone rather than a
+# submodule. Ignored for now; convert to a proper submodule (`forge install foundry-rs/forge-std`)
+# once the build settles, so dependency versions are pinned in the repo.
+contracts/lib/
+
+*.tmp
+.DS_Store
