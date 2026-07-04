@@ -1,0 +1,14 @@
+cache/
+out/
+broadcast/
+!broadcast/**/run-latest.json
+
+.env
+.env.*
+!.env.example
+*.key
+keystore/
+
+docs/
+node_modules/
+.DS_Store
