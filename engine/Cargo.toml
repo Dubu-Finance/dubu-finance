@@ -1,0 +1,26 @@
+[workspace]
+resolver = "2"
+members = ["crates/dubu-core"]
+
+[workspace.package]
+edition = "2021"
+rust-version = "1.75"
+license = "MIT"
+repository = "https://github.com/dubu/dubu"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+proptest = "1"
+num-bigint = "0.4"
+
+# The engine is a latency-tolerant (1-5 Hz) but correctness-critical process. Optimise
+# release builds for the differential fuzzers and backtests, not for the quote loop.
+[profile.release]
+lto = "thin"
+codegen-units = 1
+overflow-checks = true    # arithmetic here mirrors Solidity 0.8 checked math; never wrap silently
+debug-assertions = false
+
+[profile.test]
+opt-level = 1             # proptest/backtest loops are slow at opt-level 0
