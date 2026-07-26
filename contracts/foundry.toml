@@ -43,4 +43,9 @@ giwa_sepolia = "https://sepolia-rpc.giwa.io"
 giwa_sepolia_flashblocks = "https://sepolia-rpc-flashblocks.giwa.io"
 
 [etherscan]
-giwa_sepolia = {key = "", url = "https://sepolia-explorer.giwa.io/api", chain = 91342}
+# NOTE: no `chain = 91342` here, and it is not an oversight. Foundry resolves that field through
+# alloy-chains' *named* chain table, which has no entry for GIWA, so its presence makes every
+# `forge script --rpc-url` invocation against this repo abort with "Chain 91342 not supported"
+# before a single line of the script runs — verification flags or not. The alias plus an explicit
+# `--verifier blockscout --verifier-url` (which the Makefile always passes) is all Blockscout needs.
+giwa_sepolia = {key = "", url = "https://sepolia-explorer.giwa.io/api"}

@@ -15,7 +15,14 @@ endif
 
 VERIFY := --verify --verifier blockscout --verifier-url $(EXPLORER)
 
-.PHONY: build test fmt snapshot cov clean deploy demo balance gas engine ci
+# forge sizes each broadcast transaction from a simulation in which the WHOLE script runs in one
+# EVM, so every account and slot after the first touch is warm. Each transaction then lands cold,
+# and on a routed swap (Router -> adapter -> pair -> 2 tokens) the cold-access surcharge exceeds
+# the default 130% head-room: measured as an OutOfGas revert on a UniV2 leg at 187,903 gas. Gas is
+# 0.001 gwei here and a limit is not a payment, so buy the margin.
+GASMUL := --gas-estimate-multiplier 200
+
+.PHONY: build test fmt snapshot cov clean deploy deploy-dry demo demo-dry balance gas engine ci
 
 build:
 	forge build
@@ -67,9 +74,17 @@ pending:
 
 deploy:
 	forge script script/Deploy.s.sol:Deploy \
-		--rpc-url $(RPC) $(SIGNER) --broadcast $(VERIFY) -vvv
+		--rpc-url $(RPC) $(SIGNER) --broadcast $(VERIFY) $(GASMUL) -vvv
+
+# Dry run against live chain state. Sends nothing, needs no key. Same output as `deploy`.
+deploy-dry:
+	forge script script/Deploy.s.sol:Deploy --rpc-url $(RPC) --sender $(DEPLOYER) -vvv
 
 # Seeds both venues with equal notional TVL and runs the comparison sweep.
+# Set DEMO_MARKETS=1 for mWETH/mUSDC only, 2 for mWBTC/mUSDC only, 3 (default) for both.
 demo:
 	forge script script/Demo.s.sol:Demo \
-		--rpc-url $(RPC) $(SIGNER) --broadcast -vvv
+		--rpc-url $(RPC) $(SIGNER) --broadcast $(GASMUL) -vvv
+
+demo-dry:
+	forge script script/Demo.s.sol:Demo --rpc-url $(RPC) --sender $(DEPLOYER) -vvv
