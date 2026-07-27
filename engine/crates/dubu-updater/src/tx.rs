@@ -155,6 +155,27 @@ impl Signer {
         // k256 normalises to low-S, which is what EIP-2 requires and what every node checks.
         Ok((rec.to_byte() & 1 == 1, U256::from_be_slice(&sig.r().to_bytes()), U256::from_be_slice(&sig.s().to_bytes())))
     }
+
+    /// Sign a 32-byte digest as `(r, s, v)` with `v` in `{27, 28}` — the shape `ecrecover` takes.
+    ///
+    /// Separate from the transaction path, which packs the same `yParity` into an RLP envelope
+    /// instead. Both go through `sign_prehash`, so there is one place a signature is produced and
+    /// two places one is packed.
+    ///
+    /// The caller supplies a finished digest and this hashes nothing. A signer that computes its
+    /// own preimage is a signer that can be talked into signing a different structure than the one
+    /// that was reviewed.
+    ///
+    /// # Errors
+    /// [`TxError::Sign`] if the curve rejects the digest.
+    pub fn sign_digest_65(&self, digest: B256) -> Result<[u8; 65], TxError> {
+        let (y_parity, r, s) = self.sign_prehash(digest)?;
+        let mut out = [0u8; 65];
+        out[0..32].copy_from_slice(&r.to_be_bytes::<32>());
+        out[32..64].copy_from_slice(&s.to_be_bytes::<32>());
+        out[64] = if y_parity { 28 } else { 27 };
+        Ok(out)
+    }
 }
 
 // ---------------------------------------------------------------------------
