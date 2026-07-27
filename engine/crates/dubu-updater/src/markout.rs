@@ -263,7 +263,9 @@ impl Markout {
             if d > TOLERANCE_SECS {
                 continue;
             }
-            if best.is_none_or(|(bd, _)| d < bd) {
+            // `is_none_or` reads better but is stable only from 1.82, and this crate's MSRV is
+            // 1.75.
+            if best.map_or(true, |(bd, _)| d < bd) {
                 best = Some((d, r));
             }
         }
