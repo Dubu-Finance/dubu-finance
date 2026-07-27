@@ -117,6 +117,9 @@ pub const ORDER_ENCODE_DATA_WORDS: usize = 12;
 /// Parse a 64-character hex literal into 32 bytes.
 ///
 /// A `const fn` so a malformed constant is a compile error rather than a test failure.
+/// The indexing is bounded by the `assert!` above it and evaluated in `const` context, so a
+/// malformed literal fails the build rather than the process. That is the point of the function.
+#[allow(clippy::indexing_slicing)]
 #[must_use]
 pub const fn hex32(s: &str) -> [u8; 32] {
     let bytes = s.as_bytes();
@@ -276,16 +279,25 @@ impl Order {
 ///
 /// `word` is always exactly 32 bytes at every call site; the slice form keeps `encode_data`
 /// readable as a table of offsets, which is how it is checked against the Solidity.
+///
+/// The three writers here index with constant bounds into a window `encode_data` cut from a
+/// fixed-size buffer. Taking `&mut [u8; 32]` instead would make that a type-level fact and remove
+/// the lint exemption — but it would also stop `encode_data` reading as a list of offsets, and the
+/// offsets are what a reviewer diffs against `PmmSettle`. The exemption is the cheaper of the two,
+/// and `encode_data`'s own tests pin every offset.
+#[allow(clippy::indexing_slicing)]
 fn write_address(word: &mut [u8], address: &[u8; 20]) {
     word[12..32].copy_from_slice(address);
 }
 
 /// Left-pad a `u128` into a 32-byte word, big-endian.
+#[allow(clippy::indexing_slicing)]
 fn write_u128(word: &mut [u8], value: u128) {
     word[16..32].copy_from_slice(&value.to_be_bytes());
 }
 
 /// Left-pad a `u64` into a 32-byte word, big-endian.
+#[allow(clippy::indexing_slicing)]
 fn write_u64(word: &mut [u8], value: u64) {
     word[24..32].copy_from_slice(&value.to_be_bytes());
 }

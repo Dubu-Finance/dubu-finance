@@ -105,6 +105,9 @@ impl Signer {
     ///
     /// # Errors
     /// [`TxError::Key`] — and the message never quotes the input.
+    /// The two slices are over fixed-size values: an uncompressed SEC1 point is always 65 bytes
+    /// and a keccak digest always 32, neither of which can be another length.
+    #[allow(clippy::indexing_slicing)]
     pub fn from_hex(hex: &str) -> Result<Self, TxError> {
         let t = hex.trim();
         let raw = unhex(t).ok_or_else(|| TxError::Key("key is not hex".into()))?;

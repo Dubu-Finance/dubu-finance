@@ -354,14 +354,25 @@ impl ReferenceError {
 }
 
 /// Median of a sorted slice. Even lengths take the mean of the two middle values.
-fn median_sorted(xs: &[u128]) -> u128 {
+///
+/// `None` on an empty slice rather than a panic. The quorum check in [`combine`] already makes
+/// that unreachable — but it does so two frames away and through a configured `min_venues`, and a
+/// defence that lives behind a config value is a defence until somebody sets the value to zero.
+/// On an empty slice the even branch would evaluate `xs[0 / 2 - 1]`, which underflows `usize`
+/// before it ever indexes, so the failure would not even read as an out-of-bounds.
+fn median_sorted(xs: &[u128]) -> Option<u128> {
     let n = xs.len();
+    if n == 0 {
+        return None;
+    }
     if n % 2 == 1 {
-        xs[n / 2]
+        xs.get(n / 2).copied()
     } else {
+        let lo = *xs.get(n / 2 - 1)?;
+        let hi = *xs.get(n / 2)?;
         // Halve each before adding: the values are feed-scale prices, so this cannot overflow,
         // but the habit is the one the rest of the crate keeps.
-        xs[n / 2 - 1] / 2 + xs[n / 2] / 2 + (xs[n / 2 - 1] % 2 + xs[n / 2] % 2) / 2
+        Some(lo / 2 + hi / 2 + (lo % 2 + hi % 2) / 2)
     }
 }
 
@@ -413,7 +424,9 @@ pub fn combine(quotes: &[VenueQuote], p: &MadParams) -> Result<Reference, Refere
 
     let mut sorted: Vec<u128> = quotes.iter().map(|q| q.micro).collect();
     sorted.sort_unstable();
-    let median = median_sorted(&sorted);
+    // `None` and zero mean the same thing here — no cross-section to price from — so they take
+    // the same exit rather than one of them being a distinct failure nobody has a response to.
+    let median = median_sorted(&sorted).unwrap_or(0);
     if median == 0 {
         return Err(ReferenceError::NoQuorum { have: 0, need });
     }
@@ -425,7 +438,7 @@ pub fn combine(quotes: &[VenueQuote], p: &MadParams) -> Result<Reference, Refere
 
     let mut mags: Vec<u128> = devs.iter().map(|d| u128::from(d.decibps.unsigned_abs())).collect();
     mags.sort_unstable();
-    let mad = median_sorted(&mags);
+    let mad = median_sorted(&mags).unwrap_or(0);
     let dispersion = u32::try_from(mad).unwrap_or(u32::MAX);
 
     // The regime gate. One venue away from the pack barely moves the MAD; half the venues away
@@ -723,12 +736,13 @@ mod tests {
 
     #[test]
     fn the_median_is_the_mean_of_the_middle_two_at_even_lengths() {
-        assert_eq!(median_sorted(&[1, 2, 3]), 2);
-        assert_eq!(median_sorted(&[1, 2, 3, 4]), 2);
-        assert_eq!(median_sorted(&[10, 20, 21, 40]), 20);
+        assert_eq!(median_sorted(&[1, 2, 3]), Some(2));
+        assert_eq!(median_sorted(&[1, 2, 3, 4]), Some(2));
+        assert_eq!(median_sorted(&[10, 20, 21, 40]), Some(20));
         // Odd sum, so the halving has to carry.
-        assert_eq!(median_sorted(&[1, 1, 2, 2]), 1);
-        assert_eq!(median_sorted(&[3, 3]), 3);
+        assert_eq!(median_sorted(&[1, 1, 2, 2]), Some(1));
+        assert_eq!(median_sorted(&[]), None, "an empty cross-section names no price");
+        assert_eq!(median_sorted(&[3, 3]), Some(3));
     }
 
     #[test]

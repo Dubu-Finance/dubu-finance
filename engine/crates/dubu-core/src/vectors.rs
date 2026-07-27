@@ -4,6 +4,18 @@
 //! Both implementations must agree on every record; that agreement is the only evidence
 //! either side is right.
 //!
+//! # Why this module may panic and the rest of the crate may not
+//!
+//! Everything else here returns a `Result`, and the crate denies `unwrap`, `expect` and `panic` to
+//! keep it that way. This module is exempt on purpose.
+//!
+//! It is a generator, not runtime code — nothing in the quote loop reaches it. It runs when
+//! somebody regenerates the fixtures, and what it produces is the evidence that the Rust and the
+//! Solidity agree. A vector it could not compute is not a degraded result to carry forward; it is
+//! a hole in that evidence, and a fixture file with a hole in it looks exactly like one without.
+//! Stopping the generation is the correct failure, and it is the same judgement `markout` makes
+//! when it counts an unmarked fill rather than guessing at one.
+//!
 //! # Wire format
 //!
 //! A flat array of uniform records — no nesting, no heterogeneous arrays, no tagged union.
@@ -132,6 +144,8 @@
 //! succeeds outright — so asserting on them would assert on the divergence rather than on the
 //! agreement. [`generate`] panics if it ever builds one, which keeps the gap visible instead
 //! of quietly widening.
+
+#![allow(clippy::expect_used, clippy::panic)]
 
 use serde::{Deserialize, Serialize};
 

@@ -88,6 +88,20 @@
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 #![warn(clippy::all)]
+// Panic discipline, enforced rather than remembered.
+//
+// Every recoverable condition in this crate returns a `Result`: an RPC that fails, a venue that
+// goes quiet, a config that will not parse, a curve solve outside its domain. None of those may
+// take the process down, because a maker that dies mid-cycle leaves a ladder on chain that nobody
+// is updating.
+//
+// The exceptions are exempted one at a time, at the site, with the bound that makes each safe
+// written next to it — a blanket `allow` at the crate root would leave the next one unexamined.
+// Not enabled for `cfg(test)`: an assertion is a panic, and that is what a test is for.
+#![cfg_attr(
+    not(test),
+    deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)
+)]
 
 pub mod curve;
 pub mod error;

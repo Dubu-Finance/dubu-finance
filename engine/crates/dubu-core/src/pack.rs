@@ -132,7 +132,12 @@ impl QuoteWord {
         let mut s = String::with_capacity(66);
         s.push_str("0x");
         for b in w {
+            // `b >> 4` and `b & 0x0f` are both nibbles, so both are in `0..16`, which is the
+            // length of `HEX`. Reaching for `get()` here would mean inventing a fallback character
+            // for a case the type system already rules out.
+            #[allow(clippy::indexing_slicing)]
             s.push(char::from(HEX[usize::from(b >> 4)]));
+            #[allow(clippy::indexing_slicing)]
             s.push(char::from(HEX[usize::from(b & 0x0f)]));
         }
         Ok(s)

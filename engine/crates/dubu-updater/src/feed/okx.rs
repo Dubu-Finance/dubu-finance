@@ -120,6 +120,9 @@ impl MarketFeed for Client {
         let f = |field: &str, v: &str| -> Result<u128, String> {
             units::parse_fixed(v, FEED_SCALE).map_err(|e| format!("{field}: {e}"))
         };
+        // Both levels were length-checked four lines up; a venue that sends a short level is
+        // rejected there with a message rather than indexed into here.
+        #[allow(clippy::indexing_slicing)]
         let tick = BookTick {
             update_id: bbo.seq_id,
             bid: f("bids[0][0]", &bid[0])?,

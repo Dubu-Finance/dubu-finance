@@ -40,6 +40,11 @@ const MASK64: u128 = u64::MAX as u128;
 
 /// `10**exp` for every `exp` this crate accepts. `10**38 < 2^127`, so the whole table fits
 /// `u128`; `10**39` does not, which is exactly why [`crate::curve::MAX_PRICE_SCALE_EXP`] is 38.
+// Indexed rather than iterated because this is a `const` block, where iterators are not
+// available. Both indices are bounded by the same literal 39 that sizes the array, and the whole
+// expression is evaluated at compile time — an out-of-bounds here would be a build error, not a
+// runtime panic.
+#[allow(clippy::indexing_slicing)]
 const POW10: [u128; 39] = {
     let mut table = [1u128; 39];
     let mut i = 1;

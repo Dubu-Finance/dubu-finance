@@ -217,6 +217,11 @@ impl Markout {
     ///
     /// Returns the fills it settled, so the caller can log them individually — the per-fill record
     /// is what a later analysis joins on, and an aggregate alone cannot be re-cut.
+    /// The indexing here is over `HORIZONS_SECS` and two arrays sized by `HORIZONS_SECS.len()`,
+    /// with the index coming from that same array's `enumerate`. The bounds are equal by
+    /// construction and a mismatch would not compile. The `expect` is on a `pop_front` guarded by
+    /// the `front()` in the loop head one line above.
+    #[allow(clippy::indexing_slicing, clippy::expect_used)]
     pub fn settle(&mut self, now_secs: u64) -> Vec<(Fill, [Option<i128>; HORIZONS_SECS.len()])> {
         let mut settled = Vec::new();
         let longest = HORIZONS_SECS[HORIZONS_SECS.len() - 1];
@@ -296,7 +301,12 @@ impl Markout {
                     // Weight by notional so the sum is in quote units and a large fill counts
                     // for what it actually was.
                     let contribution = bps_e2.saturating_mul(notional) / 1_000_000;
-                    score.pnl[i] = score.pnl[i].saturating_add(contribution);
+                    // `i` enumerates `marks`, and `marks` and `score.pnl` are both sized by
+                    // `HORIZONS_SECS.len()`, so the two lengths are equal at compile time.
+                    #[allow(clippy::indexing_slicing)]
+                    {
+                        score.pnl[i] = score.pnl[i].saturating_add(contribution);
+                    }
                 }
             }
         }
@@ -322,6 +332,8 @@ impl Markout {
 
     /// Counterparties ordered worst-first at the given horizon, for reporting.
     #[must_use]
+    /// Same shape as `settle`: the index is bounded by the array it indexes.
+    #[allow(clippy::indexing_slicing)]
     pub fn worst(&self, horizon_index: usize, limit: usize) -> Vec<(Address, &Score)> {
         let mut v: Vec<_> = self.scores.iter().map(|(a, s)| (*a, s)).collect();
         v.sort_by_key(|(_, s)| s.markout_e2(horizon_index).unwrap_or(0));

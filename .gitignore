@@ -1,6 +1,5 @@
 # Vendored third-party repos — reference material only, NEVER commit these.
 # context/codes/ contains private repositories belonging to other organisations
-# (igneous-labs prop-s / prop-s-offchain) plus OKX's public routers. None of it is ours
 # to redistribute, and the private ones must not end up in this project's history.
 context/codes/
 

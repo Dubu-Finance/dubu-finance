@@ -241,6 +241,9 @@ impl SwapWatch {
     ///   against the wrong reference is worse than a missing one, because it looks like data.
     ///
     /// A block whose timestamp cannot be established drops its fills and counts them.
+    /// The one index is on the `Ok(i)` arm of a `binary_search_by_key` over the vector being
+    /// indexed, which is the position that search just returned.
+    #[allow(clippy::indexing_slicing)]
     async fn resolve_timestamps(&self, rpc: &Rpc, out: &mut Polled) -> Result<(), RpcError> {
         let mut wanted: Vec<u64> =
             out.fills.iter().filter(|f| f.at_secs == 0).map(|f| f.block_number).collect();

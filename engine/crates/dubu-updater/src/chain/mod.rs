@@ -909,6 +909,11 @@ impl ChainReader {
     ///
     /// # Errors
     /// [`RpcError`] — including the two that never leave the process.
+    /// Indexing into `results` is bounded by `decode_batch`, which rejects any length other than
+    /// the exact one asked for on the line above. The bound is local and explicit rather than an
+    /// invariant held somewhere else, which is why it is exempted here and not suppressed
+    /// crate-wide.
+    #[allow(clippy::indexing_slicing)]
     pub async fn read(&self, rpc: &Rpc) -> Result<ChainView, RpcError> {
         let raw = rpc.eth_call(self.multicall, &self.calldata, "pending").await?;
         let results = decode_batch(&raw, 2 + self.pair_ids.len() + self.tokens.len())?;
@@ -994,6 +999,10 @@ pub struct ChainFacts {
 ///
 /// # Errors
 /// [`RpcError`] for a failed read, or [`RpcError::Decode`] carrying the mismatch.
+/// Indexing into `res` is bounded by `decode_batch` on the line that produced it, which rejects
+/// any length but the exact one requested. The `BTreeMap` indexes below are over maps this
+/// function has just built from the same `pair_ids` and token list it is now iterating.
+#[allow(clippy::indexing_slicing)]
 pub async fn verify_against_chain(
     rpc: &Rpc,
     pool: Address,
