@@ -521,6 +521,59 @@ mod tests {
         assert_eq!(w.seen_set.len(), SEEN_CAPACITY);
     }
 
+    /// A log this decoder has never seen, captured verbatim from GIWA Sepolia.
+    ///
+    /// Every other test here builds its input with the same `sol!` types the decoder reads it
+    /// back with, so all of them would still pass if the event's ABI and the deployed contract's
+    /// had drifted apart. This one cannot: it is what the chain actually returned for a swap on
+    /// `0xA629071E606F425dB93310c3ecc35E00Fbe16358`, field names, casing, and all.
+    ///
+    /// It is also the routed case — `sender` is the router adapter and `receiver` is the taker —
+    /// which is a third of the fills in this sample and the reason `markout` scores the receiver.
+    fn captured_from_chain() -> serde_json::Value {
+        json!({
+            "blockNumber": "0x1e4c3d3",
+            "blockTimestamp": "0x6a66b02f",
+            "logIndex": "0x2d",
+            "transactionHash": "0xca570d313b4436c024d1c02d7f32c8b93194c285ab4462fb65d28928abb24783",
+            "removed": false,
+            "topics": [
+                "0x9cfe9d5c9c99284d3a07f72aeb4e1e2a5656e85926c7542e3d0c631e6751930d",
+                "0x0000000000000000000000000000000000000000000000000000000000000001",
+                "0x00000000000000000000000016c5a0df5ad0c8b0a450edaa67c56593b02d19e2",
+                "0x0000000000000000000000002b10d0b50ca3a7c0c7ccabc969615b4db3fb9471",
+            ],
+            "data": "0x0000000000000000000000000000000000000000000000000000000000000000\
+                      000000000000000000000000000000000000000000000000000000003b9aca00\
+                      00000000000000000000000000000000000000000000000006ef77ce918afa2e\
+                      0000000000000000000000000000000000000000000000000000000000000000",
+        })
+    }
+
+    #[test]
+    fn decodes_a_log_captured_from_the_live_chain() {
+        let f = decode(&captured_from_chain()).expect("a real Swap log must decode");
+        assert_eq!(f.pair_id, 1);
+        assert_eq!(f.sender, address!("16C5A0DF5AD0C8B0A450EDAA67C56593B02D19E2"));
+        assert_eq!(f.receiver, address!("2B10D0B50CA3A7C0C7CCABC969615B4DB3FB9471"));
+        assert_ne!(f.sender, f.receiver, "the routed case: an adapter sent it, a taker received it");
+        assert!(!f.is_bid, "the pool sold base for 1e9 quote units");
+        assert_eq!(f.amount_in, 1_000_000_000);
+        assert_eq!(f.amount_out, 499_749_812_750_187_054);
+        assert_eq!(f.partner_id, 0);
+        assert_eq!(f.block_number, 31_769_555);
+        assert_eq!(f.at_secs, 1_785_114_671); // 2026-07-27T01:11:11Z
+        assert_eq!(f.log_index, 45);
+    }
+
+    /// GIWA supplies `blockTimestamp` on every log, so `resolve_timestamps` should have nothing to
+    /// do. If a node ever stops supplying it this test still passes and the fallback carries it —
+    /// the point is to record which path the live chain actually takes.
+    #[test]
+    fn the_live_chain_needs_no_timestamp_backfill() {
+        assert_ne!(decode(&captured_from_chain()).expect("decodes").at_secs, 0);
+    }
+
     /// A log filter is only as good as its topic. If the event's shape ever changes, this fails
     /// before the watcher starts silently returning nothing.
     #[test]
