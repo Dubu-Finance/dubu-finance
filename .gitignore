@@ -29,3 +29,8 @@ contracts/lib/
 
 **/context 
 **/docs
+
+# Cloudflare Worker build + deps
+aggregator/node_modules/
+aggregator/.wrangler/
+aggregator/package-lock.json

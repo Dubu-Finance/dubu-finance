@@ -1,0 +1,28 @@
+name = "dubu-aggregator"
+main = "src/index.ts"
+compatibility_date = "2026-07-01"
+
+# Public addresses. Not secrets -- they are in DEPLOYMENTS.md and on the explorer. Kept here rather
+# than only as defaults in config.ts so that repointing at a redeployed contract is a config change
+# with a diff, not a code change.
+[vars]
+RPC_URL = "https://sepolia-rpc.giwa.io"
+ROUTER = "0x2B10D0b50ca3A7c0C7CCaBc969615b4Db3fb9471"
+PROP_POOL = "0xBbE55E29BbC6d71EcAb1ac011c9Ac5206aB2Fe74"
+PROP_ADAPTER = "0x16C5A0df5Ad0c8b0A450eDaa67c56593B02D19e2"
+UNIV2_ADAPTER = "0xA7383784E39d2d3C717C61735A363654360DeF46"
+UNIV2_ROUTER02 = "0x98E2aa881cEFe66E394C8261d1D1BdE25D4BffA6"
+PMM_SETTLE = "0x68CFa6E265AffD5D0DB2C49E4bb9DaEC5A920A9E"
+PMM_ADAPTER = "0x92CC1139212d02c8CF198dE804161432feEa4eBD"
+PARTNER_ID = "0"
+
+# RFQ_MAKER_URL and RFQ_MAKER_ADDRESS are deliberately absent.
+#
+# The maker service is the one input this worker does not compute, and the address is what every
+# order's signature must recover to. Setting the URL without the address would mean accepting
+# orders from whoever answers that URL, so config.ts treats them as a pair and disables the RFQ leg
+# unless both are present -- which is why leaving them unset here is a working configuration rather
+# than a broken one. Set them with:
+#
+#   wrangler secret put RFQ_MAKER_URL
+#   wrangler secret put RFQ_MAKER_ADDRESS

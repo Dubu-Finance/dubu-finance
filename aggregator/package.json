@@ -1,0 +1,22 @@
+{
+  "name": "dubu-aggregator",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "DEX aggregator for GIWA. Quotes the prop AMM, UniV2 and the RFQ maker, and returns signable route calldata.",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "viem": "^2.21.0"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5.20260722.1",
+    "typescript": "^5.6.0",
+    "vitest": "^3.2.4",
+    "wrangler": "^4.0.0"
+  }
+}
