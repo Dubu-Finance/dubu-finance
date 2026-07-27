@@ -4,135 +4,112 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 
 <!--
-  A single file, no build step, no dependencies. Open it, or serve the directory.
+  One file, no build step, no dependencies. Serve the directory and open it.
 
-  It talks to the chain directly from the browser because every endpoint we need sends
-  `access-control-allow-origin: *` — checked before this was written. Binance's public
-  bookTicker stream is the reference price and needs no key.
+  It talks to the chain directly from the browser — every endpoint it needs sends
+  `access-control-allow-origin: *`, checked before this was written — and takes its reference
+  price from Binance's public bookTicker, the same feed the updater tracks. Nothing of ours sits
+  between the viewer and the data.
 
-  The point of the page is one comparison: the same trade against the prop AMM and against a
-  constant-product pool holding the SAME inventory, priced against the same reference mid.
+  The page shows EFFECTIVE EXECUTION PRICE rather than basis points, because a price is a number
+  you can check against an exchange and a basis point is a number you have to trust. The bp
+  columns are still there, decomposed, underneath.
 -->
 
 <style>
   :root {
     color-scheme: light;
-    --surface-0:  #f4f4f2;
-    --surface-1:  #fcfcfb;
-    --surface-2:  #ebebe7;
-    --border:     #dcdcd6;
-    --text-1:     #0b0b0b;
-    --text-2:     #52514e;
-    --text-3:     #86857e;
-    --prop:       #2a78d6;
-    --univ2:      #008300;
-    --good:       #008300;
-    --warn:       #eda100;
-    --crit:       #e34948;
+    --surface-0:#f4f4f2; --surface-1:#fcfcfb; --surface-2:#ebebe7; --border:#dcdcd6;
+    --text-1:#0b0b0b; --text-2:#52514e; --text-3:#86857e;
+    --prop:#2a78d6; --univ2:#008300;
+    --good:#008300; --warn:#eda100; --crit:#e34948;
     --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
   }
-  @media (prefers-color-scheme: dark) {
-    :root:where(:not([data-theme="light"])) {
-      color-scheme: dark;
-      --surface-0: #131312; --surface-1: #1a1a19; --surface-2: #242422;
-      --border: #35352f; --text-1: #ffffff; --text-2: #c3c2b7; --text-3: #8a897f;
-      --prop: #3987e5; --univ2: #1e9e1e; --good: #1e9e1e; --warn: #c98500; --crit: #e66767;
-    }
-  }
+  @media (prefers-color-scheme: dark) { :root:where(:not([data-theme="light"])) {
+    color-scheme: dark;
+    --surface-0:#131312; --surface-1:#1a1a19; --surface-2:#242422; --border:#35352f;
+    --text-1:#fff; --text-2:#c3c2b7; --text-3:#8a897f;
+    --prop:#3987e5; --univ2:#1e9e1e; --good:#1e9e1e; --warn:#c98500; --crit:#e66767; } }
   :root[data-theme="dark"] {
     color-scheme: dark;
-    --surface-0: #131312; --surface-1: #1a1a19; --surface-2: #242422;
-    --border: #35352f; --text-1: #ffffff; --text-2: #c3c2b7; --text-3: #8a897f;
-    --prop: #3987e5; --univ2: #1e9e1e; --good: #1e9e1e; --warn: #c98500; --crit: #e66767;
-  }
+    --surface-0:#131312; --surface-1:#1a1a19; --surface-2:#242422; --border:#35352f;
+    --text-1:#fff; --text-2:#c3c2b7; --text-3:#8a897f;
+    --prop:#3987e5; --univ2:#1e9e1e; --good:#1e9e1e; --warn:#c98500; --crit:#e66767; }
 
-  * { box-sizing: border-box; }
-  body {
-    margin: 0; background: var(--surface-0); color: var(--text-1);
-    font: 14px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
-    -webkit-font-smoothing: antialiased;
-  }
-  .wrap { max-width: 1120px; margin: 0 auto; padding: 24px 20px 64px; }
+  * { box-sizing:border-box }
+  body { margin:0; background:var(--surface-0); color:var(--text-1);
+    font:14px/1.5 ui-sans-serif, system-ui, -apple-system, sans-serif; -webkit-font-smoothing:antialiased }
+  .wrap { max-width:1180px; margin:0 auto; padding:24px 20px 64px }
 
-  header { display: flex; flex-wrap: wrap; gap: 16px; align-items: baseline; margin-bottom: 4px; }
-  h1 { font-size: 20px; font-weight: 650; margin: 0; letter-spacing: -0.01em; }
-  .sub { color: var(--text-2); font-size: 13px; }
-  .sub a { color: inherit; }
+  header { display:flex; flex-wrap:wrap; gap:14px; align-items:baseline }
+  h1 { font-size:20px; font-weight:650; margin:0; letter-spacing:-.01em }
+  .sub { color:var(--text-2); font-size:13px } .sub a { color:inherit }
 
-  .statusbar {
-    display: flex; flex-wrap: wrap; gap: 8px 20px; align-items: center;
-    margin: 16px 0 24px; padding: 10px 14px;
-    background: var(--surface-1); border: 1px solid var(--border); border-radius: 8px;
-    font-family: var(--mono); font-size: 12px; color: var(--text-2);
-  }
-  .dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; margin-right: 7px; }
-  .st-good { background: var(--good); } .st-warn { background: var(--warn); } .st-crit { background: var(--crit); }
-  .statusbar b { color: var(--text-1); font-weight: 600; }
+  .statusbar { display:flex; flex-wrap:wrap; gap:8px 20px; align-items:center;
+    margin:16px 0 22px; padding:10px 14px; background:var(--surface-1);
+    border:1px solid var(--border); border-radius:8px;
+    font-family:var(--mono); font-size:12px; color:var(--text-2) }
+  .dot { width:8px; height:8px; border-radius:50%; display:inline-block; margin-right:7px }
+  .st-good{background:var(--good)} .st-warn{background:var(--warn)} .st-crit{background:var(--crit)}
+  .statusbar b { color:var(--text-1); font-weight:600 }
 
-  .markets { display: grid; gap: 16px; grid-template-columns: repeat(auto-fit, minmax(430px, 1fr)); }
-  @media (max-width: 620px) { .markets { grid-template-columns: 1fr; } }
+  .card { background:var(--surface-1); border:1px solid var(--border); border-radius:10px;
+    padding:18px 20px; margin-bottom:16px }
+  .card h2 { font-size:15px; font-weight:620; margin:0 0 2px }
+  .card .meta { color:var(--text-3); font-size:12px; font-family:var(--mono); margin-bottom:16px }
 
-  .card {
-    background: var(--surface-1); border: 1px solid var(--border);
-    border-radius: 10px; padding: 18px 20px;
-  }
-  .card h2 { font-size: 15px; font-weight: 620; margin: 0 0 2px; }
-  .card .meta { color: var(--text-3); font-size: 12px; font-family: var(--mono); margin-bottom: 16px; }
+  /* Top-of-book: the two venues' best quotes against the reference, as prices. */
+  .quotes { display:grid; grid-template-columns:repeat(3,1fr); gap:1px;
+    background:var(--border); border:1px solid var(--border); border-radius:8px;
+    overflow:hidden; margin-bottom:18px }
+  .q { background:var(--surface-1); padding:11px 13px }
+  .q .who { font-size:11px; text-transform:uppercase; letter-spacing:.05em; color:var(--text-3);
+    margin-bottom:6px; display:flex; align-items:center }
+  .q .pair { font-family:var(--mono); font-size:17px; font-weight:600; letter-spacing:-.02em }
+  .q .pair .bid { color:var(--text-1) } .q .pair .sep { color:var(--text-3); margin:0 5px }
+  .q .spread { font-family:var(--mono); font-size:11.5px; color:var(--text-2); margin-top:3px }
+  .swatch { width:8px; height:8px; border-radius:2px; display:inline-block; margin-right:6px }
 
-  .prices { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 18px; }
-  .price-block .lbl { font-size: 11px; text-transform: uppercase; letter-spacing: .05em; color: var(--text-3); margin-bottom: 3px; }
-  .price-block .val { font-family: var(--mono); font-size: 22px; font-weight: 600; letter-spacing: -0.02em; }
-  .price-block .val.small { font-size: 15px; font-weight: 500; }
-  .delta { font-family: var(--mono); font-size: 12px; margin-top: 2px; }
+  table { width:100%; border-collapse:collapse; font-family:var(--mono); font-size:12.5px }
+  caption { text-align:left; font-family:ui-sans-serif,system-ui,sans-serif; font-size:12px;
+    color:var(--text-2); padding:2px 0 9px }
+  th { font-weight:500; color:var(--text-3); padding:0 0 7px; font-size:10.5px;
+    text-transform:uppercase; letter-spacing:.04em; border-bottom:1px solid var(--border); text-align:right }
+  th:first-child, td:first-child { text-align:left }
+  td { padding:7px 0; text-align:right; border-bottom:1px solid var(--surface-2) }
+  tr:last-child td { border-bottom:none }
+  .grp { border-left:1px solid var(--surface-2); padding-left:14px !important }
+  th.grp { border-left:1px solid var(--border) }
+  .p-prop { color:var(--prop); font-weight:600 } .p-univ2 { color:var(--univ2); font-weight:600 }
+  .dim { color:var(--text-3) } .neg { color:var(--crit) }
 
-  /* The ladder: four prices on one axis, bid side left of the reference, ask side right. */
-  .ladder { margin: 4px 0 18px; }
-  .ladder-track { position: relative; height: 34px; }
-  .ladder-line { position: absolute; top: 21px; left: 0; right: 0; height: 1px; background: var(--border); }
-  .ladder-span { position: absolute; top: 17px; height: 9px; border-radius: 2px; opacity: .85; }
-  .ladder-span.bid { background: var(--prop); }
-  .ladder-span.ask { background: var(--prop); }
-  .ladder-ref { position: absolute; top: 8px; width: 2px; height: 27px; background: var(--text-1); }
-  .ladder-ref::after {
-    content: attr(data-l); position: absolute; top: -12px; left: 50%; transform: translateX(-50%);
-    font: 10px var(--mono); color: var(--text-2); white-space: nowrap;
-  }
-  .ladder-scale { display: flex; justify-content: space-between; font: 10px var(--mono); color: var(--text-3); margin-top: 2px; }
+  .split { display:grid; grid-template-columns:1fr 1fr; gap:26px; margin-top:20px }
+  @media (max-width:760px){ .split{grid-template-columns:1fr} .quotes{grid-template-columns:1fr} }
 
-  table { width: 100%; border-collapse: collapse; font-family: var(--mono); font-size: 12.5px; }
-  th { text-align: right; font-weight: 500; color: var(--text-3); padding: 0 0 7px; font-size: 11px;
-       text-transform: uppercase; letter-spacing: .04em; border-bottom: 1px solid var(--border); }
-  th:first-child, td:first-child { text-align: left; }
-  td { padding: 7px 0; text-align: right; border-bottom: 1px solid var(--surface-2); }
-  tr:last-child td { border-bottom: none; }
-  .swatch { width: 9px; height: 9px; border-radius: 2px; display: inline-block; margin-right: 6px; vertical-align: baseline; }
-  .bar-cell { width: 46%; }
-  .bar { height: 9px; border-radius: 0 2px 2px 0; display: block; min-width: 1px; }
-  .bar.prop { background: var(--prop); } .bar.univ2 { background: var(--univ2); }
-  .ratio { color: var(--text-1); font-weight: 600; }
-  .dim { color: var(--text-3); }
+  .lvr { margin-top:18px; padding:13px 15px; background:var(--surface-2);
+    border-radius:8px; font-size:12.5px }
+  .lvr h3 { margin:0 0 8px; font-size:12px; font-weight:620; letter-spacing:.01em;
+    font-family:ui-sans-serif,system-ui,sans-serif }
+  .lvr-row { display:flex; justify-content:space-between; gap:12px; font-family:var(--mono);
+    padding:4px 0 }
+  .lvr .why { color:var(--text-2); font-size:12px; margin-top:9px; line-height:1.55;
+    font-family:ui-sans-serif,system-ui,sans-serif }
 
-  .legend { display: flex; gap: 16px; font-size: 12px; color: var(--text-2); margin: 14px 0 10px; }
-
-  .note {
-    margin-top: 28px; padding: 16px 18px; background: var(--surface-1);
-    border: 1px solid var(--border); border-left: 3px solid var(--warn); border-radius: 8px;
-    font-size: 13px; color: var(--text-2);
-  }
-  .note b { color: var(--text-1); font-weight: 600; }
-  .note ol { margin: 8px 0 0; padding-left: 20px; }
-  .note li { margin-bottom: 7px; }
-  .err { color: var(--crit); font-family: var(--mono); font-size: 12px; }
-  footer { margin-top: 26px; font-size: 12px; color: var(--text-3); font-family: var(--mono); }
-  footer a { color: var(--text-2); }
+  .note { margin-top:26px; padding:16px 18px; background:var(--surface-1);
+    border:1px solid var(--border); border-left:3px solid var(--warn); border-radius:8px;
+    font-size:13px; color:var(--text-2) }
+  .note b { color:var(--text-1); font-weight:600 }
+  .note ol { margin:8px 0 0; padding-left:20px } .note li { margin-bottom:7px }
+  footer { margin-top:24px; font-size:12px; color:var(--text-3); font-family:var(--mono) }
+  .err { color:var(--crit) }
 </style>
 
 <div class="wrap">
   <header>
     <h1>DuBu</h1>
     <span class="sub">proprietary AMM on GIWA Sepolia ·
-      <a href="https://sepolia-explorer.giwa.io/address/0xA629071E606F425dB93310c3ecc35E00Fbe16358" target="_blank"
-         rel="noopener">0xA629…6358</a></span>
+      <a href="https://sepolia-explorer.giwa.io/address/0xA629071E606F425dB93310c3ecc35E00Fbe16358"
+         target="_blank" rel="noopener">0xA629…6358</a></span>
   </header>
 
   <div class="statusbar">
@@ -143,283 +120,289 @@
     <span class="dim" id="tick"></span>
   </div>
 
-  <div class="markets" id="markets"></div>
+  <div id="markets"></div>
 
   <div class="note">
-    <b>What this comparison does and does not say.</b> Both venues hold the same token inventory and
-    are measured against the same reference mid, so the difference is the pricing mechanism and
-    nothing else. Four things it is not:
+    <b>What this does and does not say.</b>
     <ol>
-      <li>At small size almost none of the gap is the curve — UniV2 charges a flat 30&nbsp;bp fee
-        against our 5&nbsp;bp half-spread, and that is essentially the whole difference.</li>
-      <li>The largest ratio is not a headline number. It is the biggest trade that still fits inside
-        one capacity epoch, where the constant-product impact has compounded and ours has not.</li>
-      <li>Past the epoch capacity this pool <em>refuses</em> — it quotes 0 and the swap reverts —
-        where UniV2 keeps filling at any size. A venue that declines is not strictly better than one
-        that fills badly. It is a different trade-off, and that bound is what limits how much a
-        stale ladder can be picked off for.</li>
-      <li>Adverse selection is not modelled. The reference mid is right by assumption here. These
-        are execution-quality numbers for an honest taker, not a claim about the market maker's
-        P&amp;L.</li>
+      <li>Both venues hold the same token inventory, so the difference in the top table is the
+        pricing mechanism — plus, for UniV2, however far its internal price has drifted from the
+        market since it was last traded. Those are separated below each table for exactly that
+        reason.</li>
+      <li>At small size most of the honest gap is fees, not curve shape: UniV2 charges a flat
+        30&nbsp;bp where this pool charges a 5&nbsp;bp half-spread. The curve only starts to matter
+        at size.</li>
+      <li>Past its capacity epoch this pool <em>refuses</em> — it quotes nothing and the swap
+        reverts — where UniV2 keeps filling at any size. Declining is not strictly better than
+        filling badly. It is a different trade-off, and it is what bounds how much a stale ladder
+        can be picked off for.</li>
+      <li>Adverse selection is not modelled. The reference is right by assumption here. These are
+        execution-quality numbers for an honest taker, not a claim about the maker's P&amp;L.</li>
     </ol>
-    Both tokens are ours and both venues were seeded by us, because GIWA has no canonical
-    stablecoin. This measures curves, not markets.
+    Both tokens are ours and both venues were seeded by us — GIWA has no canonical stablecoin, so
+    there is no third-party liquidity to compare against. This measures curves, not markets.
   </div>
 
-  <footer>
-    reads <span id="rpcName">sepolia-rpc.giwa.io</span> every block · reference from
-    binance bookTicker · <span id="errline"></span>
-  </footer>
+  <footer>reads sepolia-rpc.giwa.io each block · reference from binance bookTicker ·
+    <span id="errline"></span></footer>
 </div>
 
 <script type="module">
-const RPC   = 'https://sepolia-rpc.giwa.io';
-const POOL  = '0xA629071E606F425dB93310c3ecc35E00Fbe16358';
+const RPC  = 'https://sepolia-rpc.giwa.io';
+const POOL = '0xA629071E606F425dB93310c3ecc35E00Fbe16358';
 
-// pairId, the two tokens, their decimals, the pair's priceScaleExp, the UniV2 pair holding the
-// same inventory, and the Binance symbol whose price the updater tracks. The tokens are mocks
-// with no market of their own — pair 1 follows ETHUSDT and pair 2 BTCUSDT, which is what makes
-// the comparison live rather than a fixture.
 const MARKETS = [
-  { id: 1, name: 'mWETH / mUSDC', sym: 'ethusdt', label: 'ETHUSDT',
-    base: '0x81e46C6379498beBEB5DCcD47ab2DdFaf967d445', baseDec: 18,
-    quote:'0xd28596C6750D87C53EA146134AfAB53de86C5155', quoteDec: 6,
-    exp: 24, v2: '0x94f0033BABBa0bEC1C17B808E0980ECFd3B35b4C' },
-  { id: 2, name: 'mWBTC / mUSDC', sym: 'btcusdt', label: 'BTCUSDT',
-    base: '0x3548991B5EF2D7805EFa95bEa6CeDeAee3869875', baseDec: 8,
-    quote:'0xd28596C6750D87C53EA146134AfAB53de86C5155', quoteDec: 6,
-    exp: 12, v2: '0xd6d0f9F9536590b2C0FDC76Fab5FE415F59C0bED' },
+  { id:1, name:'mWETH / mUSDC', sym:'ethusdt', label:'ETHUSDT', dp:2,
+    base:'0x81e46C6379498beBEB5DCcD47ab2DdFaf967d445', baseDec:18,
+    quote:'0xd28596C6750D87C53EA146134AfAB53de86C5155', quoteDec:6,
+    exp:24, v2:'0x94f0033BABBa0bEC1C17B808E0980ECFd3B35b4C' },
+  { id:2, name:'mWBTC / mUSDC', sym:'btcusdt', label:'BTCUSDT', dp:2,
+    base:'0x3548991B5EF2D7805EFa95bEa6CeDeAee3869875', baseDec:8,
+    quote:'0xd28596C6750D87C53EA146134AfAB53de86C5155', quoteDec:6,
+    exp:12, v2:'0xd6d0f9F9536590b2C0FDC76Fab5FE415F59C0bED' },
 ];
+const SIZES = [1_000, 10_000, 100_000, 1_000_000];   // notional, in whole quote units
 
-// Quote sizes, in whole units of the QUOTE token. Kept identical across markets so the two cards
-// are read against each other.
-const SIZES = [1_000n, 10_000n, 100_000n, 1_000_000n];
-
-// ---- minimal ABI plumbing. Every call here takes and returns fixed-width value types, so
-// encoding is selector + 32-byte words and decoding is slicing them back out. Pulling in a
-// library for this would be more code than the code.
-const SEL = {
-  getAmountOut: '0x4aa06652',   // getAmountOut(address,address,uint256)
-  snapshot:     '0x082af76c',   // snapshot(uint16)
-  getReserves:  '0x0902f1ac',   // getReserves()
-};
-const w  = v => BigInt(v).toString(16).padStart(64, '0');
-const wa = a => a.toLowerCase().replace('0x', '').padStart(64, '0');
-const words = hex => { const h = hex.slice(2); const o = [];
-  for (let i = 0; i < h.length; i += 64) o.push(BigInt('0x' + h.slice(i, i + 64))); return o; };
-
-let rpcId = 0;
-async function batch(calls) {
-  const body = calls.map(c => ({ jsonrpc: '2.0', id: ++rpcId, method: 'eth_call',
-    params: [{ to: c.to, data: c.data }, 'latest'] }));
-  const r = await fetch(RPC, { method: 'POST', headers: { 'content-type': 'application/json' },
-    body: JSON.stringify(body) });
-  if (!r.ok) throw new Error('rpc ' + r.status);
-  const j = await r.json();
-  const byId = new Map(j.map(x => [x.id, x]));
-  return body.map(b => { const res = byId.get(b.id);
-    // A view that reverts is a bug in the pool, not an exception here: IPropPool promises 0
-    // instead. Surface it as null rather than pretending it quoted.
-    return res && res.result && res.result !== '0x' ? res.result : null; });
-}
-async function blockNumber() {
-  const r = await fetch(RPC, { method: 'POST', headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ jsonrpc: '2.0', id: ++rpcId, method: 'eth_blockNumber', params: [] }) });
-  return Number(BigInt((await r.json()).result));
-}
-
-// ---- pricing helpers
+const SEL = { getAmountOut:'0x4aa06652', snapshot:'0x082af76c', getReserves:'0x0902f1ac' };
+const w  = v => BigInt(v).toString(16).padStart(64,'0');
+const wa = a => a.toLowerCase().replace('0x','').padStart(64,'0');
+const words = h => { const s=h.slice(2), o=[]; for(let i=0;i<s.length;i+=64) o.push(BigInt('0x'+s.slice(i,i+64))); return o };
 const pow10 = n => 10n ** BigInt(n);
 
-// The pool stores price such that quote = base * price / 10**exp. Convert to a human price per
-// whole base token for display.
-const humanPrice = (p, m) => Number(p) / Number(pow10(m.exp)) * Number(pow10(m.baseDec)) / Number(pow10(m.quoteDec));
+let rid = 0;
+async function rpc(body) {
+  const r = await fetch(RPC,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)});
+  if(!r.ok) throw new Error('rpc '+r.status);
+  return r.json();
+}
+async function batch(calls) {
+  const body = calls.map(c=>({jsonrpc:'2.0',id:++rid,method:'eth_call',params:[{to:c.to,data:c.data},'latest']}));
+  const j = await rpc(body); const by = new Map(j.map(x=>[x.id,x]));
+  // A view that reverts is a pool bug — IPropPool promises 0 instead — so surface null rather
+  // than pretending it quoted.
+  return body.map(b=>{ const r=by.get(b.id); return r&&r.result&&r.result!=='0x' ? r.result : null });
+}
 
 // Constant product with the 0.3% fee, exactly as UniswapV2Pair computes it.
-const v2Out = (amtIn, rIn, rOut) => {
-  if (amtIn <= 0n || rIn <= 0n || rOut <= 0n) return 0n;
-  const withFee = amtIn * 997n;
-  return (withFee * rOut) / (rIn * 1000n + withFee);
-};
+const v2Out = (aIn,rIn,rOut) => (aIn<=0n||rIn<=0n||rOut<=0n) ? 0n
+  : (aIn*997n*rOut)/(rIn*1000n+aIn*997n);
 
-// Realised cost against the reference mid, in basis points. Positive means the taker paid more
-// than the mid — every honest venue is positive.
-const costBps = (got, expected) => expected === 0 ? null : (expected - got) / expected * 10_000;
-
-// ---- reference price, straight from the exchange the updater tracks
-const ref = {};
-let feedOk = false;
-function connectFeed() {
-  const streams = MARKETS.map(m => m.sym + '@bookTicker').join('/');
-  const ws = new WebSocket('wss://stream.binance.com:9443/stream?streams=' + streams);
-  ws.onopen  = () => { feedOk = true;  paintFeed(); };
-  ws.onclose = () => { feedOk = false; paintFeed(); setTimeout(connectFeed, 2000); };
-  ws.onerror = () => { feedOk = false; paintFeed(); };
-  ws.onmessage = e => {
-    const d = JSON.parse(e.data).data; if (!d) return;
-    const bid = +d.b, ask = +d.a, qb = +d.B, qa = +d.A;
-    // Micro-price, not the mid: weighting each side by the size resting on the OTHER side is
-    // what makes it track where the book is actually leaning. The updater uses the same formula.
-    ref[d.s.toLowerCase()] = (qa + qb) > 0 ? (bid * qa + ask * qb) / (qa + qb) : (bid + ask) / 2;
-  };
+const ref = {}; let feedOk = false;
+function connectFeed(){
+  const ws = new WebSocket('wss://stream.binance.com:9443/stream?streams='+MARKETS.map(m=>m.sym+'@bookTicker').join('/'));
+  ws.onopen=()=>{feedOk=true;paintFeed()};
+  ws.onclose=()=>{feedOk=false;paintFeed();setTimeout(connectFeed,2000)};
+  ws.onerror=()=>{feedOk=false;paintFeed()};
+  ws.onmessage=e=>{ const d=JSON.parse(e.data).data; if(!d) return;
+    const b=+d.b,a=+d.a,qb=+d.B,qa=+d.A;
+    // Micro-price, not the mid. Weighting each side by the size resting on the OTHER side is
+    // what makes it track where the book is leaning; the updater uses the same formula.
+    ref[d.s.toLowerCase()] = (qa+qb)>0 ? (b*qa+a*qb)/(qa+qb) : (b+a)/2; };
 }
 const paintFeed = () => {
-  document.getElementById('feedDot').className = 'dot ' + (feedOk ? 'st-good' : 'st-crit');
-  document.getElementById('feed').textContent = feedOk ? 'live' : 'reconnecting';
+  document.getElementById('feedDot').className='dot '+(feedOk?'st-good':'st-crit');
+  document.getElementById('feed').textContent=feedOk?'live':'reconnecting';
 };
 
-// ---- render
-const fmt = (n, d = 2) => n == null || !isFinite(n) ? '—'
-  : n.toLocaleString('en-US', { minimumFractionDigits: d, maximumFractionDigits: d });
+const f = (n,d=2)=> n==null||!isFinite(n) ? '—'
+  : n.toLocaleString('en-US',{minimumFractionDigits:d,maximumFractionDigits:d});
+const sgn = (n,d=1)=> n==null||!isFinite(n) ? '—' : (n>=0?'+':'')+f(n,d);
 
-document.getElementById('markets').innerHTML = MARKETS.map(m => `
-  <div class="card" id="card${m.id}">
+document.getElementById('markets').innerHTML = MARKETS.map(m=>`
+  <div class="card">
     <h2>${m.name}</h2>
     <div class="meta">pairId ${m.id} · priceScaleExp ${m.exp} · tracks ${m.label}</div>
-    <div class="prices">
-      <div class="price-block">
-        <div class="lbl">reference (binance)</div>
-        <div class="val" id="ref${m.id}">—</div>
+
+    <div class="quotes">
+      <div class="q">
+        <div class="who">reference · binance ${m.label}</div>
+        <div class="pair"><span id="r${m.id}">—</span></div>
+        <div class="spread" id="rs${m.id}">micro-price</div>
       </div>
-      <div class="price-block">
-        <div class="lbl">pool ladder</div>
-        <div class="val small" id="lad${m.id}">—</div>
-        <div class="delta dim" id="dev${m.id}"></div>
+      <div class="q">
+        <div class="who"><span class="swatch" style="background:var(--prop)"></span>DuBu — bid / ask</div>
+        <div class="pair"><span class="bid" id="pb${m.id}">—</span><span class="sep">/</span><span id="pa${m.id}">—</span></div>
+        <div class="spread" id="ps${m.id}"></div>
+      </div>
+      <div class="q">
+        <div class="who"><span class="swatch" style="background:var(--univ2)"></span>UniV2 — bid / ask</div>
+        <div class="pair"><span class="bid" id="ub${m.id}">—</span><span class="sep">/</span><span id="ua${m.id}">—</span></div>
+        <div class="spread" id="us${m.id}"></div>
       </div>
     </div>
-    <div class="ladder">
-      <div class="ladder-track" id="track${m.id}"><div class="ladder-line"></div></div>
-      <div class="ladder-scale"><span id="lo${m.id}"></span><span id="hi${m.id}"></span></div>
+
+    <div class="split">
+      <div>
+        <table>
+          <caption><b>Buying base</b> — effective price you actually pay</caption>
+          <thead><tr><th>notional</th><th>DuBu</th><th>UniV2</th><th class="grp">DuBu bp</th><th>UniV2 bp</th></tr></thead>
+          <tbody id="buy${m.id}"></tbody>
+        </table>
+      </div>
+      <div>
+        <table>
+          <caption><b>Selling base</b> — effective price you actually receive</caption>
+          <thead><tr><th>notional</th><th>DuBu</th><th>UniV2</th><th class="grp">DuBu bp</th><th>UniV2 bp</th></tr></thead>
+          <tbody id="sell${m.id}"></tbody>
+        </table>
+      </div>
     </div>
-    <div class="legend">
-      <span><span class="swatch" style="background:var(--prop)"></span>prop AMM</span>
-      <span><span class="swatch" style="background:var(--univ2)"></span>UniV2 (same inventory)</span>
+
+    <div class="lvr">
+      <h3>Drift from market — who pays, and how much</h3>
+      <div class="lvr-row"><span><span class="swatch" style="background:var(--prop)"></span>DuBu</span>
+        <span id="dprop${m.id}">—</span></div>
+      <div class="lvr-row"><span><span class="swatch" style="background:var(--univ2)"></span>UniV2</span>
+        <span id="duni${m.id}">—</span></div>
+      <div class="why" id="dwhy${m.id}"></div>
     </div>
-    <table>
-      <thead><tr><th>buy base</th><th>prop</th><th>univ2</th><th class="bar-cell"></th><th>ratio</th></tr></thead>
-      <tbody id="rows${m.id}"></tbody>
-    </table>
   </div>`).join('');
 
-async function tick() {
+async function tick(){
   const errEl = document.getElementById('errline');
   try {
-    const bn = await blockNumber();
-    document.getElementById('block').textContent = bn.toLocaleString();
-    document.getElementById('chainDot').className = 'dot st-good';
+    const bnRes = await rpc({jsonrpc:'2.0',id:++rid,method:'eth_blockNumber',params:[]});
+    document.getElementById('block').textContent = Number(BigInt(bnRes.result)).toLocaleString();
+    document.getElementById('chainDot').className='dot st-good';
 
-    const calls = [];
-    for (const m of MARKETS) {
-      calls.push({ to: POOL, data: SEL.snapshot + w(m.id) });
-      calls.push({ to: m.v2, data: SEL.getReserves });
-      for (const s of SIZES) {
-        const amt = s * pow10(m.quoteDec);
-        calls.push({ to: POOL, data: SEL.getAmountOut + wa(m.quote) + wa(m.base) + w(amt) });
+    const calls=[];
+    for(const m of MARKETS){
+      calls.push({to:POOL,data:SEL.snapshot+w(m.id)});
+      calls.push({to:m.v2,data:SEL.getReserves});
+      // Two directions per size: quote in (buy base) and base in (sell base). The base leg is
+      // sized off the reference so both venues are asked for the same notional.
+      for(const s of SIZES){
+        calls.push({to:POOL,data:SEL.getAmountOut+wa(m.quote)+wa(m.base)+w(BigInt(s)*pow10(m.quoteDec))});
+        const r = ref[m.sym];
+        const baseAmt = r ? BigInt(Math.floor(s/r*Number(pow10(m.baseDec)))) : 0n;
+        calls.push({to:POOL,data:SEL.getAmountOut+wa(m.base)+wa(m.quote)+w(baseAmt)});
       }
     }
     const out = await batch(calls);
 
-    let i = 0, worstAge = null, anyCapacity = false;
-    for (const m of MARKETS) {
-      const snapRaw = out[i++], resRaw = out[i++];
-      const propOut = SIZES.map(() => out[i++]);
+    let i=0, worstAge=null, anyCap=false;
+    for(const m of MARKETS){
+      const snap=out[i++], resRaw=out[i++];
+      const legs=[]; for(let k=0;k<SIZES.length;k++) legs.push([out[i++],out[i++]]);
       const r = ref[m.sym];
+      document.getElementById('r'+m.id).textContent = r?f(r,m.dp):'—';
 
-      document.getElementById('ref' + m.id).textContent = r ? fmt(r, 2) : '—';
+      if(!snap) continue;
+      const s = words(snap);
+      const [minBid,maxBid,minAsk] = s, updatedAt = s[4], askCap = s[6];
+      // price is stored so that quote = base * price / 10**exp; convert to a human price per
+      // whole base token.
+      const hp = p => Number(p)/Number(pow10(m.exp))*Number(pow10(m.baseDec))/Number(pow10(m.quoteDec));
+      const pBid = hp(maxBid), pAsk = hp(minAsk);
 
-      if (!snapRaw) { document.getElementById('lad' + m.id).textContent = 'unreadable'; continue; }
-      const s = words(snapRaw);
-      const [minBid, maxBid, minAsk, maxAsk, updatedAt] = s;
-      const askCapacity = s[6], maxStale = s[13];
+      document.getElementById('pb'+m.id).textContent = f(pBid,m.dp);
+      document.getElementById('pa'+m.id).textContent = f(pAsk,m.dp);
+      document.getElementById('ps'+m.id).textContent =
+        `spread ${f((pAsk-pBid)/((pAsk+pBid)/2)*1e4,1)} bp`;
 
-      const hb = humanPrice(maxBid, m), ha = humanPrice(minAsk, m);
-      const lo = humanPrice(minBid, m), hi = humanPrice(maxAsk, m);
-      document.getElementById('lad' + m.id).textContent = `${fmt(hb, 2)} / ${fmt(ha, 2)}`;
+      const age = Math.max(0, Math.floor(Date.now()/1000)-Number(updatedAt));
+      if(worstAge===null||age>worstAge) worstAge=age;
+      if(askCap>0n) anyCap=true;
 
-      // Age drives the whole status line: past maxStaleSecs the pool stops quoting by design.
-      const age = Math.max(0, Math.floor(Date.now() / 1000) - Number(updatedAt));
-      if (worstAge === null || age > worstAge) worstAge = age;
-      if (askCapacity > 0n) anyCapacity = true;
+      // UniV2 reserves come back as token0/token1; order by address to know which is base.
+      let rBase=0n, rQuote=0n;
+      if(resRaw){ const [a,b]=words(resRaw);
+        const baseIs0 = m.base.toLowerCase() < m.quote.toLowerCase();
+        rBase = baseIs0?a:b; rQuote = baseIs0?b:a; }
+      const xB = Number(rBase)/Number(pow10(m.baseDec));      // base held
+      const yQ = Number(rQuote)/Number(pow10(m.quoteDec));    // quote held
+      const uMid = xB>0 ? yQ/xB : null;                       // the pool's own internal price
 
-      const dev = document.getElementById('dev' + m.id);
-      if (r) {
-        const mid = (hb + ha) / 2;
-        const bps = (mid - r) / r * 10_000;
-        dev.textContent = `${bps >= 0 ? '+' : ''}${fmt(bps, 1)} bp vs reference`;
-        dev.style.color = Math.abs(bps) < 25 ? 'var(--good)' : Math.abs(bps) < 200 ? 'var(--warn)' : 'var(--crit)';
-      } else dev.textContent = '';
+      // UniV2 top of book: the marginal price at infinitesimal size is its mid adjusted by the
+      // fee on whichever side you cross.
+      if(uMid){
+        document.getElementById('ub'+m.id).textContent = f(uMid*0.997,m.dp);
+        document.getElementById('ua'+m.id).textContent = f(uMid/0.997,m.dp);
+        // Derived, not written down: crossing costs the 0.3% fee on each side, so the round
+        // trip is 1/0.997 − 0.997 regardless of size or reserves.
+        document.getElementById('us'+m.id).textContent =
+          `spread ${f((1/0.997 - 0.997)*1e4,1)} bp — the 30 bp fee, both ways`;
+      }
+      if(r) document.getElementById('rs'+m.id).textContent =
+        `DuBu ${sgn((( pBid+pAsk)/2 - r)/r*1e4)} bp · UniV2 ${uMid?sgn((uMid-r)/r*1e4):'—'} bp`;
 
-      // Ladder strip, scaled to whichever is wider — the ladder or the reference's distance
-      // from it — so a badly drifted pool is visibly drifted rather than silently re-centred.
-      const track = document.getElementById('track' + m.id);
-      const centre = r || (lo + hi) / 2;
-      const halfSpan = Math.max(hi - centre, centre - lo, (hi - lo) * 0.6) * 1.15 || 1;
-      const x = v => ((v - (centre - halfSpan)) / (2 * halfSpan)) * 100;
-      track.querySelectorAll('.ladder-span,.ladder-ref').forEach(e => e.remove());
-      const span = (a, b, cls) => { const d = document.createElement('div');
-        d.className = 'ladder-span ' + cls; d.style.left = x(a) + '%';
-        d.style.width = Math.max(0.6, x(b) - x(a)) + '%'; track.append(d); };
-      span(lo, hb, 'bid'); span(ha, hi, 'ask');
-      if (r) { const d = document.createElement('div'); d.className = 'ladder-ref';
-        d.style.left = x(r) + '%'; d.dataset.l = 'ref'; track.append(d); }
-      document.getElementById('lo' + m.id).textContent = fmt(centre - halfSpan, 0);
-      document.getElementById('hi' + m.id).textContent = fmt(centre + halfSpan, 0);
-
-      // Reserves come back token0/token1; order by address to know which is base.
-      let rBase = 0n, rQuote = 0n;
-      if (resRaw) { const [r0, r1] = words(resRaw);
-        const baseIsToken0 = m.base.toLowerCase() < m.quote.toLowerCase();
-        rBase = baseIsToken0 ? r0 : r1; rQuote = baseIsToken0 ? r1 : r0; }
-
-      const rows = SIZES.map((size, k) => {
-        const amtIn = size * pow10(m.quoteDec);
-        const expectedBase = r ? Number(size) / r : null;   // what the reference mid would buy
-        const pOutRaw = propOut[k] ? words(propOut[k])[0] : 0n;
-        const pBase = Number(pOutRaw) / Number(pow10(m.baseDec));
-        const vBase = Number(v2Out(amtIn, rQuote, rBase)) / Number(pow10(m.baseDec));
-        const pBps = expectedBase && pBase > 0 ? costBps(pBase, expectedBase) : null;
-        const vBps = expectedBase && vBase > 0 ? costBps(vBase, expectedBase) : null;
-        return { size, pBps, vBps, quoting: pOutRaw > 0n };
+      const rows = SIZES.map((size,k)=>{
+        const [buyRaw,sellRaw] = legs[k];
+        // BUY: pay `size` quote, receive base. Effective price = quote paid / base received.
+        const bOut = buyRaw ? Number(words(buyRaw)[0])/Number(pow10(m.baseDec)) : 0;
+        const pBuy = bOut>0 ? size/bOut : null;
+        const uBuyOut = Number(v2Out(BigInt(size)*pow10(m.quoteDec), rQuote, rBase))/Number(pow10(m.baseDec));
+        const uBuy = uBuyOut>0 ? size/uBuyOut : null;
+        // SELL: give `size/ref` base, receive quote. Effective = quote received / base given.
+        const baseIn = r ? size/r : null;
+        const sOut = sellRaw ? Number(words(sellRaw)[0])/Number(pow10(m.quoteDec)) : 0;
+        const pSell = (sOut>0&&baseIn) ? sOut/baseIn : null;
+        const uSellOut = r ? Number(v2Out(BigInt(Math.floor(baseIn*Number(pow10(m.baseDec)))), rBase, rQuote))/Number(pow10(m.quoteDec)) : 0;
+        const uSell = (uSellOut>0&&baseIn) ? uSellOut/baseIn : null;
+        return {size, pBuy, uBuy, pSell, uSell,
+                quoting: bOut>0, quotingSell: sOut>0};
       });
 
-      const maxBps = Math.max(1, ...rows.flatMap(x => [x.pBps, x.vBps].filter(v => v != null && isFinite(v))));
-      document.getElementById('rows' + m.id).innerHTML = rows.map(x => {
-        const pw = x.pBps != null ? Math.max(0.5, x.pBps / maxBps * 100) : 0;
-        const vw = x.vBps != null ? Math.max(0.5, x.vBps / maxBps * 100) : 0;
-        const ratio = x.pBps > 0 && x.vBps != null ? (x.vBps / x.pBps) : null;
-        return `<tr>
-          <td>$${Number(x.size).toLocaleString()}</td>
-          <td>${x.quoting ? fmt(x.pBps, 2) : '<span class="dim">no quote</span>'}</td>
-          <td>${fmt(x.vBps, 2)}</td>
-          <td class="bar-cell">
-            <span class="bar prop"  style="width:${pw}%"></span>
-            <span class="bar univ2" style="width:${vw}%;margin-top:2px"></span>
-          </td>
-          <td class="ratio">${ratio ? fmt(ratio, 1) + '×' : '—'}</td>
-        </tr>`;
-      }).join('');
+      const cost = (px, side) => px==null||!r ? null : (side==='buy' ? (px-r)/r : (r-px)/r)*1e4;
+      const cell = (px,c,cls) => px==null
+        ? '<td class="dim">no quote</td>' : `<td class="${cls}">${f(px,m.dp)}</td>`;
+
+      document.getElementById('buy'+m.id).innerHTML = rows.map(x=>`<tr>
+        <td>$${x.size.toLocaleString()}</td>
+        ${x.quoting?cell(x.pBuy,0,'p-prop'):'<td class="dim">no quote</td>'}
+        ${cell(x.uBuy,0,'p-univ2')}
+        <td class="grp">${f(cost(x.pBuy,'buy'),2)}</td>
+        <td>${f(cost(x.uBuy,'buy'),2)}</td></tr>`).join('');
+
+      document.getElementById('sell'+m.id).innerHTML = rows.map(x=>`<tr>
+        <td>$${x.size.toLocaleString()}</td>
+        ${x.quotingSell?cell(x.pSell,0,'p-prop'):'<td class="dim">no quote</td>'}
+        ${cell(x.uSell,0,'p-univ2')}
+        <td class="grp">${f(cost(x.pSell,'sell'),2)}</td>
+        <td>${f(cost(x.uSell,'sell'),2)}</td></tr>`).join('');
+
+      // Drift, and what it is actually worth. A price gap is not a value gap: closing a 2.7%
+      // gap on a 5,000-unit pool takes ~67 units of trade, so the transfer is far smaller than
+      // the gap. The number that matters is what an arbitrageur can take out of the LP, which is
+      // the constant-product LVR: rebalance to the market price and compare the pool's value at
+      // that price, before and after.
+      const dProp = r ? ((pBid+pAsk)/2 - r)/r*1e4 : null;
+      document.getElementById('dprop'+m.id).innerHTML =
+        `<span class="p-prop">${sgn(dProp)} bp</span> <span class="dim">· nothing to extract</span>`;
+
+      if(uMid && r){
+        const k = xB*yQ, x2 = Math.sqrt(k/r), y2 = k/x2;
+        const before = xB*r + yQ, after = x2*r + y2;
+        const leak = before - after;
+        document.getElementById('duni'+m.id).innerHTML =
+          `<span class="p-univ2">${sgn((uMid-r)/r*1e4)} bp</span> <span class="dim">·
+           $${f(leak,0)} extractable (${f(leak/before*1e4,2)} bp of TVL)</span>`;
+        document.getElementById('dwhy'+m.id).textContent =
+          `UniV2 still prices base at ${f(uMid,m.dp)} while the market is ${f(r,m.dp)}. `+
+          `An arbitrageur closes that by trading ~${f(Math.abs(x2-xB),2)} base against the pool and `+
+          `keeps $${f(leak,0)} — taken from the LP, not from a taker. That is loss-versus-rebalancing, `+
+          `and it repeats on every price move. This pool has none of it by construction: it reprices `+
+          `instead of waiting to be arbitraged. The UniV2 bp columns above include this drift, so at `+
+          `small size most of what they show is staleness rather than curve shape.`;
+      }
     }
 
-    // One status line for the whole pool, because the failure people need to see is "it stopped
-    // quoting", and that is a property of the updater rather than of either market.
-    const ageEl = document.getElementById('age'), capEl = document.getElementById('cap');
-    if (worstAge != null) {
-      ageEl.textContent = worstAge < 90 ? worstAge + 's'
-        : worstAge < 5400 ? Math.round(worstAge / 60) + 'm' : (worstAge / 3600).toFixed(1) + 'h';
-      ageEl.style.color = worstAge < 120 ? 'var(--good)' : worstAge < 2400 ? 'var(--warn)' : 'var(--crit)';
+    const ageEl=document.getElementById('age'), capEl=document.getElementById('cap');
+    if(worstAge!=null){
+      ageEl.textContent = worstAge<90?worstAge+'s' : worstAge<5400?Math.round(worstAge/60)+'m'
+        : (worstAge/3600).toFixed(1)+'h';
+      ageEl.style.color = worstAge<120?'var(--good)':worstAge<2400?'var(--warn)':'var(--crit)';
     }
-    capEl.textContent = anyCapacity ? 'posted' : 'withdrawn';
-    capEl.style.color = anyCapacity ? 'var(--good)' : 'var(--crit)';
-    errEl.textContent = '';
-  } catch (e) {
-    document.getElementById('chainDot').className = 'dot st-crit';
-    errEl.innerHTML = '<span class="err">' + e.message + '</span>';
+    capEl.textContent = anyCap?'posted':'withdrawn';
+    capEl.style.color = anyCap?'var(--good)':'var(--crit)';
+    errEl.textContent='';
+  } catch(e){
+    document.getElementById('chainDot').className='dot st-crit';
+    errEl.innerHTML='<span class="err">'+e.message+'</span>';
   }
-  document.getElementById('tick').textContent = new Date().toLocaleTimeString();
+  document.getElementById('tick').textContent=new Date().toLocaleTimeString();
 }
 
-connectFeed();
-paintFeed();
-tick();
-setInterval(tick, 1500);   // a little over the 1s block time; the RPC is shared and rate-limited
+connectFeed(); paintFeed(); tick();
+setInterval(tick, 1500);   // a little over the 1s block time; the public RPC is shared
 </script>
