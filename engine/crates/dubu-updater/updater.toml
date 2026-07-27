@@ -43,7 +43,7 @@ rpc_url = "https://giwa-sepolia.nodit.io/${NODIT_API_KEY}"
 flashblocks_rpc_url = "https://sepolia-rpc-flashblocks.giwa.io"
 
 chain_id = 91342
-pool = "0xA629071E606F425dB93310c3ecc35E00Fbe16358"
+pool = "0xBbE55E29BbC6d71EcAb1ac011c9Ac5206aB2Fe74"
 
 # Preinstalled in GIWA's genesis at the canonical address. This is what makes a whole read
 # cycle — block number, block timestamp, both snapshots, three balances — one `eth_call`. KEPT

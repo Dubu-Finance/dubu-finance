@@ -3,7 +3,10 @@
 ## GIWA Sepolia (chain id 91342)
 
 Deployed 2026-07-27 from `0x5AD176eBb13CAbE62Ee7c07F52a67b4A48CbEf83`, nonce 0.
-All 11 contracts verified on Blockscout.
+
+The original 11 contracts are verified on Blockscout. **`PropPool`, `PmmSettle` and `PmmAdapter`
+below are not** — they were deployed in a later pass with verification deliberately skipped, and
+the source is in this repo at the commit that deployed them.
 
 | contract | address |
 |---|---|
@@ -12,14 +15,44 @@ All 11 contracts verified on Blockscout.
 | mWBTC (8 dec) | [`0x3548991B5EF2D7805EFa95bEa6CeDeAee3869875`](https://sepolia-explorer.giwa.io/address/0x3548991B5EF2D7805EFa95bEa6CeDeAee3869875) |
 | UniswapV2Factory | [`0x751cd28542301ac7158a0417C9B8475aae22eD59`](https://sepolia-explorer.giwa.io/address/0x751cd28542301ac7158a0417C9B8475aae22eD59) |
 | UniswapV2Router02 | [`0x98E2aa881cEFe66E394C8261d1D1BdE25D4BffA6`](https://sepolia-explorer.giwa.io/address/0x98E2aa881cEFe66E394C8261d1D1BdE25D4BffA6) |
-| **PropPool** | [`0xA629071E606F425dB93310c3ecc35E00Fbe16358`](https://sepolia-explorer.giwa.io/address/0xA629071E606F425dB93310c3ecc35E00Fbe16358) |
+| **PropPool** | [`0xBbE55E29BbC6d71EcAb1ac011c9Ac5206aB2Fe74`](https://sepolia-explorer.giwa.io/address/0xBbE55E29BbC6d71EcAb1ac011c9Ac5206aB2Fe74) |
 | **Router** | [`0x2B10D0b50ca3A7c0C7CCaBc969615b4Db3fb9471`](https://sepolia-explorer.giwa.io/address/0x2B10D0b50ca3A7c0C7CCaBc969615b4Db3fb9471) |
 | PropPoolAdapter | [`0x16C5A0df5Ad0c8b0A450eDaa67c56593B02D19e2`](https://sepolia-explorer.giwa.io/address/0x16C5A0df5Ad0c8b0A450eDaa67c56593B02D19e2) |
 | UniV2Adapter | [`0xA7383784E39d2d3C717C61735A363654360DeF46`](https://sepolia-explorer.giwa.io/address/0xA7383784E39d2d3C717C61735A363654360DeF46) |
+| **PmmSettle** (RFQ) | [`0x68CFa6E265AffD5D0DB2C49E4bb9DaEC5A920A9E`](https://sepolia-explorer.giwa.io/address/0x68CFa6E265AffD5D0DB2C49E4bb9DaEC5A920A9E) |
+| PmmAdapter | [`0x92CC1139212d02c8CF198dE804161432feEa4eBD`](https://sepolia-explorer.giwa.io/address/0x92CC1139212d02c8CF198dE804161432feEa4eBD) |
 | pair mWETH/mUSDC | [`0x94f0033BABBa0bEC1C17B808E0980ECFd3B35b4C`](https://sepolia-explorer.giwa.io/address/0x94f0033BABBa0bEC1C17B808E0980ECFd3B35b4C) |
 | pair mWBTC/mUSDC | [`0xd6d0f9F9536590b2C0FDC76Fab5FE415F59C0bED`](https://sepolia-explorer.giwa.io/address/0xd6d0f9F9536590b2C0FDC76Fab5FE415F59C0bED) |
 
 Markets: pairId 1 = mWETH/mUSDC (18/6, `priceScaleExp` 24), pairId 2 = mWBTC/mUSDC (8/6, exp 12).
+
+### The pool was redeployed
+
+`PropPool` moved from `0xA629071E606F425dB93310c3ecc35E00Fbe16358` to the address above. The first
+deployment predated the Pyth deviation bound and the capacity decay ramp, both of which added
+storage, so the live contract and this repo's build had drifted apart — the old address answers
+`snapshot(uint16)` but has no `setPairDecay` selector (`0xcddec480`), which is how the drift was
+confirmed rather than assumed.
+
+`Router`, `PropPoolAdapter` and `UniV2Adapter` were **not** redeployed and did not need to be. None
+of them holds any state: the pool is a call argument carried in the route's step word, so a new pool
+address costs nothing but a config change. That is the routing design paying for itself.
+
+The old pool still holds its demo inventory and still works; it is simply not what anything points
+at any more. `chain::swaps` keeps a decoder fixture captured from a swap on it, which stays valid —
+a historical log does not stop being a real log.
+
+### The RFQ leg
+
+`PmmSettle`'s EIP-712 domain separator is
+`0x785df92cfa961225995c562e9a42c1b5645097a5bd5b868c303785afb34c5ee7`, and the deploy script derived
+that value independently before broadcasting and then asserted it against the deployed instance. A
+maker whose signer disagrees with the chain here produces quotes nobody can fill, with no error on
+the maker's side, so it is checked from two directions on purpose.
+
+The maker has approved `PmmSettle` for $1M of notional per asset — 1,000,000 mUSDC, 500 mWETH,
+10 mWBTC. Finite rather than `type(uint256).max`: `PmmSettle` custodies nothing, so that allowance
+is the maker's entire exposure to a bug in it.
 
 All four roles are the deployer. That is fine on testnet and wrong on mainnet — the split exists
 because the updater key is hot and will eventually leak, and it only means something when the

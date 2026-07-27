@@ -525,8 +525,14 @@ mod tests {
     ///
     /// Every other test here builds its input with the same `sol!` types the decoder reads it
     /// back with, so all of them would still pass if the event's ABI and the deployed contract's
-    /// had drifted apart. This one cannot: it is what the chain actually returned for a swap on
-    /// `0xA629071E606F425dB93310c3ecc35E00Fbe16358`, field names, casing, and all.
+    /// had drifted apart. This one cannot: it is what the chain actually returned, field names,
+    /// casing, and all.
+    ///
+    /// Captured from `0xA629071E606F425dB93310c3ecc35E00Fbe16358`, which is the *previous*
+    /// `PropPool` — see `DEPLOYMENTS.md`. Not restamped with the current address, because the
+    /// point of the fixture is that a real node produced these exact bytes, and rewriting them to
+    /// look current would throw that away for cosmetics. The `Swap` event is unchanged between the
+    /// two deployments, which is what the fixture actually pins.
     ///
     /// It is also the routed case — `sender` is the router adapter and `receiver` is the taker —
     /// which is a third of the fills in this sample and the reason `markout` scores the receiver.
