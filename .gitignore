@@ -25,3 +25,7 @@ contracts/lib/
 
 *.tmp
 .DS_Store
+
+
+**/context 
+**/docs

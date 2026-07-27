@@ -49,6 +49,7 @@ use tokio::sync::watch;
 use tracing::{error, info, warn};
 
 use dubu_updater::chain::heads::{self, HeadShared};
+use dubu_updater::chain::swaps::SwapWatch;
 use dubu_updater::chain::{ChainFacts, ChainHealth, ChainReader, ChainStatus, ChainView, Rpc};
 use dubu_updater::config::{Config, KeySource};
 use dubu_updater::fair_value::{self, Reference, VenueQuote};
@@ -56,6 +57,7 @@ use dubu_updater::feed::ws::MarketFeed;
 use dubu_updater::feed::{binance, bybit, coinbase, okx, FeedStatus, VenueFeeds, VenueId, VenueWatch};
 use dubu_updater::jump;
 use dubu_updater::ladder::{self, RowInputs};
+use dubu_updater::markout::{self, Markout};
 use dubu_updater::policy::{self, CapacityDecision, Context, Decision};
 use dubu_updater::risk::{Halt, KillSwitch, Position};
 use dubu_updater::skew::{self, Inventory, Volatility};
@@ -194,6 +196,12 @@ struct Runtime {
     sender: Sender,
     kill: KillSwitch,
     health: ChainHealth,
+    /// Follows our own `Swap` logs. Read off the canonical RPC, not the flashblocks one: markout
+    /// anchors to block timestamps, so a preconfirmed head buys it nothing, and a fill read out of
+    /// a preconfirmation that later reorganises would be a phantom counterparty score.
+    swaps: SwapWatch,
+    /// Who has been trading against us and how it went. Fed by [`scan_fills`].
+    markout: Markout,
 }
 
 /// Why this cycle is running. Logged on every cycle, because "the fallback timer has been the
@@ -439,6 +447,7 @@ async fn run(args: &Args) -> Result<i32, Box<dyn std::error::Error>> {
     };
 
     let health = ChainHealth::new(Instant::now(), cfg.chain.degraded_after_secs, cfg.chain.halt_after_secs);
+    let cfg_pool = cfg.chain.pool;
     let mut rt = Runtime {
         cfg,
         facts,
@@ -454,6 +463,8 @@ async fn run(args: &Args) -> Result<i32, Box<dyn std::error::Error>> {
         sender,
         kill,
         health,
+        swaps: SwapWatch::new(cfg_pool),
+        markout: Markout::new(),
     };
 
     wait_for_feed(&rt).await;
@@ -809,6 +820,119 @@ async fn withdraw_pair(rt: &mut Runtime, pair_id: u16, why: &str) {
     }
 }
 
+/// Read the fills that landed since the last cycle, mark the ones that have matured, and log both.
+///
+/// Runs after the quote decisions rather than before them, deliberately. Markout is a measurement
+/// and this cycle's quotes do not depend on it — putting an `eth_getLogs` round trip in front of
+/// the ladder would add latency to the one thing on this loop that is actually racing. Acting on
+/// what it learns is a decision for a later cycle, which is the correct shape anyway: a score is
+/// only meaningful once it has settled.
+///
+/// Bounded to the confirmed head from `newHeads`, not to `view.block_number`. The read view comes
+/// from the flashblocks endpoint's `pending` tag and can be *ahead* of any block the canonical RPC
+/// has, so using it would ask for logs from a block that does not exist there yet. With no head,
+/// the scan is skipped rather than guessed at — the cursor does not advance, so the next poll
+/// picks the same range up. That replayability is why this polls instead of subscribing.
+async fn scan_fills(rt: &mut Runtime, head: &heads::HeadSnapshot) {
+    let Some(confirmed) = head.last.map(|h| h.number) else {
+        return;
+    };
+
+    let polled = match rt.swaps.poll(&rt.rpc, confirmed).await {
+        Ok(p) => p,
+        Err(e) => {
+            warn!(
+                target: "markout", event = "poll_failed", error = %e,
+                cursor = ?rt.swaps.cursor(),
+                "could not read Swap logs; the cursor is unchanged and the next cycle re-reads this range"
+            );
+            return;
+        }
+    };
+
+    if polled.undecodable > 0 || polled.unresolved > 0 {
+        error!(
+            target: "markout", event = "logs_lost",
+            undecodable = polled.undecodable, unresolved = polled.unresolved,
+            "SWAP LOGS COULD NOT BE ACCOUNTED FOR: these fills are missing from every markout \
+             total below. A non-zero count here means the chain and the engine disagree about the \
+             event, and is never a rounding matter"
+        );
+    }
+
+    for log in &polled.fills {
+        let Some(meta) = rt.facts.pairs.get(&log.pair_id).copied() else {
+            warn!(
+                target: "markout", event = "unknown_pair", pair_id = log.pair_id,
+                tx = %log.tx_hash, "a fill on a pair this updater does not quote; not scored"
+            );
+            continue;
+        };
+
+        // The notional denominator. Our reference at the fill's own timestamp when we have one;
+        // otherwise the price the trade itself executed at, which is always available and is a
+        // true statement about the fill. Both are honest scales for "how big was this trade" —
+        // what would not be is reaching for the nearest reference regardless of how far away it
+        // is, which is the one thing `reference_at`'s tolerance exists to prevent.
+        let base = if log.is_bid { log.amount_in } else { log.amount_out };
+        let quote = if log.is_bid { log.amount_out } else { log.amount_in };
+        let ref_at_fill = match rt.markout.reference_at(log.pair_id, log.at_secs) {
+            Some(r) => r,
+            None => {
+                let scale = 10u128.pow(u32::from(meta.price_scale_exp));
+                match quote.checked_mul(scale).and_then(|n| n.checked_div(base.max(1))) {
+                    Some(p) if p > 0 => p,
+                    _ => continue,
+                }
+            }
+        };
+
+        info!(
+            target: "markout", event = "fill", pair_id = log.pair_id,
+            receiver = %log.receiver, sender = %log.sender, routed = log.sender != log.receiver,
+            partner_id = log.partner_id, is_bid = log.is_bid,
+            amount_in = log.amount_in, amount_out = log.amount_out,
+            block = log.block_number, at_secs = log.at_secs, tx = %log.tx_hash,
+            "fill observed"
+        );
+
+        rt.markout.observe_fill(markout::Fill {
+            pair_id: log.pair_id,
+            receiver: log.receiver,
+            partner_id: log.partner_id,
+            is_bid: log.is_bid,
+            amount_in: log.amount_in,
+            amount_out: log.amount_out,
+            at_secs: log.at_secs,
+            ref_at_fill,
+            price_scale_exp: meta.price_scale_exp,
+        });
+    }
+
+    // Settled against the chain's clock, since that is what the fills are stamped with.
+    let now_secs = head.last.map(|h| h.timestamp).unwrap_or(0);
+    for (fill, marks) in rt.markout.settle(now_secs) {
+        info!(
+            target: "markout", event = "marked", pair_id = fill.pair_id,
+            receiver = %fill.receiver, is_bid = fill.is_bid, at_secs = fill.at_secs,
+            m1_e2 = ?marks[0], m10_e2 = ?marks[1], m60_e2 = ?marks[2],
+            "fill marked out; negative is the counterparty winning"
+        );
+    }
+
+    if !polled.fills.is_empty() || rt.markout.pending_len() > 0 {
+        let worst = rt.markout.worst(markout::HORIZONS_SECS.len() - 1, 3);
+        info!(
+            target: "markout", event = "scoreboard",
+            new_fills = polled.fills.len(), pending = rt.markout.pending_len(),
+            unmarked = rt.markout.unmarked, duplicates = polled.duplicates, removed = polled.removed,
+            gaps = rt.swaps.gaps(), skipped_blocks = rt.swaps.skipped_blocks(),
+            worst = ?worst.iter().map(|(a, s)| (a.to_string(), s.markout_e2(2), s.fills)).collect::<Vec<_>>(),
+            "markout scoreboard"
+        );
+    }
+}
+
 /// One evaluation over every pair. Returns `true` if a killswitch latched.
 async fn run_cycle(
     rt: &mut Runtime,
@@ -945,6 +1069,9 @@ async fn run_cycle(
                 log_reference(&pair.symbol, pair.pair_id, r, &snaps, shift, vol);
                 units::to_pool_price(r.micro, shift)
             }
+            // No branch on the error side: markout's reference history must contain only prices
+            // the venues actually agreed on. Carrying the last good one forward through an outage
+            // would mark every fill in that window against a price nobody was showing.
             Err(e) => {
                 // No reference means no return either. Folding a gap into the estimator would
                 // enter the whole outage as one enormous one-second return.
@@ -962,6 +1089,13 @@ async fn run_cycle(
         let sigma_sq = vol.sigma_sq_bps_e6();
         let sigma_millibps = vol.sigma_millibps();
         let vol_samples = vol.samples();
+
+        // Stamped with the block timestamp, not the wall clock, because the fills these marks are
+        // compared against carry block timestamps too. Mixing the two clocks would put a systematic
+        // offset between a fill and its own reference.
+        if let Some(f) = fair {
+            rt.markout.observe_reference(pair.pair_id, view.block_timestamp, f);
+        }
 
         let base_balance = view.balances.get(&meta.base).copied().unwrap_or(0);
         let quote_balance = view.balances.get(&meta.quote).copied().unwrap_or(0);
@@ -1229,6 +1363,8 @@ async fn run_cycle(
     for intent in sends {
         emit(rt, intent).await;
     }
+
+    scan_fills(rt, head).await;
 
     // The killswitches. Skipped entirely when any pair has no fair value: marking inventory
     // against a price we do not have would be an invention, and an invented NAV is worse than

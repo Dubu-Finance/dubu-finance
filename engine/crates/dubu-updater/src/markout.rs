@@ -252,7 +252,7 @@ impl Markout {
     /// Nearest rather than interpolated: the reference is a jump process and interpolating across
     /// a jump invents a price that never held. A tolerance rather than an exact match because the
     /// cycle is event-driven and does not land on whole seconds.
-    fn reference_at(&self, pair_id: u16, at: u64) -> Option<u128> {
+    pub fn reference_at(&self, pair_id: u16, at: u64) -> Option<u128> {
         const TOLERANCE_SECS: u64 = 3;
         let mut best: Option<(u64, u128)> = None;
         for &(t, p, r) in &self.refs {
