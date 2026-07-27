@@ -2,6 +2,7 @@
 pragma solidity ^0.8.28;
 
 import {IPropPool} from "./interfaces/IPropPool.sol";
+import {IPyth, PythStructs} from "./interfaces/IPyth.sol";
 import {PropCurve} from "./libraries/PropCurve.sol";
 import {ReentrancyLock} from "./libraries/ReentrancyLock.sol";
 import {SafeTransfer} from "./libraries/SafeTransfer.sol";
@@ -52,15 +53,145 @@ interface IERC20Balance {
 /// would add a second write *and* hand an attacker a way to restore the pool's risk budget by
 /// inducing price churn. Refilling capacity stays a separate, deliberate risk decision.
 ///
+/// ## The reference-oracle deviation bound
+///
+/// Everything above enforces *coherence*: the ladder does not cross, it clears `minPrice`, it is
+/// fresh, it has capacity behind it. None of that knows what the asset is worth. A feed that is
+/// confidently wrong — a bad parse, a stale socket that keeps serving, an exchange printing
+/// garbage through an outage — produces a perfectly coherent ladder at the wrong level, and the
+/// first informed taker collects the difference against real inventory. So does a leaked updater
+/// key, which is the same failure with intent behind it.
+///
+/// The bound is an independent price, checked on chain, from Pyth.
+///
+/// **Pyth is a BOUND, never a price source, and getting this backwards is the single most likely
+/// misreading of this file.** The pool does not price from Pyth and it does not blend Pyth into
+/// the ladder. If it priced from Pyth and validated against Pyth the check would compare a number
+/// with itself and pass unconditionally — it would cost gas and prove nothing. Fair value comes
+/// from the off-chain engine's own feeds; Pyth's only job is to refuse a ladder that has drifted
+/// implausibly far from a reference the updater does not control. Independence is the entire
+/// mechanism. If you ever find yourself reading `_referencePrice` into the ladder rather than
+/// comparing the ladder against it, stop.
+///
+/// ### What is bounded, and why those two numbers
+///
+/// Exactly two of the four ladder prices, the two at the taker-favourable end:
+///
+///   * `maxBid` — the highest price the pool will ever PAY for base — must be at or below
+///     `ref * (1 + maxDeviationBps)`.
+///   * `minAsk` — the lowest price the pool will ever ACCEPT for base — must be at or above
+///     `ref * (1 - maxDeviationBps)`.
+///
+/// These are the two loss-bearing prices, and they are the only two. `minBid` and `maxAsk` sit at
+/// the far end of the ladder, where the pool pays less and charges more, so widening the ladder
+/// only ever moves them in the pool's favour; bounding them would price the pool's own *width*
+/// against the oracle and force the operator to keep `maxDeviationBps` above whatever spread the
+/// desk happens to be quoting. Bounding the mid instead is what `archi_v2.md` §4.4 sketches, and
+/// it implies these two only via `validateLadder`'s non-crossing rule — true today, but a
+/// second-hand guarantee that lives in another library. The direct form states the economic claim
+/// itself: never buy above the reference by more than the tolerance, never sell below it by more.
+///
+/// ### Where the check lives: `updateQuote`, not `swap`
+///
+/// Deliberate, and the alternative is not obviously worse, so here is the reasoning.
+///
+/// Checking at push time rejects a bad ladder at the boundary where the untrusted actor writes.
+/// The threat model is a wrong or compromised updater, and `updateQuote` is the *only* write that
+/// actor has; bounding the write bounds the threat at its source. It also leaves `swap` — the path
+/// takers pay for and aggregators route on — at exactly the gas it had before.
+///
+/// ### What it costs, measured
+///
+/// Every figure below comes from `test/PropPoolOracle.t.sol`, which prints them, and is measured
+/// **cold**: `vm.cool` before each call, a genuinely different ladder each time (re-pushing an
+/// identical word collapses the SSTORE to 100 gas and flatters the result by 2,800), and a dirty
+/// quote slot so the write is 2,900 rather than 22,100 — the steady state for a bot pushing every
+/// block. It is not cheap and this table is not arranged to make it look cheap.
+///
+///   | call                                         | gas    | delta   |
+///   |----------------------------------------------|--------|---------|
+///   | `updateQuote`, 1 pair, no feed configured    | 15,178 | —       |
+///   | `updateQuote`, 1 pair, bounded               | 34,175 | +18,997 |
+///   | `updateQuote`, 2 pairs, both bounded         | 60,944 | +26,769 for the second |
+///   | `updateQuote`, 1 pair, pool never uses Pyth  | 15,067 | (+111 to carry the feature unused) |
+///   | `swap`, exact-in bid                         | 19,164 | **+0**  |
+///   | `getAmountOut`                               |  6,085 | **+0**  |
+///
+/// So the bound roughly doubles a push and leaves swaps and quotes untouched. Read plainly: this
+/// is **outside** the ~20k budget `updateQuote` was designed to, and it is being accepted anyway,
+/// because the gas is paid by us on a key we control rather than by takers, and because the thing
+/// it buys is the difference between a coherent ladder and a correct one.
+///
+/// Of the +18,997, roughly 6,800 is ours (three cold SLOADs — both oracle words and the `pyth`
+/// address — plus the cold account access) and the rest is inside Pyth. The mock reads a whole
+/// five-word `PriceFeed`; the real contract's `PriceInfo` is packed tighter, so the on-chain
+/// figure should come in somewhat *below* this. That is the direction an estimate should err in,
+/// but it has not been measured against the live contract and should not be quoted as if it had.
+///
+/// Two numbers are worth keeping in view when tuning. The marginal cost of a second bounded pair
+/// is 26,769, not 18,997 — only the Pyth account access and the `pyth` SLOAD amortise across a
+/// batch, and each feed's own storage is cold per feed. And a pair with no feed costs **+111
+/// gas**: one cold `feedId` SLOAD that short-circuits before any external call, which is what
+/// makes it viable to batch unbounded and bounded markets together.
+///
+/// Checking at swap time would catch a different failure — the ladder was right when pushed and
+/// Pyth has since moved — and three things argue against it:
+///
+///  1. It would have to be duplicated into the views. A `swap` that reverts on a bound the quote
+///     path did not apply means `getAmountOut` lies, aggregators route into reverts, and the pool
+///     is dropped from their books. So the external call lands in the batch-quote path, which is
+///     precisely the thing `_reserve` exists to keep out of it (see that comment: the view path
+///     must not make an external call that a hostile or unavailable callee can revert to poison an
+///     aggregator's whole multicall). Pyth is that callee.
+///  2. Post-push drift is already `maxStaleSecs`'s job, and §4.4 chose it deliberately as a hard
+///     cliff. A swap-time oracle check is a second, weaker freshness mechanism layered on the
+///     first, and its failure mode is worse than the first's.
+///  3. It hands Pyth's liveness a veto over every trade. Pyth is a pull oracle: if nobody pushes,
+///     it goes stale, and with a swap-time check every swap in the pool reverts because of a third
+///     party's inaction.
+///
+/// The coverage gap is smaller than it looks, and it is worth being precise about. The updater
+/// heartbeats far below `maxStaleSecs` (the engine caps its heartbeat at `maxStaleSecs * 4 / 5`
+/// and is actually driven by `newHeads`, ~1s), and *every* heartbeat re-runs this check. So a live
+/// ladder is re-bounded against Pyth about once a second, not once per `maxStaleSecs`. What
+/// push-time checking genuinely does not cover is the interval between the last successful push
+/// and the staleness cliff — a ladder that stops being re-pushed while the market moves under it.
+/// That window is bounded by `maxStaleSecs`, which is the manager's dial, and it is the same
+/// window the design already accepted for every other reason.
+///
+/// ### When Pyth is unavailable: fail closed
+///
+/// If a pair has a feed configured and the reference cannot be established — Pyth reverts, the
+/// feed was never populated, the price is stale by our own window, the price is non-positive, the
+/// scaling is out of range — `updateQuote` **reverts**. It does not fall through to the
+/// unbounded path.
+///
+/// What that trades away, stated plainly: anyone who can stall Pyth can stop us posting new
+/// ladders, and after `maxStaleSecs` the pool stops quoting. That is a denial of service, and it
+/// is real. The alternative is worse in kind rather than in degree: falling through means an
+/// attacker who can stall Pyth has *removed the bound*, and stalling it is exactly what they would
+/// do first if they held the updater key. Fail-open converts a liveness attack into a solvency
+/// attack. Fail-closed converts it into an outage.
+///
+/// The outage is also not a wedge, which is the property that makes it acceptable. Nothing else in
+/// the pool depends on Pyth: `pause`, `refreshCapacity`, `withdraw`, `deposit`, `sync` and every
+/// view keep working, in-flight ladders keep trading until they go stale, and the **manager** — not
+/// the owner, not a timelock — can set `feedId` to zero and restore pushes in one transaction if
+/// Pyth is durably down. Recovery does not require the slowest role.
+///
 /// ## Roles
 ///
-/// - `owner`    — rotates every role, adds pairs, withdraws inventory. Destined for a timelock.
-/// - `manager`  — per-pair configuration and inventory top-ups.
+/// - `owner`    — rotates every role, adds pairs, withdraws inventory, sets the Pyth address.
+///                Destined for a timelock.
+/// - `manager`  — per-pair configuration, including the whole reference bound, and inventory
+///                top-ups.
 /// - `updater`  — `updateQuote` / `refreshCapacity` and nothing else. **Hard invariant: no
 ///                function reachable by the updater transfers a token or touches `_reserve`.**
 ///                This key signs many times a minute from a hot process; assume it leaks.
-///                (It can still cause loss by posting bad-but-coherent prices. Bounding *that*
-///                is the reference-oracle deviation check's job — out of scope here.)
+///                It can still cause loss by posting bad-but-coherent prices, and bounding *that*
+///                is the reference bound above. Note which role owns which dial: the updater
+///                cannot set a feed id, a deviation limit, a staleness window or the Pyth address,
+///                so it cannot widen its own leash — only push ladders that fit inside it.
 /// - `guardian` — pause only, held on separate hardware from the updater.
 contract PropPool is IPropPool {
     using SafeTransfer for address;
@@ -92,6 +223,19 @@ contract PropPool is IPropPool {
     error ZeroOutput();
     error LengthMismatch();
     error CapacityOutOfDomain();
+    error PythNotSet();
+    error DeviationTooLarge();
+    error ZeroPythStaleWindow();
+
+    /// @dev The ladder would have the pool BUY base above `referencePrice * (1 + maxDeviationBps)`.
+    ///      Carries the reference it was judged against so the updater's logs record what the
+    ///      chain saw, not just what the bot sent.
+    error BidCeilingExceeded(uint16 pairId, uint256 referencePrice, uint256 maxBid);
+    /// @dev The ladder would have the pool SELL base below `referencePrice * (1 - maxDeviationBps)`.
+    error AskFloorBreached(uint16 pairId, uint256 referencePrice, uint256 minAsk);
+    /// @dev A feed is configured but no reference could be established. `status` is one of the
+    ///      `REF_*` codes, so the revert says *which* way the oracle failed.
+    error ReferenceUnavailable(uint16 pairId, uint8 status);
 
     // ---------------------------------------------------------------------
     // Additional events (the integration-visible ones live in IPropPool)
@@ -106,6 +250,10 @@ contract PropPool is IPropPool {
         uint16 indexed pairId, uint32 maxStaleSecs, uint56 minPrice, uint96 minBaseReserve, uint96 minQuoteReserve
     );
     event ReserveSynced(address indexed token, uint256 reserve);
+    event PythUpdated(address indexed previousPyth, address indexed newPyth);
+    event PairOracleUpdated(
+        uint16 indexed pairId, bytes32 feedId, uint16 maxDeviationBps, uint32 maxPythStaleSecs, int8 refExpo
+    );
 
     // ---------------------------------------------------------------------
     // Bit layout constants
@@ -136,9 +284,20 @@ contract PropPool is IPropPool {
     uint256 private constant SHIFT_GEN = 192;
     uint256 private constant SHIFT_FLAGS = 224;
 
-    /// @dev flags bit 0 (word bit 224) = paused. Bits 1..15 are reserved; the natural next
+    /// @dev flags bit 0 (word bit 224) = paused. Bits 1..14 are reserved; the natural next
     ///      occupants are `bidDisabled` / `askDisabled` for one-sided withdrawal.
+    ///
+    ///      **Bit 15 is not a stored flag and never will be.** `snapshot` synthesizes it from the
+    ///      oracle config to report whether the pair is bounded — see `FLAG_SNAPSHOT_BOUNDED`. It
+    ///      is carved out of the top of the range rather than taken from the bottom precisely so
+    ///      that a future stored flag can claim bit 1 without colliding with it.
     uint256 private constant FLAG_PAUSED = uint256(1) << SHIFT_FLAGS;
+
+    /// @notice `snapshot().flags` bit 15: this pair has a reference-oracle feed configured.
+    /// @dev Derived at read time, never stored. Zero means the pair quotes unbounded, which is a
+    ///      legitimate configuration (see `setPairOracle`) and one an integrator should be able to
+    ///      see without a second call. `pairOracle(pairId)` is the authoritative, detailed answer.
+    uint16 internal constant FLAG_SNAPSHOT_BOUNDED = uint16(1) << 15;
 
     /// @dev `_route` value: bits 0..15 pairId (1-based), bit 16 set when `tokenIn` is the base.
     ///      A zero value therefore means "no such route" even for an ask on pair 1, which is why
@@ -184,10 +343,114 @@ contract PropPool is IPropPool {
         uint256 minReserveOut;
     }
 
+    /// @notice Per-pair reference-oracle configuration. Manager-set, updater-invisible.
+    ///
+    /// @dev Field order is load-bearing in the same way `PairConfig`'s is, but for a different
+    ///      reason: `feedId` is a full 32-byte word and therefore owns slot 0 alone, while the
+    ///      three small fields pack into slot 1. `_referencePrice` reads `feedId` first and
+    ///      returns before touching slot 1 when it is zero, so an unbounded pair costs exactly one
+    ///      cold SLOAD on the hot push path and never makes the external call.
+    ///
+    ///      Kept in its own mapping rather than folded into `PairConfig` so that adding a fourth
+    ///      manager-owned word does not disturb the single-SLOAD freshness-and-scale read that
+    ///      `_load` depends on.
+    struct PairOracle {
+        /// @notice Pyth price feed id. **Zero disables the bound for this pair entirely.**
+        /// @dev Not every listable asset has a Pyth feed, and a pair that cannot be configured is
+        ///      a pair that cannot be listed. Zero is a supported production state, not a
+        ///      placeholder — it is reported in `snapshot().flags` bit 15 so an integrator can
+        ///      tell a bounded pair from an unbounded one.
+        bytes32 feedId;
+        /// @notice How far the ladder's taker-favourable ends may sit from the reference, in bps.
+        /// @dev Capped at `BPS` (100%). At exactly `BPS` the ask floor degenerates to zero and the
+        ///      bid ceiling to `2 * ref`, which is a legitimate "very loose" setting; above it the
+        ///      floor arithmetic would underflow, so it is rejected rather than clamped.
+        uint16 maxDeviationBps;
+        /// @notice Tolerated distance between Pyth's `publishTime` and `block.timestamp`.
+        /// @dev Ours, not Pyth's. `getValidTimePeriod` is the oracle's own advisory number; the
+        ///      tolerable staleness of a *bound* is a property of our risk model. Compared as an
+        ///      absolute difference, so a future-dated price is stale in the same way a past-dated
+        ///      one is — a reference that has not been observed yet is not a reference.
+        uint32 maxPythStaleSecs;
+        /// @notice Decimal shift from Pyth's own scale into this pair's `priceScaleExp` scale.
+        ///
+        /// @dev This is the number to get right, and it is the number a reviewer should check
+        ///      first. The pool's price convention is
+        ///      `quoteAmount = baseAmount * price / 10**priceScaleExp`, so one whole base token
+        ///      fetches `10**baseDecimals * price / 10**priceScaleExp` quote units, which is
+        ///      `humanPrice * 10**quoteDecimals` quote units. Solving,
+        ///
+        ///          poolPrice = humanPrice * 10**(priceScaleExp + quoteDecimals - baseDecimals)
+        ///
+        ///      and Pyth reports `humanPrice = pythPrice * 10**pythExpo`. Hence
+        ///
+        ///          refExpo   = priceScaleExp + quoteDecimals - baseDecimals
+        ///          poolPrice = pythPrice * 10**(pythExpo + refExpo)
+        ///
+        ///      `pythExpo` is read from the response every time, never hardcoded: it is per-feed
+        ///      and Pyth can change it. `refExpo` is the part that is fixed by the pair's own
+        ///      decimals and its immutable `priceScaleExp`, so it is stored.
+        ///
+        ///      Worked, for the two live markets:
+        ///
+        ///        | market      | base/quote dp | priceScaleExp | refExpo | pythExpo | net |
+        ///        |-------------|---------------|---------------|---------|----------|-----|
+        ///        | mWETH/mUSDC | 18 / 6        | 24            | +12     | -8       | +4  |
+        ///        | mWBTC/mUSDC | 8 / 6         | 12            | +10     | -8       | +2  |
+        ///
+        ///      ETH at $2,000 arrives as `2e11` and scales to `2e15`, which is exactly the pool
+        ///      mid the deploy script encodes. BTC at $100,000 arrives as `1e13` and scales to
+        ///      `1e15`, likewise.
+        ///
+        ///      A wrong `refExpo` fails **closed**, in both directions: too small and the
+        ///      reference collapses far below the ladder, tripping `BidCeilingExceeded`; too large
+        ///      and it explodes above it, tripping `AskFloorBreached` or `REF_INVALID`. Either way
+        ///      the very first push after a misconfiguration reverts loudly instead of quietly
+        ///      bounding against nonsense. It is signed because a pair with more base decimals
+        ///      than `priceScaleExp + quoteDecimals` legitimately needs a negative shift.
+        int8 refExpo;
+    }
+
     uint256 private constant STATUS_OK = 0;
     uint256 private constant STATUS_UNKNOWN = 1;
     uint256 private constant STATUS_PAUSED = 2;
     uint256 private constant STATUS_STALE = 3;
+
+    // ---------------------------------------------------------------------
+    // Reference-bound constants and status codes
+    // ---------------------------------------------------------------------
+
+    uint256 private constant BPS = 10_000;
+
+    /// @notice `referencePrice` succeeded; the returned price is usable as a bound.
+    uint8 public constant REF_OK = 0;
+    /// @notice No feed id configured. The pair quotes unbounded, on purpose.
+    uint8 public constant REF_DISABLED = 1;
+    /// @notice The Pyth address is unset, has no code, or the call reverted.
+    uint8 public constant REF_UNAVAILABLE = 2;
+    /// @notice A price exists but is outside `maxPythStaleSecs` of now, in either direction.
+    uint8 public constant REF_STALE = 3;
+    /// @notice The price is non-positive, or the scaling puts it outside a representable range.
+    uint8 public constant REF_INVALID = 4;
+
+    /// @dev Largest scaled reference the bound will accept.
+    ///
+    ///      Ladder prices are `uint56`, so the widest one is ~7.2e16. A reference above
+    ///      `type(uint64).max` (~1.8e19) is more than 250x that, which no market move produces
+    ///      against a pair whose own ladder still fits the field — it describes a broken `refExpo`
+    ///      or a broken feed, and it is rejected as `REF_INVALID` rather than silently failing
+    ///      every ladder as "out of bound", because those are different operator problems.
+    ///
+    ///      It is also what keeps `ref * (BPS + maxDeviationBps)` far from overflow: at most
+    ///      `1.8e19 * 20000 = 3.7e23`, against a `uint256` ceiling of ~1.2e77.
+    uint256 private constant MAX_REFERENCE_PRICE = type(uint64).max;
+
+    /// @dev Bound on `pythExpo + refExpo` before the power-of-ten is formed. `10**58` multiplied
+    ///      by the widest `int64` price (~9.2e18) is ~9.2e76, still inside `uint256`; anything
+    ///      beyond would overflow before `MAX_REFERENCE_PRICE` could reject it. Real values are
+    ///      +4 and +2, so this only ever fires on a misconfiguration or a feed with an absurd
+    ///      exponent.
+    int256 private constant MAX_NET_EXPONENT = 58;
 
     // ---------------------------------------------------------------------
     // Storage
@@ -208,7 +471,22 @@ contract PropPool is IPropPool {
     ///         emergency path, and `swap` reads the pair word for the per-pair flag anyway.
     bool public allPaused;
 
+    /// @notice The reference oracle. Zero until the owner sets it, after which it can be rotated
+    ///         but not unset.
+    /// @dev Storage rather than `immutable` for two reasons, and cheapness is not one of them.
+    ///      First, the constructor signature is part of the deployment surface and every script
+    ///      and test that builds a pool calls it; adding a fifth argument to buy a read that
+    ///      happens at most once per `updateQuote` is a bad trade. Second, the oracle root of
+    ///      trust is exactly the kind of thing that should be rotatable by the timelock rather
+    ///      than frozen at deploy — Pyth's own address is a proxy, but the pool should not have to
+    ///      be redeployed if that ever stops being true.
+    ///
+    ///      Read lazily, inside `_referencePrice`, and never before `feedId` has proved non-zero.
+    ///      A pool with no bounded pairs therefore never touches this slot at all.
+    address public pyth;
+
     mapping(uint16 => PairConfig) private _config;
+    mapping(uint16 => PairOracle) private _oracle;
     mapping(uint16 => uint256) private _quoteWord;
     mapping(uint16 => uint256) private _capacityWord;
     mapping(uint16 => uint256) private _usedWord;
@@ -407,6 +685,104 @@ contract PropPool is IPropPool {
     }
 
     // ---------------------------------------------------------------------
+    // Reference-oracle administration
+    //
+    // Owner sets the oracle contract; manager sets the per-pair terms. The updater appears
+    // nowhere in this section, which is the point of it: a key that could raise its own
+    // `maxDeviationBps`, lengthen its own `maxPythStaleSecs` or zero its own `feedId` would be
+    // bounded by nothing at all, and the bound exists precisely because that key is hot.
+    // ---------------------------------------------------------------------
+
+    /// @notice Point the pool at a Pyth deployment.
+    /// @dev Owner-gated because this is a root of trust, not a risk parameter: whoever sets it
+    ///      decides what "independent" means for every bounded pair at once. On GIWA Sepolia the
+    ///      argument is the genesis pre-install `0x2880aB155794e7179c9eE2e38200202908C17B43`.
+    ///
+    ///      The zero address is rejected. Unsetting it would silently break every configured pair
+    ///      into `REF_UNAVAILABLE` — which fails closed, so it is not a *safety* hole, but it
+    ///      would halt every push across the pool with no per-pair record of why. Disabling the
+    ///      bound is `setPairOracle(pairId, 0, ...)`, per pair, deliberately, with an event.
+    function setPyth(address newPyth) external onlyOwner {
+        if (newPyth == address(0)) revert ZeroAddress();
+        emit PythUpdated(pyth, newPyth);
+        pyth = newPyth;
+    }
+
+    /// @notice Set, retune, or disable one pair's reference bound.
+    ///
+    /// @dev Manager-gated, and separate from `setPairConfig` so that retuning a deviation limit
+    ///      does not require restating the reserve floors (and vice versa) — restating a parameter
+    ///      you did not mean to change is how parameters get changed by accident.
+    ///
+    ///      **This function does not read Pyth.** Configuring a pair therefore does not depend on
+    ///      the oracle being live, which matters given that the check fails closed: an operator
+    ///      must be able to point a pair at a feed before that feed's first on-chain push, and
+    ///      must be able to *disable* a bound while Pyth is down without needing Pyth to answer.
+    ///      The cost is that a typo'd `feedId` or a wrong `refExpo` is not caught here. Call
+    ///      `referencePrice(pairId)` immediately afterwards and check for `REF_OK` — it is a free
+    ///      `eth_call`, it never reverts, and it is the intended preflight.
+    ///
+    /// @param feedId           Pyth price feed id, or **zero to disable the bound for this pair**.
+    ///                         The remaining arguments are stored but unread while it is zero.
+    /// @param maxDeviationBps  tolerance on `maxBid` above and `minAsk` below the reference.
+    /// @param maxPythStaleSecs our freshness window on Pyth's `publishTime`, not Pyth's own.
+    /// @param refExpo          `priceScaleExp + quoteDecimals - baseDecimals`. See `PairOracle`.
+    function setPairOracle(
+        uint16 pairId,
+        bytes32 feedId,
+        uint16 maxDeviationBps,
+        uint32 maxPythStaleSecs,
+        int8 refExpo
+    ) external onlyManager {
+        if (pairId == 0 || pairId > pairCount) revert UnknownPair();
+
+        // Validated only when the bound is actually being switched on. Disabling a pair must not
+        // be blockable by the state of parameters that are about to stop mattering.
+        if (feedId != bytes32(0)) {
+            if (pyth == address(0)) revert PythNotSet();
+            // Above BPS the ask floor `ref * (BPS - dev)` underflows. Rejected rather than
+            // clamped: a manager who typed 20000 meant something, and it was not "100%".
+            if (maxDeviationBps > BPS) revert DeviationTooLarge();
+            // A zero window demands a price published in this exact second, which no pull oracle
+            // guarantees. It would brick every push on the pair, so it is a config error.
+            if (maxPythStaleSecs == 0) revert ZeroPythStaleWindow();
+        }
+
+        _oracle[pairId] = PairOracle({
+            feedId: feedId,
+            maxDeviationBps: maxDeviationBps,
+            maxPythStaleSecs: maxPythStaleSecs,
+            refExpo: refExpo
+        });
+
+        emit PairOracleUpdated(pairId, feedId, maxDeviationBps, maxPythStaleSecs, refExpo);
+    }
+
+    /// @notice One pair's reference-oracle configuration. `feedId == 0` means unbounded.
+    function pairOracle(uint16 pairId) external view returns (PairOracle memory) {
+        return _oracle[pairId];
+    }
+
+    /// @notice The reference price for `pairId`, already scaled into the pair's own price units,
+    ///         and the status that produced it.
+    ///
+    /// @dev **Total: this never reverts, for any `pairId`, in any oracle state.** It is the
+    ///      preflight the updater should run before spending gas on a push that `updateQuote`
+    ///      would reject, and the way an integrator answers "is this pair currently boundable"
+    ///      without simulating a state-changing call. `status` is `REF_OK` only when `price` is
+    ///      meaningful; every other code returns `price == 0`.
+    ///
+    ///      Directly comparable with `snapshot(pairId).maxBid` and `.minAsk` — same units, same
+    ///      `priceScaleExp` — which is the whole reason it returns a scaled number rather than the
+    ///      raw Pyth pair.
+    ///
+    ///      Reminder, because it is the misreading this file most expects: this is a **bound**.
+    ///      Nothing in the pool prices from it. Do not build a quoter that does.
+    function referencePrice(uint16 pairId) external view returns (uint256 price, uint8 status) {
+        return _referencePrice(pairId);
+    }
+
+    // ---------------------------------------------------------------------
     // Updater surface — writes prices and capacity, moves no tokens
     // ---------------------------------------------------------------------
 
@@ -430,10 +806,26 @@ contract PropPool is IPropPool {
     ///      log). Existence is checked against `pairCount`, not `PairConfig.exists`, precisely
     ///      to avoid a second cold SLOAD per entry.
     ///
-    ///      Not enforced here, by design: deviation from a reference oracle. That check hooks
-    ///      in immediately after `validateLadder` and needs a price feed this contract does not
-    ///      yet depend on. `validateLadder` can only reject an *incoherent* book, not a wrong
-    ///      one.
+    ///      **The reference-oracle bound is enforced here**, immediately after `validateLadder`,
+    ///      which can only reject an *incoherent* book and not a wrong one. That is what makes
+    ///      this the pool's price-correctness boundary rather than merely its price-coherence one,
+    ///      and it is the reason this function — not `swap` — pays for the oracle. Read the
+    ///      contract header for the placement argument and the fail-closed policy; the short
+    ///      version is that the updater is the untrusted actor, this is its only write, and
+    ///      leaving `swap` and the views free of an external call is worth the gas landing here.
+    ///
+    ///      Cost of the bound, measured cold in `test/PropPoolOracle.t.sol`: **+18,997 gas** on the
+    ///      first bounded pair and **+26,769** on each subsequent one — only the Pyth account
+    ///      access and the `pyth` SLOAD amortise across a batch; each feed's own storage is cold
+    ///      per feed. A pair with **no feed configured costs +111 gas**, a single cold `feedId`
+    ///      SLOAD that short-circuits before the external call, so a batch of unbounded pairs is
+    ///      essentially unchanged. The contract header has the full table and is explicit that
+    ///      this puts a bounded push outside the original ~20k budget on purpose.
+    ///
+    ///      The batch is atomic, and deliberately so: one out-of-bound pair reverts every pair in
+    ///      the call. Partial application would leave the updater guessing which ladders landed,
+    ///      and the ladders that did land were priced by a feed that just proved itself wrong on
+    ///      another pair.
     function updateQuote(uint256[] calldata packed) external onlyUpdater {
         uint256 n = pairCount;
         uint256 stamp = uint256(uint32(block.timestamp)) << SHIFT_UPDATED_AT;
@@ -450,6 +842,7 @@ contract PropPool is IPropPool {
             uint256 maxAsk = (word >> SHIFT_MAX_ASK) & MASK_56;
 
             PropCurve.validateLadder(minBid, maxBid, minAsk, maxAsk, _config[uint16(pairId)].minPrice);
+            _checkReferenceBound(uint16(pairId), maxBid, minAsk);
 
             _quoteWord[uint16(pairId)] = (word & LADDER_MASK) | stamp;
 
@@ -682,6 +1075,19 @@ contract PropPool is IPropPool {
         s.capGen = uint32((c >> SHIFT_GEN) & MASK_32);
         s.flags = uint16((c >> SHIFT_FLAGS) & MASK_16);
 
+        // Bit 15, synthesized rather than stored: does this pair have a reference bound at all?
+        //
+        // It rides in `flags` rather than in a new struct field because `PairSnapshot` is a static
+        // tuple that off-chain decoders — the Rust updater's `sol!` mirror among them — reproduce
+        // field by field, and appending to it changes the return encoding under every one of them.
+        // A spare bit in a field they already decode as `uint16` costs them nothing. `pairOracle`
+        // is the detailed answer; this is the one that comes free with a call they already make.
+        //
+        // Note what it does NOT claim: that the bound is currently *satisfiable*. Answering that
+        // means reading Pyth, and `snapshot` is bound by the same no-revert contract as the
+        // quoting views. `referencePrice` is the (also total) call for that question.
+        if (_oracle[pairId].feedId != bytes32(0)) s.flags |= FLAG_SNAPSHOT_BOUNDED;
+
         s.bidUsed = uint96(u & MASK_96);
         s.askUsed = uint96((u >> SHIFT_ASK_CAPACITY) & MASK_96);
         s.usedGen = uint32((u >> SHIFT_GEN) & MASK_32);
@@ -858,6 +1264,147 @@ contract PropPool is IPropPool {
         }
 
         st.reserveOut = _reserve[st.tokenOut];
+    }
+
+    // ---------------------------------------------------------------------
+    // Internal: the reference bound
+    //
+    // Read the contract header before changing anything here. In particular: Pyth is a bound and
+    // never a price source, and the check runs at push time rather than at swap time. Both are
+    // decisions with reasons, and both are easy to "fix" into something worse.
+    // ---------------------------------------------------------------------
+
+    /// @dev The reference price in this pair's own units, or a status explaining why there isn't
+    ///      one. **Total — no input and no oracle state makes this revert.** That is a hard
+    ///      requirement, not a convenience: `referencePrice` exposes it as a view and
+    ///      `IPropPool`'s no-revert contract would be broken by a Pyth call that escaped.
+    ///
+    ///      The totality is assembled from four separate guards, because Solidity gives no single
+    ///      one that covers the ground:
+    ///
+    ///        1. `feedId == 0` short-circuits before anything external happens. This is also the
+    ///           gas argument: an unbounded pair pays one cold SLOAD and stops.
+    ///        2. `p.code.length == 0` is checked *before* the call. `try`/`catch` does **not**
+    ///           catch a return-data decoding failure — the docs are explicit that such an
+    ///           exception happens in the current context and is not caught — and a call to an
+    ///           address with no code succeeds while returning nothing, which is precisely a
+    ///           decoding failure. Without this line an unset or self-destructed oracle would
+    ///           revert straight through the `try`.
+    ///        3. `catch` handles the ordinary revert: `PriceFeedNotFound` for a feed nobody has
+    ///           pushed yet, and anything else the oracle chooses to throw.
+    ///        4. The arithmetic below is guarded rather than merely `unchecked`-avoided: the
+    ///           exponent is range-limited before `10 **` forms it, and the product is bounded by
+    ///           `MAX_REFERENCE_PRICE` before any caller multiplies it by a bps factor.
+    ///
+    ///      An oracle that burns all the gas rather than returning is **not** a hole, and the
+    ///      reason is EIP-150 rather than anything written here: the callee receives 63/64 of the
+    ///      remaining gas, exhausts it, and reverts, which arm 3 catches — and the retained 1/64 is
+    ///      more than enough to finish, since nothing after the call does more than arithmetic.
+    ///      Measured `REF_UNAVAILABLE` at 100k, 200k, 1M and 10M gas. Do not add work after the
+    ///      `try` block on the strength of that margin without re-measuring it.
+    ///
+    ///      The residual hole is an oracle address that has code and returns well-formed but
+    ///      *untrue* data — a lying oracle rather than a broken one. Nothing on chain can detect
+    ///      that, and reaching it requires the owner to have pointed `pyth` at a hostile contract,
+    ///      which is outside the threat model this bound exists for: the untrusted actor here is
+    ///      the updater, and the updater cannot set `pyth`.
+    ///
+    ///      `getPriceUnsafe` is used rather than `getPriceNoOlderThan`, and the choice is
+    ///      deliberate: the latter reverts `StalePrice`, which `catch` would flatten into
+    ///      `REF_UNAVAILABLE` and lose the distinction between "Pyth is gone" and "Pyth is behind".
+    ///      Those are different operational problems. Doing the comparison here also means the
+    ///      window is ours (`maxPythStaleSecs`) rather than the oracle's advisory
+    ///      `getValidTimePeriod`, which is the correct ownership: how stale a *bound* may be is a
+    ///      property of our risk model.
+    function _referencePrice(uint16 pairId) private view returns (uint256 price, uint8 status) {
+        PairOracle storage o = _oracle[pairId];
+
+        bytes32 feedId = o.feedId;
+        if (feedId == bytes32(0)) return (0, REF_DISABLED);
+
+        address p = pyth;
+        if (p == address(0) || p.code.length == 0) return (0, REF_UNAVAILABLE);
+
+        PythStructs.Price memory quoted;
+        try IPyth(p).getPriceUnsafe(feedId) returns (PythStructs.Price memory r) {
+            quoted = r;
+        } catch {
+            return (0, REF_UNAVAILABLE);
+        }
+
+        // Absolute difference, matching Pyth's own `diff`. A price published ahead of the chain is
+        // stale in exactly the way a price published behind it is: a reference is only a reference
+        // if it has been observed, and a future timestamp has not been.
+        uint256 publishTime = quoted.publishTime;
+        uint256 age =
+            publishTime > block.timestamp ? publishTime - block.timestamp : block.timestamp - publishTime;
+        if (age > o.maxPythStaleSecs) return (0, REF_STALE);
+
+        // Rejected, not cast. `price` is `int64` and Pyth feeds for rates and spreads do go
+        // negative; a wrapping cast would turn -1 into ~1.8e19 and hand the ladder a bound it
+        // trivially satisfies on one side and trivially fails on the other. Zero is rejected with
+        // it — it is not a price, and as a bound it would pin the bid ceiling to zero.
+        if (quoted.price <= 0) return (0, REF_INVALID);
+
+        // `pythExpo` comes off the response every time. It is per-feed, Pyth can change it, and a
+        // consumer that hardcodes it is one governance action away from being wrong by orders of
+        // magnitude — which, in a deviation bound, means accepting anything.
+        int256 net = int256(quoted.expo) + int256(o.refExpo);
+        if (net > MAX_NET_EXPONENT || net < -MAX_NET_EXPONENT) return (0, REF_INVALID);
+
+        // Every cast below is discharged by the two lines above: `quoted.price > 0` makes the
+        // widening to `uint256` value-preserving, and `|net| <= 58` plus the branch's own sign
+        // test makes both `uint256(net)` and `uint256(-net)` small positive numbers — the latter
+        // also cannot be the `-type(int256).min` trap for the same reason.
+        uint256 raw = uint256(int256(quoted.price));
+        if (net >= 0) {
+            price = raw * (10 ** uint256(net));
+        } else {
+            // Floors. Only reachable when `priceScaleExp + quoteDecimals - baseDecimals` is more
+            // negative than Pyth's own exponent, which `addPair`'s "take the largest exponent that
+            // fits" rule already pushes away from; both live markets land at net +4 and +2. When it
+            // is reachable the truncation tightens the bid ceiling and loosens the ask floor by at
+            // most one unit in the last place, so it is not symmetric — prefer a `priceScaleExp`
+            // that keeps `net >= 0` and the question does not arise.
+            price = raw / (10 ** uint256(-net));
+        }
+
+        // `price == 0` catches the division collapsing the reference to nothing, which is what a
+        // badly wrong `refExpo` looks like from here. The upper bound is explained at the
+        // constant.
+        if (price == 0 || price > MAX_REFERENCE_PRICE) return (0, REF_INVALID);
+
+        status = REF_OK;
+    }
+
+    /// @dev The guard itself, called from `updateQuote` immediately after `validateLadder` — the
+    ///      ladder must be coherent before asking whether it is *right*, so that an incoherent
+    ///      book reports as incoherent rather than as off-reference.
+    ///
+    ///      Only `maxBid` and `minAsk` are passed, because only those two are bounded; see the
+    ///      contract header for why bounding the ladder's far ends, or its mid, are both worse.
+    ///
+    ///      Fails closed on every non-OK status except `REF_DISABLED`. `REF_DISABLED` is a
+    ///      configuration the operator chose and returns silently; everything else is the oracle
+    ///      failing to do its job, and the pool declines to post a new ladder until it does. The
+    ///      header spells out what that trades away.
+    ///
+    ///      Overflow, since these are the products the bound rests on: `maxBid` and `minAsk` are
+    ///      `uint56` (< 7.3e16) so the left sides reach at most ~7.3e20, and `ref` is capped at
+    ///      `MAX_REFERENCE_PRICE` with `dev <= BPS` so the right sides reach at most ~3.7e23. Both
+    ///      are ~53 orders of magnitude clear of `uint256`. No `unchecked`, and none needed.
+    function _checkReferenceBound(uint16 pairId, uint256 maxBid, uint256 minAsk) private view {
+        (uint256 ref, uint8 status) = _referencePrice(pairId);
+        if (status == REF_DISABLED) return;
+        if (status != REF_OK) revert ReferenceUnavailable(pairId, status);
+
+        // Warm: `_referencePrice` already touched this slot for `maxPythStaleSecs`/`refExpo`.
+        uint256 dev = _oracle[pairId].maxDeviationBps;
+
+        // The pool must never offer to BUY base above the reference plus tolerance.
+        if (maxBid * BPS > ref * (BPS + dev)) revert BidCeilingExceeded(pairId, ref, maxBid);
+        // ...nor to SELL base below the reference minus tolerance.
+        if (minAsk * BPS < ref * (BPS - dev)) revert AskFloorBreached(pairId, ref, minAsk);
     }
 
     function _loadChecked(uint16 pairId, bool isBid) private view returns (PairState memory st) {

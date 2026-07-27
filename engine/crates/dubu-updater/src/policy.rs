@@ -849,10 +849,13 @@ mod tests {
             (Context { halted: true, ..base }, Hold::Halted),
             (Context { chain: ChainStatus::Down { stale_secs: 600 }, ..base }, Hold::ChainDown),
             (
-                Context { feed: FeedStatus::Stale { age_ms: 9_000 }, ..base },
-                Hold::FeedNotLive(FeedStatus::Stale { age_ms: 9_000 }),
+                Context { feed: FeedStatus::NoQuorum { have: 1, need: 2 }, ..base },
+                Hold::FeedNotLive(FeedStatus::NoQuorum { have: 1, need: 2 }),
             ),
-            (Context { feed: FeedStatus::Disconnected, ..base }, Hold::FeedNotLive(FeedStatus::Disconnected)),
+            (
+                Context { feed: FeedStatus::Dispersed { dispersion_bps: 600, limit_bps: 250, venues: 3 }, ..base },
+                Hold::FeedNotLive(FeedStatus::Dispersed { dispersion_bps: 600, limit_bps: 250, venues: 3 }),
+            ),
             (
                 Context { view_age_secs: 21, ..base },
                 Hold::ChainViewStale { age_secs: 21, limit_secs: 20 },
@@ -891,12 +894,25 @@ mod tests {
     }
 
     #[test]
-    fn a_stale_feed_blocks_even_a_pair_that_has_never_quoted() {
+    fn a_feed_without_quorum_blocks_even_a_pair_that_has_never_quoted() {
         // The tempting exception — "it has no quote at all, surely anything is better" — is
-        // wrong: a price from a dead feed is how the first fill gets picked off.
+        // wrong: a price nothing corroborates is how the first fill gets picked off.
         let s = snap(ladder(0, 0, 0, 0), 100, 0, 0);
-        let c = Context { feed: FeedStatus::NoData, ..ctx(&s, Some(ladder(900, 1_000, 1_100, 1_200))) };
-        assert_eq!(evaluate_quote(&c).unwrap(), Decision::Hold(Hold::FeedNotLive(FeedStatus::NoData)));
+        let no_quorum = FeedStatus::NoQuorum { have: 1, need: 2 };
+        let c = Context { feed: no_quorum, ..ctx(&s, Some(ladder(900, 1_000, 1_100, 1_200))) };
+        assert_eq!(evaluate_quote(&c).unwrap(), Decision::Hold(Hold::FeedNotLive(no_quorum)));
+    }
+
+    #[test]
+    fn venues_that_disagree_block_a_push_exactly_as_a_dead_feed_does() {
+        // A split cross-section is not a noisy price, it is the absence of one. Quoting the mean
+        // of two camps 60 bp apart is quoting a number no venue is showing.
+        let l = ladder(900, 1_000, 1_100, 1_200);
+        let s = snap(l, 100, 0, 1_000);
+        let dispersed = FeedStatus::Dispersed { dispersion_bps: 600, limit_bps: 250, venues: 4 };
+        let c = Context { feed: dispersed, ..ctx(&s, Some(ladder(800, 900, 1_000, 1_100))) };
+        assert_eq!(evaluate_quote(&c).unwrap(), Decision::Hold(Hold::FeedNotLive(dispersed)));
+        assert_eq!(evaluate_capacity(&c), CapacityDecision::Hold(Hold::FeedNotLive(dispersed)));
     }
 
     // -----------------------------------------------------------------------
@@ -993,9 +1009,10 @@ mod tests {
         let l = ladder(900, 1_000, 1_100, 1_200);
         let mut s = snap(l, 1_000, 0, 1_000);
         s.bid_capacity = 0;
-        let mut c = Context { feed: FeedStatus::Disconnected, ..ctx(&s, Some(l)) };
+        let no_quorum = FeedStatus::NoQuorum { have: 0, need: 2 };
+        let mut c = Context { feed: no_quorum, ..ctx(&s, Some(l)) };
         c.capacity = CapacityPlan { bid: 1_000, ask: 1_000, bid_cut_by_inventory: false, ask_cut_by_inventory: false };
-        assert_eq!(evaluate_capacity(&c), CapacityDecision::Hold(Hold::FeedNotLive(FeedStatus::Disconnected)));
+        assert_eq!(evaluate_capacity(&c), CapacityDecision::Hold(Hold::FeedNotLive(no_quorum)));
     }
 
     #[test]

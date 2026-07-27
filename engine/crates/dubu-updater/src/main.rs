@@ -50,12 +50,14 @@ use tracing::{error, info, warn};
 
 use dubu_updater::chain::heads::{self, HeadShared};
 use dubu_updater::chain::{ChainFacts, ChainHealth, ChainReader, ChainStatus, ChainView, Rpc};
-use dubu_updater::config::{Config, KeySource, PairConfig};
-use dubu_updater::fair_value::FairValueTracker;
-use dubu_updater::feed::{binance, FeedShared, FeedStatus};
+use dubu_updater::config::{Config, KeySource};
+use dubu_updater::fair_value::{self, Reference, VenueQuote};
+use dubu_updater::feed::ws::MarketFeed;
+use dubu_updater::feed::{binance, bybit, coinbase, okx, FeedStatus, VenueFeeds, VenueId, VenueWatch};
 use dubu_updater::ladder::{self, RowInputs};
 use dubu_updater::policy::{self, CapacityDecision, Context, Decision};
 use dubu_updater::risk::{Halt, KillSwitch, Position};
+use dubu_updater::skew::{self, Inventory, Volatility};
 use dubu_updater::tx::{Intent, Sender, Sent, Settled, Signer};
 use dubu_updater::units::{self, FEED_SCALE};
 
@@ -170,13 +172,18 @@ struct Runtime {
     /// Flashblocks RPC: every state read, `pending` tag, ~200ms preconfirmed. Freshest.
     flash: Rpc,
     reader: ChainReader,
-    feed: Arc<FeedShared>,
+    /// Every configured venue's feed state. One socket, one reconnect loop and one liveness
+    /// state per venue, so one venue failing cannot take another down.
+    feeds: Arc<VenueFeeds>,
+    /// Edge-triggers per-venue liveness, so that losing a venue is an event rather than one
+    /// fewer entry in a cross-section that still looks confident.
+    watch: VenueWatch,
     /// State of the `newHeads` subscription that drives the loop.
     heads: Arc<HeadShared>,
-    /// Keyed by pair id rather than positionally: a `Vec` indexed in lock-step with
-    /// `cfg.pairs` is an invariant nothing enforces, and getting it wrong prices one pair
-    /// off another's outlier history.
-    trackers: BTreeMap<u16, FairValueTracker>,
+    /// Return-variance estimator per pair. Keyed by pair id rather than positionally: a `Vec`
+    /// indexed in lock-step with `cfg.pairs` is an invariant nothing enforces, and getting it
+    /// wrong sizes one pair's skew off another pair's volatility.
+    vol: BTreeMap<u16, Volatility>,
     sender: Sender,
     kill: KillSwitch,
     health: ChainHealth,
@@ -303,6 +310,16 @@ async fn run(args: &Args) -> Result<i32, Box<dyn std::error::Error>> {
         fallback_poll_interval_ms = cfg.chain.fallback_poll_interval_ms,
         requests_per_sec = cfg.chain.requests_per_sec,
         nav_token = %facts.nav_token,
+        venues = %cfg.venues().iter().map(ToString::to_string).collect::<Vec<_>>().join(","),
+        min_venues = cfg.feed.min_venues,
+        mad_k = cfg.feed.mad_k,
+        mad_floor_bps = cfg.feed.mad_floor_bps,
+        max_dispersion_bps = cfg.feed.max_dispersion_bps,
+        gamma = cfg.skew.gamma,
+        vol_horizon_secs = cfg.skew.vol_horizon_secs,
+        vol_tau_ms = cfg.skew.vol_tau_ms,
+        skew_cap_bps = cfg.skew.max_positive_bps,
+        skew_floor_bps = -i32::from(cfg.skew.max_negative_bps),
         "dubu-updater starting"
     );
     if !cfg.tx.transmit_allowed {
@@ -326,9 +343,35 @@ async fn run(args: &Args) -> Result<i32, Box<dyn std::error::Error>> {
     }
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let feed = Arc::new(FeedShared::new(Duration::from_millis(cfg.feed.stale_after_ms)));
-    let streams: Vec<String> = cfg.pairs.iter().map(PairConfig::stream_name).collect();
-    let feed_task = tokio::spawn(binance::run(cfg.feed.clone(), streams, Arc::clone(&feed), shutdown_rx.clone()));
+
+    // One task per venue a pair actually names. A venue is enabled by being used, not by a
+    // separate switch, so there is no way to configure a venue that connects and quotes nothing.
+    let venues = cfg.venues();
+    let feeds = Arc::new(VenueFeeds::new(&venues, Duration::from_millis(cfg.feed.stale_after_ms)));
+    let mut feed_tasks = Vec::new();
+    for venue in &venues {
+        let symbols = cfg.venue_symbols(*venue);
+        let client: Box<dyn MarketFeed> = match venue {
+            VenueId::Binance => Box::new(binance::Client::new(&symbols)),
+            VenueId::Okx => Box::new(okx::Client::new(&symbols)),
+            VenueId::Bybit => Box::new(bybit::Client::new(&symbols)),
+            VenueId::Coinbase => Box::new(coinbase::Client::new(&symbols)),
+        };
+        let Some(shared) = feeds.venue(*venue) else { continue };
+        info!(
+            target: "startup", event = "venue", venue = %venue,
+            url = %cfg.feed.urls.get(*venue),
+            symbols = %symbols.iter().map(|(v, c)| format!("{v}->{c}")).collect::<Vec<_>>().join(","),
+            "market data venue configured"
+        );
+        feed_tasks.push(tokio::spawn(dubu_updater::feed::ws::run(
+            cfg.feed.clone(),
+            cfg.feed.urls.get(*venue).to_string(),
+            client,
+            shared,
+            shutdown_rx.clone(),
+        )));
+    }
 
     // The `newHeads` subscription: what drives the loop. A `watch` channel rather than an `mpsc`
     // because it coalesces — two heads landing during one cycle should produce one more cycle
@@ -349,14 +392,24 @@ async fn run(args: &Args) -> Result<i32, Box<dyn std::error::Error>> {
         cfg.pairs.iter().map(|p| p.pair_id).collect(),
         facts.tokens.clone(),
     );
-    let trackers: BTreeMap<u16, FairValueTracker> = cfg
-        .pairs
-        .iter()
-        .map(|p| (p.pair_id, FairValueTracker::new(cfg.feed.max_jump_bps, cfg.feed.outlier_tolerance)))
-        .collect();
+    let vol: BTreeMap<u16, Volatility> =
+        cfg.pairs.iter().map(|p| (p.pair_id, Volatility::new(cfg.skew.vol_config()))).collect();
 
     let health = ChainHealth::new(Instant::now(), cfg.chain.degraded_after_secs, cfg.chain.halt_after_secs);
-    let mut rt = Runtime { cfg, facts, rpc, flash, reader, feed, heads, trackers, sender, kill, health };
+    let mut rt = Runtime {
+        cfg,
+        facts,
+        rpc,
+        flash,
+        reader,
+        feeds,
+        watch: VenueWatch::new(),
+        heads,
+        vol,
+        sender,
+        kill,
+        health,
+    };
 
     wait_for_feed(&rt).await;
     wait_for_first_head(&rt).await;
@@ -365,28 +418,39 @@ async fn run(args: &Args) -> Result<i32, Box<dyn std::error::Error>> {
     let code = quote_loop(&mut rt, limit, head_rx, shutdown_rx).await;
 
     let _ = shutdown_tx.send(true);
-    let _ = tokio::time::timeout(Duration::from_secs(3), feed_task).await;
+    for task in feed_tasks {
+        let _ = tokio::time::timeout(Duration::from_secs(3), task).await;
+    }
     let _ = tokio::time::timeout(Duration::from_secs(3), heads_task).await;
     Ok(code)
 }
 
-/// Give the socket a chance to produce a first tick before the first cycle, so the opening log
-/// line is a quote rather than "feed not live".
+/// Give the sockets a chance to reach quorum before the first cycle, so the opening log line is a
+/// quote rather than "no quorum".
+///
+/// Waits for **quorum**, not for every venue. Blocking on the slowest venue would make the bot's
+/// startup as slow as its worst endpoint, and the whole design is that a missing venue is a
+/// degradation rather than an outage.
 async fn wait_for_feed(rt: &Runtime) {
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
-        let all_live = rt
+        let now = Instant::now();
+        let worst = rt
             .cfg
             .pairs
             .iter()
-            .all(|p| rt.feed.snapshot(&p.symbol, Instant::now()).status == FeedStatus::Live);
-        if all_live {
-            info!(target: "feed", event = "ready", "every configured symbol is live");
+            .map(|p| rt.feeds.snapshots(&p.symbol, now).iter().filter(|(_, s)| s.status.is_live()).count())
+            .min()
+            .unwrap_or(0);
+        if worst >= usize::from(rt.cfg.feed.min_venues) {
+            info!(target: "feed", event = "ready", venues_live = worst,
+                  min_venues = rt.cfg.feed.min_venues, "every configured symbol has quorum");
             return;
         }
         if Instant::now() >= deadline {
-            warn!(target: "feed", event = "not_ready",
-                  "starting the loop without a live feed on every symbol; pushes will be gated until it arrives");
+            warn!(target: "feed", event = "not_ready", venues_live = worst,
+                  min_venues = rt.cfg.feed.min_venues,
+                  "starting the loop without quorum on every symbol; pushes will be gated until it arrives");
             return;
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -629,41 +693,69 @@ async fn run_cycle(
         let pair = rt.cfg.pairs[i].clone();
         let Some(meta) = rt.facts.pairs.get(&pair.pair_id).copied() else { continue };
         let Some(snap) = view.snaps.get(&pair.pair_id).copied() else { continue };
-        let Some(tracker) = rt.trackers.get_mut(&pair.pair_id) else { continue };
 
-        let feed_snap = rt.feed.snapshot(&pair.symbol, Instant::now());
+        let now = Instant::now();
         let shift = units::price_shift(meta.price_scale_exp, meta.base_decimals, meta.quote_decimals);
 
-        // Fair value. The tracker is reset whenever the feed is not live so that a recovered
-        // feed is not immediately rejected as an outlier against a pre-outage price.
-        let fair = match feed_snap.live() {
-            None => {
-                tracker.reset();
+        // --- the cross-section -------------------------------------------------------------
+        //
+        // Every venue that quotes this symbol, then the MAD filter and the quorum rule on top.
+        // A venue that is not `Live` contributes nothing and is reported as a transition, never
+        // as an absence: a cross-section that silently shrinks from three venues to two still
+        // produces a confident-looking price.
+        let snaps = rt.feeds.snapshots(&pair.symbol, now);
+        for t in rt.watch.diff(&pair.symbol, &snaps) {
+            if t.recovered() {
+                info!(target: "feed", event = "venue_up", venue = %t.venue, symbol = %t.symbol,
+                      from = t.from.label(), to = t.to.label(), "venue is delivering again");
+            } else {
+                warn!(target: "feed", event = "venue_down", venue = %t.venue, symbol = %t.symbol,
+                      from = t.from.label(), to = t.to.label(),
+                      "VENUE LOST: it no longer contributes to the reference price");
+            }
+        }
+
+        let mut quotes: Vec<VenueQuote> = Vec::new();
+        for (venue, s) in &snaps {
+            let Some(tick) = s.live() else { continue };
+            match VenueQuote::new(*venue, tick, s.age_ms.unwrap_or(0)) {
+                Ok(q) => quotes.push(q),
+                Err(e) => warn!(target: "feed", event = "venue_book_rejected", venue = %venue,
+                                symbol = %pair.symbol, error = %e,
+                                "structurally broken book; this venue is out of the cross-section"),
+            }
+        }
+
+        let reference = fair_value::combine(&quotes, &rt.cfg.feed.mad_params());
+        let feed_status = match &reference {
+            Ok(_) => FeedStatus::Live,
+            Err(e) => e.status(),
+        };
+
+        let Some(vol) = rt.vol.get_mut(&pair.pair_id) else { continue };
+        let fair = match &reference {
+            Ok(r) => {
+                vol.observe(r.micro, now);
+                log_reference(&pair.symbol, pair.pair_id, r, &snaps, shift, vol);
+                units::to_pool_price(r.micro, shift)
+            }
+            Err(e) => {
+                // No reference means no return either. Folding a gap into the estimator would
+                // enter the whole outage as one enormous one-second return.
+                vol.reset();
+                warn!(
+                    target: "feed", event = "no_reference", pair_id = pair.pair_id,
+                    symbol = %pair.symbol, reason = e.label(), error = %e,
+                    venues_live = quotes.len(), venues_configured = snaps.len(),
+                    min_venues = rt.cfg.feed.min_venues,
+                    "NO REFERENCE PRICE: not quoting this pair until the venues agree"
+                );
                 None
             }
-            Some(tick) => match tracker.observe(tick) {
-                Ok(fv) => {
-                    let pool_price = units::to_pool_price(fv.micro, shift);
-                    info!(
-                        target: "feed", event = "fair_value", pair_id = pair.pair_id, symbol = %pair.symbol,
-                        micro = %units::format_fixed(fv.micro, FEED_SCALE),
-                        bid = %units::format_fixed(fv.bid, FEED_SCALE),
-                        ask = %units::format_fixed(fv.ask, FEED_SCALE),
-                        book_spread_bps = fv.book_spread_bps,
-                        pool_price = ?pool_price,
-                        regime_shift = fv.after_concession,
-                        feed_age_ms = ?feed_snap.age_ms,
-                        "fair value"
-                    );
-                    pool_price
-                }
-                Err(e) => {
-                    warn!(target: "feed", event = "tick_rejected", pair_id = pair.pair_id,
-                          symbol = %pair.symbol, error = %e, "tick rejected by the outlier filter");
-                    None
-                }
-            },
         };
+        let sigma_sq = vol.sigma_sq_bps_e6();
+        let sigma_millibps = vol.sigma_millibps();
+        let vol_samples = vol.samples();
 
         let base_balance = view.balances.get(&meta.base).copied().unwrap_or(0);
         let quote_balance = view.balances.get(&meta.quote).copied().unwrap_or(0);
@@ -701,13 +793,54 @@ async fn run_cycle(
         let bid_cap = if snap.bid_capacity == 0 { capacity.bid } else { snap.bid_capacity };
         let ask_cap = if snap.ask_capacity == 0 { capacity.ask } else { snap.ask_capacity };
 
+        // --- the inventory skew ------------------------------------------------------------
+        //
+        // Avellaneda-Stoikov: r = s - q * gamma * sigma^2. Computed here and applied as
+        // `RowInputs::skew_bps`, which means it goes through `dubu-core`'s own `skewed_mid`
+        // and therefore through `validateLadder` and every other check `ladder::build` runs,
+        // BEFORE anything is packed. There is no path by which a skew reaches the chain
+        // unvalidated.
+        let half_spread = pair.half_spread_bps.saturating_add(degraded_extra);
+        let skew = fair.map(|f| {
+            let inventory = Inventory {
+                base_value: dubu_updater::risk::value(base_balance, f, meta.price_scale_exp).unwrap_or(0),
+                // The shared quote token split evenly across pairs. Named as a simplification in
+                // `skew::Inventory`; it is the same assumption archi_v2 5.4's missing cross-asset
+                // clamp already makes.
+                quote_share: quote_balance / rt.cfg.pairs.len().max(1) as u128,
+                target_ppm: pair.target_base_share_ppm(),
+            };
+            let floor_cap = skew::min_price_cap_bps(f, meta.min_price, half_spread);
+            let s = skew::compute(&inventory, sigma_sq, sigma_millibps, &rt.cfg.skew.params(), floor_cap);
+
+            // Every row, every cycle. This is the input to tuning gamma later, and without it
+            // gamma is guesswork: `raw_decibps` next to `applied_bps` is what says whether the
+            // model or the clamp has been doing the deciding.
+            info!(
+                target: "skew", event = "skew", pair_id = pair.pair_id, symbol = %pair.symbol,
+                imbalance_ppm = s.imbalance_ppm,
+                target_ppm = inventory.target_ppm,
+                base_value = %inventory.base_value, quote_share = %inventory.quote_share,
+                sigma_millibps = s.sigma_millibps,
+                sigma_horizon_secs = rt.cfg.skew.vol_horizon_secs,
+                vol_samples,
+                gamma = rt.cfg.skew.gamma,
+                raw_decibps = s.raw_decibps,
+                applied_bps = s.applied_bps,
+                clamp = s.clamp.label(), clamped = s.clamp.bound(),
+                floor_cap_bps = s.floor_cap_bps,
+                "inventory skew"
+            );
+            s
+        });
+
         let row = fair.and_then(|f| {
             match ladder::build(&RowInputs {
                 pair_id: pair.pair_id,
                 fair: f,
-                half_spread_bps: pair.half_spread_bps.saturating_add(degraded_extra),
+                half_spread_bps: half_spread,
                 width_bps: pair.width_bps,
-                skew_bps: pair.skew_bps,
+                skew_bps: skew.map_or(0, |s| s.applied_bps),
                 capture: pair.capture_units().unwrap_or(0),
                 bid_capacity: bid_cap,
                 ask_capacity: ask_cap,
@@ -717,6 +850,7 @@ async fn run_cycle(
                 Ok(r) => Some(r),
                 Err(e) => {
                     warn!(target: "ladder", event = "row_dropped", pair_id = pair.pair_id, error = %e,
+                          skew_bps = skew.map_or(0, |s| s.applied_bps),
                           "computed row failed an off-chain check; dropped and NOT sent");
                     None
                 }
@@ -736,6 +870,8 @@ async fn run_cycle(
                 bid_binding = ?r.bid.binding, ask_binding = ?r.ask.binding,
                 ask_repaired = r.ask_repaired,
                 bid_capture_cost = %r.bid_capture_cost, ask_capture_cost = %r.ask_capture_cost,
+                skew_bps = skew.map_or(0, |s| s.applied_bps),
+                fair = %r.fair, mid = %r.mid,
                 word = %r.word.to_hex().unwrap_or_default(),
                 "ladder computed and validated"
             );
@@ -748,7 +884,7 @@ async fn run_cycle(
             capacity,
             min_price: meta.min_price,
             halted: rt.kill.is_halted(),
-            feed: feed_snap.status,
+            feed: feed_status,
             chain: status,
             view_age_secs: view_age,
             view_stale_secs: rt.cfg.chain.view_stale_secs,
@@ -775,7 +911,8 @@ async fn run_cycle(
             bid_used = %snap.bid_used(), ask_used = %snap.ask_used(),
             bid_capacity = %snap.bid_capacity, ask_capacity = %snap.ask_capacity,
             block = view.block_number, block_timestamp = view.block_timestamp,
-            view_age_secs = view_age, feed = feed_snap.status.label(), chain = status.label(),
+            view_age_secs = view_age, feed = feed_status.label(), chain = status.label(),
+            venues_live = quotes.len(), venues_configured = snaps.len(),
             "decision"
         );
 
@@ -836,6 +973,47 @@ async fn run_cycle(
     }
 
     false
+}
+
+/// One line per pair per cycle saying how the reference price was reached.
+///
+/// The whole cross-section is in it, rejections included, because "which venue was dropped and
+/// how far out was it" is the question asked after the fact and there is nowhere else to get it.
+/// `bound` says whether the MAD or the floor set the rejection threshold, which is the same as
+/// saying whether the filter is in its fast-market regime or its calm one.
+fn log_reference(
+    symbol: &str,
+    pair_id: u16,
+    r: &Reference,
+    snaps: &[(VenueId, dubu_updater::feed::FeedSnapshot)],
+    shift: i32,
+    vol: &Volatility,
+) {
+    info!(
+        target: "feed", event = "reference", pair_id, symbol = %symbol,
+        micro = %units::format_fixed(r.micro, FEED_SCALE),
+        median = %units::format_fixed(r.median, FEED_SCALE),
+        pool_price = ?units::to_pool_price(r.micro, shift),
+        venues_used = r.venues_used(),
+        venues_configured = snaps.len(),
+        venues_rejected = r.rejected.len(),
+        detail = %r.venue_summary(),
+        dispersion_decibps = r.dispersion_decibps,
+        threshold_decibps = r.threshold_decibps,
+        bound = r.bound.label(),
+        sigma_millibps = vol.sigma_millibps(),
+        vol_samples = vol.samples(),
+        "reference price"
+    );
+    for d in &r.rejected {
+        warn!(
+            target: "feed", event = "venue_rejected", pair_id, symbol = %symbol,
+            venue = %d.venue, micro = %units::format_fixed(d.micro, FEED_SCALE),
+            deviation_decibps = d.decibps, threshold_decibps = r.threshold_decibps,
+            mad_decibps = r.dispersion_decibps, bound = r.bound.label(),
+            "OUTLIER: venue dropped from the cross-section for this cycle"
+        );
+    }
 }
 
 async fn emit(rt: &mut Runtime, intent: Intent) {

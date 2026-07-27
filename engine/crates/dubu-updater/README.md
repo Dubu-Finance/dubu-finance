@@ -8,14 +8,14 @@ pushes a new ladder, the one it holds is the one it quotes, until `maxStaleSecs`
 quotes nothing at all. This is that something.
 
 ```
-  Binance bookTicker (wss)      Nodit newHeads (wss) ──► wakes the loop, 1s
+  Binance / OKX / Bybit (wss)   Nodit newHeads (wss) ──► wakes the loop, 1s
            │                    GIWA flashblocks (http, `pending`) ──► state, ~200ms
            ▼                                          ▼
-  feed ──► fair_value ──► ladder ──► policy ──► tx ──► PropPool.updateQuote
-           micro-price    dubu-core   send?           PropPool.refreshCapacity
-                                        ▲
-                                        │
-                                 risk (killswitches)
+  feed ──► fair_value ──► skew ──► ladder ──► policy ──► tx ──► PropPool.updateQuote
+  n venues  MAD + quorum   A–S    dubu-core    send?           PropPool.refreshCapacity
+                                                 ▲
+                                                 │
+                                          risk (killswitches)
 ```
 
 ## Layout
@@ -23,8 +23,11 @@ quotes nothing at all. This is that something.
 | module | what it owns |
 |---|---|
 | `config.rs` | TOML, unknown fields rejected, every range checked at load; redacted endpoint URLs |
-| `feed/` | Binance `bookTicker` websocket: reconnect, sequence regression, staleness |
-| `fair_value.rs` | size-weighted micro-price, outlier filter |
+| `feed/mod.rs` | per-venue liveness, staleness, sequence regression, and the transition log |
+| `feed/ws.rs` | the one reconnect loop every venue shares |
+| `feed/{binance,okx,bybit,coinbase}.rs` | one wire format each, and nothing else |
+| `fair_value.rs` | micro-price per venue, MAD outlier rejection, quorum, one reference |
+| `skew.rs` | EWMA volatility and the Avellaneda–Stoikov reservation price |
 | `chain/mod.rs` | JSON-RPC, the runaway guard, one `eth_call` per cycle, chain health |
 | `chain/heads.rs` | the `newHeads` subscription that drives the loop, and its watchdog |
 | `ladder.rs` | fair value + knobs → `SolveInput` → four `uint56` prices → packed word |
@@ -36,19 +39,26 @@ quotes nothing at all. This is that something.
 
 ## Four things that are load-bearing
 
-**Two independent price sources.** Fair value comes from public exchange market data. The
-on-chain deviation bound is Pyth's job, later. Pyth is live on GIWA and `PropPool` is designed
-to grow a deviation check against it — but if this bot also priced from Pyth, that check would
-be comparing a value against itself and would catch nothing.
+**Several venues, and they are not redundancy.** Fair value comes from three public market-data
+websockets combined into one reference. One venue made the ladder's own price bounds vacuous in
+exactly the way a single-source oracle is — the row and the limits meant to check it came from
+the same number — so a feed that was *confidently* wrong produced a ladder nothing caught. The
+on-chain deviation bound is still Pyth's job, later, and the cross-venue filter is not a
+substitute for it: an error correlated across every venue is invisible to both. Pyth is live on
+GIWA and `PropPool` is designed to grow a deviation check against it — but if this bot also
+priced from Pyth, that check would be comparing a value against itself and would catch nothing.
 
 **The pool's tokens have no market.** `mWETH`, `mWBTC` and `mUSDC` are mocks we deployed and
 nothing anywhere trades them. Each pair is priced off the **real** asset its mock stands in for:
 pairId 1 follows `ETHUSDT`, pairId 2 follows `BTCUSDT`. That is what makes the demo move and
-what will make a markout study mean anything.
+what will make a markout study mean anything. Every venue spells that asset differently, so
+`[pairs.venues]` names each one explicitly rather than guessing a transformation.
 
-**Market data only.** No API key, no account endpoint, no order entry, and no way to add one
-without a signing step that does not exist here. The book is unhedged because a Korean corporate
-real-name exchange account is not available, so there is no account to hedge into.
+**Market data only.** No API key, no account endpoint, no order entry on any venue, and no way
+to add one without a signing step that does not exist here. The book is unhedged because a
+Korean corporate real-name exchange account is not available, so there is no account to hedge
+into — which is also why the inventory skew exists. With no hedge venue, Avellaneda–Stoikov is
+the only inventory control there is.
 
 **One curve, in `dubu-core`.** The skew, the spread projection, the inverse solve, the
 validator, the round-trip check, the executable top, the inventory mark and the calldata packing
@@ -109,10 +119,182 @@ to start otherwise, because signing as anyone else means every transaction rever
 - **Ranges are checked at load, and cross-checks too.** A fallback interval below the block time,
   a head watchdog window that could never fire before the halt timer, an `http(s)` `ws_url`, a
   loss budget below the bleed limit, `adverse_drift_bps` above `favourable_drift_bps`, a capture
-  above capacity, a zero half-spread — all refused at startup with the field named.
+  above capacity, a zero half-spread — all refused at startup with the field named. So are the
+  four that came with this change: `min_venues < 2` (which would be the single-source oracle
+  again), a pair naming fewer venues than the quorum needs (it could never quote), a
+  `max_dispersion_bps` at or below `mad_floor_bps` (the regime gate would fire before the filter
+  ever ran), and `max_negative_bps > max_positive_bps` (the book-lifting cap must be the tighter
+  one).
+- **A venue is enabled by a pair naming a symbol for it**, under `[pairs.venues]`, and by nothing
+  else. Two switches for one venue is two places for them to disagree, and the failure that
+  produces — a venue connected and quoting nothing — counts toward nothing and reads as healthy.
+  Unknown keys there are a hard error, so `bybbit = "ETHUSDT"` fails at startup instead of
+  quietly leaving the pair one venue short of the quorum it is written to have. Endpoints are
+  built-in defaults; `[feed.urls]` overrides one.
 - **Chain checks run before the loop.** That a pair exists, that `base_decimals` matches the
   deployed ERC-20, that `heartbeat_secs` fits inside the pool's own `maxStaleSecs`, that all
   pairs share a quote token. Each of those failing silently would be expensive.
+
+## The reference price: several venues, a MAD filter, and a quorum
+
+Three venues, all quoting against **USDT**, because the pairs track `ETHUSDT` and `BTCUSDT`:
+
+| venue | stream | shape |
+|---|---|---|
+| Binance | `bookTicker`, combined stream in the URL | `{"u","s","b","B","a","A"}`, snapshot per frame |
+| OKX | `bbo-tbt`, subscribed over the socket | `{"arg":{"instId"},"data":[{"bids":[[px,sz,·,·]],"asks":[…],"seqId"}]}` |
+| Bybit | `orderbook.1`, subscribed over the socket | `{"topic","type":"snapshot"\|"delta","data":{"s","b":[[px,sz]],"a":[…],"u"}}` |
+
+Coinbase is **implemented and deliberately not configured**, which is a measurement rather than
+a preference. Over 60s of live ETHUSDT/BTCUSDT on 2026-07-27:
+
+- its deep `ETH-USD`/`BTC-USD` books sat a persistent **+8.4 / +9.3 bps** above the three USDT
+  venues. That entire gap is the USDT/USD basis. A USD-quoted venue is not a second observation
+  of the same price, it is a different price, and averaging it into a 5 bp half-spread is a units
+  error wearing the costume of redundancy;
+- its `ETH-USDT` book is the right *unit* but thin, and Coinbase's `ticker` channel fires on
+  **trades** rather than on book changes, so it updated in 4 of 24 samples. It would count toward
+  quorum and contribute nothing, which is worse than being absent.
+
+The client is still there, parsed against a captured live frame in its tests, for a pair whose
+base genuinely trades against USD.
+
+### Combining them
+
+```text
+per venue   micro-price, plus the unconditional rejections (crossed, zero depth, zero price)
+median      of the cross-section
+dev_v       |micro_v − median|,  in deci-bps of the median
+mad         median(dev_v)                    ← the market's current disagreement
+threshold   max(mad_k × mad, mad_floor_bps)
+survivors   dev_v ≤ threshold
+reference   mean(survivors)                  ← equal weight
+```
+
+**Why MAD and not a fixed band.** A fixed band is wrong in both directions at once: too wide in a
+calm market to catch anything, and firing constantly in a fast one. It also had to *concede*
+after a few consecutive rejections or a genuine fast move became a permanent outage — so every
+real move cost several ticks of staleness at exactly the moment staleness is most expensive.
+`mad` is the disagreement itself, so the band widens by itself when the market is fast. A venue
+printing garbage is far from a median the others agree on whatever the regime; a real move takes
+every venue with it, the median moves, and nothing is rejected and nothing has to be conceded.
+
+**Why the floor.** It is not a fixed band smuggled back in — it is what stops the filter eating
+itself. When every venue agrees to within a tick, `mad` collapses to zero and everything but the
+median is an outlier. Measured, `mad` runs 0.1–1.0 bps and the largest ordinary single-venue
+deviation was 1.6 bps, so `mad_floor_bps = 2` is above ordinary disagreement and below anything
+that matters. In calm markets the floor binds and in fast ones the MAD does; `bound` in every
+`reference` log line says which.
+
+**Why equal weight.** *Liquidity weight* reads well and is wrong: top-of-book size is mostly a
+function of tick size, so a venue with a coarse tick would dominate for a reason unrelated to how
+good its price is — and each venue's own liquidity information is already inside its micro-price.
+*The median itself* is maximally robust and throws away every venue but one, and it moves
+discontinuously as venues drop out. Equal weight over MAD-filtered survivors takes the robustness
+from the filter and the efficiency from the average. Every survivor is within `threshold` of the
+median by construction, so **losing a venue moves the reference by at most `threshold / n`** — the
+price stays continuous while the redundancy does not, which is why the venue count is in every log
+line.
+
+### Degrading, which is never silent
+
+```
+quorum        min_venues survivors, ≥ 2 and refused below it at startup
+below quorum  no reference, no push, feed = no_quorum
+dispersed     mad > max_dispersion_bps → no reference, no push, feed = dispersed
+venue lost    edge-triggered `venue_down` / `venue_up`, naming the venue and both statuses
+outlier       `venue_rejected` per venue per cycle, with its deviation and the threshold
+```
+
+`Dispersed` is the one that matters and it is why the gate is on the **dispersion** rather than on
+a count of rejections. One venue away from the pack barely moves `mad`. Half the venues away from
+the other half moves it to roughly half the gap, and at that point their mean is a number no venue
+is showing — so the bot stops rather than averaging through a regime change. A rejection count
+could never distinguish the two: at least half the cross-section always survives a MAD filter, so
+"a majority was rejected" is not a state that can occur.
+
+Below quorum the pair simply does not quote. `policy`'s `FeedNotLive` gate is unchanged; what
+changed is that the status it carries is now `NoQuorum` or `Dispersed` rather than a single
+socket's health, because one venue's status is never on its own a reason to quote or not to.
+
+## Inventory skew: Avellaneda–Stoikov, linear term only
+
+```text
+r = s − q · γ · σ²
+```
+
+The bot used to quote symmetrically around the reference regardless of what the pool held, so
+sustained one-way flow accumulated inventory and nothing pushed it back.
+
+The load-bearing detail, and the reason to reach for A–S rather than a hand-rolled `κ · q`: the
+coefficient scales with **σ², not with a constant**. The same imbalance is far more dangerous in a
+fast market than a calm one, and a fixed `κ` is wrong in both directions at once.
+
+**The derivative and integral terms are deliberately absent.** A PID needs three coefficients
+tuned against replay data that does not exist here — three numbers picked by feel, which
+archi_v2 §5.4 is explicit about not doing. The linear term is one coefficient and is provably
+optimal under the model's assumptions. A derivative term earns its place once fills show the
+imbalance *oscillating* around target rather than converging; an integral term once they show a
+steady-state offset the proportional term never closes. Both are measurable from the `skew` log
+line plus fills, and neither should be added before they have been measured.
+
+**Volatility.** EWMA of squared relative returns, sampled once per quote cycle (~1 Hz off
+`newHeads`), kept as a *per-second* variance so cycle-cadence jitter does not bias the level, then
+scaled by √t to a **300-second horizon**. That horizon is the same window as
+`risk.bleed_window_secs`, and that is the argument: the bleed killswitch already defines the
+horizon over which an adverse move against inventory counts as a real loss, and the skew exists to
+push inventory back before that switch has anything to measure. One second is the cycle cadence,
+not a holding horizon; one hour is the staleness backstop, and at that scale σ² barely moves and
+the skew becomes the constant A–S was chosen over. `vol_tau_ms` is the EWMA time constant, so the
+half-life is `τ·ln2 ≈ 41s`; the estimator re-anchors rather than folding a feed outage in as one
+enormous one-second return, and it is seeded at zero so an unknown volatility produces no skew
+rather than an invented one.
+
+**Units, so γ is a number a human can reason about.** `q` is a share of the book in ppm, σ is in
+bps, and `skew_bps = γ · q · σ² / 10⁴`. Measured live, ETHUSDT's 300s σ is about **10 bps** and
+BTCUSDT's about **3 bps**, so at `γ = 1000` a pool 20% off target skews 2 bp against a 5 bp
+half-spread. This was first written with `γ = 100` on a guess that σ was 30 bps; since the skew is
+quadratic in σ the guess was wrong by a factor of nine and the applied skew rounded to zero on
+every row. Every row logs `imbalance_ppm`, `sigma_millibps`, `raw_decibps`, `applied_bps` and
+whether the clamp bound — which is the sample a back-solve needs, and without which γ is guesswork.
+
+**Target inventory is configuration**, per pair, as `target_base_share_pct` — a *share* of the
+book rather than an amount, so it stays meaningful as the pool grows. The book is the pair's base
+valued at the reference plus its share of the shared quote token, split evenly across pairs. That
+split is a simplification and is named as one: it makes exactly the assumption archi_v2 §5.4's
+missing cross-asset clamp already makes, in the same place.
+
+**The clamp, and why it is asymmetric.** `max_positive_bps = 30`, `max_negative_bps = 10`.
+
+- A **positive** skew moves the book down: the pool is long, wants to sell, and both sides fall.
+  The bid falling is defensive and the ask falling is the point. Neither is a gift to a taker.
+- A **negative** skew moves the book up: the pool is short, and its **bid** rises toward and past
+  the reference. A bid above fair value is a free option written to whoever notices first — the
+  same direction the `adverse_drift_bps` asymmetry exists to defend against — and there is no
+  structural floor to stop it. So it is capped tighter. A short book is worked off more slowly
+  than a long one, which is the right trade for a book that cannot hedge: a slow recovery costs
+  volume, a picked-off bid costs money. The config validator refuses these two the other way round.
+
+Both caps also stop a wild σ print from inverting the strategy: σ² is quadratic, so a 10× error in
+volatility is a 100× error in skew.
+
+**The skew can never produce a row the chain rejects.** Two separate reasons:
+
+- *Crossing is structurally impossible.* The skew moves the **mid**, and both targets hang off the
+  skewed mid with the same half-spread, so the spread between them is preserved exactly and
+  `minBid < minAsk` for every skew in range. A test checks the whole range against `dubu-core`'s
+  own builder rather than by argument.
+- *The floor is clamped, not discovered.* A large positive skew can push the bid target under the
+  pair's `minPrice`, at which point `ladder::build` correctly refuses the row — but a refused row
+  is a quoting outage. `skew::min_price_cap_bps` computes the largest skew that still clears the
+  floor and folds it into the cap, logged as `clamp = "min_price_floor"`. A test proves the
+  clamped skew still builds a row and one bp more does not.
+
+The skew is applied as `RowInputs::skew_bps`, so it goes through `dubu-core`'s own `skewed_mid`,
+the inverse solve, `validateLadder`, the round-trip check and the fill check **before** anything is
+packed. There is no path by which a skew reaches the chain unvalidated. Resolution is whole bps,
+because that is what `dubu-core` takes and sub-bp resolution here would mean a second
+implementation of the skew in this crate.
 
 ## Endpoints, and which one drives what
 
@@ -141,11 +323,13 @@ higher plan tier and `trace_block` does not exist; nothing here calls either.
 
 ### One thing worth knowing if you touch `heads.rs`
 
-**Nodit sends JSON-RPC over WebSocket *binary* frames.** Binance's market-data feed sends text.
+**Nodit sends JSON-RPC over WebSocket *binary* frames.** All four market-data venues send text.
 Both are legal — RFC 6455 leaves the choice to the application — and a client that matches on
 the opcode instead of the payload silently drops every frame from the other one. The failure
 gives no signal pointing at the cause: the handshake returns 101, frames arrive on schedule,
-and it presents as "the endpoint never replied". `heads::payload` handles both and a test pins it.
+and it presents as "the endpoint never replied". `heads::payload` handles both and a test pins
+it; `feed::ws` decodes binary frames as UTF-8 for the same reason, against the day a venue
+changes its mind.
 
 ## The loop is event-driven, and what is left of the polling machinery
 
@@ -310,11 +494,11 @@ back-solved from a replay drawdown, per archi_v2 §5.4. Do not pick them by feel
 
 Listed because each one is a real gap, not because the list is decorative.
 
-- **The reference-oracle deviation bound.** The only genuinely independent check on a wrong fair
-  value, and it is absent on both sides: `PropPool.updateQuote` has no Pyth read, and this bot
-  has nothing to compare against. `ladder.rs`'s bid ceiling and ask floor are *self-consistency*
-  bounds against the same number that produced the row — they cannot catch a feed that is
-  confidently wrong. This is the largest gap here.
+- **The on-chain reference-oracle deviation bound.** `PropPool.updateQuote` still has no Pyth
+  read. The cross-venue filter narrowed this gap and did not close it: it catches *one* venue
+  being confidently wrong, and it is silent about an error correlated across all of them.
+  `ladder.rs`'s bid ceiling and ask floor remain *self-consistency* bounds against the number
+  that produced the row. This is still the largest gap here.
 - **Deposit and withdrawal attribution.** A manager `deposit` or an owner `withdraw` moves
   balances with no trade, so it lands in `tradePnl` — a withdrawal looks like a loss to the
   budget switch. Fixing it needs the pool's `Swap` and `ReserveSynced` events.
@@ -322,16 +506,23 @@ Listed because each one is a real gap, not because the list is decorative.
   Capacity is clamped to inventory **per pair**; both pairs draw bids from the same mUSDC and
   nothing caps the sum. Harmless at current sizing (≈$4.3M of configured bid against $11.1M
   held) and wrong in principle.
-- **Inventory-driven skew.** `skew_bps` is static. archi_v2 §5.4's
-  `bidSkew = clamp(slope × (current/target − 1))` needs a target inventory per pair.
 - **Cost-basis ask floor.** `askFloor = costBasis × (1 + minExitEdgeBps)`, and the cold-start
   rule that forces `askCapacity = 0` when the cost basis is unknown. Needs fill history.
+- **A tuned γ.** The skew is live and `γ = 1000` was set from one measurement of σ on one quiet
+  afternoon. archi_v2 §5.4 says thresholds come from a replay back-solve, and that applies here
+  too. The `skew` log line exists to make that possible; nothing consumes it yet.
+- **The derivative and integral terms** of the inventory controller. Deliberate, and the
+  conditions that would justify each are written down above.
 - **Directional flow budget.** The leaky bucket where a bid fill debits the bid budget and
   charges the ask.
-- **True sequence-gap detection.** `bookTicker`'s update id is monotone but not contiguous, so a
-  dropped message is undetectable on this stream and this crate does not claim to detect one —
-  only a *regression*, which is dropped and counted. Contiguity needs the `depth` diff stream's
-  `U`/`u` ranges.
+- **True sequence-gap detection.** Every venue's update id is monotone but not contiguous, so a
+  dropped message is undetectable on these streams and this crate does not claim to detect one —
+  only a *regression*, which is dropped and counted. Contiguity needs each venue's depth-diff
+  stream and its own sequencing rules.
+- **A failover venue list.** Three venues is enough to reject an outlier and, with
+  `min_venues = 2`, to survive losing one. Losing two stops the pair, and there is no fourth
+  configured to fall back on — Coinbase is implemented but disqualified for these pairs, for the
+  measured reasons above.
 - **Markout.** Every quote and decision is logged as structured JSON for exactly this, and
   nothing consumes it yet. archi_v2 §5.5 wants ClickHouse or Parquet.
 - **Metrics and alerting.** Logs only. No Prometheus, no pager.
@@ -359,14 +550,33 @@ retires all of it.
 ## Tests
 
 ```
-cargo test --all                              # 138 in this crate
+cargo test --all                              # 200 in this crate
 cargo clippy --all-targets -- -D warnings
 ```
 
-No test touches the network. The feed and chain are mocked by *constructing the data types
-directly* rather than by a mock object, so there is no mock that can drift from the real thing.
+No test touches the network. The feeds and chain are mocked by *constructing the data types
+directly* rather than by a mock object, so there is no mock that can drift from the real thing —
+and every venue parser is pinned against a frame **captured verbatim off that venue's live
+socket**, which is the closest a network-free test gets to the wire.
 The load-bearing ones:
 
+- **feed** — one venue dying not touching another; losing a venue producing exactly one event
+  and a steady outage producing none; a `Stale { age_ms }` that changes every cycle not
+  re-firing; a venue that never connects announcing itself once; Bybit's `delta` leaving the
+  untouched side alone, its `["px","0"]` deletion not being read as a price, and a reconnect
+  clearing the merge state; a protocol-level `snapshot` overriding the regression check.
+- **fair_value** — one venue printing garbage rejected while the rest still quote; a
+  market-wide move taking every venue with it and rejecting nothing; the band widening by itself
+  so that the same 3 bp deviation is an outlier in a calm cross-section and ordinary in a fast
+  one; a split cross-section refusing to quote rather than averaging through it; two venues
+  declining to attribute an outlier; a venue dropping out moving the reference by less than the
+  threshold.
+- **skew** — a flat market skewing zero *while the imbalance is non-zero*; the estimator
+  converging on the volatility it is fed and scaling as √t; an outage gap re-anchoring instead of
+  becoming one enormous return; 2× σ producing 4× skew and not 2×; the book-lifting cap being the
+  tighter one; the `minPrice` clamp checked against `dubu-core` by building a row at the clamp and
+  failing one bp past it; and **no skew in range crossing the book**, checked across the whole
+  range rather than argued.
 - **heads** — a real `newHeads` frame parsed out of **both** a text and a binary frame; a
   notification from *another* subscription not counting as our liveness; a replayed header not
   resetting the watchdog; a connected-but-silent subscription reading `Stale` rather than `Live`

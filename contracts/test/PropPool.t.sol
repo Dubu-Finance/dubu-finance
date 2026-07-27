@@ -251,7 +251,7 @@ contract PropPoolTest is Test {
         uint256[] memory oneCap = new uint256[](1);
         oneCap[0] = _packCapacity(PAIR, BID_CAP, ASK_CAP);
 
-        fns = new Fn[](34);
+        fns = new Fn[](44);
         uint256 i;
 
         // --- the three functions the updater is supposed to reach, and nothing else ---
@@ -272,12 +272,22 @@ contract PropPoolTest is Test {
             Fn("addPair", abi.encodeCall(PropPool.addPair, (address(0xB1), address(0xB2), 6, 60, 1)), Gate.OwnerOnly);
         // The one that actually moves value out of the pool to a chosen address.
         fns[i++] = Fn("withdraw", abi.encodeCall(PropPool.withdraw, (address(quote), 1e6, updater)), Gate.OwnerOnly);
+        // The reference oracle's root of trust. Owner, not manager: it decides what
+        // "independent" means for every bounded pair at once.
+        fns[i++] = Fn("setPyth", abi.encodeCall(PropPool.setPyth, (address(0xB0DE))), Gate.OwnerOnly);
 
         // --- manager ---
         fns[i++] =
             Fn("setPairConfig", abi.encodeCall(PropPool.setPairConfig, (PAIR, 60, MIN_PRICE, 0, 0)), Gate.ManagerOnly);
         fns[i++] = Fn("deposit", abi.encodeCall(PropPool.deposit, (address(quote), 1e6)), Gate.ManagerOnly);
         fns[i++] = Fn("sync", abi.encodeCall(PropPool.sync, (address(quote))), Gate.ManagerOnly);
+        // The updater's leash. Manager, emphatically not updater — a hot key that can widen its
+        // own deviation limit or zero its own feed id is bounded by nothing. That this line sits
+        // under `--- manager ---` is the whole point of the census.
+        fns[i++] = Fn(
+            "setPairOracle", abi.encodeCall(PropPool.setPairOracle, (PAIR, bytes32(uint256(1)), 100, 60, int8(12))),
+            Gate.ManagerOnly
+        );
 
         // --- guardian ---
         fns[i++] = Fn("pause", abi.encodeCall(PropPool.pause, (PAIR)), Gate.GuardianOnly);
@@ -314,6 +324,9 @@ contract PropPoolTest is Test {
         fns[i++] = Fn("getSupportedPairs", abi.encodeCall(PropPool.getSupportedPairs, ()), Gate.ViewOnly);
         fns[i++] = Fn("reserveOf", abi.encodeCall(PropPool.reserveOf, (address(quote))), Gate.ViewOnly);
         fns[i++] = Fn("pairConfig", abi.encodeCall(PropPool.pairConfig, (PAIR)), Gate.ViewOnly);
+        fns[i++] = Fn("pairOracle", abi.encodeCall(PropPool.pairOracle, (PAIR)), Gate.ViewOnly);
+        fns[i++] = Fn("referencePrice", abi.encodeCall(PropPool.referencePrice, (PAIR)), Gate.ViewOnly);
+        fns[i++] = Fn("pyth", abi.encodeWithSignature("pyth()"), Gate.ViewOnly);
         fns[i++] = Fn("owner", abi.encodeWithSignature("owner()"), Gate.ViewOnly);
         fns[i++] = Fn("pendingOwner", abi.encodeWithSignature("pendingOwner()"), Gate.ViewOnly);
         fns[i++] = Fn("manager", abi.encodeWithSignature("manager()"), Gate.ViewOnly);
@@ -321,6 +334,15 @@ contract PropPoolTest is Test {
         fns[i++] = Fn("guardian", abi.encodeWithSignature("guardian()"), Gate.ViewOnly);
         fns[i++] = Fn("allPaused", abi.encodeWithSignature("allPaused()"), Gate.ViewOnly);
         fns[i++] = Fn("pairCount", abi.encodeWithSignature("pairCount()"), Gate.ViewOnly);
+
+        // `referencePrice` returns a bare `uint8` status, so the codes are part of the integration
+        // surface and are exposed as named constants rather than left to a doc comment for
+        // integrators to transcribe. Getters, hence selectors, hence census entries.
+        fns[i++] = Fn("REF_OK", abi.encodeWithSignature("REF_OK()"), Gate.ViewOnly);
+        fns[i++] = Fn("REF_DISABLED", abi.encodeWithSignature("REF_DISABLED()"), Gate.ViewOnly);
+        fns[i++] = Fn("REF_UNAVAILABLE", abi.encodeWithSignature("REF_UNAVAILABLE()"), Gate.ViewOnly);
+        fns[i++] = Fn("REF_STALE", abi.encodeWithSignature("REF_STALE()"), Gate.ViewOnly);
+        fns[i++] = Fn("REF_INVALID", abi.encodeWithSignature("REF_INVALID()"), Gate.ViewOnly);
 
         assertEq(i, fns.length, "surface census length out of sync with its entries");
     }
@@ -451,7 +473,7 @@ contract PropPoolTest is Test {
     function _knownPush4() internal view returns (bytes4[] memory known) {
         Fn[] memory fns = _surface();
         // errors + non-selector 4-byte constants
-        bytes4[] memory extra = new bytes4[](37);
+        bytes4[] memory extra = new bytes4[](44);
         uint256 e;
         extra[e++] = PropPool.NotOwner.selector;
         extra[e++] = PropPool.NotManager.selector;
@@ -477,6 +499,17 @@ contract PropPoolTest is Test {
         extra[e++] = PropPool.SlippageExceeded.selector;
         extra[e++] = PropPool.ZeroOutput.selector;
         extra[e++] = PropPool.LengthMismatch.selector;
+        // --- reference-oracle bound ---
+        extra[e++] = PropPool.PythNotSet.selector;
+        extra[e++] = PropPool.DeviationTooLarge.selector;
+        extra[e++] = PropPool.ZeroPythStaleWindow.selector;
+        extra[e++] = PropPool.BidCeilingExceeded.selector;
+        extra[e++] = PropPool.AskFloorBreached.selector;
+        extra[e++] = PropPool.ReferenceUnavailable.selector;
+        // The one call PropPool makes into the oracle. It is the only external call on any path
+        // reachable by the updater, and it is a `staticcall` to a view — worth being able to point
+        // at that fact in this list.
+        extra[e++] = bytes4(0x96834ad3); // IPyth.getPriceUnsafe(bytes32)
         extra[e++] = PropCurve.AmountExceedsCapacity.selector;
         extra[e++] = PropCurve.ZeroCapacity.selector;
         extra[e++] = PropCurve.ZeroPrice.selector;

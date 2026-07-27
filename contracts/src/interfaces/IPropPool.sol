@@ -47,6 +47,32 @@ interface IPropPool {
     ///      curve accepts or returns is capped at `type(uint128).max`. `refreshCapacity` will not
     ///      accept a capacity that could push a quote leg past it, so a snapshot never describes a
     ///      pair whose own capacity is out of domain.
+    ///
+    ///      ## `flags`
+    ///
+    ///      | bit    | meaning                                                                  |
+    ///      |--------|--------------------------------------------------------------------------|
+    ///      | 0      | paused — this pair will not quote or fill                                 |
+    ///      | 1..14  | reserved                                                                 |
+    ///      | 15     | **bounded** — a reference oracle is configured for this pair              |
+    ///
+    ///      Bits 0..14 are read straight out of the pool's capacity word. **Bit 15 is derived, not
+    ///      stored**, and is the answer to "is this pair's ladder checked against an independent
+    ///      price, or does it quote on the operator's word alone?" Zero is a supported production
+    ///      configuration — not every listable asset has a Pyth feed, and a pair that could not be
+    ///      listed without one would simply not be listed — so an integrator sizing its exposure to
+    ///      this venue should be able to tell the two apart, and this is where.
+    ///
+    ///      The bit says a bound is *configured*, not that it is currently *satisfiable*; the
+    ///      latter needs a live oracle read, which no function under the no-revert contract makes.
+    ///      `PropPool.pairOracle(pairId)` returns the full configuration and
+    ///      `PropPool.referencePrice(pairId)` returns the current reference with a status code,
+    ///      both totally, if you need more than the bit.
+    ///
+    ///      **Do not append fields to this struct.** It is a static tuple and off-chain consumers
+    ///      mirror it positionally — the Rust updater declares its own `sol!` copy — so a new
+    ///      field changes the return encoding under every one of them at once. New per-pair state
+    ///      goes in its own view, as `pairOracle` did.
     struct PairSnapshot {
         uint56 minBid;
         uint56 maxBid;

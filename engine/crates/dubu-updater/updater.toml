@@ -102,25 +102,64 @@ halt_after_secs = 600
 view_stale_secs = 20
 
 [feed]
-# Binance combined streams. PUBLIC MARKET DATA ONLY — no API key, no account endpoint, no order
-# entry anywhere in this crate. The stream list is built from the per-pair symbols below.
-ws_url = "wss://stream.binance.com:9443/stream"
+# ---------------------------------------------------------------------------
+# SEVERAL VENUES, AND THE RULES FOR COMBINING THEM.
+#
+# PUBLIC MARKET DATA ONLY — no API key, no account endpoint, no order entry
+# anywhere in this crate, on any venue.
+#
+# One exchange made the ladder's own price bounds vacuous in exactly the way a
+# single-source oracle is: the row and the limits meant to check it came from
+# the same number, so a feed that was CONFIDENTLY wrong — a bad parse, a socket
+# that stays open serving stale data, an exchange printing garbage mid-outage —
+# produced a ladder nothing caught. Three venues give the combiner a
+# cross-section to reject against.
+#
+# The endpoints are NOT listed here. Each venue has a built-in public default
+# (feed::VenueId::default_ws_url); add a `[feed.urls]` table only to override
+# one. A venue is enabled by a pair naming a symbol for it below, and by
+# nothing else — two switches for one venue is two places for them to disagree.
+# ---------------------------------------------------------------------------
 
-# A symbol with no accepted tick for this long is stale, and a stale feed blocks every push.
-# Not advisory: the feed type will not hand out a price past this point.
+# A symbol with no accepted tick for this long is stale ON THAT VENUE, and a stale venue
+# contributes nothing to the cross-section. Not advisory: the feed type will not hand out a
+# price past this point.
 stale_after_ms = 5000
 
 reconnect_initial_ms = 500
 reconnect_max_ms = 30000
 
-# Binance pings every ~20s, so a socket with no frame at all for this long is dead whatever TCP
-# thinks. Must be >= stale_after_ms or the staleness window is never observable.
+# Every venue here either pushes continuously or answers a keepalive every 20s, so a socket with
+# no frame at all for this long is dead whatever TCP thinks. Must be >= stale_after_ms or the
+# staleness window is never observable.
 read_timeout_ms = 45000
 
-# Outlier filter. A single bad print is dropped; a genuine fast move is conceded after
-# `outlier_tolerance` consecutive ticks at the new level, which on a liquid book is tens of ms.
-max_jump_bps = 200
-outlier_tolerance = 3
+# THE QUORUM. Below this many surviving venues there is no reference price and the bot quotes
+# nothing, logging `no_quorum`. Refused below 2 at startup: one venue is the single-source oracle
+# this whole arrangement exists to stop being. With three venues configured, losing one still
+# quotes and is logged as an event; losing two stops the pair.
+min_venues = 2
+
+# THE MAD OUTLIER FILTER. A venue further than `mad_k * MAD` from the cross-venue median is
+# dropped for that cycle. MAD *is* the market's current disagreement, so the band widens by
+# itself when the market is fast and tightens when it is calm — which is what a fixed band could
+# never do, being too wide in a calm market and firing constantly in a fast one.
+mad_k = 4.0
+
+# ... and the floor under that band, which is what stops the filter eating itself: when every
+# venue agrees to within a tick the MAD collapses to zero and everything but the median would be
+# rejected. Measured over 60s of live ETHUSDT and BTCUSDT across Binance/OKX/Bybit on 2026-07-27,
+# the MAD ran 0.1-1.0 bps and the largest single-venue deviation seen was 1.6 bps. 2 bps is above
+# ordinary disagreement and below anything that matters.
+mad_floor_bps = 2.0
+
+# THE REGIME GATE, and the one that matters most. Cross-venue MAD above this means the venues do
+# not AGREE — not that one of them is wrong. One venue away from the pack barely moves the MAD;
+# half the venues away from the other half moves it to roughly half the gap, and at that point
+# the mean of them is a number no venue is showing. The bot refuses to quote rather than
+# averaging through a regime change. 25 bps is ~5x the ETH half-spread and ~25x the observed
+# calm-market MAD, so it cannot fire on ordinary conditions.
+max_dispersion_bps = 25.0
 
 [tx]
 # NON-NEGOTIABLE DEFAULT. Nothing is broadcast unless this is explicitly true. `--dry-run`
@@ -148,6 +187,95 @@ max_priority_fee_per_gas_gwei = "0.005"
 # A pair with an unconfirmed transaction is NOT superseded. After this long the intent is
 # abandoned (not replaced), the pair is unblocked, and the nonce is resynced from the node.
 pending_timeout_secs = 120
+
+[skew]
+# ---------------------------------------------------------------------------
+# INVENTORY SKEW — Avellaneda-Stoikov, linear term only.
+#
+#   r = s - q * gamma * sigma^2
+#
+# The bot used to quote symmetrically around the reference regardless of what
+# the pool held, so sustained one-way flow accumulated inventory and nothing
+# pushed it back. There is NO HEDGE VENUE, so this is not one inventory control
+# among several — it is the only one there is.
+#
+# The load-bearing detail, and the reason to reach for A-S rather than a
+# hand-rolled constant: the coefficient scales with sigma^2, NOT with a
+# constant. The same imbalance is far more dangerous in a fast market than a
+# calm one, and a fixed kappa is wrong in both directions at once.
+#
+# The derivative and integral terms are DELIBERATELY ABSENT. A PID needs three
+# coefficients tuned against replay data we do not have — three numbers picked
+# by feel, which archi_v2 5.4 is explicit about not doing. The linear term is
+# one coefficient and is provably optimal under the model's assumptions.
+# src/skew.rs records what would justify adding the other two.
+# ---------------------------------------------------------------------------
+
+# THE VOLATILITY ESTIMATOR. EWMA of squared relative returns, sampled once per quote cycle
+# (~1 Hz off newHeads), kept as a per-second variance so cycle-cadence jitter does not bias the
+# level, and scaled to the horizon by sqrt-of-time.
+#
+# tau is the EWMA time constant; the half-life is tau * ln2, about 41s here.
+vol_tau_ms = 60000
+
+# THE HORIZON, which is the choice worth arguing about because it sets the range gamma has to
+# live in. 300s is the SAME WINDOW as risk.bleed_window_secs below, and that is the whole
+# argument: the bleed killswitch already defines the horizon over which an adverse move against
+# inventory counts as a real loss rather than noise, and the skew exists to push inventory back
+# before that switch has anything to measure. Any other horizon means two parts of one risk
+# system disagreeing about what "soon" means.
+#
+# Not 1s (the cycle cadence): the position being worked off survives orders of magnitude longer
+# than one block. Not 3600s (the pool's maxStaleSecs): that is a staleness backstop, not a
+# holding horizon, and at that scale sigma^2 barely moves and the skew becomes the constant that
+# A-S was chosen over.
+vol_horizon_secs = 300
+
+# Samples closer than this are skipped rather than divided by a tiny interval; gaps longer than
+# this are an outage, not a return, and the estimator re-anchors instead of entering the whole
+# outage as one enormous one-second move.
+vol_min_sample_ms = 100
+vol_max_sample_ms = 10000
+
+# RISK AVERSION.  skew_bps = gamma * q * sigma_bps^2 / 10000
+#
+# MEASURED on the live feed, 2026-07-27, over ~200 cycles: sigma across the 300s horizon is about
+# 10 bps on ETHUSDT and 3 bps on BTCUSDT. So sigma^2/10000 is 0.01 bp for ETH, and a pool 20%
+# away from its target skews 2 bp against a 5 bp half-spread — visible, not dominant. The 30 bp
+# cap below is then reached at q * sigma^2 = 300 bps^2, e.g. half the book off target in a market
+# 2.5x more volatile than the one measured, which is the right place for a backstop to sit.
+#
+# This value was FIRST WRITTEN as 100, on a guess that sigma was 30 bps. The measurement said 10.
+# Because the skew is quadratic in sigma that guess was wrong by a factor of nine and the applied
+# skew rounded to zero on every row. Every row logs (imbalance_ppm, sigma_millibps, raw_decibps,
+# applied_bps) precisely so the next correction is a back-solve and not another guess.
+#
+# Note both pairs share this: BTCUSDT's skew comes out near zero because its imbalance is ~1% and
+# its vol is a third of ETH's. That is the model working, not a misconfiguration.
+gamma = 1000.0
+
+# THE CLAMP, and it is ASYMMETRIC on purpose.
+#
+# POSITIVE skew moves the book DOWN: the pool is long, wants to sell, and both its bid and its
+# ask fall. The bid falling is defensive and the ask falling is the point. Neither side is a gift
+# to a taker, so this one is the looser cap.
+#
+# NEGATIVE skew moves the book UP: the pool is short base, wants to buy, and its BID rises toward
+# and eventually past the reference. A bid above fair value is a free option written to whoever
+# notices first — the exact adverse-selection direction the adverse_drift_bps asymmetry below
+# exists to defend against — and unlike the positive direction there is no structural floor to
+# stop it. So it is capped tighter, and a short book is worked off more slowly than a long one.
+# That is the correct trade for a book that cannot hedge: a slow recovery costs volume, a
+# picked-off bid costs money. The validator refuses these two the other way round.
+#
+# Both caps also stop a single wild sigma print from inverting the strategy: sigma^2 is
+# quadratic, so a 10x volatility error is a 100x skew error.
+#
+# The pair's own minPrice floor is folded in on top of max_positive_bps and clamps tighter when
+# fair value is near it — logged as clamp="min_price_floor". Clamping there keeps the pool
+# quoting a less-skewed book instead of having the row refused outright.
+max_positive_bps = 30
+max_negative_bps = 10
 
 [risk]
 # The killswitch latch. Written atomically after every change and read at startup: a halted book
@@ -186,6 +314,9 @@ pair_id = 1
 # IMPORTANT: this is the REAL asset the pool's mock base token stands in for, NOT a market in
 # the mock. mWETH is an ERC-20 we deployed and nothing anywhere trades it. Pricing pairId 1 off
 # ETHUSDT is what makes the demo live and what will make markout mean something.
+#
+# It is also the CANONICAL name every venue's ticks are recorded under; each venue's own spelling
+# is in [pairs.venues] at the bottom of this block.
 symbol = "ETHUSDT"
 
 base_decimals = 18
@@ -200,9 +331,14 @@ half_spread_bps = 5
 # ceiling allows only `half_spread` of lift, so `W <= 2 * 5bp * 1000/20 = 500 bp`.
 width_bps = 25
 
-# Positive shifts the whole book down (the pool is long and wants to sell). Static; an
-# inventory-driven skew is listed as not built in the README.
-skew_bps = 0
+# TARGET INVENTORY, as a share of this pair's book — configuration, not a constant, and a share
+# rather than an amount so it stays meaningful as the pool grows or shrinks. The book is this
+# pair's mWETH valued at the reference plus its share of the shared mUSDC; see skew::Inventory on
+# what "its share" means while archi_v2 5.4's cross-asset quote clamp is still unbuilt.
+#
+# 50 is a balanced book. The pool currently sits above that, so the live skew is positive: it
+# quotes slightly lower on both sides and works the position down through its ask.
+target_base_share_pct = 50
 
 # The size the half-spread is guaranteed over, on average. Not a size limit — the epoch is
 # `bid_capacity`/`ask_capacity` — but the size the quote is honest about.
@@ -229,6 +365,21 @@ favourable_drift_bps = 8
 # Refresh the capacity epoch once remaining capacity falls this far below the planned one.
 capacity_divergence_pct = 30
 
+# EVERY VENUE'S OWN SPELLING OF THIS MARKET. Naming a venue here is what enables it; an unknown
+# key is a hard error, so `bybbit = ...` fails at startup instead of quietly leaving the pair one
+# venue short of the quorum it is written to have.
+#
+# All three quote against USDT, which is the point. Coinbase is implemented (feed/coinbase.rs)
+# and deliberately NOT listed: measured on 2026-07-27, its deep USD books sat a persistent
+# +8.4 bps above these three — that is the USDT/USD basis, and against a 5 bp half-spread it is a
+# bias wearing the costume of redundancy — while its ETH-USDT book is the right unit but so thin
+# that its trade-driven `ticker` channel updated in 4 of 24 samples and would have counted toward
+# quorum while contributing nothing.
+[pairs.venues]
+binance = "ETHUSDT"
+okx     = "ETH-USDT"
+bybit   = "ETHUSDT"
+
 # ---------------------------------------------------------------------------
 # pairId 2 — mWBTC/mUSDC, 8/6 decimals, priceScaleExp 12
 # ---------------------------------------------------------------------------
@@ -245,7 +396,9 @@ quote_decimals = 6
 # less of it in notional terms.
 half_spread_bps = 8
 width_bps = 40
-skew_bps = 0
+
+# See pairId 1. Same balanced target; the imbalance and the resulting skew are logged per row.
+target_base_share_pct = 50
 
 capture = "0.2"
 bid_capacity = "20"
@@ -255,3 +408,8 @@ heartbeat_secs = 2400
 adverse_drift_bps = 3
 favourable_drift_bps = 12
 capacity_divergence_pct = 30
+
+[pairs.venues]
+binance = "BTCUSDT"
+okx     = "BTC-USDT"
+bybit   = "BTCUSDT"

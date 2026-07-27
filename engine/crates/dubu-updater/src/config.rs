@@ -42,6 +42,9 @@ use std::path::{Path, PathBuf};
 use alloy_primitives::Address;
 use serde::Deserialize;
 
+use crate::fair_value::MadParams;
+use crate::feed::VenueId;
+use crate::skew::{SkewParams, VolConfig};
 use crate::units::{self, UnitsError};
 
 /// Why a config was refused.
@@ -265,10 +268,12 @@ pub fn load_dotenv(path: &Path) -> usize {
 pub struct Config {
     /// RPC endpoints, polling cadence and the request budget.
     pub chain: ChainConfig,
-    /// Exchange market-data feed.
+    /// Exchange market-data feeds, the quorum rule and the MAD filter.
     pub feed: FeedConfig,
     /// Transaction construction and the transmit switch.
     pub tx: TxConfig,
+    /// Inventory skew: the volatility estimator and the Avellaneda–Stoikov knobs.
+    pub skew: SkewConfig,
     /// Killswitches.
     pub risk: RiskConfig,
     /// One entry per pair the bot quotes.
@@ -298,6 +303,7 @@ impl Config {
         self.chain.validate()?;
         self.feed.validate()?;
         self.tx.validate()?;
+        self.skew.validate()?;
         self.risk.validate()?;
 
         if self.pairs.is_empty() {
@@ -306,7 +312,7 @@ impl Config {
         let mut seen_ids = BTreeSet::new();
         let mut seen_symbols = BTreeSet::new();
         for p in &self.pairs {
-            p.validate()?;
+            p.validate(self.feed.min_venues)?;
             if !seen_ids.insert(p.pair_id) {
                 return Err(invalid(format!("pairs: pair_id {} appears twice", p.pair_id)));
             }
@@ -323,6 +329,28 @@ impl Config {
     #[must_use]
     pub fn pair(&self, pair_id: u16) -> Option<&PairConfig> {
         self.pairs.iter().find(|p| p.pair_id == pair_id)
+    }
+
+    /// Every venue at least one pair names, in a stable order.
+    ///
+    /// A venue is enabled by being *used*, not by a separate switch. Two places to turn a venue
+    /// on is two places for them to disagree, and the failure that produces — a venue configured
+    /// but quoting no symbol — is one that counts toward nothing and reads as healthy.
+    #[must_use]
+    pub fn venues(&self) -> Vec<VenueId> {
+        VenueId::ALL
+            .into_iter()
+            .filter(|v| self.pairs.iter().any(|p| p.venues.symbol(*v).is_some()))
+            .collect()
+    }
+
+    /// The `(venue symbol, canonical symbol)` pairs one venue should subscribe to.
+    #[must_use]
+    pub fn venue_symbols(&self, venue: VenueId) -> Vec<(String, String)> {
+        self.pairs
+            .iter()
+            .filter_map(|p| p.venues.symbol(venue).map(|s| (s.to_string(), p.symbol.clone())))
+            .collect()
     }
 }
 
@@ -600,20 +628,66 @@ impl ChainConfig {
 // Feed
 // ---------------------------------------------------------------------------
 
-/// Exchange market-data feed.
+/// Per-venue endpoint overrides. Every one is optional; the defaults are the public endpoints
+/// on [`VenueId::default_ws_url`].
+///
+/// There is no API key field and no secret field here, for any venue, because none of these
+/// streams has one. A venue is enabled by a pair naming a symbol for it under
+/// [`PairVenues`], not by appearing in this table.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VenueUrls {
+    /// Binance combined-stream endpoint.
+    #[serde(default)]
+    pub binance: Option<String>,
+    /// OKX v5 public endpoint.
+    #[serde(default)]
+    pub okx: Option<String>,
+    /// Bybit v5 spot public endpoint.
+    #[serde(default)]
+    pub bybit: Option<String>,
+    /// Coinbase Exchange feed endpoint.
+    #[serde(default)]
+    pub coinbase: Option<String>,
+}
+
+impl VenueUrls {
+    /// The endpoint for one venue: the override if given, otherwise the public default.
+    #[must_use]
+    pub fn get(&self, venue: VenueId) -> &str {
+        let over = match venue {
+            VenueId::Binance => &self.binance,
+            VenueId::Okx => &self.okx,
+            VenueId::Bybit => &self.bybit,
+            VenueId::Coinbase => &self.coinbase,
+        };
+        over.as_deref().unwrap_or_else(|| venue.default_ws_url())
+    }
+}
+
+/// Exchange market-data feeds, the quorum rule, and the MAD outlier filter.
 ///
 /// **Market data only.** There is no API key field, no secret field, and no order-entry code
-/// path anywhere in this crate. The design is unhedged precisely because a Korean corporate
-/// real-name exchange account is not available, so there is no account to place an order
-/// against even if the code existed. See the crate README.
+/// path anywhere in this crate, on any venue. The design is unhedged precisely because a Korean
+/// corporate real-name exchange account is not available, so there is no account to place an
+/// order against even if the code existed. See the crate README.
+///
+/// # Why the quorum knobs live here and what they are worth
+///
+/// One exchange makes the ladder's own price bounds vacuous: they would be derived from the same
+/// number they are checking. Several venues give [`crate::fair_value::combine`] a cross-section,
+/// and these four fields are the entire policy for what to do with it — how many venues are
+/// enough, how far from the pack is too far, and how far apart the pack itself may be before
+/// there is no single price to quote at all.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FeedConfig {
-    /// Combined-stream endpoint. `wss://stream.binance.com:9443/stream` — the stream list is
-    /// built from the per-pair symbols, so this is the bare endpoint.
-    pub ws_url: String,
-    /// A symbol with no accepted tick for this long is **stale**, and a stale feed blocks every
-    /// push. Not a soft signal: [`crate::feed::FeedSnapshot::live`] returns nothing past it.
+    /// Endpoint overrides. Omit the table entirely to use the public defaults.
+    #[serde(default)]
+    pub urls: VenueUrls,
+    /// A symbol with no accepted tick for this long is **stale on that venue**, and a stale venue
+    /// contributes nothing to the cross-section. Not a soft signal:
+    /// [`crate::feed::FeedSnapshot::live`] returns nothing past it.
     #[serde(default = "d_feed_stale_ms")]
     pub stale_after_ms: u64,
     /// First reconnect delay. Doubles per consecutive failure up to the ceiling.
@@ -622,17 +696,31 @@ pub struct FeedConfig {
     /// Reconnect delay ceiling.
     #[serde(default = "d_reconnect_max_ms")]
     pub reconnect_max_ms: u64,
-    /// No frame at all — not even a server ping — for this long forces a reconnect. Binance
-    /// pings every 20s, so a silent socket is a dead socket well before the TCP stack notices.
+    /// No frame at all — not even a keepalive answer — for this long forces a reconnect. The
+    /// venues here either push continuously or answer a ping every 20s, so a silent socket is a
+    /// dead socket well before the TCP stack notices.
     #[serde(default = "d_read_timeout_ms")]
     pub read_timeout_ms: u64,
-    /// A tick whose micro-price is more than this far from the last accepted one is rejected as
-    /// an outlier. See [`crate::fair_value`] for how a genuine fast move gets through anyway.
-    #[serde(default = "d_max_jump_bps")]
-    pub max_jump_bps: u32,
-    /// How many consecutive outliers before the tracker concedes the level has really moved.
-    #[serde(default = "d_outlier_tolerance")]
-    pub outlier_tolerance: u32,
+    /// **The quorum.** Venues that must survive the MAD filter for a reference price to exist at
+    /// all. Below it the bot quotes nothing and says `no_quorum`. Must be at least 2: a single
+    /// venue is the single-source oracle this whole change exists to stop being.
+    #[serde(default = "d_min_venues")]
+    pub min_venues: u8,
+    /// Multiplier on the median absolute deviation. A venue further than `mad_k * MAD` from the
+    /// cross-venue median is an outlier and is dropped.
+    #[serde(default = "d_mad_k")]
+    pub mad_k: f64,
+    /// Floor under the rejection threshold, in bps. Without it, venues agreeing to within a tick
+    /// drive the MAD to zero and everything but the median gets rejected. Measured on live
+    /// ETHUSDT/BTCUSDT the largest ordinary single-venue deviation was 1.6 bps, so 2 is above
+    /// ordinary disagreement and below anything that matters.
+    #[serde(default = "d_mad_floor_bps")]
+    pub mad_floor_bps: f64,
+    /// **The regime gate.** Cross-venue MAD above this, in bps, means the venues do not agree —
+    /// not that one of them is wrong. The bot refuses to quote rather than averaging through a
+    /// split market. Must exceed `mad_floor_bps`.
+    #[serde(default = "d_max_dispersion_bps")]
+    pub max_dispersion_bps: f64,
 }
 
 fn d_feed_stale_ms() -> u64 {
@@ -647,17 +735,44 @@ fn d_reconnect_max_ms() -> u64 {
 fn d_read_timeout_ms() -> u64 {
     45_000
 }
-fn d_max_jump_bps() -> u32 {
-    200
+fn d_min_venues() -> u8 {
+    2
 }
-fn d_outlier_tolerance() -> u32 {
-    3
+fn d_mad_k() -> f64 {
+    4.0
+}
+fn d_mad_floor_bps() -> f64 {
+    2.0
+}
+fn d_max_dispersion_bps() -> f64 {
+    25.0
+}
+
+/// Round a bps value to deci-bps, the resolution the cross-section is measured at.
+fn decibps(v: f64) -> u32 {
+    (v * 10.0).round().max(0.0) as u32
 }
 
 impl FeedConfig {
+    /// The MAD filter's knobs, converted out of the config's decimal-bps form.
+    #[must_use]
+    pub fn mad_params(&self) -> MadParams {
+        MadParams {
+            min_venues: self.min_venues,
+            k_tenths: (self.mad_k * 10.0).round().max(0.0) as u32,
+            floor_decibps: decibps(self.mad_floor_bps),
+            max_dispersion_decibps: decibps(self.max_dispersion_bps),
+        }
+    }
+
     fn validate(&self) -> Result<(), ConfigError> {
-        if !(self.ws_url.starts_with("wss://") || self.ws_url.starts_with("ws://")) {
-            return Err(invalid(format!("feed.ws_url: must be a ws(s) URL, got `{}`", self.ws_url)));
+        for venue in VenueId::ALL {
+            let url = self.urls.get(venue);
+            if !(url.starts_with("wss://") || url.starts_with("ws://")) {
+                return Err(invalid(format!(
+                    "feed.urls.{venue}: must be a ws(s) URL, got `{url}`"
+                )));
+            }
         }
         if !(100..=600_000).contains(&self.stale_after_ms) {
             return Err(invalid("feed.stale_after_ms: must be 100..=600000"));
@@ -672,11 +787,164 @@ impl FeedConfig {
                 self.read_timeout_ms, self.stale_after_ms
             )));
         }
-        if !(1..=10_000).contains(&self.max_jump_bps) {
-            return Err(invalid("feed.max_jump_bps: must be 1..=10000"));
+        // One venue is a single-source oracle: the ladder and the bounds that are supposed to
+        // check it would both come from the same number. That is the shape this change exists to
+        // remove, and allowing it back in through a config value would remove it right back.
+        if self.min_venues < 2 {
+            return Err(invalid(format!(
+                "feed.min_venues is {}, and must be at least 2; quoting off a single venue makes \
+                 the ladder's own price bounds a check against the number that produced them",
+                self.min_venues
+            )));
         }
-        if !(1..=100).contains(&self.outlier_tolerance) {
-            return Err(invalid("feed.outlier_tolerance: must be 1..=100"));
+        if usize::from(self.min_venues) > VenueId::ALL.len() {
+            return Err(invalid(format!(
+                "feed.min_venues ({}) exceeds the {} venues this crate can speak to",
+                self.min_venues,
+                VenueId::ALL.len()
+            )));
+        }
+        if !self.mad_k.is_finite() || self.mad_k <= 0.0 || self.mad_k > 100.0 {
+            return Err(invalid("feed.mad_k: must be a finite value in (0, 100]"));
+        }
+        if !self.mad_floor_bps.is_finite() || self.mad_floor_bps <= 0.0 {
+            return Err(invalid(
+                "feed.mad_floor_bps: must be finite and non-zero; a zero floor rejects every \
+                 venue but the median as soon as the venues agree closely",
+            ));
+        }
+        if !self.max_dispersion_bps.is_finite() || self.max_dispersion_bps <= 0.0 {
+            return Err(invalid("feed.max_dispersion_bps: must be finite and non-zero"));
+        }
+        // Otherwise the regime gate fires before the outlier filter is ever consulted, and the
+        // bot stops quoting on the ordinary disagreement the floor was chosen to tolerate.
+        if self.max_dispersion_bps <= self.mad_floor_bps {
+            return Err(invalid(format!(
+                "feed.max_dispersion_bps ({}) must exceed feed.mad_floor_bps ({}); \
+                 a dispersion limit at or below the rejection floor gates before the filter runs",
+                self.max_dispersion_bps, self.mad_floor_bps
+            )));
+        }
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Inventory skew
+// ---------------------------------------------------------------------------
+
+/// The volatility estimator and the Avellaneda–Stoikov knobs.
+///
+/// Global rather than per-pair, with one exception: `target_base_share_pct` is a per-pair
+/// allocation decision and lives on [`PairConfig`]. Risk aversion and the horizon it is measured
+/// over are properties of the desk, not of the instrument, and two pairs disagreeing about how
+/// far ahead to look would be two different strategies sharing one killswitch.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SkewConfig {
+    /// EWMA time constant for the return variance, in milliseconds. The half-life is
+    /// `tau * ln2`, about 0.69 of this.
+    #[serde(default = "d_vol_tau_ms")]
+    pub vol_tau_ms: u64,
+    /// The horizon `sigma` is scaled to, in seconds. See [`crate::skew::Volatility`] for why the
+    /// default is the same window as `risk.bleed_window_secs`.
+    #[serde(default = "d_vol_horizon_secs")]
+    pub vol_horizon_secs: u64,
+    /// Samples closer together than this are skipped rather than divided by a tiny interval.
+    #[serde(default = "d_vol_min_sample_ms")]
+    pub vol_min_sample_ms: u64,
+    /// A gap longer than this is an outage, not a return. The estimator re-anchors.
+    #[serde(default = "d_vol_max_sample_ms")]
+    pub vol_max_sample_ms: u64,
+    /// Risk aversion `gamma`. `skew_bps = gamma * q * sigma_bps^2 / 10_000`, so with ETHUSDT's
+    /// measured 300s `sigma` of about 10 bps, `gamma = 1000` and a 20% imbalance give 2 bp.
+    #[serde(default = "d_gamma")]
+    pub gamma: f64,
+    /// Cap on a **positive** skew (book down, the pool is long and selling), in bps.
+    #[serde(default = "d_skew_max_positive_bps")]
+    pub max_positive_bps: u16,
+    /// Cap on a **negative** skew (book up, the pool is short and buying), as a magnitude in bps.
+    /// Deliberately the tighter of the two; [`crate::skew::compute`] argues why at length.
+    #[serde(default = "d_skew_max_negative_bps")]
+    pub max_negative_bps: u16,
+}
+
+fn d_vol_tau_ms() -> u64 {
+    60_000
+}
+fn d_vol_horizon_secs() -> u64 {
+    300
+}
+fn d_vol_min_sample_ms() -> u64 {
+    100
+}
+fn d_vol_max_sample_ms() -> u64 {
+    10_000
+}
+fn d_gamma() -> f64 {
+    1_000.0
+}
+fn d_skew_max_positive_bps() -> u16 {
+    30
+}
+fn d_skew_max_negative_bps() -> u16 {
+    10
+}
+
+impl SkewConfig {
+    /// The volatility estimator's configuration.
+    #[must_use]
+    pub const fn vol_config(&self) -> VolConfig {
+        VolConfig {
+            tau_ms: self.vol_tau_ms,
+            horizon_secs: self.vol_horizon_secs,
+            min_sample_ms: self.vol_min_sample_ms,
+            max_sample_ms: self.vol_max_sample_ms,
+        }
+    }
+
+    /// The skew's own knobs.
+    #[must_use]
+    pub fn params(&self) -> SkewParams {
+        SkewParams {
+            gamma_e2: (self.gamma * 100.0).round().max(0.0) as u64,
+            max_positive_bps: self.max_positive_bps,
+            max_negative_bps: self.max_negative_bps,
+        }
+    }
+
+    fn validate(&self) -> Result<(), ConfigError> {
+        if !(1_000..=3_600_000).contains(&self.vol_tau_ms) {
+            return Err(invalid("skew.vol_tau_ms: must be 1000..=3600000"));
+        }
+        if !(1..=86_400).contains(&self.vol_horizon_secs) {
+            return Err(invalid("skew.vol_horizon_secs: must be 1..=86400"));
+        }
+        if self.vol_min_sample_ms == 0 || self.vol_max_sample_ms <= self.vol_min_sample_ms {
+            return Err(invalid(
+                "skew.vol_max_sample_ms must exceed skew.vol_min_sample_ms, which must be non-zero",
+            ));
+        }
+        if !self.gamma.is_finite() || self.gamma <= 0.0 || self.gamma > 100_000.0 {
+            return Err(invalid("skew.gamma: must be a finite value in (0, 100000]"));
+        }
+        let max_bps = dubu_core::ladder::MAX_BPS;
+        for (name, v) in [("max_positive_bps", self.max_positive_bps), ("max_negative_bps", self.max_negative_bps)] {
+            if u128::from(v) > max_bps {
+                return Err(invalid(format!("skew.{name}: must be <= {max_bps}")));
+            }
+        }
+        // The asymmetry runs one way for a reason. A negative skew lifts the pool's BID toward
+        // and past fair value, which is a free option written to whoever notices; a positive one
+        // lowers both sides, which is defensive. Capping the book-lifting direction more loosely
+        // than the book-lowering one inverts that and is never what was meant.
+        if self.max_negative_bps > self.max_positive_bps {
+            return Err(invalid(format!(
+                "skew.max_negative_bps ({}) exceeds skew.max_positive_bps ({}); \
+                 the book-LIFTING direction raises the pool's bid toward fair value and is the \
+                 pick-off direction, so it must be the tighter cap, not the looser one",
+                self.max_negative_bps, self.max_positive_bps
+            )));
         }
         Ok(())
     }
@@ -890,23 +1158,85 @@ impl RiskConfig {
 // Pairs
 // ---------------------------------------------------------------------------
 
+/// Which symbol each venue quotes for one pair.
+///
+/// Every venue spells the same market differently — `ETHUSDT`, `ETH-USDT`, `ETH-USD` — so the
+/// mapping is configuration rather than a transformation guessed in code. Naming a venue here is
+/// also what **enables** it: a venue no pair names is never connected to.
+///
+/// The field names are the venue labels and unknown ones are a hard error, so `bybbit = "..."`
+/// fails at startup instead of quietly leaving the bot one venue short of the quorum it thinks it
+/// has.
+///
+/// The choice of product is load-bearing and not interchangeable. `ETH-USD` is **not** a second
+/// observation of `ETHUSDT`: measured on 2026-07-27 the USDT/USD basis put Coinbase's USD books
+/// a persistent 8-9 bps above the three USDT venues, which against a 5 bp half-spread is a bias,
+/// not redundancy. See [`crate::feed::coinbase`].
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PairVenues {
+    /// Binance symbol, e.g. `ETHUSDT`.
+    #[serde(default)]
+    pub binance: Option<String>,
+    /// OKX instrument id, e.g. `ETH-USDT`.
+    #[serde(default)]
+    pub okx: Option<String>,
+    /// Bybit spot symbol, e.g. `ETHUSDT`.
+    #[serde(default)]
+    pub bybit: Option<String>,
+    /// Coinbase product id, e.g. `ETH-USDT`.
+    #[serde(default)]
+    pub coinbase: Option<String>,
+}
+
+impl PairVenues {
+    /// This pair's symbol on one venue, if it is quoted there.
+    #[must_use]
+    pub fn symbol(&self, venue: VenueId) -> Option<&str> {
+        match venue {
+            VenueId::Binance => self.binance.as_deref(),
+            VenueId::Okx => self.okx.as_deref(),
+            VenueId::Bybit => self.bybit.as_deref(),
+            VenueId::Coinbase => self.coinbase.as_deref(),
+        }
+    }
+
+    /// Every venue this pair is quoted on, in a stable order.
+    pub fn iter(&self) -> impl Iterator<Item = (VenueId, &str)> {
+        VenueId::ALL.into_iter().filter_map(|v| self.symbol(v).map(|s| (v, s)))
+    }
+
+    /// How many venues quote this pair.
+    #[must_use]
+    pub fn count(&self) -> usize {
+        self.iter().count()
+    }
+}
+
 /// One quoted pair.
 ///
 /// # The symbol is not the token
 ///
-/// `symbol` is the **real** asset the pool's mock token tracks, not a market in the mock token.
-/// `mWETH` has no market anywhere; it is a mock ERC-20 we deployed, and nothing trades it. The
-/// bot prices pairId 1 off Binance's `ETHUSDT` because that is the asset the mock stands in for,
-/// which is what makes the demo live and what makes a later markout study mean anything. A
-/// reader who takes `symbol = "ETHUSDT"` to mean "mWETH trades at 1943" has misread it.
+/// `symbol` is the **canonical** name for the **real** asset the pool's mock token tracks, not a
+/// market in the mock token. `mWETH` has no market anywhere; it is a mock ERC-20 we deployed, and
+/// nothing trades it. The bot prices pairId 1 off `ETHUSDT` because that is the asset the mock
+/// stands in for, which is what makes the demo live and what makes a later markout study mean
+/// anything. A reader who takes `symbol = "ETHUSDT"` to mean "mWETH trades at 1943" has misread
+/// it.
+///
+/// `symbol` is also the key every venue's ticks are recorded under, which is why each venue's own
+/// spelling is a separate field in [`PairVenues`]: without the translation each venue would sit
+/// in its own namespace and the cross-section would be permanently empty.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PairConfig {
     /// `PropPool` pair id. 1-based; id 0 is reserved and never a real pair.
     pub pair_id: u16,
-    /// Exchange symbol of the **real** asset this pair's mock base token tracks. See the struct
+    /// Canonical symbol of the **real** asset this pair's mock base token tracks. See the struct
     /// docs — this is not a market in the mock token.
     pub symbol: String,
+    /// Which symbol each venue quotes this pair under. At least `feed.min_venues` of them.
+    pub venues: PairVenues,
     /// Decimals of the base token. Verified against the deployed ERC-20 at startup.
     pub base_decimals: u8,
     /// Decimals of the quote token. Verified against the deployed ERC-20 at startup.
@@ -917,10 +1247,16 @@ pub struct PairConfig {
     /// this far across the whole posted depth. It is an *upper* bound — the inverse solver
     /// narrows it further whenever the price bounds bind.
     pub width_bps: u16,
-    /// Inventory skew, in bps. Positive shifts the whole book down. Static here; see the README
-    /// for what an inventory-driven skew would need.
-    #[serde(default)]
-    pub skew_bps: i16,
+    /// **Target inventory, as a share of this pair's book, in percent.**
+    ///
+    /// Configuration rather than a constant, and a *share* rather than an amount so that it stays
+    /// meaningful as the pool grows or shrinks. The book is this pair's base holdings valued at
+    /// the reference plus its share of the quote balance; see [`crate::skew::Inventory`] for what
+    /// "its share" means when two pairs draw bids from the same quote token.
+    ///
+    /// `50` is a balanced book. Lower means the pool would rather hold quote than base, which is
+    /// the sensible default for an asset it cannot hedge.
+    pub target_base_share_pct: f64,
     /// The trade size the half-spread is guaranteed over, in human base units. The solver picks
     /// the widest ladder whose *average* price over `[0, capture]` hits the target, so this is
     /// the size the quote is honest about rather than the size it is limited to.
@@ -971,10 +1307,10 @@ impl PairConfig {
         Ok(units::parse_fixed(&self.ask_capacity, self.base_decimals)?)
     }
 
-    /// Lower-case Binance stream name, e.g. `ethusdt@bookTicker`.
+    /// [`Self::target_base_share_pct`] in parts per million of the pair's book.
     #[must_use]
-    pub fn stream_name(&self) -> String {
-        format!("{}@bookTicker", self.symbol.to_lowercase())
+    pub fn target_base_share_ppm(&self) -> u32 {
+        (self.target_base_share_pct * 10_000.0).round().clamp(0.0, 1_000_000.0) as u32
     }
 
     /// [`Self::adverse_drift_bps`] in deci-bps (tenths of a bps), which is the precision
@@ -990,13 +1326,28 @@ impl PairConfig {
         (self.favourable_drift_bps * 10.0).round() as u32
     }
 
-    fn validate(&self) -> Result<(), ConfigError> {
+    fn validate(&self, min_venues: u8) -> Result<(), ConfigError> {
         let id = self.pair_id;
         if id == 0 {
             return Err(invalid("pairs.pair_id: 0 is reserved and is never a real pair"));
         }
         if self.symbol.is_empty() || !self.symbol.bytes().all(|b| b.is_ascii_alphanumeric()) {
             return Err(invalid(format!("pairs[{id}].symbol: must be alphanumeric, got `{}`", self.symbol)));
+        }
+        // A pair that names fewer venues than the quorum needs can never quote. Refusing here
+        // rather than discovering it as a permanent `no_quorum` at run time is the difference
+        // between a startup error and a bot that looks healthy and quotes nothing.
+        let venues = self.venues.count();
+        if venues < usize::from(min_venues) {
+            return Err(invalid(format!(
+                "pairs[{id}].venues names {venues} venue(s) but feed.min_venues is {min_venues}; \
+                 this pair could never reach quorum and would never quote"
+            )));
+        }
+        for (venue, symbol) in self.venues.iter() {
+            if symbol.trim().is_empty() {
+                return Err(invalid(format!("pairs[{id}].venues.{venue}: must not be empty")));
+            }
         }
         if self.base_decimals > 30 || self.quote_decimals > 30 {
             return Err(invalid(format!("pairs[{id}]: token decimals must be <= 30")));
@@ -1008,8 +1359,11 @@ impl PairConfig {
         if u128::from(self.width_bps) > max_bps {
             return Err(invalid(format!("pairs[{id}].width_bps: must be <= {max_bps}")));
         }
-        if i128::from(self.skew_bps).unsigned_abs() > max_bps {
-            return Err(invalid(format!("pairs[{id}].skew_bps: must be within +/-{max_bps}")));
+        if !self.target_base_share_pct.is_finite() || !(0.0..=100.0).contains(&self.target_base_share_pct) {
+            return Err(invalid(format!(
+                "pairs[{id}].target_base_share_pct: must be a finite value in [0, 100], got {}",
+                self.target_base_share_pct
+            )));
         }
         // A zero half-spread quotes both sides at fair value and loses the spread to every
         // taker. It is never a configuration, only a typo.
@@ -1087,9 +1441,11 @@ multicall3 = "0xcA11bde05977b3631167028862bE2a173976CA11"
 fallback_poll_interval_ms = 2000
 
 [feed]
-ws_url = "wss://stream.binance.com:9443/stream"
+min_venues = 2
 
 [tx]
+
+[skew]
 
 [risk]
 state_path = "state/killswitch.json"
@@ -1100,10 +1456,12 @@ loss_budget = "10000"
 [[pairs]]
 pair_id = 1
 symbol = "ETHUSDT"
+venues = { binance = "ETHUSDT", okx = "ETH-USDT", bybit = "ETHUSDT" }
 base_decimals = 18
 quote_decimals = 6
 half_spread_bps = 5
 width_bps = 25
+target_base_share_pct = 50
 capture = "20"
 bid_capacity = "1000"
 ask_capacity = "1000"
@@ -1125,7 +1483,108 @@ capacity_divergence_pct = 30
         let cfg = parse(good()).expect("reference config must validate");
         assert_eq!(cfg.pairs.len(), 1);
         assert_eq!(cfg.pairs[0].capture_units().unwrap(), 20_000_000_000_000_000_000);
-        assert_eq!(cfg.pairs[0].stream_name(), "ethusdt@bookTicker");
+        assert_eq!(cfg.pairs[0].target_base_share_ppm(), 500_000);
+    }
+
+    // -----------------------------------------------------------------------
+    // Venues and the quorum
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn a_venue_is_enabled_by_a_pair_naming_it_and_by_nothing_else() {
+        let cfg = parse(good()).unwrap();
+        assert_eq!(cfg.venues(), vec![VenueId::Binance, VenueId::Okx, VenueId::Bybit]);
+        assert!(!cfg.venues().contains(&VenueId::Coinbase), "an unnamed venue must not be connected to");
+        assert_eq!(cfg.venue_symbols(VenueId::Okx), vec![("ETH-USDT".to_string(), "ETHUSDT".to_string())]);
+        assert!(cfg.venue_symbols(VenueId::Coinbase).is_empty());
+    }
+
+    #[test]
+    fn each_venue_falls_back_to_its_public_endpoint() {
+        let cfg = parse(good()).unwrap();
+        assert_eq!(cfg.feed.urls.get(VenueId::Bybit), "wss://stream.bybit.com/v5/public/spot");
+
+        // The override table has to come after the scalar keys or TOML reads them as its own.
+        let s = format!("{}\n[feed.urls]\nbybit = \"wss://example.test/spot\"\n", good());
+        let cfg = parse(&s).unwrap();
+        assert_eq!(cfg.feed.urls.get(VenueId::Bybit), "wss://example.test/spot");
+        assert_eq!(cfg.feed.urls.get(VenueId::Okx), "wss://ws.okx.com:8443/ws/v5/public", "one override must not disturb the rest");
+    }
+
+    #[test]
+    fn a_misspelled_venue_is_a_hard_error_and_not_one_venue_fewer() {
+        // The failure this prevents is the whole reason `deny_unknown_fields` is on this struct:
+        // `bybbit` would leave the pair one venue short of the quorum it is written to have, and
+        // nothing at run time would say so.
+        let s = good().replace(r#"bybit = "ETHUSDT""#, r#"bybbit = "ETHUSDT""#);
+        assert!(matches!(parse(&s), Err(ConfigError::Parse(_))));
+    }
+
+    #[test]
+    fn a_pair_that_could_never_reach_quorum_is_refused_at_startup() {
+        let s = good()
+            .replace(r#"venues = { binance = "ETHUSDT", okx = "ETH-USDT", bybit = "ETHUSDT" }"#,
+                     r#"venues = { binance = "ETHUSDT" }"#);
+        assert!(matches!(parse(&s), Err(ConfigError::Invalid(m)) if m.contains("could never reach quorum")));
+    }
+
+    #[test]
+    fn a_single_venue_quorum_is_refused() {
+        // One venue is the single-source oracle this whole design exists to stop being, and a
+        // config value must not be able to put it back.
+        let s = good().replace("min_venues = 2", "min_venues = 1");
+        assert!(matches!(parse(&s), Err(ConfigError::Invalid(m)) if m.contains("at least 2")));
+    }
+
+    #[test]
+    fn a_dispersion_limit_below_the_rejection_floor_is_refused() {
+        // Otherwise the regime gate fires on the ordinary disagreement the floor exists to
+        // tolerate, and the bot stops quoting for a reason that is purely arithmetic.
+        let s = good().replace("min_venues = 2", "min_venues = 2\nmad_floor_bps = 30.0\nmax_dispersion_bps = 25.0");
+        assert!(matches!(parse(&s), Err(ConfigError::Invalid(m)) if m.contains("gates before the filter runs")));
+    }
+
+    #[test]
+    fn the_mad_knobs_reach_the_filter_at_deci_bps_resolution() {
+        let s = good().replace("min_venues = 2", "min_venues = 3\nmad_k = 4.5\nmad_floor_bps = 2.5\nmax_dispersion_bps = 25.0");
+        let p = parse(&s).unwrap().feed.mad_params();
+        assert_eq!(p.min_venues, 3);
+        assert_eq!(p.k_tenths, 45);
+        assert_eq!(p.floor_decibps, 25);
+        assert_eq!(p.max_dispersion_decibps, 250);
+    }
+
+    // -----------------------------------------------------------------------
+    // Skew
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn the_skew_section_defaults_to_the_documented_numbers() {
+        let cfg = parse(good()).unwrap();
+        let p = cfg.skew.params();
+        assert_eq!(p.gamma_e2, 100_000, "gamma = 1000");
+        assert_eq!(p.max_positive_bps, 30);
+        assert_eq!(p.max_negative_bps, 10);
+        let v = cfg.skew.vol_config();
+        assert_eq!(v.tau_ms, 60_000);
+        assert_eq!(v.horizon_secs, 300, "the same window as risk.bleed_window_secs");
+    }
+
+    #[test]
+    fn a_looser_cap_on_the_book_lifting_direction_is_refused() {
+        // Lifting the book raises the pool's BID toward fair value, which is the pick-off
+        // direction. Capping it more loosely than the book-lowering direction inverts the whole
+        // argument in `skew::compute`.
+        let s = good().replace("[skew]\n", "[skew]\nmax_positive_bps = 10\nmax_negative_bps = 30\n");
+        assert!(matches!(parse(&s), Err(ConfigError::Invalid(m)) if m.contains("must be the tighter cap")));
+    }
+
+    #[test]
+    fn a_target_inventory_outside_the_book_is_refused() {
+        for bad in ["-5", "150"] {
+            let s = good().replace("target_base_share_pct = 50", &format!("target_base_share_pct = {bad}"));
+            assert!(matches!(parse(&s), Err(ConfigError::Invalid(m)) if m.contains("target_base_share_pct")));
+        }
     }
 
     #[test]

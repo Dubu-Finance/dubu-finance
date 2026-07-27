@@ -6,34 +6,44 @@
 //! expires and it quotes nothing at all. This crate is that something.
 //!
 //! ```text
-//!   Binance bookTicker (wss)      Nodit newHeads (wss) ──> wakes the loop, 1s
+//!   Binance / OKX / Bybit (wss)   Nodit newHeads (wss) ──> wakes the loop, 1s
 //!            |                    GIWA flashblocks (http, `pending`) ──> state, ~200ms
 //!            v                                      v
-//!   feed ──> fair_value ──> ladder ──> policy ──> tx ──> PropPool.updateQuote
-//!            (micro-price)  (dubu-core)  (send?)         PropPool.refreshCapacity
-//!                                          ^
-//!                                          |
-//!                                   risk (killswitches)
+//!   feed ──> fair_value ──> skew ──> ladder ──> policy ──> tx ──> PropPool.updateQuote
+//!   (n venues) (MAD +        (A-S)   (dubu-core) (send?)         PropPool.refreshCapacity
+//!              quorum)                              ^
+//!                                                   |
+//!                                            risk (killswitches)
 //! ```
 //!
-//! # Two sources, deliberately not one
+//! # Several venues, deliberately not one
 //!
-//! Fair value comes from **public exchange market data**; the on-chain deviation bound is
-//! **Pyth's** job, later. Pyth is live on GIWA and `PropPool` is designed to grow a deviation
-//! check against it — but if this bot also priced from Pyth, that check would be comparing a
-//! value against itself and would catch nothing. The two must stay independent.
+//! Fair value comes from **several independent public market-data websockets**, combined by
+//! [`fair_value::combine`] after a MAD outlier filter and behind a quorum rule. One venue would
+//! make the ladder's own price bounds vacuous in the way a single-source oracle is: the row and
+//! the limits that are supposed to check it would come from the same number, so a feed that is
+//! *confidently* wrong produces a ladder nothing catches. Losing a venue is an explicit logged
+//! event, a majority disagreeing stops quoting outright, and neither is ever a silent absence.
 //!
-//! The market-data connection is read-only: no API key, no account endpoint, no order entry,
+//! The on-chain deviation bound is still **Pyth's** job, later. Pyth is live on GIWA and
+//! `PropPool` is designed to grow a deviation check against it — but if this bot also priced from
+//! Pyth, that check would be comparing a value against itself and would catch nothing. The two
+//! must stay independent, and the cross-venue filter is not a substitute: an error correlated
+//! across every venue is invisible to it.
+//!
+//! Every market-data connection is read-only: no API key, no account endpoint, no order entry,
 //! and no way to add one without a signing step that does not exist here. The book is unhedged
 //! because a Korean corporate real-name exchange account is not available, so there is no
-//! account to hedge into.
+//! account to hedge into — which is also why [`skew`] exists. With no hedge venue, the
+//! Avellaneda–Stoikov reservation price is the only inventory control there is.
 //!
 //! # The pool's tokens have no market
 //!
 //! `mWETH`, `mWBTC` and `mUSDC` are mocks we deployed. Nothing trades them anywhere. Each pair
 //! is priced off the **real** asset its mock stands in for — pairId 1 follows `ETHUSDT`, pairId
 //! 2 follows `BTCUSDT` — which is what makes the demo move and what will make a markout study
-//! mean anything. See [`config::PairConfig`].
+//! mean anything. Each venue spells that asset differently, so the mapping is configuration:
+//! see [`config::PairVenues`].
 //!
 //! # The loop is event-driven
 //!
@@ -84,5 +94,6 @@ pub mod feed;
 pub mod ladder;
 pub mod policy;
 pub mod risk;
+pub mod skew;
 pub mod tx;
 pub mod units;

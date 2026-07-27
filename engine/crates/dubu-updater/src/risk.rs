@@ -110,7 +110,15 @@ pub struct Position {
 ///
 /// Uses the chain's own quote path so the mark and a real fill agree on what the inventory is
 /// worth, rather than differing by whatever a hand-written division rounds differently.
-fn value(base_balance: u128, fair: u128, price_scale_exp: u8) -> Result<u128, dubu_core::CurveError> {
+///
+/// Public because [`crate::skew`] needs the *same* valuation to measure inventory imbalance
+/// against target. Two valuation functions that disagree by a rounding step would mean the
+/// killswitch and the skew arguing about how much the pool holds, which is the sort of
+/// discrepancy that is invisible until it matters.
+///
+/// # Errors
+/// [`dubu_core::CurveError`] only from the shared domain.
+pub fn value(base_balance: u128, fair: u128, price_scale_exp: u8) -> Result<u128, dubu_core::CurveError> {
     if base_balance == 0 || fair == 0 {
         return Ok(0);
     }
