@@ -147,8 +147,13 @@
       <li>Adverse selection is not modelled. The reference is right by assumption here. These are
         execution-quality numbers for an honest taker, not a claim about the maker's P&amp;L.</li>
     </ol>
-    Both tokens are ours and both venues were seeded by us — GIWA has no canonical stablecoin, so
-    there is no third-party liquidity to compare against. This measures curves, not markets.
+    Both tokens are ours and both venues were seeded by us. The reason is token overlap, not an
+    absence of venues — an earlier version of this page said GIWA had no third-party liquidity to
+    compare against, and that was wrong. A scan of swap-event topics over 100,000 blocks finds four
+    factories that are not ours and 227 third-party swaps across 20 pools. Those pools hold real
+    WBTC, USDC and WETH9; ours hold mocks, because GIWA has no canonical stablecoin and no Circle
+    CCTP domain, and the third-party tokens expose no mint or faucet — that inventory would have to
+    be bought. So nothing routes between the two sets. This measures curves, not markets.
   </div>
 
   <footer>reads sepolia-rpc.giwa.io each block · reference from binance bookTicker ·
@@ -175,9 +180,13 @@ const SIZES = [1_000, 10_000, 100_000, 1_000_000];   // notional, in whole quote
 //
 // These are NOT ours and we cannot route to them: they hold different token instances (real
 // WBTC and USDC, where our pool holds mocks), so there is no path between the two. What they
-// give is a far better foil than our own comparison pool. Ours is a UniV2 we deployed and then
-// left alone, so it drifts; this one is a real Uniswap V3 that somebody else is actively
-// arbitraging, and it is the strongest available answer to "did you just build a strawman".
+// give is a better foil than our own comparison pool, whose drift is partly our own doing —
+// we seeded it at the mid and then left it. This one runs without us.
+//
+// It is NOT, however, being arbitraged tightly: six swaps in 27.8 hours and a price well off
+// the market. An earlier version of this comment claimed otherwise on no evidence. The weaker
+// true statement is the more useful one anyway — passive liquidity drifts and nobody is
+// obliged to fix it, which is exactly the gap an actively repriced pool closes.
 //
 // The comparison is legitimate because all three venues are pricing the same underlying asset
 // against the same reference. It is a price comparison, not an executable route, and the page
@@ -300,9 +309,12 @@ document.getElementById('markets').innerHTML = MARKETS.map(m=>`
       <div class="why">
         Not ours, and not routable — it holds real ${THIRD_PARTY[m.id].s0} and
         ${THIRD_PARTY[m.id].s1} where this pool holds mocks, so there is no path between them.
-        It is here because it is the honest foil: the UniV2 above is one we deployed and left
-        alone, while this is a live pool somebody else is actively arbitraging. All three price
-        the same underlying asset against the same reference.
+        It is here because it is the honest foil: the UniV2 above is one we deployed, seeded at
+        the reference mid, and then left alone, so its drift is partly our own doing. This one
+        runs without us and drifts on its own. It is not being arbitraged tightly either — six
+        swaps in the last 27.8 hours, and it currently sits well off the market — which is itself
+        the point about passive liquidity. All three price the same asset against the same
+        reference.
       </div>
     </div>` : ''}
   </div>`).join('');
@@ -457,7 +469,7 @@ async function tick(){
           `<b>${f(px, m.dp)}</b> <span class="dim">· ${sgn(drift)} bp vs market</span>`;
         document.getElementById('dtp'+m.id).innerHTML =
           `<span style="color:var(--text-2);font-weight:600">${sgn(drift)} bp</span>
-           <span class="dim">· actively arbitraged by someone</span>`;
+           <span class="dim">· nobody's job to fix</span>`;
         if(tpBal0 && tpBal1){
           const b0 = Number(words(tpBal0)[0]) / Number(pow10(tp.d0));
           const b1 = Number(words(tpBal1)[0]) / Number(pow10(tp.d1));

@@ -70,8 +70,23 @@ Four things, all of which belong next to the table and not in a footnote:
    live chain a stale ladder gets picked off and nothing above measures that. These are
    execution-quality numbers for an honest taker, not a claim about the market maker's PnL.
 
-And both tokens are ours and both venues were seeded by us, because GIWA has no canonical
-stablecoin to compare against. This measures curves, not markets.
+And both tokens are ours and both venues were seeded by us. The reason is token overlap, not an
+absence of venues: an earlier version of this file said GIWA had no third-party liquidity to
+compare against, and that was wrong. A scan of UniV2/UniV3 `Swap` topics over 100,000 blocks
+(~27.8 h, ending block 31,781,085) finds four factories that are not ours and 227 third-party swaps
+across 20 pools. Those pools hold real WBTC, USDC, WETH9 and GIWAP; ours hold mocks we minted,
+because GIWA has no canonical stablecoin and no Circle CCTP domain — and the third-party WBTC and
+USDC expose no `mint` or `faucet` in their bytecode, so that inventory would have to be bought
+rather than minted. There is no path between the two token sets, so nothing routes across them.
+This measures curves, not markets.
+
+The honest external check is the third-party UniV3 pool
+`0x98e5d56f4844cb510ce62cf8e2479b8cbf18acfc` (WBTC/USDC, 0.30%, 2.2901 WBTC + 176,598 USDC,
+about $325K). It is not ours and not routable from here, but it prices the same asset: measured at
+64,923 USDC/WBTC against a 65,470 Binance mid, **−83.5 bp**, where the UniV2 above was seeded at
+the reference mid. `web/index.html` shows all three side by side. This is a small ecosystem — 227
+third-party swaps in 27.8 hours, six in that pool — and a pool sitting 83.5 bp off market is not
+one being arbitraged tightly.
 
 ## Reproducing
 
