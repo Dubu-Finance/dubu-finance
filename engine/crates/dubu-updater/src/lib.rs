@@ -123,6 +123,7 @@ pub mod jump;
 pub mod ladder;
 pub mod markout;
 pub mod policy;
+pub mod quoting;
 pub mod risk;
 pub mod skew;
 pub mod spread;
