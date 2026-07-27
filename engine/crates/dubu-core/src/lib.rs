@@ -13,7 +13,7 @@
 //! [`inverse`] floors the impact it bakes into the ladder so the realised average can only land
 //! on the pool's side of the target.
 //!
-//! # The four things in here
+//! # The five things in here
 //!
 //! | module | what | on-chain twin |
 //! |---|---|---|
@@ -21,6 +21,11 @@
 //! | [`inverse`] | target price + capture size -> widest safe ladder | none |
 //! | [`ladder`]  | strategy knobs -> four prices, always valid | none |
 //! | [`pack`]    | the `updateQuote` calldata word | the pool's decoder |
+//! | [`rfq`]     | the signed-order EIP-712 digest | `PmmSettle.sol`, exact port |
+//!
+//! [`rfq`] belongs to the *other* path — a firm off-chain quote settled on chain, rather than a
+//! ladder the pool prices against — but it is here for the same reason everything else is: the
+//! engine computes a value it then believes the chain agrees with, and a disagreement is silent.
 //!
 //! # Why this has to be exact
 //!
@@ -90,6 +95,7 @@ pub mod inverse;
 pub mod ladder;
 pub mod math;
 pub mod pack;
+pub mod rfq;
 pub mod vectors;
 
 pub use curve::{
@@ -100,3 +106,4 @@ pub use error::{CurveError, LadderError, PackError};
 pub use inverse::{solve_ask, solve_bid, solve_two_sided, SolveInput, Solution, TwoSided, WidthBinding};
 pub use ladder::LadderBuilder;
 pub use pack::QuoteWord;
+pub use rfq::{Domain as RfqDomain, Order as RfqOrder, ORDER_TYPEHASH, ORDER_TYPE_STRING};
