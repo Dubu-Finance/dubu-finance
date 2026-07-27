@@ -64,12 +64,29 @@
 //! | startup metadata | ordinary (Nodit HTTPS) | `latest` |
 //! | nonce, fees, submit, receipts | ordinary (Nodit HTTPS) | `pending` / `latest` |
 //!
-//! Heads say *when* to look; they are not what is read. The flashblocks endpoint is still the
-//! freshest source of state and is still only worth using under the `pending` tag, where the
-//! ~200ms preconfirmed state lives — fresher than the 1s confirmed head that triggered the read,
-//! which is exactly why the split is worth keeping. Its `latest` **lags the ordinary RPC by
-//! about two blocks**, so reading `latest` from it is strictly worse than reading `latest` from
-//! the ordinary endpoint. Transactions go to the ordinary endpoint because that is the canonical
+//! Heads say *when* to look; they are not what is read.
+//!
+//! **Most of the freshness is the tag, not the host**, and this used to say otherwise. Measured on
+//! GIWA by polling `snapshot(1).minBid` — which changes on every push, unlike `updatedAt`, which
+//! is `block.timestamp` and quantised to a second — against the moment the updater sent it:
+//!
+//! ```text
+//!   flash `pending`  vs  ordinary `latest`     ordinary lags  ~871ms   <- the TAG
+//!   flash `pending`  vs  ordinary `pending`    ordinary lags   ~82ms   <- the HOST
+//!   send             ->  visible on `pending`             as low as 5ms
+//! ```
+//!
+//! So `pending` over `latest` is worth most of a block, and the flashblocks host is worth a
+//! further ~82ms on top of that. Both are worth having for a maker, but the second is a tenth of
+//! what the first is, and the earlier framing credited the host with all of it.
+//!
+//! The 5ms floor is the one that matters for how this bot behaves: a preconfirmation can carry our
+//! new ladder almost immediately, so the quote is effective long before any receipt exists for it.
+//! Anything that waits for a *confirmed* receipt before quoting again is therefore waiting on
+//! bookkeeping rather than on the chain — see `tx::Sender`'s in-flight gate.
+//!
+//! Its `latest` **lags the ordinary RPC by about two blocks**, so reading `latest` from it is
+//! strictly worse than reading `latest` from the ordinary endpoint. Transactions go to the ordinary endpoint because that is the canonical
 //! view, and a nonce read from a preconfirmed state that later reorganises is a stuck
 //! transaction.
 

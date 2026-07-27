@@ -52,8 +52,10 @@ import type { Config } from './config.js';
 /**
  * A quote must still be valid this long after we return it.
  *
- * Three seconds, against a measured 950ms median from `eth_sendRawTransaction` to a confirmed
- * receipt on GIWA — roughly 3x margin over the thing it has to survive.
+ * Three seconds. The number it is sized against is *inclusion*, not confirmation: a transaction on
+ * GIWA is visible in a preconfirmation in as little as 5ms, and an RFQ order only has to be
+ * unexpired at the block that includes the fill. A confirmed receipt takes about a second, but
+ * nothing here waits for one.
  *
  * It was 20s, which was picked for comfort rather than from a measurement, and comfort turned out
  * to be expensive: the maker's TTL is an option it writes, priced by `quoting::ttl_premium_e2` and
