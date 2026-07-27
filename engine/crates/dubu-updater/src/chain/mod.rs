@@ -971,8 +971,30 @@ pub struct PairMeta {
 pub struct ChainView {
     /// Block number the call was answered at.
     pub block_number: u64,
-    /// Block timestamp the call was answered at. This — not the local clock — is what quote
-    /// staleness is measured against, because it is what `PropPool` compares to.
+    /// Block timestamp the read was answered at.
+    ///
+    /// **Do not use this for time arithmetic.** It comes from `getCurrentBlockTimestamp` under the
+    /// `pending` tag, and `pending` executes against a block that has not been sealed — the node
+    /// projects that block's header, and measured on GIWA it projects the timestamp **about 12
+    /// seconds into the future**, on both endpoints:
+    ///
+    /// ```text
+    ///   flash/pending  +11.5s      flash/latest  -2.3s
+    ///   canon/pending  +11.0s      canon/latest  -1.8s      block header  -1.4s
+    /// ```
+    ///
+    /// Twelve seconds is Ethereum L1's block interval, which is a strong hint that it is an
+    /// `op-geth` default nobody adjusted for a one-second L2.
+    ///
+    /// The consequences were not theoretical. Quote age came out as a constant 12s, so the
+    /// heartbeat fired every cycle — 85% of all pushes — and `markout` stamped its references 12s
+    /// ahead of the fills it compares them to, past `reference_at`'s tolerance, so every fill
+    /// would have settled `unmarked`.
+    ///
+    /// Use [`crate::chain::heads::Head::timestamp`] for anything time-based: it is a *sealed*
+    /// block's header, so it is real. It lags by about a second, which over-states age slightly —
+    /// the safe direction. This field is kept for logging, and because the block number beside it
+    /// is genuinely the freshest thing available.
     pub block_timestamp: u64,
     /// One entry per configured pair.
     pub snaps: BTreeMap<u16, Snap>,

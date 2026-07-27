@@ -1087,6 +1087,16 @@ async fn run_cycle(
 
     let view_age = view.age(Instant::now()).as_secs();
 
+    // The clock. NOT `view.block_timestamp` — see `ChainView::block_timestamp`: the `pending` tag
+    // projects an unsealed block's header and lands about twelve seconds in the future, which made
+    // every quote read as 12s old. The `newHeads` head is a sealed block, so its timestamp is real;
+    // it lags by roughly a second, which over-states age slightly and is the safe direction.
+    //
+    // Falling back to the local clock when heads are down is a worse approximation than a sealed
+    // header and a much better one than a projection: the machine's skew against the sequencer is
+    // seconds at worst, where the projection is twelve out by construction.
+    let chain_now = head.last.map_or_else(now_unix, |h| h.timestamp);
+
     // One line per cycle saying what woke it and how far the read got ahead of the head. The
     // delta is the flashblocks endpoint earning its place: `pending` there is typically at or
     // ahead of the confirmed head that triggered the read, which is the freshness the split
@@ -1215,7 +1225,7 @@ async fn run_cycle(
         // compared against carry block timestamps too. Mixing the two clocks would put a systematic
         // offset between a fill and its own reference.
         if let Some(f) = fair {
-            rt.markout.observe_reference(pair.pair_id, view.block_timestamp, f);
+            rt.markout.observe_reference(pair.pair_id, chain_now, f);
         }
 
         let base_balance = view.balances.get(&meta.base).copied().unwrap_or(0);
@@ -1409,7 +1419,7 @@ async fn run_cycle(
         }
 
         let ctx = Context {
-            block_timestamp: view.block_timestamp,
+            block_timestamp: chain_now,
             snap: &snap,
             planned: row.as_ref().map(|r| r.ladder),
             capacity,
@@ -1442,7 +1452,7 @@ async fn run_cycle(
             target: "policy", event = "decision", pair_id = pair.pair_id, symbol = %pair.symbol,
             quote = quote_decision.label(), quote_detail = ?quote_decision,
             capacity = capacity_decision.label(), capacity_detail = ?capacity_decision,
-            quote_age_secs = snap.quote_age_secs(view.block_timestamp),
+            quote_age_secs = snap.quote_age_secs(chain_now),
             heartbeat_limit_secs = ctx.heartbeat_limit(),
             bid_used = %snap.bid_used(), ask_used = %snap.ask_used(),
             bid_capacity = %snap.bid_capacity, ask_capacity = %snap.ask_capacity,
