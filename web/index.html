@@ -14,6 +14,14 @@
   The page shows EFFECTIVE EXECUTION PRICE rather than basis points, because a price is a number
   you can check against an exchange and a basis point is a number you have to trust. The bp
   columns are still there, decomposed, underneath.
+
+  The comparison venue used to be a UniswapV2 pair we deployed ourselves and then never touched.
+  That was worthless: we seeded it at $100k/BTC, the market moved, and the page ended up
+  reporting a 5,311 bp "UniV2 cost" that was really our own abandoned pool being 53% mispriced.
+  It has been removed entirely — from the quotes, from the tables, and from the drift section,
+  where dressing it up as loss-versus-rebalancing would have been the same dishonesty pointed the
+  other way. The BTC market is now compared against a Uniswap V3 pool that is not ours. The ETH
+  market is compared against nothing, because on this chain there is nothing to compare it to.
 -->
 
 <style>
@@ -21,7 +29,7 @@
     color-scheme: light;
     --surface-0:#f4f4f2; --surface-1:#fcfcfb; --surface-2:#ebebe7; --border:#dcdcd6;
     --text-1:#0b0b0b; --text-2:#52514e; --text-3:#86857e;
-    --prop:#2a78d6; --univ2:#008300;
+    --prop:#2a78d6; --rival:#008300;
     --good:#008300; --warn:#eda100; --crit:#e34948;
     --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
   }
@@ -29,12 +37,12 @@
     color-scheme: dark;
     --surface-0:#131312; --surface-1:#1a1a19; --surface-2:#242422; --border:#35352f;
     --text-1:#fff; --text-2:#c3c2b7; --text-3:#8a897f;
-    --prop:#3987e5; --univ2:#1e9e1e; --good:#1e9e1e; --warn:#c98500; --crit:#e66767; } }
+    --prop:#3987e5; --rival:#1e9e1e; --good:#1e9e1e; --warn:#c98500; --crit:#e66767; } }
   :root[data-theme="dark"] {
     color-scheme: dark;
     --surface-0:#131312; --surface-1:#1a1a19; --surface-2:#242422; --border:#35352f;
     --text-1:#fff; --text-2:#c3c2b7; --text-3:#8a897f;
-    --prop:#3987e5; --univ2:#1e9e1e; --good:#1e9e1e; --warn:#c98500; --crit:#e66767; }
+    --prop:#3987e5; --rival:#1e9e1e; --good:#1e9e1e; --warn:#c98500; --crit:#e66767; }
 
   * { box-sizing:border-box }
   body { margin:0; background:var(--surface-0); color:var(--text-1);
@@ -58,7 +66,7 @@
   .card h2 { font-size:15px; font-weight:620; margin:0 0 2px }
   .card .meta { color:var(--text-3); font-size:12px; font-family:var(--mono); margin-bottom:16px }
 
-  /* Top-of-book: the two venues' best quotes against the reference, as prices. */
+  /* Top-of-book: the venues' best quotes against the reference, as prices. */
   .quotes { display:grid; grid-template-columns:repeat(3,1fr); gap:1px;
     background:var(--border); border:1px solid var(--border); border-radius:8px;
     overflow:hidden; margin-bottom:18px }
@@ -68,6 +76,8 @@
   .q .pair { font-family:var(--mono); font-size:17px; font-weight:600; letter-spacing:-.02em }
   .q .pair .bid { color:var(--text-1) } .q .pair .sep { color:var(--text-3); margin:0 5px }
   .q .spread { font-family:var(--mono); font-size:11.5px; color:var(--text-2); margin-top:3px }
+  .q.void .msg { font-size:12px; line-height:1.45; color:var(--text-2) }
+  .q.void .msg b { color:var(--text-1); font-weight:600 }
   .swatch { width:8px; height:8px; border-radius:2px; display:inline-block; margin-right:6px }
 
   table { width:100%; border-collapse:collapse; font-family:var(--mono); font-size:12.5px }
@@ -80,8 +90,9 @@
   tr:last-child td { border-bottom:none }
   .grp { border-left:1px solid var(--surface-2); padding-left:14px !important }
   th.grp { border-left:1px solid var(--border) }
-  .p-prop { color:var(--prop); font-weight:600 } .p-univ2 { color:var(--univ2); font-weight:600 }
+  .p-prop { color:var(--prop); font-weight:600 } .p-rival { color:var(--rival); font-weight:600 }
   .dim { color:var(--text-3) } .neg { color:var(--crit) }
+  .oor { color:var(--text-3); font-style:italic }
 
   .split { display:grid; grid-template-columns:1fr 1fr; gap:26px; margin-top:20px }
   @media (max-width:760px){ .split{grid-template-columns:1fr} .quotes{grid-template-columns:1fr} }
@@ -133,27 +144,39 @@
   <div class="note">
     <b>What this does and does not say.</b>
     <ol>
-      <li>Both venues hold the same token inventory, so the difference in the top table is the
-        pricing mechanism — plus, for UniV2, however far its internal price has drifted from the
-        market since it was last traded. Those are separated below each table for exactly that
-        reason.</li>
-      <li>At small size most of the honest gap is fees, not curve shape: UniV2 charges a flat
-        30&nbsp;bp where this pool charges a 5&nbsp;bp half-spread. The curve only starts to matter
-        at size.</li>
+      <li>The comparison column is a Uniswap&nbsp;V3 pool that is <em>not ours</em> —
+        0x98e5…acfc, real WBTC/USDC, 0.30% fee. We did not seed it, do not maintain it and cannot
+        move it. Its quotes include however far its own price has drifted from the market since
+        it was last traded; that drift is separated out below each table for exactly that reason.
+        An earlier version of this page compared against a UniswapV2 pair we had deployed and
+        abandoned, and reported its 53% staleness as a cost of the constant-product curve. That
+        was not a baseline, it was our own neglect, and it has been removed.</li>
+      <li>At small size most of the honest gap is fees, not curve shape: the V3 pool charges a
+        flat 30&nbsp;bp where this pool quotes a 5&nbsp;bp half-spread. The curve only starts to
+        matter at size.</li>
+      <li>The V3 figures at size are <b>in-range</b> figures. Between two initialized ticks a V3
+        pool is a constant product on virtual reserves and the closed form used here is exact.
+        Across a tick boundary its liquidity changes and the formula stops being true, so a size
+        that would cross is printed as <em>out of range</em> rather than filled in with a number
+        this page cannot stand behind.</li>
       <li>Past its capacity epoch this pool <em>refuses</em> — it quotes nothing and the swap
-        reverts — where UniV2 keeps filling at any size. Declining is not strictly better than
-        filling badly. It is a different trade-off, and it is what bounds how much a stale ladder
-        can be picked off for.</li>
+        reverts — where the V3 pool keeps filling at any size, tick after tick. Declining is not
+        strictly better than filling badly. It is a different trade-off, and it is what bounds how
+        much a stale ladder can be picked off for.</li>
       <li>Adverse selection is not modelled. The reference is right by assumption here. These are
         execution-quality numbers for an honest taker, not a claim about the maker's P&amp;L.</li>
     </ol>
-    Both tokens are ours and both venues were seeded by us. The reason is token overlap, not an
-    absence of venues — an earlier version of this page said GIWA had no third-party liquidity to
-    compare against, and that was wrong. A scan of swap-event topics over 100,000 blocks finds four
-    factories that are not ours and 227 third-party swaps across 20 pools. Those pools hold real
-    WBTC, USDC and WETH9; ours hold mocks, because GIWA has no canonical stablecoin and no Circle
-    CCTP domain, and the third-party tokens expose no mint or faucet — that inventory would have to
-    be bought. So nothing routes between the two sets. This measures curves, not markets.
+    Both tokens on our side are mocks, and the two venues are not routable against each other: the
+    V3 pool holds real WBTC and USDC where ours hold mocks, because GIWA has no canonical
+    stablecoin, no Circle CCTP domain, and the third-party tokens expose no mint or faucet — that
+    inventory would have to be bought. So nothing routes between the two sets. This is a price
+    comparison, not an executable route. <b>For ETH there is no comparison at all.</b> Neither
+    third-party V3 factory on this chain has a WETH pool (they hold WBTC/USDC, WBTC/USDT ×2 and
+    USDC/USDT), and the only third-party WETH-against-a-stablecoin V2 pair, 0x4DB7…9d46, is
+    unusable: its "USDT" carries 18 decimals and the pair holds 1.79 WETH against 115 trillion of
+    it, implying a price near 6&times;10<sup>13</sup>. A Uniswap&nbsp;V4 PoolManager also exists
+    at 0x6f97…a8b7 and has emitted a V4 Swap event, but only one in the last ~60,000 blocks, so
+    there is nothing there to quote against yet.
   </div>
 
   <footer>reads sepolia-rpc.giwa.io each block · reference from binance bookTicker ·
@@ -167,38 +190,39 @@ const POOL = '0xA629071E606F425dB93310c3ecc35E00Fbe16358';
 const MARKETS = [
   { id:1, name:'mWETH / mUSDC', sym:'ethusdt', label:'ETHUSDT', dp:2,
     base:'0x81e46C6379498beBEB5DCcD47ab2DdFaf967d445', baseDec:18,
-    quote:'0xd28596C6750D87C53EA146134AfAB53de86C5155', quoteDec:6,
-    exp:24, v2:'0x94f0033BABBa0bEC1C17B808E0980ECFd3B35b4C' },
+    quote:'0xd28596C6750D87C53EA146134AfAB53de86C5155', quoteDec:6, exp:24 },
   { id:2, name:'mWBTC / mUSDC', sym:'btcusdt', label:'BTCUSDT', dp:2,
     base:'0x3548991B5EF2D7805EFa95bEa6CeDeAee3869875', baseDec:8,
-    quote:'0xd28596C6750D87C53EA146134AfAB53de86C5155', quoteDec:6,
-    exp:12, v2:'0xd6d0f9F9536590b2C0FDC76Fab5FE415F59C0bED' },
+    quote:'0xd28596C6750D87C53EA146134AfAB53de86C5155', quoteDec:6, exp:12 },
 ];
 const SIZES = [1_000, 10_000, 100_000, 1_000_000];   // notional, in whole quote units
 
-// Third-party venues already on this chain, keyed to the market whose asset they price.
+// The rival venue, keyed to the market whose asset it prices.
 //
-// These are NOT ours and we cannot route to them: they hold different token instances (real
-// WBTC and USDC, where our pool holds mocks), so there is no path between the two. What they
-// give is a better foil than our own comparison pool, whose drift is partly our own doing —
-// we seeded it at the mid and then left it. This one runs without us.
+// This is NOT ours and we cannot route to it — it holds real WBTC and USDC where our pool holds
+// mocks — but it is the only comparison on this chain worth printing: a book somebody else
+// deployed, somebody else supplies, and we cannot touch. That is the whole reason it replaced
+// the UniswapV2 pair we used to compare against, which we had seeded at the mid and then left,
+// so its "cost" was mostly our own abandonment.
 //
-// It is NOT, however, being arbitraged tightly: six swaps in 27.8 hours and a price well off
-// the market. An earlier version of this comment claimed otherwise on no evidence. The weaker
-// true statement is the more useful one anyway — passive liquidity drifts and nobody is
-// obliged to fix it, which is exactly the gap an actively repriced pool closes.
+// It is NOT tightly arbitraged, and this page does not claim it is: six swaps in the 27.8 hours
+// measured before this was written, and a price visibly off the market. The weaker true statement
+// is the more useful one — passive liquidity drifts and nobody is obliged to fix it, which is
+// exactly the gap an actively repriced pool closes.
 //
-// The comparison is legitimate because all three venues are pricing the same underlying asset
-// against the same reference. It is a price comparison, not an executable route, and the page
-// says so.
+// There is deliberately no entry for market 1. Nothing on this chain prices WETH against a
+// stablecoin in a way that can be read: see the note at the bottom of the page.
 const THIRD_PARTY = {
-  2: { pool:'0x98e5d56f4844cb510ce62cf8e2479b8cbf18acfc', kind:'Uniswap V3', fee:'0.30%',
+  2: { pool:'0x98e5d56f4844cb510ce62cf8e2479b8cbf18acfc', kind:'Uniswap V3', short:'Uni V3',
+       feeHuman:'0.30%', fee:3000/1e6,
+       // token0 is the market's base. Checked on chain, not assumed: token0() returns the WBTC
+       // address, and 0x1C3c… < 0x46ee… as V3 requires.
        t0:'0x1C3c0af23c627ee742eCE45846E22CE5346DbF53', d0:8, s0:'WBTC',
        t1:'0x46ee2447366ab4D86c23E7eF47E5c932Fc3a4298', d1:6, s1:'USDC' },
 };
 
-const SEL = { getAmountOut:'0x4aa06652', snapshot:'0x082af76c', getReserves:'0x0902f1ac',
-              slot0:'0x3850c7bd', balanceOf:'0x70a08231' };
+const SEL = { getAmountOut:'0x4aa06652', snapshot:'0x082af76c', balanceOf:'0x70a08231',
+              slot0:'0x3850c7bd', liquidity:'0x1a686502', tickSpacing:'0xd0c93a7c' };
 const w  = v => BigInt(v).toString(16).padStart(64,'0');
 const wa = a => a.toLowerCase().replace('0x','').padStart(64,'0');
 const words = h => { const s=h.slice(2), o=[]; for(let i=0;i<s.length;i+=64) o.push(BigInt('0x'+s.slice(i,i+64))); return o };
@@ -218,9 +242,30 @@ async function batch(calls) {
   return body.map(b=>{ const r=by.get(b.id); return r&&r.result&&r.result!=='0x' ? r.result : null });
 }
 
-// Constant product with the 0.3% fee, exactly as UniswapV2Pair computes it.
-const v2Out = (aIn,rIn,rOut) => (aIn<=0n||rIn<=0n||rOut<=0n) ? 0n
-  : (aIn*997n*rOut)/(rIn*1000n+aIn*997n);
+// ── Uniswap V3, inside one tick ──────────────────────────────────────────────────────────────
+//
+// Between two initialized ticks a V3 pool is an ordinary constant product on its VIRTUAL
+// reserves (L/sqrtP, L·sqrtP), so the closed forms below are EXACT there — not an approximation.
+// They become wrong the instant the trade crosses a tick, because L changes at the boundary and
+// nothing here has read what it changes to. Every amount is in RAW token units, because that is
+// what sqrtP = sqrt(token1_raw / token0_raw) and L are denominated in.
+//
+// Both functions return null when the trade would leave the tick. Null is printed as "out of
+// range"; it is never silently turned into a number.
+const sqrtAtTick = t => Math.pow(1.0001, t/2);
+
+function v3BuyBase(v, amtIn1){                  // token1 in → token0 out
+  if(!(amtIn1 > 0)) return null;
+  const sp2 = v.sqrtP + amtIn1*(1-v.fee)/v.L;   // sqrtP' = sqrtP + dy/L
+  if(!(sp2 <= v.sqHi)) return null;
+  return v.L*(1/v.sqrtP - 1/sp2);
+}
+function v3SellBase(v, amtIn0){                 // token0 in → token1 out
+  if(!(amtIn0 > 0)) return null;
+  const sp2 = 1/(1/v.sqrtP + amtIn0*(1-v.fee)/v.L);   // 1/sqrtP' = 1/sqrtP + dx/L
+  if(!(sp2 >= v.sqLo)) return null;
+  return v.L*(v.sqrtP - sp2);
+}
 
 const ref = {}; let feedOk = false;
 function connectFeed(){
@@ -243,7 +288,12 @@ const f = (n,d=2)=> n==null||!isFinite(n) ? '—'
   : n.toLocaleString('en-US',{minimumFractionDigits:d,maximumFractionDigits:d});
 const sgn = (n,d=1)=> n==null||!isFinite(n) ? '—' : (n>=0?'+':'')+f(n,d);
 
-document.getElementById('markets').innerHTML = MARKETS.map(m=>`
+document.getElementById('markets').innerHTML = MARKETS.map(m=>{
+  const tp = THIRD_PARTY[m.id];
+  const head = tp
+    ? `<th>DuBu</th><th>${tp.short}</th><th class="grp">DuBu bp</th><th>${tp.short} bp</th>`
+    : `<th>DuBu</th><th class="grp">DuBu bp</th>`;
+  return `
   <div class="card">
     <h2>${m.name}</h2>
     <div class="meta">pairId ${m.id} · priceScaleExp ${m.exp} · tracks ${m.label}</div>
@@ -259,25 +309,33 @@ document.getElementById('markets').innerHTML = MARKETS.map(m=>`
         <div class="pair"><span class="bid" id="pb${m.id}">—</span><span class="sep">/</span><span id="pa${m.id}">—</span></div>
         <div class="spread" id="ps${m.id}"></div>
       </div>
+      ${tp ? `
       <div class="q">
-        <div class="who"><span class="swatch" style="background:var(--univ2)"></span>UniV2 — bid / ask</div>
-        <div class="pair"><span class="bid" id="ub${m.id}">—</span><span class="sep">/</span><span id="ua${m.id}">—</span></div>
-        <div class="spread" id="us${m.id}"></div>
-      </div>
+        <div class="who"><span class="swatch" style="background:var(--rival)"></span>${tp.kind} · third party</div>
+        <div class="pair"><span class="bid" id="vb${m.id}">—</span><span class="sep">/</span><span id="va${m.id}">—</span></div>
+        <div class="spread" id="vs${m.id}"></div>
+      </div>` : `
+      <div class="q void">
+        <div class="who">no comparison venue</div>
+        <div class="msg"><b>No third-party venue on this chain prices WETH against a
+          stablecoin.</b> Neither non-DuBu V3 factory has a WETH pool, and the one third-party
+          WETH/&ldquo;USDT&rdquo; V2 pair holds a broken 18-decimal token. Details at the bottom
+          of the page.</div>
+      </div>`}
     </div>
 
     <div class="split">
       <div>
         <table>
           <caption><b>Buying base</b> — effective price you actually pay</caption>
-          <thead><tr><th>notional</th><th>DuBu</th><th>UniV2</th><th class="grp">DuBu bp</th><th>UniV2 bp</th></tr></thead>
+          <thead><tr><th>notional</th>${head}</tr></thead>
           <tbody id="buy${m.id}"></tbody>
         </table>
       </div>
       <div>
         <table>
           <caption><b>Selling base</b> — effective price you actually receive</caption>
-          <thead><tr><th>notional</th><th>DuBu</th><th>UniV2</th><th class="grp">DuBu bp</th><th>UniV2 bp</th></tr></thead>
+          <thead><tr><th>notional</th>${head}</tr></thead>
           <tbody id="sell${m.id}"></tbody>
         </table>
       </div>
@@ -287,37 +345,34 @@ document.getElementById('markets').innerHTML = MARKETS.map(m=>`
       <h3>Drift from market — who pays, and how much</h3>
       <div class="lvr-row"><span><span class="swatch" style="background:var(--prop)"></span>DuBu</span>
         <span id="dprop${m.id}">—</span></div>
-      <div class="lvr-row"><span><span class="swatch" style="background:var(--univ2)"></span>UniV2</span>
-        <span id="duni${m.id}">—</span></div>
-      ${THIRD_PARTY[m.id] ? `<div class="lvr-row"><span><span class="swatch"
-        style="background:var(--text-3)"></span>${THIRD_PARTY[m.id].kind} · third party</span>
+      ${tp ? `<div class="lvr-row"><span><span class="swatch"
+        style="background:var(--rival)"></span>${tp.kind} · third party</span>
         <span id="dtp${m.id}">—</span></div>` : ''}
       <div class="why" id="dwhy${m.id}"></div>
     </div>
 
-    ${THIRD_PARTY[m.id] ? `
+    ${tp ? `
     <div class="tp">
       <h3>Somebody else's pool, same asset</h3>
       <div class="tp-row">
-        <span><a href="https://sepolia-explorer.giwa.io/address/${THIRD_PARTY[m.id].pool}"
-                 target="_blank" rel="noopener">${THIRD_PARTY[m.id].pool.slice(0,10)}…</a>
-          <span class="dim">${THIRD_PARTY[m.id].kind}, fee ${THIRD_PARTY[m.id].fee},
-          ${THIRD_PARTY[m.id].s0}/${THIRD_PARTY[m.id].s1}</span></span>
+        <span><a href="https://sepolia-explorer.giwa.io/address/${tp.pool}"
+                 target="_blank" rel="noopener">${tp.pool.slice(0,10)}…</a>
+          <span class="dim">${tp.kind}, fee ${tp.feeHuman}, ${tp.s0}/${tp.s1}</span></span>
         <span id="tpx${m.id}">—</span>
       </div>
       <div class="tp-row"><span class="dim">inventory</span><span id="tpv${m.id}" class="dim">—</span></div>
+      <div class="tp-row"><span class="dim">in-range depth · current tick</span>
+        <span id="tpr${m.id}" class="dim">—</span></div>
       <div class="why">
-        Not ours, and not routable — it holds real ${THIRD_PARTY[m.id].s0} and
-        ${THIRD_PARTY[m.id].s1} where this pool holds mocks, so there is no path between them.
-        It is here because it is the honest foil: the UniV2 above is one we deployed, seeded at
-        the reference mid, and then left alone, so its drift is partly our own doing. This one
-        runs without us and drifts on its own. It is not being arbitraged tightly either — six
-        swaps in the last 27.8 hours, and it currently sits well off the market — which is itself
-        the point about passive liquidity. All three price the same asset against the same
-        reference.
+        Not ours, and not routable — it holds real ${tp.s0} and ${tp.s1} where this pool holds
+        mocks, so there is no path between them. It is here because it is the only honest foil on
+        this chain: a book we did not seed, do not maintain and cannot move. It is not being
+        arbitraged tightly either — six swaps in the 27.8 hours measured before this page was
+        written, and it currently sits off the market — which is itself the point about passive
+        liquidity. Both venues price the same asset against the same reference.
       </div>
     </div>` : ''}
-  </div>`).join('');
+  </div>`}).join('');
 
 async function tick(){
   const errEl = document.getElementById('errline');
@@ -329,10 +384,11 @@ async function tick(){
     const calls=[];
     for(const m of MARKETS){
       calls.push({to:POOL,data:SEL.snapshot+w(m.id)});
-      calls.push({to:m.v2,data:SEL.getReserves});
       const tp = THIRD_PARTY[m.id];
       if(tp){
         calls.push({to:tp.pool, data:SEL.slot0});
+        calls.push({to:tp.pool, data:SEL.liquidity});
+        calls.push({to:tp.pool, data:SEL.tickSpacing});
         calls.push({to:tp.t0,   data:SEL.balanceOf+wa(tp.pool)});
         calls.push({to:tp.t1,   data:SEL.balanceOf+wa(tp.pool)});
       }
@@ -349,12 +405,48 @@ async function tick(){
 
     let i=0, worstAge=null, anyCap=false;
     for(const m of MARKETS){
-      const snap=out[i++], resRaw=out[i++];
+      const snap=out[i++];
       const tp = THIRD_PARTY[m.id];
-      const tpSlot0 = tp ? out[i++] : null, tpBal0 = tp ? out[i++] : null, tpBal1 = tp ? out[i++] : null;
+      const tpS0=tp?out[i++]:null, tpL=tp?out[i++]:null, tpTS=tp?out[i++]:null,
+            tpB0=tp?out[i++]:null, tpB1=tp?out[i++]:null;
       const legs=[]; for(let k=0;k<SIZES.length;k++) legs.push([out[i++],out[i++]]);
       const r = ref[m.sym];
       document.getElementById('r'+m.id).textContent = r?f(r,m.dp):'—';
+
+      // ── the rival's state, and the tick window its arithmetic is valid inside ──────────────
+      let v3 = null;
+      if(tp && tpS0 && tpL && tpTS){
+        const s0 = words(tpS0);
+        const sq = s0[0];                                     // sqrtPriceX96, uint160
+        const tk = Number(BigInt.asIntN(256, s0[1]));         // tick, int24, sign-extended
+        const spacing = Number(BigInt.asIntN(256, words(tpTS)[0]));
+        // Liquidity only changes at INITIALIZED ticks, and initialized ticks are multiples of
+        // tickSpacing. So [b, b+spacing] with b = floor(tick/spacing)*spacing is always a subset
+        // of the interval over which L is constant — narrower than the truth when the bucket
+        // edge happens not to be initialized, never wider. Conservative in the safe direction:
+        // it can refuse a size that would in fact have been fine, but it can never print a
+        // number that has left its domain. Costs no extra call beyond tickSpacing.
+        const b = Math.floor(tk/spacing)*spacing;
+        v3 = { fee: tp.fee, tick: tk, spacing,
+               sqrtP: Number(sq)/2**96,     // ~25.5 here; exact division, full double precision
+               L: Number(words(tpL)[0]),
+               sqLo: sqrtAtTick(b), sqHi: sqrtAtTick(b+spacing),
+               // Displayed price keeps the BigInt path: sq**2 is ~4e60 and would shed bits as a
+               // Number, but sq**2 >> 160 lands near 2.8e12 — exact — and the residual 2**32
+               // divides clean. price = (sq/2**96)**2 in raw token1-per-token0.
+               px: Number((sq*sq)>>160n)/2**32 * Number(pow10(tp.d0))/Number(pow10(tp.d1)) };
+        if(!(v3.L > 0)) v3 = null;         // no active liquidity: nothing to quote at any size
+      }
+
+      if(v3){
+        // Top of book: the marginal price at infinitesimal size is the pool's own price adjusted
+        // by the fee on whichever side you cross. Same identity as constant product — the fee is
+        // taken off the input before any curve math happens.
+        document.getElementById('vb'+m.id).textContent = f(v3.px*(1-v3.fee), m.dp);
+        document.getElementById('va'+m.id).textContent = f(v3.px/(1-v3.fee), m.dp);
+        document.getElementById('vs'+m.id).textContent =
+          `spread ${f((1/(1-v3.fee) - (1-v3.fee))*1e4,1)} bp — the ${f(v3.fee*1e4,0)} bp fee, both ways`;
+      }
 
       if(!snap) continue;
       const s = words(snap);
@@ -373,109 +465,143 @@ async function tick(){
       if(worstAge===null||age>worstAge) worstAge=age;
       if(askCap>0n) anyCap=true;
 
-      // UniV2 reserves come back as token0/token1; order by address to know which is base.
-      let rBase=0n, rQuote=0n;
-      if(resRaw){ const [a,b]=words(resRaw);
-        const baseIs0 = m.base.toLowerCase() < m.quote.toLowerCase();
-        rBase = baseIs0?a:b; rQuote = baseIs0?b:a; }
-      const xB = Number(rBase)/Number(pow10(m.baseDec));      // base held
-      const yQ = Number(rQuote)/Number(pow10(m.quoteDec));    // quote held
-      const uMid = xB>0 ? yQ/xB : null;                       // the pool's own internal price
-
-      // UniV2 top of book: the marginal price at infinitesimal size is its mid adjusted by the
-      // fee on whichever side you cross.
-      if(uMid){
-        document.getElementById('ub'+m.id).textContent = f(uMid*0.997,m.dp);
-        document.getElementById('ua'+m.id).textContent = f(uMid/0.997,m.dp);
-        // Derived, not written down: crossing costs the 0.3% fee on each side, so the round
-        // trip is 1/0.997 − 0.997 regardless of size or reserves.
-        document.getElementById('us'+m.id).textContent =
-          `spread ${f((1/0.997 - 0.997)*1e4,1)} bp — the 30 bp fee, both ways`;
-      }
-      if(r) document.getElementById('rs'+m.id).textContent =
-        `DuBu ${sgn((( pBid+pAsk)/2 - r)/r*1e4)} bp · UniV2 ${uMid?sgn((uMid-r)/r*1e4):'—'} bp`;
+      if(r) document.getElementById('rs'+m.id).textContent = v3
+        ? `DuBu ${sgn(((pBid+pAsk)/2 - r)/r*1e4)} bp · ${tp.short} ${sgn((v3.px-r)/r*1e4)} bp`
+        : `DuBu ${sgn(((pBid+pAsk)/2 - r)/r*1e4)} bp`;
 
       const rows = SIZES.map((size,k)=>{
         const [buyRaw,sellRaw] = legs[k];
         // BUY: pay `size` quote, receive base. Effective price = quote paid / base received.
         const bOut = buyRaw ? Number(words(buyRaw)[0])/Number(pow10(m.baseDec)) : 0;
         const pBuy = bOut>0 ? size/bOut : null;
-        const uBuyOut = Number(v2Out(BigInt(size)*pow10(m.quoteDec), rQuote, rBase))/Number(pow10(m.baseDec));
-        const uBuy = uBuyOut>0 ? size/uBuyOut : null;
         // SELL: give `size/ref` base, receive quote. Effective = quote received / base given.
         const baseIn = r ? size/r : null;
         const sOut = sellRaw ? Number(words(sellRaw)[0])/Number(pow10(m.quoteDec)) : 0;
         const pSell = (sOut>0&&baseIn) ? sOut/baseIn : null;
-        const uSellOut = r ? Number(v2Out(BigInt(Math.floor(baseIn*Number(pow10(m.baseDec)))), rBase, rQuote))/Number(pow10(m.quoteDec)) : 0;
-        const uSell = (uSellOut>0&&baseIn) ? uSellOut/baseIn : null;
-        return {size, pBuy, uBuy, pSell, uSell,
-                quoting: bOut>0, quotingSell: sOut>0};
+
+        // The rival, same notional. `undefined` means we could not read the pool at all;
+        // `null` means the trade would cross a tick and the in-range formula does not apply.
+        let vBuy, vSell;
+        if(v3){
+          const o = v3BuyBase(v3, size*Number(pow10(tp.d1)));
+          vBuy = o==null ? null : size/(o/Number(pow10(tp.d0)));
+          if(baseIn){
+            const so = v3SellBase(v3, baseIn*Number(pow10(tp.d0)));
+            vSell = so==null ? null : (so/Number(pow10(tp.d1)))/baseIn;
+          }
+        }
+        return {size, pBuy, pSell, vBuy, vSell, quoting: bOut>0, quotingSell: sOut>0};
       });
 
       const cost = (px, side) => px==null||!r ? null : (side==='buy' ? (px-r)/r : (r-px)/r)*1e4;
-      const cell = (px,c,cls) => px==null
-        ? '<td class="dim">no quote</td>' : `<td class="${cls}">${f(px,m.dp)}</td>`;
+      // Three states, three different marks. "out of range" is a refusal to answer, not a zero,
+      // and it must not be mistaken for one.
+      const priceCell = (px,cls) => px===undefined ? '<td class="dim">—</td>'
+        : px===null ? '<td class="oor" title="this size would push the pool past a tick boundary, where its liquidity changes and the in-range formula stops holding">out of range</td>'
+        : `<td class="${cls}">${f(px,m.dp)}</td>`;
+      const bpCell = (px,side,cls) => typeof px==='number'
+        ? `<td class="${cls}">${f(cost(px,side),2)}</td>` : `<td class="dim ${cls}">—</td>`;
 
-      document.getElementById('buy'+m.id).innerHTML = rows.map(x=>`<tr>
-        <td>$${x.size.toLocaleString()}</td>
-        ${x.quoting?cell(x.pBuy,0,'p-prop'):'<td class="dim">no quote</td>'}
-        ${cell(x.uBuy,0,'p-univ2')}
-        <td class="grp">${f(cost(x.pBuy,'buy'),2)}</td>
-        <td>${f(cost(x.uBuy,'buy'),2)}</td></tr>`).join('');
+      const render = (id, key, vkey, side, ok) =>
+        document.getElementById(id+m.id).innerHTML = rows.map(x=>`<tr>
+          <td>$${x.size.toLocaleString()}</td>
+          ${x[ok] ? priceCell(x[key],'p-prop') : '<td class="dim">no quote</td>'}
+          ${tp ? priceCell(x[vkey],'p-rival') : ''}
+          ${x[ok] ? bpCell(x[key],side,'grp') : '<td class="dim grp">—</td>'}
+          ${tp ? bpCell(x[vkey],side,'') : ''}
+        </tr>`).join('');
 
-      document.getElementById('sell'+m.id).innerHTML = rows.map(x=>`<tr>
-        <td>$${x.size.toLocaleString()}</td>
-        ${x.quotingSell?cell(x.pSell,0,'p-prop'):'<td class="dim">no quote</td>'}
-        ${cell(x.uSell,0,'p-univ2')}
-        <td class="grp">${f(cost(x.pSell,'sell'),2)}</td>
-        <td>${f(cost(x.uSell,'sell'),2)}</td></tr>`).join('');
+      render('buy',  'pBuy',  'vBuy',  'buy',  'quoting');
+      render('sell', 'pSell', 'vSell', 'sell', 'quotingSell');
 
-      // Drift, and what it is actually worth. A price gap is not a value gap: closing a 2.7%
-      // gap on a 5,000-unit pool takes ~67 units of trade, so the transfer is far smaller than
-      // the gap. The number that matters is what an arbitrageur can take out of the LP, which is
-      // the constant-product LVR: rebalance to the market price and compare the pool's value at
-      // that price, before and after.
+      // ── Drift, and what it is actually worth ───────────────────────────────────────────────
       const dProp = r ? ((pBid+pAsk)/2 - r)/r*1e4 : null;
       document.getElementById('dprop'+m.id).innerHTML =
         `<span class="p-prop">${sgn(dProp)} bp</span> <span class="dim">· nothing to extract</span>`;
 
-      if(uMid && r){
-        const k = xB*yQ, x2 = Math.sqrt(k/r), y2 = k/x2;
-        const before = xB*r + yQ, after = x2*r + y2;
-        const leak = before - after;
-        document.getElementById('duni'+m.id).innerHTML =
-          `<span class="p-univ2">${sgn((uMid-r)/r*1e4)} bp</span> <span class="dim">·
-           $${f(leak,0)} extractable (${f(leak/before*1e4,2)} bp of TVL)</span>`;
+      if(!tp){
         document.getElementById('dwhy'+m.id).textContent =
-          `UniV2 still prices base at ${f(uMid,m.dp)} while the market is ${f(r,m.dp)}. `+
-          `An arbitrageur closes that by trading ~${f(Math.abs(x2-xB),2)} base against the pool and `+
-          `keeps $${f(leak,0)} — taken from the LP, not from a taker. That is loss-versus-rebalancing, `+
-          `and it repeats on every price move. This pool has none of it by construction: it reprices `+
-          `instead of waiting to be arbitraged. The UniV2 bp columns above include this drift, so at `+
-          `small size most of what they show is staleness rather than curve shape.`;
+          'There is no third-party venue on this chain pricing WETH against a stablecoin, so '+
+          'there is nothing to set beside this row. The mechanism argument is the one made in '+
+          'the BTC card: a pool that reprices on every reference move has no drift to be '+
+          'arbitraged out of it, and a pool that waits does. Only the BTC market can show it '+
+          'against somebody else’s book.';
+      } else if(v3 && r){
+        const drift = (v3.px - r)/r*1e4;
+        // A price gap is not a value gap. What an arbitrageur takes out of the LP is the
+        // loss-versus-rebalancing: move the pool to the market price, and compare the pool's
+        // holdings valued at that price before and after.
+        //
+        // For a concentrated position the classic constant-product formula does NOT apply, but
+        // the in-range case has an exact form and — usefully — it does not need the position
+        // bounds. Moving the pool from s to s' changes its reserves by dx = L(1/s - 1/s') and
+        // dy = L(s' - s). The bounds appear in x and y but cancel in the difference, so marking
+        // both states at the market price p gives
+        //
+        //     extracted(s')  =  (x - x')·p + (y - y')  =  L·(1/s - 1/s')·p − L·(s' − s)
+        //
+        // in raw token1. With s' = sqrt(p) this collapses to the tidy L·(s' − s)²/s, and the two
+        // agree to the last cent — checked against each other before this shipped.
+        //
+        // It is exact only while L is constant, i.e. while s' stays inside the tick window. When
+        // the market has moved further, s' is clamped to the window edge and what is left is the
+        // value of the PREFIX of the arbitrage that fits inside the current tick — still exact
+        // for that prefix, and a strict floor on the whole, since every further unit traded
+        // while the pool is still cheap adds more. Do not substitute the squared form here: with
+        // s' clamped it is no longer the same quantity and it understates the floor about
+        // two-fold. Labelled as a floor whenever that happens, never as the whole figure.
+        const rRaw   = r * Number(pow10(tp.d1)) / Number(pow10(tp.d0));
+        const sTgt   = Math.sqrt(rRaw);
+        const sClamp = Math.min(Math.max(sTgt, v3.sqLo), v3.sqHi);
+        const whole  = sClamp === sTgt;
+        const leak   = v3.L * ((1/v3.sqrtP - 1/sClamp)*rRaw - (sClamp - v3.sqrtP))
+                       / Number(pow10(tp.d1));
+
+        document.getElementById('dtp'+m.id).innerHTML =
+          `<span class="p-rival">${sgn(drift)} bp</span> <span class="dim">·
+           ${whole?'':'&ge;'}$${f(leak,0)} to a rebalancer${whole?'':' (in-range floor)'}
+           · nobody’s job to fix</span>`;
+
+        document.getElementById('dwhy'+m.id).innerHTML =
+          `${tp.kind} prices ${tp.s0} at ${f(v3.px,m.dp)} while the market is ${f(r,m.dp)} — `+
+          `${sgn(drift)} bp, on a pool that is not ours. Closing that gap hands `+
+          `${whole?'':'at least '}$${f(leak,0)} to whoever closes it, taken from the LP rather `+
+          `than from a taker, and it happens again on the next price move. That is `+
+          `loss-versus-rebalancing. It is not a defect in that pool — passive liquidity drifts `+
+          `because repricing it is nobody’s obligation. This pool has none of it by `+
+          `construction: it reprices instead of waiting to be arbitraged. `+
+          (whole
+            ? `The rebalance stays inside the current tick, so that figure is exact. `
+            : `The market has moved further than the current tick, so the figure counts only the `+
+              `part of the rebalance that fits inside it — past that boundary the pool’s `+
+              `liquidity changes and this page has not read what it changes to. The true number `+
+              `is larger; how much larger is not something it can honestly say. `)+
+          `Either way it is gross of the ${f(v3.fee*1e4,0)} bp the arbitrageur pays back into the `+
+          `pool. The ${tp.short} bp columns above carry this same drift, so at small size much of `+
+          `what they show is staleness rather than curve shape.`;
       }
 
-      // Third-party venue. Its price comes straight out of slot0, so this is exact rather than
-      // an estimate — no tick traversal is involved in reading where the pool currently sits.
-      if(tp && tpSlot0 && r){
-        const sq = words(tpSlot0)[0];                       // sqrtPriceX96
-        // price = (sq / 2**96)**2, i.e. sq**2 / 2**192, in raw token1-per-token0. Shift 160 bits
-        // in BigInt first: sq**2 is ~4e60 and would lose precision as a Number, but sq**2 >> 160
-        // lands near 2.8e12, comfortably exact, and the remaining 2**32 divides cleanly.
-        const raw = Number((sq * sq) >> 160n) / 2 ** 32;
-        const px  = raw * Number(pow10(tp.d0)) / Number(pow10(tp.d1));
-        const drift = (px - r) / r * 1e4;
-        document.getElementById('tpx'+m.id).innerHTML =
-          `<b>${f(px, m.dp)}</b> <span class="dim">· ${sgn(drift)} bp vs market</span>`;
-        document.getElementById('dtp'+m.id).innerHTML =
-          `<span style="color:var(--text-2);font-weight:600">${sgn(drift)} bp</span>
-           <span class="dim">· nobody's job to fix</span>`;
-        if(tpBal0 && tpBal1){
-          const b0 = Number(words(tpBal0)[0]) / Number(pow10(tp.d0));
-          const b1 = Number(words(tpBal1)[0]) / Number(pow10(tp.d1));
-          document.getElementById('tpv'+m.id).textContent =
-            `${f(b0, 4)} ${tp.s0} + ${f(b1, 0)} ${tp.s1}  ≈ $${f(b0 * r + b1, 0)}`;
+      // ── The rival's own panel ──────────────────────────────────────────────────────────────
+      if(tp && v3){
+        document.getElementById('tpx'+m.id).innerHTML = r
+          ? `<b>${f(v3.px,m.dp)}</b> <span class="dim">· ${sgn((v3.px-r)/r*1e4)} bp vs market</span>`
+          : `<b>${f(v3.px,m.dp)}</b>`;
+        if(tpB0 && tpB1){
+          const b0 = Number(words(tpB0)[0]) / Number(pow10(tp.d0));
+          const b1 = Number(words(tpB1)[0]) / Number(pow10(tp.d1));
+          document.getElementById('tpv'+m.id).textContent = r
+            ? `${f(b0,4)} ${tp.s0} + ${f(b1,0)} ${tp.s1}  ≈ $${f(b0*r + b1,0)}`
+            : `${f(b0,4)} ${tp.s0} + ${f(b1,0)} ${tp.s1}`;
         }
+        // How much actually fits before the arithmetic stops being exact — inverting the two
+        // quote formulas at the window edges. Printing this stops "out of range" from looking
+        // arbitrary.
+        const maxIn1 = (v3.sqHi - v3.sqrtP)*v3.L/(1-v3.fee)/Number(pow10(tp.d1));
+        const maxIn0 = (1/v3.sqLo - 1/v3.sqrtP)*v3.L/(1-v3.fee)/Number(pow10(tp.d0));
+        document.getElementById('tpr'+m.id).textContent =
+          `buy ≤ $${f(maxIn1,0)} · sell ≤ ${f(maxIn0,4)} ${tp.s0} · tick ${v3.tick} `+
+          `in [${Math.floor(v3.tick/v3.spacing)*v3.spacing}, `+
+          `${Math.floor(v3.tick/v3.spacing)*v3.spacing + v3.spacing}]`;
       }
     }
 
