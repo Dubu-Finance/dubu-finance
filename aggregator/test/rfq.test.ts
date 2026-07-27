@@ -170,23 +170,52 @@ describe('expiry', () => {
   });
 });
 
-describe('a price that is too good', () => {
-  it('is refused when it beats the AMMs by more than a plausible margin', async () => {
-    const absurd = baseOrder({ makerAmount: 50_000_000_000_000_000_000n }); // 10x the AMM quote
-    const r = await validateQuote(loadConfig(env()), req, await signed(absurd));
-    expect(r.rejected).toBe('implausible');
+describe('can the maker actually deliver', () => {
+  it('is refused when the order exceeds what the maker can pay out', async () => {
+    const r = await validateQuote(
+      loadConfig(env()),
+      { ...req, makerCanDeliver: 4_000_000_000_000_000_000n },
+      await signed(baseOrder()), // asks for 5
+    );
+    expect(r.rejected).toBe('maker-cannot-deliver');
   });
 
-  it('is accepted when it beats them by a realistic margin', async () => {
-    const better = baseOrder({ makerAmount: 4_950_000_000_000_000_000n }); // ~1% over the AMMs
+  it('is accepted when the maker can cover it exactly', async () => {
+    const r = await validateQuote(
+      loadConfig(env()),
+      { ...req, makerCanDeliver: 5_000_000_000_000_000_000n },
+      await signed(baseOrder()),
+    );
+    expect(r.rejected).toBeNull();
+  });
+
+  // An unread balance must not read as a passing one. The caller reports it as unverified instead
+  // of this pretending it checked.
+  it('does not invent a verdict when the solvency read failed', async () => {
+    const r = await validateQuote(loadConfig(env()), { ...req, makerCanDeliver: undefined }, await signed(baseOrder()));
+    expect(r.rejected).toBeNull();
+  });
+});
+
+describe('the nonsense filter', () => {
+  // The regression this replaced a 5% bound to fix: on GIWA the UniV2 pool was 30% off the market
+  // and the maker was right. A correct quote must survive being much better than a stale AMM.
+  it('accepts a quote that beats a stale AMM by 30%', async () => {
+    const better = baseOrder({ makerAmount: 6_400_000_000_000_000_000n }); // ~30% over the AMMs
     const r = await validateQuote(loadConfig(env()), req, await signed(better));
     expect(r.rejected).toBeNull();
   });
 
+  it('still refuses a response that cannot be a price at all', async () => {
+    const absurd = baseOrder({ makerAmount: 5_000_000_000_000_000_000_000_000n }); // a million times
+    const r = await validateQuote(loadConfig(env()), req, await signed(absurd));
+    expect(r.rejected).toBe('implausible');
+  });
+
   // On a market the AMMs cannot serve there is no baseline, and refusing on those grounds would
   // refuse RFQ precisely where RFQ is the only venue.
-  it('skips the plausibility check when the AMMs quoted nothing', async () => {
-    const huge = baseOrder({ makerAmount: 50_000_000_000_000_000_000n });
+  it('is skipped when the AMMs quoted nothing', async () => {
+    const huge = baseOrder({ makerAmount: 5_000_000_000_000_000_000_000_000n });
     const r = await validateQuote(loadConfig(env()), { ...req, ammAmountOut: 0n }, await signed(huge));
     expect(r.rejected).toBeNull();
   });

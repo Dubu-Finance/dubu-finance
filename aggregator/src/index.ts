@@ -1,7 +1,7 @@
 import { getAddress, isAddress, type Address } from 'viem';
 
 import { findMarket, loadConfig, type Env } from './config.js';
-import { makeClient, quoteAmms, WEIGHT_DENOMINATOR, type Leg } from './quote.js';
+import { makeClient, makerCanDeliver, quoteAmms, WEIGHT_DENOMINATOR, type Leg } from './quote.js';
 import { requestQuote, type RfqQuote } from './rfq.js';
 import { buildRoute } from './route.js';
 
@@ -117,11 +117,20 @@ async function handleQuote(request: Request, env: Env): Promise<Response> {
   }
 
   const nowSecs = Math.floor(Date.now() / 1000);
+
+  // What the maker could actually pay out, read before its quote is trusted. Only fetched when
+  // the RFQ leg is on, so an AMM-only deployment pays nothing for it.
+  const canDeliver =
+    cfg.rfqMakerAddress && cfg.pmmSettle
+      ? await makerCanDeliver(client, tokenOut, cfg.rfqMakerAddress, cfg.pmmSettle)
+      : undefined;
+
   const rfq = await requestQuote(cfg, {
     tokenIn,
     tokenOut,
     amountIn,
     ammAmountOut: amm.amountOut,
+    makerCanDeliver: canDeliver,
     nowSecs,
   });
 
@@ -187,6 +196,10 @@ async function handleQuote(request: Request, env: Env): Promise<Response> {
       univ2: amm.solo.univ2.toString(),
       rfq: rfq.quote ? rfq.quote.amountOut.toString() : null,
       rfqRejected: rfq.rejected,
+      rfqMakerReason: rfq.makerReason ?? null,
+      // Stated rather than implied: `null` means the solvency read failed and the quote was taken
+      // unverified on that axis, which is a different claim from "verified and fine".
+      rfqMakerCanDeliver: canDeliver === undefined ? null : canDeliver.toString(),
       split: !useRfq && amm.split,
       legs: legs.map((l) => ({
         venue: l.venue,

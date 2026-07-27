@@ -1383,18 +1383,31 @@ async fn run_cycle(
             "decision"
         );
 
-        // Which of the two goes out when both fired.
+        // What goes out when both fired, and in what order.
         //
-        // Ordinarily capacity first: a ladder is worthless against a zero epoch, and posting the
-        // epoch first means the row that follows is solved against the capacity it will execute on.
+        // Ordinarily one intent per pair per cycle, capacity first: a ladder is worthless against a
+        // zero epoch, and posting the epoch first means the row that follows is solved against the
+        // capacity it will execute on.
         //
-        // REVERSED when the pool is currently offering no depth, which is the state a jump
-        // withdrawal leaves it in. There, capacity-first would restore a full epoch behind
-        // whatever ladder is stored — the pre-jump one — and hand a taker exactly the fill the
-        // withdrawal was for. With zero capacity the pool quotes nothing whatever is stored, so
-        // pushing the row first costs nothing and closes that window. `ladder::build` already
-        // solves against the *planned* capacity when the on-chain one is zero, so the row is
-        // coherent either way.
+        // When the pool is offering no depth — the state a jump withdrawal leaves it in, and the
+        // state a freshly deployed pool starts in — **both** go out, row first.
+        //
+        // The ordering is the point. Capacity-first there would restore a full epoch behind
+        // whatever ladder is stored, which after a jump is the pre-jump one, handing a taker
+        // exactly the fill the withdrawal was for. Sending both with sequential nonces makes them
+        // execute in that order, and between the two landings the pool holds a fresh row against a
+        // zero epoch, which quotes nothing. The window the reversal exists to close stays closed.
+        //
+        // Sending *only* the row there — which is what this did until a redeployed pool sat at zero
+        // capacity for 141 cycles without ever posting an epoch — is a livelock. The row is stale
+        // every cycle precisely because the reference keeps moving, so it wins the arbitration
+        // every cycle, and the capacity refresh it is meant to precede never gets a turn. Nothing
+        // is stuck: transactions land, gas is spent, the ladder is current, and the pool quotes
+        // zero forever. That is the failure mode worth naming, because unlike a deadlock it looks
+        // exactly like a healthy process.
+        //
+        // `ladder::build` already solves against the *planned* capacity when the on-chain one is
+        // zero, so the row is coherent against the epoch that is about to follow it.
         let quote_intent = || match row.as_ref().map(ladder::QuoteRow::packed) {
             Some(Ok(word)) => Some(Intent::UpdateQuote { pair_id: pair.pair_id, word }),
             Some(Err(e)) => {
@@ -1411,21 +1424,24 @@ async fn run_cycle(
         };
         let wants_quote = quote_decision.sends();
         let wants_capacity = matches!(capacity_decision, CapacityDecision::Send(_));
-        let quote_first = ctx.withdrawn_on_chain();
-        let pushed = if wants_quote && (quote_first || !wants_capacity) {
+        let withdrawn = ctx.withdrawn_on_chain();
+
+        // A validated row that will not pack falls through rather than taking the capacity refresh
+        // down with it.
+        let pushed_quote = if wants_quote && (withdrawn || !wants_capacity) {
             match quote_intent() {
                 Some(i) => {
                     sends.push(i);
                     true
                 }
-                // A validated row that would not pack. Fall through, so a capacity refresh that
-                // also fired still goes out rather than being lost with it.
                 None => false,
             }
         } else {
             false
         };
-        if !pushed && wants_capacity {
+        // Both when the pool is dark, so it can come back; otherwise whichever one the
+        // arbitration above did not already take.
+        if wants_capacity && (withdrawn || !pushed_quote) {
             sends.push(capacity_intent());
         }
 

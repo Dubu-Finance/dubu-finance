@@ -27,19 +27,40 @@ import type { Config } from './config.js';
  * - The expiry must have [`MIN_EXPIRY_HEADROOM_SECS`] left, so a quote cannot expire between being
  *   returned and being mined.
  *
- * # Being suspicious of a good price
+ * # Checking that the maker can deliver, rather than guessing from the price
  *
- * [`MAX_IMPROVEMENT_BPS`] rejects a quote that beats the on-chain venues by more than a plausible
- * margin. A maker quoting 40% better than the AMMs is not generous, it is broken or hostile, and
- * routing into it produces a plan that reverts and a user who paid gas to find out. An RFQ leg
- * should beat the curve by tens of basis points, not by a multiple.
+ * An earlier version refused any quote beating the AMMs by more than 5%, on the reasoning that a
+ * maker quoting far better than the curve is broken or hostile. That check was aimed at the wrong
+ * variable, and the live deployment proved it: the maker quoted mWETH off a real Binance reference
+ * while the UniV2 pool — seeded once and never arbitraged — was 30% away from the market. The
+ * maker was right and the AMM was wrong, and the check rejected the correct price. The premise
+ * "the AMMs are near fair" is exactly what an aggregator cannot assume; it is what it exists to
+ * find out.
+ *
+ * What the check was reaching for is real, but it is not a price property. The failure that costs
+ * a taker gas is an order the maker *cannot honour* — insufficient balance, or an allowance that
+ * no longer covers it — and `PmmSettle` pulls both legs with `transferFrom`, so that fails at fill
+ * time with nothing useful in the trace. That is directly observable: [`checkSolvency`] reads the
+ * maker's balance and its allowance to the settler, in the same multicall the venue quotes already
+ * use. A quote the maker cannot cover is refused for the reason it will actually fail.
+ *
+ * [`MAX_IMPROVEMENT_BPS`] survives at a much wider setting, as a last-resort guard against a
+ * response that is not merely optimistic but nonsensical — a maker offering a thousand times the
+ * market is malfunctioning whatever its balance says.
  */
 
 /** A quote must still be valid this long after we return it. */
 export const MIN_EXPIRY_HEADROOM_SECS = 20;
 
-/** How far past the best AMM quote an RFQ quote may claim to be, in bps, before it is refused. */
-export const MAX_IMPROVEMENT_BPS = 500;
+/**
+ * How far past the best AMM quote an RFQ quote may claim to be, in bps, before it is refused.
+ *
+ * 100x, not the 5% an earlier version used. This is a nonsense filter, not a price opinion: on a
+ * market where the AMMs are stale a correct RFQ quote can be tens of percent better, and refusing
+ * it would be refusing the right price. What it still catches is a response that cannot be a price
+ * at all.
+ */
+export const MAX_IMPROVEMENT_BPS = 1_000_000;
 
 export interface Order {
   maker: Address;
@@ -72,19 +93,37 @@ export type RfqRejection =
   | 'wrong-size'
   | 'expired'
   | 'bad-signature'
-  | 'implausible';
+  | 'implausible'
+  | 'maker-cannot-deliver'
+  | 'refused';
 
 export interface RfqResult {
   quote: RfqQuote | null;
   rejected: RfqRejection | null;
+  /**
+   * The maker's own words, when it refused for a reason of its own.
+   *
+   * Kept because 'the maker declined, and here is why' and 'the maker could not be reached' are
+   * different operational facts and collapsing them loses the one that is actionable. A size over
+   * the maker's per-order cap read as `unreachable` until this existed, which pointed at the
+   * network instead of at the cap.
+   */
+  makerReason?: string;
 }
 
 export interface RfqRequest {
   tokenIn: Address;
   tokenOut: Address;
   amountIn: bigint;
-  /** The best the on-chain venues offered, for the plausibility check. Zero disables it. */
+  /** The best the on-chain venues offered, for the nonsense filter. Zero disables it. */
   ammAmountOut: bigint;
+  /**
+   * What the maker can actually pay out: the lesser of its balance in the maker asset and its
+   * allowance to `PmmSettle`. `undefined` skips the check, which is what happens when the read
+   * failed — a missing observation must not silently become a passing one, so the caller says so
+   * in the response rather than this pretending it verified something.
+   */
+  makerCanDeliver?: bigint;
   nowSecs: number;
 }
 
@@ -111,7 +150,16 @@ export async function requestQuote(cfg: Config, req: RfqRequest, fetchImpl = fet
         takerAmount: req.amountIn.toString(),
       }),
     });
-    if (!res.ok) return { quote: null, rejected: 'unreachable' };
+    if (!res.ok) {
+      // A 5xx is the maker failing; a 4xx is the maker declining, and it says why in the body.
+      const reason = await res
+        .json()
+        .then((b) => (b as { error?: string })?.error)
+        .catch(() => undefined);
+      return res.status >= 500
+        ? { quote: null, rejected: 'unreachable', makerReason: reason }
+        : { quote: null, rejected: 'refused', makerReason: reason ?? `http ${res.status}` };
+    }
     body = await res.json();
   } catch {
     return { quote: null, rejected: 'unreachable' };
@@ -141,9 +189,16 @@ export async function validateQuote(cfg: Config, req: RfqRequest, body: unknown)
     return { quote: null, rejected: 'malformed' };
   }
 
-  // A quote that is too good is a defect, not a gift. Skipped when there is no AMM quote to
-  // compare against, because then there is no baseline and refusing would just mean refusing every
-  // RFQ quote on a market the AMMs cannot serve — which is the market RFQ exists for.
+  // The check that matters: can the maker actually pay this out? An order it cannot cover fails
+  // at fill time inside a `transferFrom`, which costs the taker gas and yields nothing useful in
+  // the trace.
+  if (req.makerCanDeliver !== undefined && order.makerAmount > req.makerCanDeliver) {
+    return { quote: null, rejected: 'maker-cannot-deliver' };
+  }
+
+  // The nonsense filter. Wide on purpose — see MAX_IMPROVEMENT_BPS. Skipped when there is no AMM
+  // quote to compare against, because then there is no baseline and refusing would mean refusing
+  // every RFQ quote on a market the AMMs cannot serve, which is the market RFQ exists for.
   if (req.ammAmountOut > 0n) {
     const ceiling = (req.ammAmountOut * BigInt(10_000 + MAX_IMPROVEMENT_BPS)) / 10_000n;
     if (order.makerAmount > ceiling) return { quote: null, rejected: 'implausible' };

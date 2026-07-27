@@ -34,6 +34,27 @@ export const PROP_POOL_ABI = [
   },
 ] as const;
 
+/** The two ERC-20 views that say whether a maker can honour an order it signed. */
+export const ERC20_ABI = [
+  {
+    type: 'function',
+    name: 'balanceOf',
+    stateMutability: 'view',
+    inputs: [{ name: 'account', type: 'address' }],
+    outputs: [{ name: '', type: 'uint256' }],
+  },
+  {
+    type: 'function',
+    name: 'allowance',
+    stateMutability: 'view',
+    inputs: [
+      { name: 'owner', type: 'address' },
+      { name: 'spender', type: 'address' },
+    ],
+    outputs: [{ name: '', type: 'uint256' }],
+  },
+] as const;
+
 /** `UniswapV2Router02`. */
 export const UNIV2_ROUTER_ABI = [
   {

@@ -1,6 +1,6 @@
 import { createPublicClient, encodeFunctionData, decodeFunctionResult, http, type Address, type PublicClient } from 'viem';
 
-import { MULTICALL3_ABI, PROP_POOL_ABI, UNIV2_ROUTER_ABI } from './abi.js';
+import { ERC20_ABI, MULTICALL3_ABI, PROP_POOL_ABI, UNIV2_ROUTER_ABI } from './abi.js';
 import { MULTICALL3, type Config } from './config.js';
 
 /**
@@ -191,4 +191,65 @@ export function chooseSplit(amountIn: bigint, propOut: bigint[], univOut: bigint
   });
 
   return best ?? { legs: [], amountOut: 0n, solo, split: false };
+}
+
+/**
+ * The most the RFQ maker could pay out in `token`: the lesser of what it holds and what it has
+ * allowed `PmmSettle` to pull.
+ *
+ * The lesser of the two, because `PmmSettle` custodies nothing — it issues a `transferFrom` against
+ * the maker's own balance, so either being short is the same failure. Reading both is the direct
+ * form of the question "will this order settle", which is what an earlier version tried to infer
+ * from how good the price looked. See `rfq.ts`.
+ *
+ * `undefined` when either read fails, and the caller must treat that as *unverified* rather than
+ * as passing. A missing observation that quietly reads as a clean bill of health is the failure
+ * mode `markout`'s `unmarked` counter exists to avoid, in a different corner of the system.
+ */
+export async function makerCanDeliver(
+  client: PublicClient,
+  token: Address,
+  maker: Address,
+  settler: Address,
+): Promise<bigint | undefined> {
+  const calls = [
+    {
+      target: token,
+      allowFailure: true,
+      callData: encodeFunctionData({ abi: ERC20_ABI, functionName: 'balanceOf', args: [maker] }),
+    },
+    {
+      target: token,
+      allowFailure: true,
+      callData: encodeFunctionData({ abi: ERC20_ABI, functionName: 'allowance', args: [maker, settler] }),
+    },
+  ];
+
+  try {
+    const results = (await client.readContract({
+      address: MULTICALL3,
+      abi: MULTICALL3_ABI,
+      functionName: 'aggregate3',
+      args: [calls],
+    })) as readonly { success: boolean; returnData: `0x${string}` }[];
+
+    const balance = decodeUint(results[0], 'balanceOf');
+    const allowance = decodeUint(results[1], 'allowance');
+    if (balance === undefined || allowance === undefined) return undefined;
+    return balance < allowance ? balance : allowance;
+  } catch {
+    return undefined;
+  }
+}
+
+function decodeUint(
+  r: { success: boolean; returnData: `0x${string}` } | undefined,
+  functionName: 'balanceOf' | 'allowance',
+): bigint | undefined {
+  if (!r?.success) return undefined;
+  try {
+    return decodeFunctionResult({ abi: ERC20_ABI, functionName, data: r.returnData }) as bigint;
+  } catch {
+    return undefined;
+  }
 }
