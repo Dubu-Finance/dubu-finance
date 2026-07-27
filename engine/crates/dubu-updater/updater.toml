@@ -204,7 +204,10 @@ max_priority_fee_per_gas_gwei = "0.005"
 
 # A pair with an unconfirmed transaction is NOT superseded. After this long the intent is
 # abandoned (not replaced), the pair is unblocked, and the nonce is resynced from the node.
-pending_timeout_secs = 120
+# 10 seconds, against a measured 440ms median from send to preconfirmation. 120 left a nonce gap
+# unnoticed for two minutes, during which the pair is gated and the pool quotes whatever it last
+# stored.
+pending_timeout_secs = 10
 
 [skew]
 # ---------------------------------------------------------------------------
@@ -557,7 +560,19 @@ ask_capacity = "1000"
 
 # Re-post at least this often. Must sit inside the pool's own maxStaleSecs (3600 here), which is
 # checked against the chain at startup; the effective limit is min(this, 0.8 * maxStaleSecs).
-heartbeat_secs = 2400
+# 5 seconds. This is the DEAD-MAN HEARTBEAT, not a refresh convenience.
+#
+# It was 2400 (two thirds of a 3600s maxStaleSecs), which meant it effectively never fired: every
+# push observed on a live run came from adverse_drift instead. That left "the bot is dead" and
+# "the market is quiet" looking identical from the chain's side -- measured on pair 2, 12% of the
+# intervals between pushes exceeded 15s and one reached 103s, with nothing wrong.
+#
+# A staleness bound can only be tight if a push is guaranteed, so the push is now guaranteed. This
+# is what Binance's Auto-Cancel kill-switch requires of an options market maker for the same
+# reason, and what pairDecay / maxStaleSecs on chain are sized against below.
+#
+# Cost: 2 pairs x 12 pushes a minute x 0.00000012 ETH = 0.0041 ETH a day.
+heartbeat_secs = 5
 
 # Drift is measured against the EXECUTABLE TOP at the current usage, never against maxBid.
 #
@@ -612,7 +627,19 @@ capture = "0.2"
 bid_capacity = "20"
 ask_capacity = "20"
 
-heartbeat_secs = 2400
+# 5 seconds. This is the DEAD-MAN HEARTBEAT, not a refresh convenience.
+#
+# It was 2400 (two thirds of a 3600s maxStaleSecs), which meant it effectively never fired: every
+# push observed on a live run came from adverse_drift instead. That left "the bot is dead" and
+# "the market is quiet" looking identical from the chain's side -- measured on pair 2, 12% of the
+# intervals between pushes exceeded 15s and one reached 103s, with nothing wrong.
+#
+# A staleness bound can only be tight if a push is guaranteed, so the push is now guaranteed. This
+# is what Binance's Auto-Cancel kill-switch requires of an options market maker for the same
+# reason, and what pairDecay / maxStaleSecs on chain are sized against below.
+#
+# Cost: 2 pairs x 12 pushes a minute x 0.00000012 ETH = 0.0041 ETH a day.
+heartbeat_secs = 5
 adverse_drift_bps = 3
 favourable_drift_bps = 12
 capacity_divergence_pct = 30
