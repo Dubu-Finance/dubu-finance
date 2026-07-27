@@ -1138,7 +1138,7 @@ async fn run_cycle(
         let jump_withdrawn = rt.jump.withdrawn(pair.pair_id);
         if jump_withdrawn
             && (snap.bid_capacity != 0 || snap.ask_capacity != 0)
-            && !rt.sender.in_flight(pair.pair_id)
+            && !rt.sender.at_capacity(pair.pair_id)
         {
             warn!(
                 target: "jump", event = "reassert", pair_id = pair.pair_id,
@@ -1419,7 +1419,7 @@ async fn run_cycle(
             chain: status,
             view_age_secs: view_age,
             view_stale_secs: rt.cfg.chain.view_stale_secs,
-            in_flight: rt.sender.in_flight(pair.pair_id),
+            in_flight: rt.sender.at_capacity(pair.pair_id),
             jump_withdrawn,
             jump_cooloff_remaining_ms: rt
                 .jump

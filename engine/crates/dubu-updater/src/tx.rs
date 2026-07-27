@@ -26,18 +26,32 @@
 //! logs loudly with the fee it used, and the pair is unblocked. Raising the config value is the
 //! operator's move.
 //!
-//! # A pending intent is not superseded
+//! # A bounded pipeline, not one at a time
 //!
-//! One unconfirmed transaction per pair, tracked in [`Sender::pending`]. While one is
-//! outstanding, [`crate::policy`] gates the pair with `PushInFlight` and computes nothing new
-//! for it. Sending a second `updateQuote` for the same pair means two rows in flight, ordered
-//! by a sequencer that sorts on fee rather than on intent, and the one that wins may be the
-//! older one — a quote that silently goes backwards.
+//! Up to [`crate::config::TxConfig::max_in_flight`] unconfirmed transactions per pair, tracked in
+//! [`Sender::pending`]. Beyond that [`crate::policy`] gates the pair with `PushInFlight` and
+//! computes nothing new for it.
 //!
-//! The escape hatch is a timeout, not a replacement: after
-//! [`crate::config::TxConfig::pending_timeout_secs`] the intent is abandoned, the pair is
-//! unblocked, and the nonce is resynced from the node. Without it a dropped transaction freezes
-//! that pair forever.
+//! This used to be one at a time, because "two rows in flight are ordered by a sequencer that
+//! sorts on fee rather than on intent, and the one that wins may be the older one". That is true
+//! across senders and false within one: nonce ordering is absolute, so `k + 1` cannot execute
+//! before `k` however the fees compare. The old rule was paying a real cost for a hazard that
+//! does not exist here — 66 of about 300 cycles on a live run were held waiting for a receipt on
+//! a transaction that had already been preconfirmed 440ms earlier.
+//!
+//! What a pipeline does cost is head-of-line blocking: if `k` never lands, every nonce behind it
+//! is unexecutable. So the depth is bounded rather than unbounded, and a timeout on the oldest
+//! drops the whole queue for that pair rather than just the one that expired — transactions
+//! behind a gap cannot settle, and tracking them would be tracking the impossible.
+//!
+//! The reason a pipeline is safe at all is that these transactions are **idempotent overwrites,
+//! not orders**. `updateQuote` replaces the row without reading it, so a dropped one needs no
+//! retry: the next cycle computes a fresh row from the current reference and sends that. A
+//! pipeline of orders would need every one of them to arrive.
+//!
+//! The escape hatch is still a timeout rather than a replacement: after
+//! [`crate::config::TxConfig::pending_timeout_secs`] the intents are abandoned, the pair is
+//! unblocked, and the nonce is resynced from the node.
 //!
 //! # Why the envelope is encoded here
 //!
@@ -404,8 +418,11 @@ pub struct Sender {
     max_priority_fee: u128,
     transmit_allowed: bool,
     nonce: Option<u64>,
-    pending: BTreeMap<u16, Pending>,
+    /// Outstanding transactions per pair, oldest first. A `Vec` rather than one slot because the
+    /// send path pipelines — see [`Sender::at_capacity`].
+    pending: BTreeMap<u16, Vec<Pending>>,
     pending_timeout: Duration,
+    max_in_flight: usize,
 }
 
 impl Sender {
@@ -430,6 +447,7 @@ impl Sender {
             nonce: None,
             pending: BTreeMap::new(),
             pending_timeout: Duration::from_secs(cfg.pending_timeout_secs),
+            max_in_flight: cfg.max_in_flight,
         }
     }
 
@@ -447,14 +465,35 @@ impl Sender {
 
     /// Whether this pair has an unconfirmed transaction.
     #[must_use]
-    pub fn in_flight(&self, pair_id: u16) -> bool {
-        self.pending.contains_key(&pair_id)
+    /// True when this pair already has as many transactions outstanding as it is allowed.
+    ///
+    /// This was one-at-a-time, on the reasoning that two rows in flight could be reordered by a
+    /// fee-sorting sequencer and the older one could win. That reasoning does not hold for a
+    /// single sender: nonce ordering is absolute, so `k + 1` cannot execute before `k` whatever
+    /// the fees. What a second in-flight transaction genuinely costs is head-of-line blocking —
+    /// if `k` never lands, everything behind it is stuck — and the answer to that is a bound, not
+    /// a ban.
+    ///
+    /// The bound matters because the transactions here are idempotent overwrites rather than
+    /// orders. `updateQuote` replaces the row without reading it, so a dropped one needs no
+    /// retry: the next cycle computes a fresh row from the current reference and sends that. A
+    /// pipeline of quotes is therefore safe in a way a pipeline of orders would not be.
+    pub fn at_capacity(&self, pair_id: u16) -> bool {
+        self.in_flight(pair_id) >= self.max_in_flight
+    }
+
+    /// How many transactions this pair has outstanding.
+    #[must_use]
+    pub fn in_flight(&self, pair_id: u16) -> usize {
+        self.pending.get(&pair_id).map_or(0, Vec::len)
     }
 
     /// The pending transaction for a pair, if any.
     #[must_use]
     pub fn pending(&self, pair_id: u16) -> Option<&Pending> {
-        self.pending.get(&pair_id)
+        // The oldest, which is the one a timeout will fire on first and the one whose fate
+        // decides every transaction behind it.
+        self.pending.get(&pair_id).and_then(|v| v.first())
     }
 
     /// Force the next send to re-read the nonce from the node.
@@ -561,15 +600,25 @@ impl Sender {
                     )));
                 }
                 self.nonce = Some(nonce + 1);
-                self.pending.insert(
-                    intent.pair_id(),
-                    Pending { hash, kind: intent.label(), nonce, submitted_at: Instant::now() },
-                );
+                self.pending
+                    .entry(intent.pair_id())
+                    .or_default()
+                    .push(Pending { hash, kind: intent.label(), nonce, submitted_at: Instant::now() });
                 Ok(Sent::Broadcast { hash, nonce })
             }
             Err(e) => {
                 self.resync_nonce();
                 Err(TxError::Rpc(e))
+            }
+        }
+    }
+
+    /// Drops one settled transaction, and the pair's entry when it was the last.
+    fn forget(&mut self, pair_id: u16, hash: B256) {
+        if let Some(v) = self.pending.get_mut(&pair_id) {
+            v.retain(|p| p.hash != hash);
+            if v.is_empty() {
+                self.pending.remove(&pair_id);
             }
         }
     }
@@ -586,7 +635,8 @@ impl Sender {
     pub async fn poll_pending(&mut self, rpc: &Rpc) -> Vec<(u16, Pending, Settled)> {
         let mut settled = Vec::new();
         let now = Instant::now();
-        let entries: Vec<(u16, Pending)> = self.pending.iter().map(|(k, v)| (*k, *v)).collect();
+        let entries: Vec<(u16, Pending)> =
+            self.pending.iter().flat_map(|(k, v)| v.iter().map(move |p| (*k, *p))).collect();
 
         for (pair_id, p) in entries {
             match rpc.call("eth_getTransactionReceipt", json!([p.hash.to_string()])).await {
@@ -602,7 +652,7 @@ impl Sender {
                         p,
                         if ok { Settled::Confirmed { block } } else { Settled::Reverted { block } },
                     ));
-                    self.pending.remove(&pair_id);
+                    self.forget(pair_id, p.hash);
                 }
                 // Either no receipt yet, or the lookup failed. Both mean "still pending", and
                 // both are subject to the timeout below.
@@ -610,6 +660,10 @@ impl Sender {
                     let waited = now.saturating_duration_since(p.submitted_at);
                     if waited >= self.pending_timeout {
                         settled.push((pair_id, p, Settled::TimedOut { waited_secs: waited.as_secs() }));
+                        // Everything behind a timed-out transaction is dropped with it, not just
+                        // the one that expired. If nonce `k` never lands there is a gap, and every
+                        // nonce after it is unexecutable however healthy its own transaction looks
+                        // — tracking those would be tracking transactions that cannot settle.
                         self.pending.remove(&pair_id);
                         // The abandoned nonce may or may not have been consumed. Re-reading is
                         // the only way to find out, and guessing produces a stuck queue.
@@ -766,6 +820,7 @@ mod tests {
             max_fee_per_gas_gwei: "0.05".into(),
             max_priority_fee_per_gas_gwei: "0.005".into(),
             pending_timeout_secs: 120,
+            max_in_flight: 2,
         }
     }
 
@@ -779,13 +834,38 @@ mod tests {
     #[test]
     fn the_pending_map_blocks_exactly_the_pair_it_is_for() {
         let mut s = Sender::new(None, 91_342, Address::ZERO, &tx_cfg(true), 50_000_000, 5_000_000);
-        assert!(!s.in_flight(1));
+        assert!(!s.at_capacity(1));
+        assert_eq!(s.in_flight(1), 0);
         s.pending.insert(
             1,
-            Pending { hash: B256::ZERO, kind: "updateQuote", nonce: 3, submitted_at: Instant::now() },
+            vec![Pending { hash: B256::ZERO, kind: "updateQuote", nonce: 3, submitted_at: Instant::now() }],
         );
-        assert!(s.in_flight(1), "the pair with a transaction outstanding must be blocked");
-        assert!(!s.in_flight(2), "... and no other pair may be");
+        assert_eq!(s.in_flight(1), 1, "the send must be tracked");
+        assert_eq!(s.in_flight(2), 0, "and no other pair may be affected");
+        assert!(!s.at_capacity(1), "one outstanding is inside the depth of two");
+    }
+
+    /// The bound is what stops a stall burning nonces without limit. Depth, not a ban.
+    #[test]
+    fn the_pipeline_is_bounded_by_max_in_flight() {
+        let mut s = Sender::new(None, 91_342, Address::ZERO, &tx_cfg(true), 50_000_000, 5_000_000);
+        let p = |n| Pending { hash: B256::from(U256::from(n)), kind: "updateQuote", nonce: n, submitted_at: Instant::now() };
+        s.pending.insert(1, vec![p(3)]);
+        assert!(!s.at_capacity(1));
+        s.pending.entry(1).or_default().push(p(4));
+        assert!(s.at_capacity(1), "two outstanding fills the default depth");
+        assert_eq!(s.in_flight(1), 2);
+    }
+
+    /// Everything behind a gap is unexecutable, so a timeout on the oldest takes the queue with
+    /// it rather than leaving transactions that can never settle.
+    #[test]
+    fn a_timeout_drops_the_whole_queue_for_that_pair() {
+        let mut s = Sender::new(None, 91_342, Address::ZERO, &tx_cfg(true), 50_000_000, 5_000_000);
+        let p = |n| Pending { hash: B256::from(U256::from(n)), kind: "updateQuote", nonce: n, submitted_at: Instant::now() };
+        s.pending.insert(1, vec![p(3), p(4)]);
+        s.pending.remove(&1); // what the timeout branch does
+        assert_eq!(s.in_flight(1), 0);
     }
 
     #[test]

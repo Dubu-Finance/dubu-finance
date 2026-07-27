@@ -1019,6 +1019,10 @@ pub struct SkewConfig {
 fn d_vol_tau_ms() -> u64 {
     60_000
 }
+fn d_max_in_flight() -> usize {
+    2
+}
+
 fn d_vol_horizon_secs() -> u64 {
     300
 }
@@ -1382,6 +1386,18 @@ pub struct TxConfig {
     /// the nonce resynced. Until then the pair is **not** superseded.
     #[serde(default = "d_pending_timeout_secs")]
     pub pending_timeout_secs: u64,
+    /// How many transactions one pair may have outstanding at once.
+    ///
+    /// Two by default. One was the old behaviour and it cost real quote freshness: measured on a
+    /// live run, 66 of ~300 cycles were held by `PushInFlight` because a transaction sent 440ms
+    /// earlier had not produced a receipt yet.
+    ///
+    /// Raising it is safe because nonce ordering is absolute for a single sender and because
+    /// `updateQuote` is an idempotent overwrite — see `tx::Sender::at_capacity`. What it is NOT
+    /// safe to make unbounded: a stall at the head blocks everything behind it, and each queued
+    /// transaction is a nonce that has to be recovered.
+    #[serde(default = "d_max_in_flight")]
+    pub max_in_flight: usize,
 }
 
 fn d_gas_limit() -> u64 {
