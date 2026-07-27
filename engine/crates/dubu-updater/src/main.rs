@@ -54,11 +54,13 @@ use dubu_updater::config::{Config, KeySource};
 use dubu_updater::fair_value::{self, Reference, VenueQuote};
 use dubu_updater::feed::ws::MarketFeed;
 use dubu_updater::feed::{binance, bybit, coinbase, okx, FeedStatus, VenueFeeds, VenueId, VenueWatch};
+use dubu_updater::jump;
 use dubu_updater::ladder::{self, RowInputs};
 use dubu_updater::policy::{self, CapacityDecision, Context, Decision};
 use dubu_updater::risk::{Halt, KillSwitch, Position};
 use dubu_updater::skew::{self, Inventory, Volatility};
-use dubu_updater::tx::{Intent, Sender, Sent, Settled, Signer};
+use dubu_updater::spread;
+use dubu_updater::tx::{Fees, Intent, Sender, Sent, Settled, Signer};
 use dubu_updater::units::{self, FEED_SCALE};
 
 /// Exit code when the bot stops because a killswitch latched or the chain went away.
@@ -184,6 +186,11 @@ struct Runtime {
     /// indexed in lock-step with `cfg.pairs` is an invariant nothing enforces, and getting it
     /// wrong sizes one pair's skew off another pair's volatility.
     vol: BTreeMap<u16, Volatility>,
+    /// Jump detection and the cool-off state machine, one detector per pair plus the scope rule.
+    /// Fed by [`jump_scan`], which runs both inside the cycle and between cycles.
+    jump: jump::Book,
+    /// Fees for a jump withdrawal, and only for one. See [`dubu_updater::tx::Sender::send_with_fees`].
+    withdraw_fees: Fees,
     sender: Sender,
     kill: KillSwitch,
     health: ChainHealth,
@@ -320,6 +327,13 @@ async fn run(args: &Args) -> Result<i32, Box<dyn std::error::Error>> {
         vol_tau_ms = cfg.skew.vol_tau_ms,
         skew_cap_bps = cfg.skew.max_positive_bps,
         skew_floor_bps = -i32::from(cfg.skew.max_negative_bps),
+        spread_vol_coefficient = cfg.spread.vol_coefficient,
+        spread_max_half_spread_bps = cfg.spread.max_half_spread_bps,
+        jump_enabled = cfg.jump.enabled,
+        jump_sigma_k = cfg.jump.sigma_k,
+        jump_cooloff_secs = cfg.jump.cooloff_secs,
+        jump_scope = cfg.jump.scope.label(),
+        jump_scan_interval_ms = cfg.jump.scan_interval_ms,
         "dubu-updater starting"
     );
     if !cfg.tx.transmit_allowed {
@@ -395,6 +409,35 @@ async fn run(args: &Args) -> Result<i32, Box<dyn std::error::Error>> {
     let vol: BTreeMap<u16, Volatility> =
         cfg.pairs.iter().map(|p| (p.pair_id, Volatility::new(cfg.skew.vol_config()))).collect();
 
+    // Both trip bounds come from the pair's OWN configuration — the floor is its half-spread and
+    // the ceiling is `half_spread + width/2`, its absorption limit — which is what lets one global
+    // `sigma_k` be correct across two instruments whose measured sigmas differ by 3x.
+    let jump_bounds: Vec<(u16, jump::Bounds)> = cfg
+        .pairs
+        .iter()
+        .map(|p| (p.pair_id, jump::Bounds::from_pair(p.half_spread_bps, p.width_bps)))
+        .collect();
+    let jump_book = jump::Book::new(
+        &jump_bounds,
+        cfg.jump.params(&cfg.skew),
+        cfg.jump.scope,
+        cfg.jump.enabled,
+    );
+    for (id, b) in &jump_bounds {
+        info!(
+            target: "jump", event = "bounds", pair_id = id,
+            enabled = cfg.jump.enabled, scope = cfg.jump.scope.label(),
+            sigma_k = cfg.jump.sigma_k,
+            floor_bps_e2 = b.floor_bps_e2, ceiling_bps_e2 = b.ceiling_bps_e2,
+            cooloff_secs = cfg.jump.cooloff_secs, scan_interval_ms = cfg.jump.scan_interval_ms,
+            "jump trip threshold is clamp(sigma_k * sigma, half_spread, half_spread + width/2)"
+        );
+    }
+    let withdraw_fees = Fees {
+        max_fee: cfg.jump.withdraw_max_fee_wei()?,
+        max_priority_fee: cfg.jump.withdraw_priority_fee_wei()?,
+    };
+
     let health = ChainHealth::new(Instant::now(), cfg.chain.degraded_after_secs, cfg.chain.halt_after_secs);
     let mut rt = Runtime {
         cfg,
@@ -406,6 +449,8 @@ async fn run(args: &Args) -> Result<i32, Box<dyn std::error::Error>> {
         watch: VenueWatch::new(),
         heads,
         vol,
+        jump: jump_book,
+        withdraw_fees,
         sender,
         kill,
         health,
@@ -493,6 +538,7 @@ async fn quote_loop(
 ) -> i32 {
     let mut last_view: Option<ChainView> = None;
     let fallback = Duration::from_millis(rt.cfg.chain.fallback_poll_interval_ms);
+    let jump_scan_every = rt.cfg.jump.scan_interval();
     let mut halted = false;
     let mut wake = Wake::Startup;
     // Edge-triggered, so a sustained outage logs once rather than once per cycle. A watchdog
@@ -505,7 +551,14 @@ async fn quote_loop(
     // harmless, but it burns a request and puts two cycles at the same block in the log.
     head_rx.borrow_and_update();
 
-    loop {
+    // Registered ONCE and polled by reference, rather than rebuilt on every pass of the wait
+    // loop. That loop now runs at the jump scan interval rather than the block time, and a
+    // freshly-created `Signal` only receives what arrives after it exists — so rebuilding it five
+    // times a second would be five times as many windows in which a SIGTERM lands on nobody.
+    let signal = wait_for_signal();
+    tokio::pin!(signal);
+
+    'outer: loop {
         let cycle_start = Instant::now();
         cycles += 1;
 
@@ -597,34 +650,163 @@ async fn quote_loop(
             return 0;
         }
 
-        // --- the wake ----------------------------------------------------------------------
+        // --- the wake, with the jump fast lane underneath it --------------------------------
         //
         // A head and the fallback timer race in one `select!`. There is no mode flag and no
         // switch between them: when the subscription is healthy the head always wins, and when
         // it is not the timer does. That is the whole fallback mechanism, and it cannot get
         // stuck in the wrong mode because there is no mode.
-        let sleep_for = fallback.saturating_sub(cycle_start.elapsed());
-        wake = tokio::select! {
-            biased;
-            _ = shutdown.changed() => break,
-            () = wait_for_signal() => break,
-            r = head_rx.changed() => match r {
-                Ok(()) => Wake::Head(*head_rx.borrow_and_update()),
-                // The subscription task is gone for good. Not fatal: the timer is now the only
-                // driver, which is the case this loop is built to survive. Sleep out the
-                // interval here so the dead channel cannot spin.
-                Err(_) => {
-                    tokio::time::sleep(sleep_for).await;
-                    Wake::Fallback
-                }
-            },
-            () = tokio::time::sleep(sleep_for) => Wake::Fallback,
+        //
+        // The third arm is the FAST LANE, and it is the one place in this bot where latency
+        // genuinely matters. Waiting for the next head would put mean jump-detection latency at
+        // half a block; this fires every `jump.scan_interval_ms` in the same task, reads only the
+        // in-memory feed snapshots, and costs zero RPC unless something actually trips. It does
+        // NOT count as a wake: after scanning it goes straight back to waiting, so a scan never
+        // consumes a chain read or a cycle.
+        let deadline = cycle_start + fallback;
+        wake = 'wait: loop {
+            let now = Instant::now();
+            if now >= deadline {
+                break Wake::Fallback;
+            }
+            let next_scan = (now + jump_scan_every).min(deadline);
+            tokio::select! {
+                biased;
+                _ = shutdown.changed() => break 'outer,
+                () = &mut signal => break 'outer,
+                r = head_rx.changed() => match r {
+                    Ok(()) => break 'wait Wake::Head(*head_rx.borrow_and_update()),
+                    // The subscription task is gone for good. Not fatal: the timer is now the only
+                    // driver, which is the case this loop is built to survive. Fall through to the
+                    // scan/deadline loop rather than sleeping the whole interval, so the fast lane
+                    // survives the loss of the subscription too — it is the defence that must not
+                    // depend on the chain telling us anything.
+                    Err(_) => tokio::time::sleep(next_scan.saturating_duration_since(Instant::now())).await,
+                },
+                () = tokio::time::sleep_until(next_scan.into()) => {}
+            }
+            jump_scan(rt).await;
         };
     }
 
     info!(target: "loop", event = "shutdown", "shutdown signal received; withdrawing quotes");
     withdraw_quotes(&rt.cfg, &rt.rpc, &mut rt.sender).await;
     0
+}
+
+/// **The fast lane.** Sample the reference on every pair, decide whether it jumped, and withdraw
+/// immediately if it did.
+///
+/// This is deliberately the shortest path in the crate, and everything that makes it short is a
+/// decision rather than an accident:
+///
+/// * **No chain read.** It works entirely off the in-memory feed snapshots the venue sockets are
+///   already writing. Waiting for the multicall would add a round trip to a race.
+/// * **No policy.** [`policy::evaluate_capacity`]'s gates exist to stop the bot *acting* on a
+///   state it does not understand; a withdrawal is the one action that is correct in every such
+///   state, and `PushInFlight` in particular must not delay it. A pair with an unconfirmed
+///   `updateQuote` is exactly a pair that needs withdrawing, and the two calls touch different
+///   storage words — even if the quote lands after the withdrawal, the capacity is still zero and
+///   the pool still quotes nothing.
+/// * **Only on the edge.** A pair already withdrawn has its cool-off re-armed by the detector and
+///   sends nothing: `refreshCapacity(pair, 0, 0)` against a pair already at zero buys nothing and
+///   burns a nonce.
+/// * **At a raised priority fee.** See [`dubu_updater::tx::Sender::send_with_fees`]; the sequencer
+///   orders by fee and the counterparty outbids quote traffic by construction.
+///
+/// The one thing it cannot skip is the nonce. In steady state it is cached from the last quote
+/// push and the withdrawal is a single `eth_sendRawTransaction`; after a resync it costs one extra
+/// round trip. The withdrawal also inherits the nonce queue, so an earlier transaction that never
+/// lands delays it — the mitigation for that would be a second signing key, which does not exist.
+async fn jump_scan(rt: &mut Runtime) {
+    if !rt.jump.enabled() {
+        return;
+    }
+    let now = Instant::now();
+    let mut owed: Vec<u16> = Vec::new();
+
+    for i in 0..rt.cfg.pairs.len() {
+        let (pair_id, symbol) = (rt.cfg.pairs[i].pair_id, rt.cfg.pairs[i].symbol.clone());
+        let snaps = rt.feeds.snapshots(&symbol, now);
+        let mut quotes: Vec<VenueQuote> = Vec::new();
+        for (venue, s) in &snaps {
+            let Some(tick) = s.live() else { continue };
+            if let Ok(q) = VenueQuote::new(*venue, tick, s.age_ms.unwrap_or(0)) {
+                quotes.push(q);
+            }
+        }
+        // No reference means no observation. The detector's own anchor then ages, and a gap past
+        // `vol_max_sample_ms` trips it as `feed_gap` on recovery — which is the right answer,
+        // because the pool spent the outage armed behind a fixed ladder.
+        let Ok(reference) = fair_value::combine(&quotes, &rt.cfg.feed.mad_params()) else { continue };
+
+        let Some(vol) = rt.vol.get(&pair_id) else { continue };
+        let Some(obs) = rt.jump.observe(pair_id, reference.micro, now, vol) else { continue };
+
+        if let Some(reason) = obs.tripped {
+            let level = if obs.edge { "JUMP" } else { "jump (already withdrawn)" };
+            warn!(
+                target: "jump", event = "trip", pair_id, symbol = %symbol,
+                reason = reason.label(), edge = obs.edge,
+                move_bps_e2 = obs.move_bps_e2, threshold_bps_e2 = obs.threshold_bps_e2,
+                bound = obs.bound.label(), sigma_bps_e2 = obs.sigma_bps_e2, dt_ms = obs.dt_ms,
+                range_bps_e2 = obs.range_bps_e2,
+                micro = %units::format_fixed(reference.micro, FEED_SCALE),
+                trips = rt.jump.detector(pair_id).map_or(0, jump::Detector::trips),
+                cooloff_secs = rt.cfg.jump.cooloff_secs,
+                "{level}: the reference moved further than the ladder absorbs; withdrawing quotes"
+            );
+            if obs.edge {
+                owed.push(pair_id);
+                // A jump on one pair is information about the other. See `jump`'s module docs for
+                // why the asymmetry decides this: contagion's false positive is one cool-off of
+                // foregone spread, its false negative is the full pick-off on the other pair.
+                for id in rt.jump.contagion(pair_id, now) {
+                    warn!(target: "jump", event = "contagion", pair_id = id, origin = pair_id,
+                          scope = rt.jump.scope().label(),
+                          "withdrawing this pair too: a jump on the other pair is information about it");
+                    owed.push(id);
+                }
+            }
+        } else if obs.resumed {
+            info!(
+                target: "jump", event = "resume", pair_id, symbol = %symbol,
+                range_bps_e2 = obs.range_bps_e2, threshold_bps_e2 = obs.threshold_bps_e2,
+                trips = rt.jump.detector(pair_id).map_or(0, jump::Detector::trips),
+                "cool-off over: the reference has settled, capacity will be restored"
+            );
+        }
+    }
+
+    for pair_id in owed {
+        withdraw_pair(rt, pair_id, "jump").await;
+    }
+}
+
+/// Post a zero capacity epoch on one pair, at the withdrawal fees.
+async fn withdraw_pair(rt: &mut Runtime, pair_id: u16, why: &str) {
+    let intent = Intent::RefreshCapacity { pair_id, bid: 0, ask: 0 };
+    let started = Instant::now();
+    match rt.sender.send_with_fees(&rt.rpc, intent, Some(rt.withdraw_fees)).await {
+        Ok(Sent::DryRun { calldata, would_be_nonce, .. }) => info!(
+            target: "tx", event = "withdraw_dry_run", pair_id, why,
+            calldata = %dubu_updater::chain::hex0x(&calldata),
+            would_be_nonce = ?would_be_nonce,
+            max_priority_fee_wei = %rt.withdraw_fees.max_priority_fee,
+            elapsed_us = started.elapsed().as_micros(),
+            "DRY RUN: would withdraw quotes by posting a zero capacity epoch"
+        ),
+        Ok(Sent::Broadcast { hash, nonce }) => warn!(
+            target: "tx", event = "withdrawn", pair_id, why, tx = %hash, nonce,
+            max_priority_fee_wei = %rt.withdraw_fees.max_priority_fee,
+            elapsed_ms = started.elapsed().as_millis(),
+            "quotes withdrawn: capacity epoch set to zero"
+        ),
+        Err(e) => error!(
+            target: "tx", event = "withdraw_failed", pair_id, why, error = %e,
+            "COULD NOT WITHDRAW QUOTES; the next cycle will re-assert it"
+        ),
+    }
 }
 
 /// One evaluation over every pair. Returns `true` if a killswitch latched.
@@ -686,8 +868,14 @@ async fn run_cycle(
               status = status.label(), "chain view is degraded; widening every half-spread");
     }
 
+    // The jump check runs BEFORE anything else in the cycle, and before `vol.observe` folds this
+    // tick's return into the variance. Testing a jump against a sigma that already contains it is
+    // a test that can never fire.
+    jump_scan(rt).await;
+
     let mut positions: Vec<Position> = Vec::new();
     let mut sends: Vec<Intent> = Vec::new();
+    let mut reassert: Vec<u16> = Vec::new();
 
     for i in 0..rt.cfg.pairs.len() {
         let pair = rt.cfg.pairs[i].clone();
@@ -696,6 +884,24 @@ async fn run_cycle(
 
         let now = Instant::now();
         let shift = units::price_shift(meta.price_scale_exp, meta.base_decimals, meta.quote_decimals);
+
+        // Re-assert a withdrawal the chain does not show. The fast lane sends once, on the edge;
+        // if that transaction was rejected, dropped, or sent while the RPC was unavailable, the
+        // pool is still armed and the detector believes otherwise. This is the only thing that
+        // notices, and it runs at the chain's own cadence rather than the fast lane's because it
+        // needs a chain read to answer the question at all.
+        let jump_withdrawn = rt.jump.withdrawn(pair.pair_id);
+        if jump_withdrawn
+            && (snap.bid_capacity != 0 || snap.ask_capacity != 0)
+            && !rt.sender.in_flight(pair.pair_id)
+        {
+            warn!(
+                target: "jump", event = "reassert", pair_id = pair.pair_id,
+                bid_capacity = %snap.bid_capacity, ask_capacity = %snap.ask_capacity,
+                "withdrawn, but the chain still shows a capacity epoch; re-sending the withdrawal"
+            );
+            reassert.push(pair.pair_id);
+        }
 
         // --- the cross-section -------------------------------------------------------------
         //
@@ -793,6 +999,41 @@ async fn run_cycle(
         let bid_cap = if snap.bid_capacity == 0 { capacity.bid } else { snap.bid_capacity };
         let ask_cap = if snap.ask_capacity == 0 { capacity.ask } else { snap.ask_capacity };
 
+        // --- the half-spread ---------------------------------------------------------------
+        //
+        // `half_spread = min(s0 + s1 * sigma, cap) + degraded_extra`, from the SAME sigma the
+        // skew below uses. Computed before the skew, because `min_price_cap_bps` needs the spread
+        // that will actually be posted: a wider spread pushes the bid target lower and therefore
+        // leaves less room to skew down, and clamping against the unwidened value would let the
+        // skew push a row under the pair's `minPrice` and have it refused outright.
+        let spread = spread::compute(
+            pair.half_spread_bps,
+            sigma_millibps,
+            degraded_extra,
+            &rt.cfg.spread.params(),
+        );
+        let half_spread = spread.half_spread_bps;
+        // Every row, every cycle. Without these five fields, back-solving `s1` from history later
+        // is guesswork — `vol_decibps` next to `capped` is what says whether the model or the
+        // ceiling has been doing the deciding.
+        info!(
+            target: "spread", event = "half_spread", pair_id = pair.pair_id, symbol = %pair.symbol,
+            s0_bps = spread.s0_bps,
+            sigma_millibps = spread.sigma_millibps,
+            sigma_horizon_secs = rt.cfg.skew.vol_horizon_secs,
+            vol_samples,
+            s1 = rt.cfg.spread.vol_coefficient,
+            vol_decibps = spread.vol_decibps,
+            vol_bps = spread.vol_bps(),
+            vol_scaled_bps = spread.vol_scaled_bps,
+            capped = spread.capped,
+            cap_bps = rt.cfg.spread.max_half_spread_bps,
+            degraded_extra_bps = spread.degraded_extra_bps,
+            half_spread_bps = spread.half_spread_bps,
+            absorption_bps = u32::from(spread.half_spread_bps) + u32::from(pair.width_bps) / 2,
+            "volatility-scaled half-spread"
+        );
+
         // --- the inventory skew ------------------------------------------------------------
         //
         // Avellaneda-Stoikov: r = s - q * gamma * sigma^2. Computed here and applied as
@@ -800,7 +1041,6 @@ async fn run_cycle(
         // and therefore through `validateLadder` and every other check `ladder::build` runs,
         // BEFORE anything is packed. There is no path by which a skew reaches the chain
         // unvalidated.
-        let half_spread = pair.half_spread_bps.saturating_add(degraded_extra);
         let skew = fair.map(|f| {
             let inventory = Inventory {
                 base_value: dubu_updater::risk::value(base_balance, f, meta.price_scale_exp).unwrap_or(0),
@@ -889,6 +1129,11 @@ async fn run_cycle(
             view_age_secs: view_age,
             view_stale_secs: rt.cfg.chain.view_stale_secs,
             in_flight: rt.sender.in_flight(pair.pair_id),
+            jump_withdrawn,
+            jump_cooloff_remaining_ms: rt
+                .jump
+                .detector(pair.pair_id)
+                .map_or(0, |d| d.cooloff_remaining_ms(now)),
             heartbeat_secs: pair.heartbeat_secs,
             adverse_drift_bps: pair.adverse_drift_decibps(),
             favourable_drift_bps: pair.favourable_drift_decibps(),
@@ -913,23 +1158,56 @@ async fn run_cycle(
             block = view.block_number, block_timestamp = view.block_timestamp,
             view_age_secs = view_age, feed = feed_status.label(), chain = status.label(),
             venues_live = quotes.len(), venues_configured = snaps.len(),
+            half_spread_bps = half_spread,
+            jump_state = rt.jump.detector(pair.pair_id).map_or("disabled", |d| d.state().label()),
+            jump_trips = rt.jump.detector(pair.pair_id).map_or(0, jump::Detector::trips),
             "decision"
         );
 
-        // Capacity first: a ladder is worthless against a zero epoch, and posting the epoch
-        // first means the row that follows is solved against the capacity it will execute on.
-        if let CapacityDecision::Send(_) = capacity_decision {
-            sends.push(Intent::RefreshCapacity {
-                pair_id: pair.pair_id,
-                bid: capacity.bid,
-                ask: capacity.ask,
-            });
-        } else if let (Decision::Send(_), Some(r)) = (quote_decision, &row) {
-            match r.packed() {
-                Ok(word) => sends.push(Intent::UpdateQuote { pair_id: pair.pair_id, word }),
-                Err(e) => error!(target: "ladder", event = "pack_failed", pair_id = pair.pair_id,
-                                 error = %e, "a validated row would not pack; dropped"),
+        // Which of the two goes out when both fired.
+        //
+        // Ordinarily capacity first: a ladder is worthless against a zero epoch, and posting the
+        // epoch first means the row that follows is solved against the capacity it will execute on.
+        //
+        // REVERSED when the pool is currently offering no depth, which is the state a jump
+        // withdrawal leaves it in. There, capacity-first would restore a full epoch behind
+        // whatever ladder is stored — the pre-jump one — and hand a taker exactly the fill the
+        // withdrawal was for. With zero capacity the pool quotes nothing whatever is stored, so
+        // pushing the row first costs nothing and closes that window. `ladder::build` already
+        // solves against the *planned* capacity when the on-chain one is zero, so the row is
+        // coherent either way.
+        let quote_intent = || match row.as_ref().map(ladder::QuoteRow::packed) {
+            Some(Ok(word)) => Some(Intent::UpdateQuote { pair_id: pair.pair_id, word }),
+            Some(Err(e)) => {
+                error!(target: "ladder", event = "pack_failed", pair_id = pair.pair_id,
+                       error = %e, "a validated row would not pack; dropped");
+                None
             }
+            None => None,
+        };
+        let capacity_intent = || Intent::RefreshCapacity {
+            pair_id: pair.pair_id,
+            bid: capacity.bid,
+            ask: capacity.ask,
+        };
+        let wants_quote = quote_decision.sends();
+        let wants_capacity = matches!(capacity_decision, CapacityDecision::Send(_));
+        let quote_first = ctx.withdrawn_on_chain();
+        let pushed = if wants_quote && (quote_first || !wants_capacity) {
+            match quote_intent() {
+                Some(i) => {
+                    sends.push(i);
+                    true
+                }
+                // A validated row that would not pack. Fall through, so a capacity refresh that
+                // also fired still goes out rather than being lost with it.
+                None => false,
+            }
+        } else {
+            false
+        };
+        if !pushed && wants_capacity {
+            sends.push(capacity_intent());
         }
 
         if let Some(f) = fair {
@@ -940,6 +1218,12 @@ async fn run_cycle(
                 price_scale_exp: meta.price_scale_exp,
             });
         }
+    }
+
+    // Withdrawals first, and at the withdrawal fees. Everything else this cycle is a quote
+    // decision; these are a risk decision that the chain has not caught up with yet.
+    for pair_id in reassert {
+        withdraw_pair(rt, pair_id, "jump_reassert").await;
     }
 
     for intent in sends {

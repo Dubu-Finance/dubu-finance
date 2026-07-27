@@ -274,6 +274,13 @@ pub struct Config {
     pub tx: TxConfig,
     /// Inventory skew: the volatility estimator and the Avellaneda–Stoikov knobs.
     pub skew: SkewConfig,
+    /// The volatility-scaled half-spread. Defaulted, so a config written before it existed still
+    /// loads — with the term **on**, because a constant half-spread is the defect it fixes.
+    #[serde(default)]
+    pub spread: SpreadConfig,
+    /// Jump detection and withdrawal. Defaulted and **on**, for the same reason.
+    #[serde(default)]
+    pub jump: JumpConfig,
     /// Killswitches.
     pub risk: RiskConfig,
     /// One entry per pair the bot quotes.
@@ -304,6 +311,8 @@ impl Config {
         self.feed.validate()?;
         self.tx.validate()?;
         self.skew.validate()?;
+        self.spread.validate()?;
+        self.jump.validate(&self.chain)?;
         self.risk.validate()?;
 
         if self.pairs.is_empty() {
@@ -320,6 +329,17 @@ impl Config {
             // and it doubles the quote traffic for one price.
             if !seen_symbols.insert(p.symbol.clone()) {
                 return Err(invalid(format!("pairs: symbol `{}` appears twice", p.symbol)));
+            }
+            // A cap below a pair's own half-spread would silently NARROW the configured spread —
+            // `spread::compute` refuses to do that, so the config would quietly mean something
+            // other than what it says. Caught here, naming both numbers.
+            if self.spread.max_half_spread_bps < p.half_spread_bps {
+                return Err(invalid(format!(
+                    "spread.max_half_spread_bps ({}) is below pairs[{}].half_spread_bps ({}); \
+                     the cap bounds the VOLATILITY TERM and can never narrow the configured spread, \
+                     so this combination would silently disable the term for that pair",
+                    self.spread.max_half_spread_bps, p.pair_id, p.half_spread_bps
+                )));
             }
         }
         Ok(())
@@ -951,6 +971,247 @@ impl SkewConfig {
 }
 
 // ---------------------------------------------------------------------------
+// The volatility-scaled half-spread
+// ---------------------------------------------------------------------------
+
+/// `half_spread = min(s0 + s1 * sigma, cap) + degraded_extra`.
+///
+/// Global rather than per-pair, and that is the point: `s1` is dimensionless and multiplies each
+/// pair's own `sigma`, so one value is already correct across ETHUSDT at 10 bp and BTCUSDT at 3 bp.
+/// See [`crate::spread`] for the derivation of both numbers.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SpreadConfig {
+    /// `s1`, in bps of half-spread per bp of `sigma` at the estimator's horizon.
+    ///
+    /// Derived, not picked: the sweep's smallest measured-positive half-spread against a 100 bp
+    /// jump is 30 bp, and it should be reached when a 100 bp jump is a live possibility, which at
+    /// ETHUSDT's measured `sigma(300s)` of 10 bp means 5x that level. `5 + s1 * 50 = 30` gives
+    /// `s1 = 0.5`.
+    #[serde(default = "d_vol_coefficient")]
+    pub vol_coefficient: f64,
+    /// The ceiling on `s0 + s1 * sigma`. Above it, widening has stopped being a defence — the
+    /// sweep's 60 bp row earns *less* than its 30 bp row — and [`crate::jump`] is what takes over.
+    ///
+    /// 30 bp is exactly UniV2's fee, which makes the rule statable: the pool never quotes worse
+    /// than the constant-fee AMM it is trying to beat, it simply does not quote 30 bp in a calm
+    /// market. The degraded-chain widening is added *after* this cap, deliberately.
+    #[serde(default = "d_max_half_spread_bps")]
+    pub max_half_spread_bps: u16,
+}
+
+fn d_vol_coefficient() -> f64 {
+    0.5
+}
+fn d_max_half_spread_bps() -> u16 {
+    30
+}
+
+impl Default for SpreadConfig {
+    fn default() -> Self {
+        Self {
+            vol_coefficient: d_vol_coefficient(),
+            max_half_spread_bps: d_max_half_spread_bps(),
+        }
+    }
+}
+
+impl SpreadConfig {
+    /// The knobs [`crate::spread::compute`] takes.
+    #[must_use]
+    pub fn params(&self) -> crate::spread::SpreadParams {
+        crate::spread::SpreadParams {
+            vol_coefficient_e2: (self.vol_coefficient * 100.0).round().max(0.0) as u32,
+            max_half_spread_bps: self.max_half_spread_bps,
+        }
+    }
+
+    fn validate(&self) -> Result<(), ConfigError> {
+        if !self.vol_coefficient.is_finite() || !(0.0..=100.0).contains(&self.vol_coefficient) {
+            return Err(invalid(
+                "spread.vol_coefficient: must be a finite value in [0, 100]; 0 disables the \
+                 volatility term and restores the constant half-spread",
+            ));
+        }
+        if self.max_half_spread_bps == 0 {
+            return Err(invalid("spread.max_half_spread_bps: must be non-zero"));
+        }
+        if u128::from(self.max_half_spread_bps) > dubu_core::ladder::MAX_BPS {
+            return Err(invalid("spread.max_half_spread_bps: must be <= 9999"));
+        }
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Jump detection
+// ---------------------------------------------------------------------------
+
+/// Jump detection and withdrawal. See [`crate::jump`] for why every one of these is what it is.
+///
+/// There is no basis-point threshold in this table, and that is deliberate. Both bounds on the
+/// trip threshold come from the pair's own `half_spread_bps` and `width_bps` — the floor is the
+/// point at which the posted quote stops being on the right side of fair value, and the ceiling is
+/// `half_spread + width/2`, the point past which the pool pays the excess whatever the volatility
+/// estimate says. A tunable bp threshold would be one more number picked by feel, and it would be
+/// wrong on one of the two pairs whichever value it took.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct JumpConfig {
+    /// Off restores the previous behaviour exactly: quote through everything.
+    #[serde(default = "d_true")]
+    pub enabled: bool,
+    /// The sigma multiplier `k`. It only ever acts *between* the two derived bounds, so raising it
+    /// cannot make the detector numb past the absorption limit and lowering it cannot make it fire
+    /// inside the half-spread.
+    #[serde(default = "d_jump_sigma_k")]
+    pub sigma_k: f64,
+    /// Minimum withdrawal, in seconds, measured from the **most recent** trip rather than the
+    /// first. The cool-off also does not end until the reference has settled; this is its floor.
+    #[serde(default = "d_jump_cooloff_secs")]
+    pub cooloff_secs: u64,
+    /// `"book"` withdraws every pair when one trips; `"pair"` withdraws only the one that did.
+    #[serde(default = "d_jump_scope")]
+    pub scope: crate::jump::Scope,
+    /// How often the fast lane samples the reference, in milliseconds.
+    ///
+    /// **This is the reaction time, and it is the one place in this crate where latency genuinely
+    /// matters.** The quote loop wakes on `newHeads` at 1 Hz, which would put mean detection
+    /// latency at 500 ms; the fast lane runs inside the same task between wakes, reads only the
+    /// in-memory feed snapshots, and costs zero RPC unless something trips.
+    #[serde(default = "d_jump_scan_interval_ms")]
+    pub scan_interval_ms: u64,
+    /// `maxPriorityFeePerGas` for a jump withdrawal only, in gwei, as a decimal string.
+    ///
+    /// GIWA's sequencer has no public mempool and orders by **highest fee first**, and `tx.rs`
+    /// deliberately pays a flat near-zero tip on ordinary quote traffic. That is the right call for
+    /// a quote and the wrong one for a withdrawal: the withdrawal is racing a searcher who is
+    /// willing to outbid a quoting bot, and being 200 ms earlier does not win a fee auction —
+    /// paying more does. At 0.001 gwei base and ~29k gas, 0.5 gwei costs about five cents.
+    #[serde(default = "d_withdraw_priority_fee_gwei")]
+    pub withdraw_priority_fee_per_gas_gwei: String,
+    /// `maxFeePerGas` for a jump withdrawal only, in gwei. Must be at least the tip above.
+    #[serde(default = "d_withdraw_max_fee_gwei")]
+    pub withdraw_max_fee_per_gas_gwei: String,
+}
+
+fn d_true() -> bool {
+    true
+}
+fn d_jump_sigma_k() -> f64 {
+    6.0
+}
+fn d_jump_cooloff_secs() -> u64 {
+    30
+}
+const fn d_jump_scope() -> crate::jump::Scope {
+    crate::jump::Scope::Book
+}
+fn d_jump_scan_interval_ms() -> u64 {
+    200
+}
+fn d_withdraw_priority_fee_gwei() -> String {
+    "0.5".into()
+}
+fn d_withdraw_max_fee_gwei() -> String {
+    "2.0".into()
+}
+
+impl Default for JumpConfig {
+    fn default() -> Self {
+        Self {
+            enabled: d_true(),
+            sigma_k: d_jump_sigma_k(),
+            cooloff_secs: d_jump_cooloff_secs(),
+            scope: d_jump_scope(),
+            scan_interval_ms: d_jump_scan_interval_ms(),
+            withdraw_priority_fee_per_gas_gwei: d_withdraw_priority_fee_gwei(),
+            withdraw_max_fee_per_gas_gwei: d_withdraw_max_fee_gwei(),
+        }
+    }
+}
+
+impl JumpConfig {
+    /// The knobs [`crate::jump::Detector`] takes. `skew` supplies the sampling window, so the jump
+    /// detector and the volatility estimator agree on what a hole in the reference is.
+    #[must_use]
+    pub fn params(&self, skew: &SkewConfig) -> crate::jump::Params {
+        crate::jump::Params {
+            sigma_k_e2: (self.sigma_k * 100.0).round().max(0.0) as u32,
+            cooloff: std::time::Duration::from_secs(self.cooloff_secs),
+            min_sample: std::time::Duration::from_millis(skew.vol_min_sample_ms),
+            max_sample: std::time::Duration::from_millis(skew.vol_max_sample_ms),
+        }
+    }
+
+    /// The fast-lane interval.
+    #[must_use]
+    pub const fn scan_interval(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(self.scan_interval_ms)
+    }
+
+    /// Withdrawal `maxFeePerGas` in wei.
+    ///
+    /// # Errors
+    /// [`ConfigError::Units`] if the string is not a decimal.
+    pub fn withdraw_max_fee_wei(&self) -> Result<u128, ConfigError> {
+        Ok(units::parse_fixed(&self.withdraw_max_fee_per_gas_gwei, 9)?)
+    }
+
+    /// Withdrawal `maxPriorityFeePerGas` in wei.
+    ///
+    /// # Errors
+    /// [`ConfigError::Units`] if the string is not a decimal.
+    pub fn withdraw_priority_fee_wei(&self) -> Result<u128, ConfigError> {
+        Ok(units::parse_fixed(&self.withdraw_priority_fee_per_gas_gwei, 9)?)
+    }
+
+    fn validate(&self, chain: &ChainConfig) -> Result<(), ConfigError> {
+        if !self.sigma_k.is_finite() || !(0.0..=1_000.0).contains(&self.sigma_k) {
+            return Err(invalid("jump.sigma_k: must be a finite value in [0, 1000]"));
+        }
+        // A cool-off shorter than a block is not a withdrawal, it is a flicker: the transaction
+        // that posts the zero epoch would not have confirmed before the resume was already due.
+        let block_secs = chain.block_time_ms.div_ceil(1_000).max(1);
+        if self.cooloff_secs < block_secs {
+            return Err(invalid(format!(
+                "jump.cooloff_secs ({}) is below one block time ({block_secs}s); \
+                 the withdrawal would not have confirmed before the resume was due",
+                self.cooloff_secs
+            )));
+        }
+        if self.cooloff_secs > 3_600 {
+            return Err(invalid("jump.cooloff_secs: must be <= 3600"));
+        }
+        if !(20..=10_000).contains(&self.scan_interval_ms) {
+            return Err(invalid("jump.scan_interval_ms: must be 20..=10000"));
+        }
+        // The fast lane exists to beat the head cadence. Set above it, it is strictly worse than
+        // doing the check in the cycle and reads as a reaction time it does not deliver.
+        if self.scan_interval_ms > chain.block_time_ms {
+            return Err(invalid(format!(
+                "jump.scan_interval_ms ({}) exceeds chain.block_time_ms ({}); \
+                 the quote loop already wakes on every head, so a slower fast lane detects \
+                 nothing sooner and only looks like it does",
+                self.scan_interval_ms, chain.block_time_ms
+            )));
+        }
+        let max = self.withdraw_max_fee_wei()?;
+        let tip = self.withdraw_priority_fee_wei()?;
+        if max == 0 {
+            return Err(invalid("jump.withdraw_max_fee_per_gas_gwei: must be non-zero"));
+        }
+        if tip > max {
+            return Err(invalid(format!(
+                "jump.withdraw_priority_fee_per_gas_gwei ({tip} wei) exceeds \
+                 jump.withdraw_max_fee_per_gas_gwei ({max} wei)"
+            )));
+        }
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Transactions
 // ---------------------------------------------------------------------------
 
@@ -1484,6 +1745,85 @@ capacity_divergence_pct = 30
         assert_eq!(cfg.pairs.len(), 1);
         assert_eq!(cfg.pairs[0].capture_units().unwrap(), 20_000_000_000_000_000_000);
         assert_eq!(cfg.pairs[0].target_base_share_ppm(), 500_000);
+    }
+
+    // -----------------------------------------------------------------------
+    // The volatility-scaled spread and the jump withdrawal
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn both_defences_default_to_on_in_a_config_written_before_they_existed() {
+        // `good()` has no `[spread]` and no `[jump]` table. A constant half-spread and quoting
+        // through a jump are the defects these fix, so absence must not mean off.
+        let cfg = parse(good()).unwrap();
+        assert!((cfg.spread.vol_coefficient - 0.5).abs() < 1e-9);
+        assert_eq!(cfg.spread.max_half_spread_bps, 30);
+        assert_eq!(cfg.spread.params().vol_coefficient_e2, 50);
+        assert!(cfg.jump.enabled);
+        assert!((cfg.jump.sigma_k - 6.0).abs() < 1e-9);
+        assert_eq!(cfg.jump.cooloff_secs, 30);
+        assert_eq!(cfg.jump.scope, crate::jump::Scope::Book);
+        assert_eq!(cfg.jump.scan_interval_ms, 200);
+        assert_eq!(cfg.jump.params(&cfg.skew).sigma_k_e2, 600);
+        // The withdrawal fee is 100x the ordinary tip, which is the point of it existing.
+        assert_eq!(cfg.jump.withdraw_priority_fee_wei().unwrap(), 500_000_000);
+        assert!(cfg.jump.withdraw_priority_fee_wei().unwrap() > cfg.tx.max_priority_fee_wei().unwrap());
+    }
+
+    #[test]
+    fn the_scope_is_a_word_and_a_misspelling_is_a_hard_error() {
+        let s = format!("{}\n[jump]\nscope = \"book\"\n", good());
+        assert_eq!(parse(&s).unwrap().jump.scope, crate::jump::Scope::Book);
+        let s = format!("{}\n[jump]\nscope = \"pair\"\n", good());
+        assert_eq!(parse(&s).unwrap().jump.scope, crate::jump::Scope::Pair);
+        let s = format!("{}\n[jump]\nscope = \"everything\"\n", good());
+        assert!(matches!(parse(&s), Err(ConfigError::Parse(_))));
+    }
+
+    #[test]
+    fn a_cap_below_a_pairs_own_half_spread_is_refused_rather_than_silently_narrowing_it() {
+        // `spread::compute` floors at `s0` and would never narrow the configured spread, so this
+        // config does not do damage — it does something other than what it says, which is what
+        // this file exists to catch.
+        let s = format!("{}\n[spread]\nmax_half_spread_bps = 3\n", good());
+        assert!(matches!(parse(&s), Err(ConfigError::Invalid(m)) if m.contains("can never narrow")));
+    }
+
+    #[test]
+    fn a_cooloff_shorter_than_a_block_is_refused() {
+        // The withdrawal transaction would not have confirmed before the resume was already due,
+        // which is a flicker rather than a withdrawal.
+        let s = format!("{}\n[jump]\ncooloff_secs = 0\n", good());
+        assert!(matches!(parse(&s), Err(ConfigError::Invalid(m)) if m.contains("below one block time")));
+    }
+
+    #[test]
+    fn a_fast_lane_slower_than_the_block_time_is_refused() {
+        // The fast lane exists to beat the head cadence. Set above it, it detects nothing sooner
+        // than the ordinary cycle would and only looks like it does.
+        let s = format!("{}\n[jump]\nscan_interval_ms = 2000\n", good());
+        assert!(matches!(parse(&s), Err(ConfigError::Invalid(m)) if m.contains("exceeds chain.block_time_ms")));
+    }
+
+    #[test]
+    fn the_volatility_term_can_be_switched_off_without_removing_it() {
+        // `0` restores the constant half-spread exactly, which is what a bisection against the
+        // simulator needs in order to attribute a change to this feature and not to the other one.
+        let s = format!("{}\n[spread]\nvol_coefficient = 0.0\n", good());
+        let cfg = parse(&s).unwrap();
+        assert_eq!(cfg.spread.params().vol_coefficient_e2, 0);
+        let sp = crate::spread::compute(5, 10_000, 0, &cfg.spread.params());
+        assert_eq!(sp.half_spread_bps, 5);
+    }
+
+    #[test]
+    fn the_jump_detector_shares_the_volatility_estimators_sampling_window() {
+        // What counts as a hole in the reference has to be one number, not two: the estimator
+        // re-anchors on it and the detector trips on it, and they must agree about where it is.
+        let cfg = parse(good()).unwrap();
+        let p = cfg.jump.params(&cfg.skew);
+        assert_eq!(p.max_sample.as_millis() as u64, cfg.skew.vol_max_sample_ms);
+        assert_eq!(p.min_sample.as_millis() as u64, cfg.skew.vol_min_sample_ms);
     }
 
     // -----------------------------------------------------------------------

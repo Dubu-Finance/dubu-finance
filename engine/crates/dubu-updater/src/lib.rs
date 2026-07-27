@@ -9,12 +9,39 @@
 //!   Binance / OKX / Bybit (wss)   Nodit newHeads (wss) ──> wakes the loop, 1s
 //!            |                    GIWA flashblocks (http, `pending`) ──> state, ~200ms
 //!            v                                      v
-//!   feed ──> fair_value ──> skew ──> ladder ──> policy ──> tx ──> PropPool.updateQuote
-//!   (n venues) (MAD +        (A-S)   (dubu-core) (send?)         PropPool.refreshCapacity
-//!              quorum)                              ^
-//!                                                   |
-//!                                            risk (killswitches)
+//!   feed ──> fair_value ──> spread ──> skew ──> ladder ──> policy ──> tx ──> updateQuote
+//!   (n venues) (MAD +      (s0+s1σ)    (A-S)  (dubu-core)  (send?)          refreshCapacity
+//!    |         quorum)                                        ^
+//!    |                                                        |
+//!    └──────> jump ────────────────────────────────────> tx   risk (killswitches)
+//!             (fast lane, 200ms, no chain read)
 //! ```
+//!
+//! # Two defences against adverse selection, and they do different jobs
+//!
+//! The measured problem is not diffusion. A simulator run over the pool as configured found that
+//! **pure diffusion produces zero informed fills** — at 1 bp/s with 2 s of quote latency the posted
+//! quote is never wrong by more than ~1.4 bp against a 5 bp half-spread — and that one 100 bp jump
+//! produced the entire -$16,580. The controlling arithmetic is
+//!
+//! ```text
+//! absorption = half_spread + width / 2
+//! loss       = (reference error - absorption) x exposed depth
+//! ```
+//!
+//! [`spread`] widens the absorption limit with volatility, because jumps cluster with it. It
+//! cannot solve the problem on its own: the sweep needs a **constant 30 bp** half-spread before the
+//! sign flips against a 100 bp jump, and a constant 30 bp is UniV2's fee.
+//!
+//! [`jump`] is what handles the rest. Above the absorption limit no spread a market maker would
+//! post is profitable, so the pool stops quoting: `refreshCapacity(pair, 0, 0)`, held until the
+//! reference settles. It runs on a **fast lane** between quote cycles, off the in-memory feed
+//! snapshots, with no chain read and none of [`policy`]'s gates in front of it — that is the one
+//! place in this crate where latency genuinely matters, because it is a race against a searcher.
+//!
+//! Both read the **one** volatility estimator in [`skew::Volatility`]. There is deliberately no
+//! second one: two estimates of how volatile the market is would be two things to keep consistent
+//! and two ways to be wrong.
 //!
 //! # Several venues, deliberately not one
 //!
@@ -91,9 +118,11 @@ pub mod chain;
 pub mod config;
 pub mod fair_value;
 pub mod feed;
+pub mod jump;
 pub mod ladder;
 pub mod policy;
 pub mod risk;
 pub mod skew;
+pub mod spread;
 pub mod tx;
 pub mod units;

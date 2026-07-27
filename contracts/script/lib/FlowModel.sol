@@ -239,6 +239,30 @@ library FlowModel {
         uint256 favourableDriftE2;
         uint256 heartbeatSecs;
         uint256 capacityDivergencePct;
+        // --- the defences, mirroring updater.toml and PropPool's capacity ramp ---
+        /// @dev Volatility coefficient, hundredths of a bp of half-spread per bp of sigma.
+        ///      `halfSpread = min(halfSpreadBps + s1 * sigma_300s, capBps)`. 50 == 0.5, the value
+        ///      `updater.toml` derives from this simulator's own half-spread sweep. Zero
+        ///      reproduces the pre-defence constant spread, which is how the before column of
+        ///      every comparison here is produced.
+        uint256 s1E2;
+        /// @dev Ceiling on the scaled half-spread. An unbounded spread in a volatility spike is a
+        ///      quoting outage wearing a disguise.
+        uint256 halfSpreadCapBps;
+        /// @dev A one-second reference move at or above this trips the jump detector, in
+        ///      hundredths of a bp. Zero disables it.
+        uint256 jumpThresholdE2;
+        /// @dev How long quotes stay withdrawn after a jump. The cost of a false positive is one
+        ///      of these in foregone spread.
+        uint256 cooloffSecs;
+        /// @dev Seconds between the detector firing and the withdrawal LANDING. This is the whole
+        ///      question: a withdrawal is a transaction, it races the searcher, and on a
+        ///      fee-ordered sequencer the searcher can outbid it. A value of zero would model a
+        ///      wish rather than a defence.
+        uint256 withdrawLatencySecs;
+        /// @dev PropPool's staleness ramp, seconds. Depth falls linearly from full at the moment
+        ///      of the push to zero at this age. Zero disables it, which is the pool's default.
+        uint16 decaySecs;
         // --- the flow ---
         uint256 uninformedPerHour;
         /// @dev Saturation arrival rate, per second, scaled by 1e6. 1e6 == one per block.
@@ -440,6 +464,39 @@ library FlowModel {
     // The ladder — byte for byte DubuScript._ladder and IntegrationTest._pushLadder
     // =====================================================================
 
+    /// @notice The half-spread the updater would post right now, given realised volatility.
+    ///
+    /// @dev Mirrors `spread.rs`. The constant half-spread was the thing the baseline runs showed
+    ///      to be indefensible: the absorption limit is `halfSpread + width/2`, it was fixed at
+    ///      17.5 bp, and a jump larger than that costs the pool the full excess across the whole
+    ///      epoch. Scaling by sigma is what makes the limit move with the risk it is sized for.
+    ///
+    ///      `sigmaE2` here is the per-second volatility the path was built with, scaled to the
+    ///      300 s horizon the updater's estimator reports, so the coefficient means the same
+    ///      thing in both places: `sigma_300 = sigma_1s * sqrt(300)`.
+    function halfSpreadAt(Params memory p) internal pure returns (uint256) {
+        if (p.s1E2 == 0) return p.halfSpreadBps;
+
+        // sqrt(300) in fixed point, x1000, so the whole thing stays in integers.
+        uint256 sigma300E2 = (p.sigmaE2 * 17_320) / 1000;
+        uint256 scaled = p.halfSpreadBps + (p.s1E2 * sigma300E2) / 10_000;
+
+        uint256 cap = p.halfSpreadCapBps == 0 ? type(uint256).max : p.halfSpreadCapBps;
+        return scaled > cap ? cap : scaled;
+    }
+
+    /// @notice Did the reference move far enough in one second to count as a jump?
+    ///
+    /// @dev Mirrors `jump.rs`'s detector, on the same input it sees: consecutive observations of
+    ///      the reference. The threshold is absolute rather than a sigma multiple here because
+    ///      the scripted paths hold sigma fixed, so the two are interchangeable within a run and
+    ///      an absolute number is the one a reader can check against the jump they configured.
+    function isJump(uint256 prevRef, uint256 nowRef, uint256 thresholdE2) internal pure returns (bool) {
+        if (thresholdE2 == 0 || prevRef == 0) return false;
+        uint256 diff = nowRef > prevRef ? nowRef - prevRef : prevRef - nowRef;
+        return (diff * 1_000_000) / prevRef >= thresholdE2;
+    }
+
     function ladder(uint256 mid, uint256 halfSpreadBps, uint256 widthBps)
         internal
         pure
@@ -468,10 +525,44 @@ library FlowModel {
     /// @dev `usedGen != capGen` means the used counters belong to a previous epoch and read as
     ///      zero. Reproduced here rather than collapsed by `snapshot`, exactly as `IPropPool`
     ///      documents.
+    /// @notice The CURVE's capacity and usage — the numbers the ladder is priced against.
+    ///
+    /// @dev Not the fillable bound. Once a pair has a staleness ramp the two diverge, and
+    ///      substituting one for the other is a real error in both directions: feed the decayed
+    ///      number to `PropCurve` and every size reprices, because the ladder's slope is defined
+    ///      against the nominal epoch; size a trade against the nominal number and it reverts.
+    ///      `IPropPool.PairSnapshot`'s docs state the rule as: age changes how much you can fill,
+    ///      never the price of what you can. Use `fillable` below for the bound.
     function room(IPropPool.PairSnapshot memory s, bool isBid) internal pure returns (uint256 capacity, uint256 used) {
         capacity = isBid ? uint256(s.bidCapacity) : uint256(s.askCapacity);
         if (s.usedGen == s.capGen) used = isBid ? uint256(s.bidUsed) : uint256(s.askUsed);
         if (used > capacity) used = capacity;
+    }
+
+    /// @notice How much BASE this side will actually accept right now, after the staleness ramp.
+    ///
+    /// @dev A live call rather than a field, because the ramp is a function of `block.timestamp`
+    ///      and `PairSnapshot` is deliberately a static tuple that off-chain consumers mirror
+    ///      positionally. This is the number the pool's own capacity guard checks.
+    ///
+    ///      Reading it is not optional for anyone sizing a trade. Skipping it is how this file
+    ///      first "measured" the staleness ramp as a perfect defence: the informed solver bisected
+    ///      against the nominal epoch, every candidate size reverted, and the run reported zero
+    ///      informed fills at every withdrawal latency including two minutes. The pool was not
+    ///      defended, the model was blind.
+    ///      Returns the ROOM — what is left after usage — as one value rather than the pair, so a
+    ///      caller does not have to spend two stack slots on it. Both harnesses sit at the legacy
+    ///      code generator's limit and `via_ir` is off in this repo's default profile.
+    function fillableRoom(IPropPool pool, uint16 pairId, IPropPool.PairSnapshot memory s, bool isBid)
+        internal
+        view
+        returns (uint256)
+    {
+        (uint96 bidCap, uint96 askCap,) = pool.effectiveCapacity(pairId);
+        uint256 available = isBid ? uint256(bidCap) : uint256(askCap);
+        uint256 used;
+        if (s.usedGen == s.capGen) used = isBid ? uint256(s.bidUsed) : uint256(s.askUsed);
+        return used >= available ? 0 : available - used;
     }
 
     /// @notice The price a taker gets right now for an infinitesimal size, per side.
@@ -548,6 +639,7 @@ library FlowModel {
     ///      worse for the pool — a risk tool should not round in its own favour.
     function informedAskSize(
         IPropPool.PairSnapshot memory s,
+        uint256 fillableRoom,
         uint256 refNet,
         uint256 scale,
         uint256 baseReserve,
@@ -558,6 +650,7 @@ library FlowModel {
         if (v.capacity == 0 || v.used >= v.capacity || s.maxAsk == 0) return 0;
 
         v.hi = v.capacity - v.used;
+        if (v.hi > fillableRoom) v.hi = fillableRoom; // the ramp, not the epoch
         if (v.hi > baseReserve) v.hi = baseReserve;
         if (v.hi == 0) return 0;
 
@@ -589,6 +682,7 @@ library FlowModel {
     ///         still monotone and the bisection is still exact.
     function informedBidSize(
         IPropPool.PairSnapshot memory s,
+        uint256 fillableRoom,
         uint256 refNet,
         uint256 scale,
         uint256 quoteReserve,
@@ -599,6 +693,7 @@ library FlowModel {
         if (v.capacity == 0 || v.used >= v.capacity) return 0;
 
         v.hi = v.capacity - v.used;
+        if (v.hi > fillableRoom) v.hi = fillableRoom; // the ramp, not the epoch
         v.pLow = s.minBid;
         v.pHigh = s.maxBid;
         v.refNet = refNet;
@@ -757,8 +852,14 @@ library FlowModel {
     }
 
     function _printMakerParams(Params memory p) private pure {
-        string memory head =
-            string.concat("  maker: half-spread ", u2s(p.halfSpreadBps), "bp  width ", u2s(p.widthBps), "bp");
+        string memory head = string.concat(
+            "  maker: half-spread ",
+            u2s(p.halfSpreadBps),
+            p.s1E2 == 0 ? "bp (constant)" : string.concat("->", u2s(halfSpreadAt(p)), "bp at this sigma"),
+            "  width ",
+            u2s(p.widthBps),
+            "bp"
+        );
         console2.log(
             string.concat(
                 head,

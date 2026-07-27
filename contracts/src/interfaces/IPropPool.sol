@@ -48,26 +48,51 @@ interface IPropPool {
     ///      accept a capacity that could push a quote leg past it, so a snapshot never describes a
     ///      pair whose own capacity is out of domain.
     ///
+    ///      ## The two capacity fields are the CURVE's capacity, not the fillable bound
+    ///
+    ///      They were the same number until the pool grew a staleness ramp, and for a pair with
+    ///      `flags` bit 14 clear they still are. When that bit is set, the pair's fillable depth
+    ///      shrinks linearly with the age of the ladder, and a simulator needs **both** numbers:
+    ///
+    ///        * `bidCapacity` / `askCapacity` — the nominal epoch. Feed these to `PropCurve`. The
+    ///          ladder's slope is defined against them, so substituting anything else reprices
+    ///          every size.
+    ///        * `PropPool.effectiveCapacity(pairId)` — the bound. Clamp the trade's BASE leg by
+    ///          `effective - used` after pricing it. This is what the pool's own capacity guard
+    ///          checks and the only thing the ramp changes.
+    ///
+    ///      Stated as one rule: **age changes how much you can fill, never the price of what you
+    ///      can.** A quote for a size that still fits is the identical number at every age; a quote
+    ///      for a size that no longer fits is zero. There is no third outcome.
+    ///
     ///      ## `flags`
     ///
     ///      | bit    | meaning                                                                  |
     ///      |--------|--------------------------------------------------------------------------|
     ///      | 0      | paused — this pair will not quote or fill                                 |
-    ///      | 1..14  | reserved                                                                 |
+    ///      | 1..13  | reserved                                                                 |
+    ///      | 14     | **decaying** — fillable depth shrinks with the age of the quote           |
     ///      | 15     | **bounded** — a reference oracle is configured for this pair              |
     ///
-    ///      Bits 0..14 are read straight out of the pool's capacity word. **Bit 15 is derived, not
-    ///      stored**, and is the answer to "is this pair's ladder checked against an independent
-    ///      price, or does it quote on the operator's word alone?" Zero is a supported production
-    ///      configuration — not every listable asset has a Pyth feed, and a pair that could not be
-    ///      listed without one would simply not be listed — so an integrator sizing its exposure to
-    ///      this venue should be able to tell the two apart, and this is where.
+    ///      Bits 0..13 are read straight out of the pool's capacity word. **Bits 14 and 15 are
+    ///      derived, not stored.**
     ///
-    ///      The bit says a bound is *configured*, not that it is currently *satisfiable*; the
-    ///      latter needs a live oracle read, which no function under the no-revert contract makes.
-    ///      `PropPool.pairOracle(pairId)` returns the full configuration and
-    ///      `PropPool.referencePrice(pairId)` returns the current reference with a status code,
-    ///      both totally, if you need more than the bit.
+    ///      Bit 15 answers "is this pair's ladder checked against an independent price, or does it
+    ///      quote on the operator's word alone?" Zero is a supported production configuration — not
+    ///      every listable asset has a Pyth feed, and a pair that could not be listed without one
+    ///      would simply not be listed — so an integrator sizing its exposure to this venue should
+    ///      be able to tell the two apart, and this is where. It says a bound is *configured*, not
+    ///      that it is currently *satisfiable*; the latter needs a live oracle read, which no
+    ///      function under the no-revert contract makes.
+    ///
+    ///      Bit 14 answers "are the two capacity fields above still the fillable bound?" It exists
+    ///      because this struct is a static tuple that cannot grow a field (below) while the answer
+    ///      changed, and because getting it wrong is silent: an integrator who assumes the old
+    ///      meaning sizes against depth the pool will not serve and routes into a zero quote.
+    ///
+    ///      `PropPool.pairOracle(pairId)`, `PropPool.referencePrice(pairId)` and
+    ///      `PropPool.effectiveCapacity(pairId)` are the authoritative answers behind the two bits,
+    ///      all three total.
     ///
     ///      **Do not append fields to this struct.** It is a static tuple and off-chain consumers
     ///      mirror it positionally — the Rust updater declares its own `sol!` copy — so a new
@@ -129,10 +154,7 @@ interface IPropPool {
     ///      `amountIn` is base when `tokenIn` is the pair's base token and quote otherwise; the
     ///      return is always the other token. Zero-cost integration path — do not break the
     ///      signature.
-    function getAmountOut(address tokenIn, address tokenOut, uint256 amountIn)
-        external
-        view
-        returns (uint256 amountOut);
+    function getAmountOut(address tokenIn, address tokenOut, uint256 amountIn) external view returns (uint256 amountOut);
 
     /// @notice Inverse of `getAmountOut`: the input needed to receive exactly `amountOut`.
     ///
@@ -141,18 +163,44 @@ interface IPropPool {
     ///
     ///      Rounds up: the returned input is the least one that delivers at least `amountOut`, so
     ///      `getAmountOut(getAmountIn(y)) >= y` and any sub-unit surplus stays with the pool.
-    function getAmountIn(address tokenIn, address tokenOut, uint256 amountOut)
-        external
-        view
-        returns (uint256 amountIn);
+    function getAmountIn(address tokenIn, address tokenOut, uint256 amountOut) external view returns (uint256 amountIn);
 
     /// @notice Index-addressed quote. `isBid == true` means base in / quote out; `false` means
     ///         quote in / base out. Same math and the same no-revert obligation as `getAmountOut`,
     ///         one lookup cheaper.
     function quoteByPair(uint16 pairId, bool isBid, uint256 amountIn) external view returns (uint256 amountOut);
 
-    /// @notice Full curve state for one pair, for off-chain simulation.
+    /// @notice Full curve state for one pair, for off-chain simulation. Pair it with
+    ///         `effectiveCapacity` when `flags` bit 14 is set — see `PairSnapshot`.
     function snapshot(uint16 pairId) external view returns (PairSnapshot memory);
+
+    /// @notice The capacity bound the pool will actually enforce for `pairId` right now, on both
+    ///         sides, in BASE units — `snapshot`'s capacities after the staleness ramp.
+    ///
+    /// @dev Same no-revert obligation as the quoting views, for the same reason: this is a call an
+    ///      aggregator makes in the same multicall as its quotes, and one poisoned pair must not
+    ///      take the batch down. Every state answers, including an unknown pair.
+    ///
+    ///      **This is a bound, not a price.** The returned numbers cap the BASE leg of a trade —
+    ///      `amountIn` for a bid, `amountOut` for an ask — against `snapshot().bidUsed` /
+    ///      `.askUsed`. They must **not** be substituted for `snapshot().bidCapacity` /
+    ///      `.askCapacity` in a `PropCurve` call: the curve's capacity is what defines the ladder's
+    ///      slope, it does not move with age, and swapping in the decayed number would produce a
+    ///      price the pool never quotes.
+    ///
+    ///      Zero on both sides means the pool will not fill at any size right now. That is one
+    ///      answer to several questions — paused, never quoted, past the staleness cliff, or a ramp
+    ///      that has completed — and `decaySecs` together with `snapshot()` distinguishes them.
+    ///
+    /// @return bidCapacity base the pool will still buy this epoch, after the ramp.
+    /// @return askCapacity base the pool will still sell this epoch, after the ramp.
+    /// @return decaySecs   age at which the ramp reaches zero, in seconds. **Zero means the ramp is
+    ///                     disabled for this pair**, in which case the two capacities above are
+    ///                     `snapshot()`'s unchanged whenever the pair is quoting at all.
+    function effectiveCapacity(uint16 pairId)
+        external
+        view
+        returns (uint96 bidCapacity, uint96 askCapacity, uint16 decaySecs);
 
     // ---------------------------------------------------------------------
     // Swapping

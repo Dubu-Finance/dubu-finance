@@ -251,7 +251,7 @@ contract PropPoolTest is Test {
         uint256[] memory oneCap = new uint256[](1);
         oneCap[0] = _packCapacity(PAIR, BID_CAP, ASK_CAP);
 
-        fns = new Fn[](44);
+        fns = new Fn[](46);
         uint256 i;
 
         // --- the three functions the updater is supposed to reach, and nothing else ---
@@ -288,6 +288,13 @@ contract PropPoolTest is Test {
             "setPairOracle", abi.encodeCall(PropPool.setPairOracle, (PAIR, bytes32(uint256(1)), 100, 60, int8(12))),
             Gate.ManagerOnly
         );
+        // The other half of the same leash, and for the same reason. `decaySecs` bounds how much
+        // depth a ladder the updater stopped refreshing can still lose; a hot key that could zero
+        // its own decay window could restore its own full exposure, which is exactly the hole
+        // `setPairOracle` sits under this heading to close. Note the storage it writes lives in the
+        // capacity word `refreshCapacity` owns — `_refreshCapacity` preserves it rather than
+        // writing it, and this line is the assertion that the preservation is not merely polite.
+        fns[i++] = Fn("setPairDecay", abi.encodeCall(PropPool.setPairDecay, (PAIR, 30)), Gate.ManagerOnly);
 
         // --- guardian ---
         fns[i++] = Fn("pause", abi.encodeCall(PropPool.pause, (PAIR)), Gate.GuardianOnly);
@@ -320,6 +327,10 @@ contract PropPoolTest is Test {
         );
         fns[i++] = Fn("quoteByPair", abi.encodeCall(PropPool.quoteByPair, (PAIR, true, 1e18)), Gate.ViewOnly);
         fns[i++] = Fn("snapshot", abi.encodeCall(PropPool.snapshot, (PAIR)), Gate.ViewOnly);
+        // `snapshot`'s two capacity fields are the CURVE's capacity; this is the fillable bound
+        // after the staleness ramp. A separate view rather than two more fields on `PairSnapshot`,
+        // which is a static tuple mirrored positionally off chain and must not grow.
+        fns[i++] = Fn("effectiveCapacity", abi.encodeCall(PropPool.effectiveCapacity, (PAIR)), Gate.ViewOnly);
         fns[i++] = Fn("pairIdFor", abi.encodeCall(PropPool.pairIdFor, (address(base), address(quote))), Gate.ViewOnly);
         fns[i++] = Fn("getSupportedPairs", abi.encodeCall(PropPool.getSupportedPairs, ()), Gate.ViewOnly);
         fns[i++] = Fn("reserveOf", abi.encodeCall(PropPool.reserveOf, (address(quote))), Gate.ViewOnly);

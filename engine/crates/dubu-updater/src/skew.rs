@@ -243,6 +243,28 @@ impl Volatility {
     pub fn sigma_millibps(&self) -> u64 {
         u64::try_from(isqrt(self.sigma_sq_bps_e6())).unwrap_or(u64::MAX)
     }
+
+    /// `sigma` over an **arbitrary** interval, in hundredths of a basis point.
+    ///
+    /// The horizon above is a property of the skew — it is the window over which an adverse move
+    /// against inventory counts as a real loss. [`crate::jump`] asks a different question, about a
+    /// single observation, and needs the same estimate scaled to that observation's own interval
+    /// instead. This is the *only* way to get it: adding a second, faster estimator would be two
+    /// numbers to keep consistent and two ways to be wrong about how volatile the market is.
+    ///
+    /// The same square-root-of-time scaling as [`Volatility::sigma_sq_bps_e6`], so a fast-lane
+    /// scan at 200 ms and a cycle scan at 1 s are compared against thresholds that differ by
+    /// exactly `sqrt(5)`, which is what makes the two sampling rates interchangeable.
+    ///
+    /// ```text
+    /// sigma_bps(dt)^2 = var_per_sec * dt_ms / (1000 * 10^8)
+    /// in hundredths of a bp, that is  * 10^4, i.e.  var_per_sec * dt_ms / 10^7
+    /// ```
+    #[must_use]
+    pub fn sigma_bps_e2_over_ms(&self, dt_ms: u64) -> u32 {
+        let v = self.var_per_sec.saturating_mul(u128::from(dt_ms)) / 10_000_000;
+        u32::try_from(isqrt(v)).unwrap_or(u32::MAX)
+    }
 }
 
 /// Integer square root, by Newton's method. Used only for the human-readable `sigma`.
@@ -550,6 +572,50 @@ mod tests {
             (150..=200).contains(&sigma_bps),
             "expected ~173 bps over the 300s horizon, got {sigma_bps}"
         );
+    }
+
+    #[test]
+    fn the_same_estimator_answers_for_a_single_observation_too() {
+        // `jump` tests one observation, not a 300s holding period, so it asks the SAME estimator
+        // for sigma over its own interval. Two estimators would be two ways to disagree about how
+        // volatile the market is.
+        let mut v = Volatility::new(vol_cfg());
+        let mut t = Instant::now();
+        let base = 100_000_000_000u128;
+        let bp = base / 10_000;
+        // A +-1 bp per second alternation: per-second sigma is 1 bp, so sigma(300s) is
+        // sqrt(300) = 17.3 bp and sigma(1s) is 1 bp = 100 hundredths.
+        for i in 0..2_000 {
+            v.observe(if i % 2 == 0 { base } else { base + bp }, t);
+            t += Duration::from_millis(1_000);
+        }
+        let one_sec = v.sigma_bps_e2_over_ms(1_000);
+        assert!((90..=110).contains(&one_sec), "expected ~100 hundredths of a bp, got {one_sec}");
+        assert!((16_000..=19_000).contains(&v.sigma_millibps()), "sigma(300s) should be ~17.3 bp");
+
+        // Square-root-of-time between the two sampling rates the loop actually uses: a 200ms
+        // fast-lane scan and a 1s cycle scan differ by exactly sqrt(5) = 2.236. That is what makes
+        // the two interchangeable — the fast lane is not testing against a different threshold, it
+        // is testing against the same one scaled to a shorter interval.
+        let fast = v.sigma_bps_e2_over_ms(200);
+        let scaled = fast * 2_236 / 1_000;
+        assert!(
+            scaled.abs_diff(one_sec) * 100 <= one_sec * 5,
+            "sqrt-of-time broke: sigma(200ms) {fast} scales to {scaled}, sigma(1s) is {one_sec}"
+        );
+
+        // And it agrees with the horizon method the skew uses: `sigma(300s)^2 == 300 * sigma(1s)^2`,
+        // which is what makes this one estimator rather than two that happen to be near each other.
+        // `isqrt(sigma_sq_bps_e6)` is milli-bps, so `/10` puts it in hundredths of a bp.
+        let from_horizon = isqrt(v.sigma_sq_bps_e6() / 300) / 10;
+        assert!(from_horizon.abs_diff(u128::from(one_sec)) <= 2, "{from_horizon} vs {one_sec}");
+    }
+
+    #[test]
+    fn a_dead_market_reports_zero_for_a_single_observation_too() {
+        let v = Volatility::new(vol_cfg());
+        assert_eq!(v.sigma_bps_e2_over_ms(1_000), 0);
+        assert_eq!(v.sigma_bps_e2_over_ms(0), 0);
     }
 
     #[test]

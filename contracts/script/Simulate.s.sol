@@ -426,14 +426,24 @@ contract Simulate is DubuScript {
         (address base, address quote) = _tokensOf(i);
         if (askEdge >= bidEdge) {
             uint256 q = FlowModel.informedAskSize(
-                s, FlowModel.refNetForAsk(L.ref, costE2), L.scale, PropPool(D.pool).reserveOf(base), 100
+                s,
+                FlowModel.fillableRoom(IPropPool(D.pool), uint16(i), s, false),
+                FlowModel.refNetForAsk(L.ref, costE2),
+                L.scale,
+                PropPool(D.pool).reserveOf(base),
+                100
             );
             uint256 pay = q == 0 ? 0 : PropPool(D.pool).getAmountIn(quote, base, q);
             uint256 worth = FlowModel.value(q, L.ref, L.exp);
             _logFreeOption("BUY base from the pool", q, _baseDecimalsOf(i), pay, worth);
         } else {
             uint256 q = FlowModel.informedBidSize(
-                s, FlowModel.refNetForBid(L.ref, costE2), L.scale, PropPool(D.pool).reserveOf(quote), 100
+                s,
+                FlowModel.fillableRoom(IPropPool(D.pool), uint16(i), s, true),
+                FlowModel.refNetForBid(L.ref, costE2),
+                L.scale,
+                PropPool(D.pool).reserveOf(quote),
+                100
             );
             uint256 got = q == 0 ? 0 : PropPool(D.pool).getAmountOut(base, quote, q);
             uint256 worth = FlowModel.value(q, L.ref, L.exp);

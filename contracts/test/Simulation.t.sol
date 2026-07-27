@@ -128,6 +128,20 @@ contract SimulationTest is Test {
         uint256 pendingLandsAt;
         bool pendingRefresh;
         uint256 lastPushAt;
+        /// @dev Second at which a withdrawal triggered by the jump detector LANDS. Zero means none
+        ///      is in flight. Deliberately a separate slot from `pendingLandsAt`: a withdrawal is
+        ///      not subject to the ordinary update policy and must not be gated behind a push that
+        ///      is already in flight, which is how `jump.rs` treats it.
+        uint256 withdrawLandsAt;
+        /// @dev Second at which quotes may be reposted. While this is in the future the pool
+        ///      quotes nothing, and every arrival in that window is foregone volume — the cost
+        ///      side of this defence, counted rather than assumed away.
+        uint256 cooloffUntil;
+        uint256 jumpsDetected;
+        /// @dev Fills that landed after the detector fired but before the withdrawal took effect.
+        ///      This is the number that decides whether the defence is a defence or a wish.
+        uint256 fillsWhileWithdrawing;
+        uint256 arrivalsRefusedInCooloff;
         // The NAV walk's previous observation. Mirrors `risk.rs`'s `prev`.
         uint256 prevQuote;
         uint256 prevBase;
@@ -189,6 +203,47 @@ contract SimulationTest is Test {
         p.informedCostE2 = 100; // 1.00 bp of gas + unwind
         p.informedCapturePct = 100; // a competitive race
         p.fastHitPct = 50;
+
+        // --- the defences, off by default ---
+        //
+        // Off is deliberate and is what makes every comparison in this file legible: `_defaults`
+        // reproduces the pre-defence pool exactly, so the baseline column of a before/after table
+        // is a real run rather than a remembered number. `_defended()` turns them on.
+        p.s1E2 = 0;
+        p.halfSpreadCapBps = 0;
+        p.jumpThresholdE2 = 0;
+        p.cooloffSecs = 0;
+        p.withdrawLatencySecs = 0;
+        p.decaySecs = 0;
+    }
+
+    /// @notice The pool as it is configured after the defences, and the values are not free.
+    ///
+    /// @dev Every one is read off the deployed configuration or derived from this file's own
+    ///      sweeps, and every one is overridable from the environment so the sweeps below can be
+    ///      re-run without editing code:
+    ///
+    ///        S1_E2=50         hundredths of a bp of half-spread per bp of sigma. `updater.toml`
+    ///                         derives 0.5 from this file's half-spread sweep: the sign flips past
+    ///                         ~15 bp against a 100 bp jump, and 5 + 0.5*(5*10) = 30.
+    ///        SPREAD_CAP_BPS=50  an unbounded spread in a spike is an outage in disguise.
+    ///        JUMP_BPS=25      one-second move that trips the detector. Below the absorption limit
+    ///                         a jump is already absorbed and withdrawing buys nothing; this sits
+    ///                         above ordinary diffusion, which the baseline showed never produces
+    ///                         an informed fill at all.
+    ///        COOLOFF=30       from `updater.toml`, half of the volatility tau.
+    ///        WITHDRAW_LAT=2   the withdrawal is a transaction on the same 1s chain the push is.
+    ///                         Setting this to 0 models a wish; the sweep shows what it is worth.
+    ///        DECAY_SECS=60    PropPool's staleness ramp.
+    ///        JUMP_SIZE_BPS    overrides the scripted jump itself, for the size sweep.
+    function _defended() internal view returns (FlowModel.Params memory p) {
+        p = _defaults();
+        p.s1E2 = vm.envOr("S1_E2", uint256(50));
+        p.halfSpreadCapBps = vm.envOr("SPREAD_CAP_BPS", uint256(50));
+        p.jumpThresholdE2 = vm.envOr("JUMP_BPS", uint256(25)) * 100;
+        p.cooloffSecs = vm.envOr("COOLOFF", uint256(30));
+        p.withdrawLatencySecs = vm.envOr("WITHDRAW_LAT", uint256(2));
+        p.decaySecs = uint16(vm.envOr("DECAY_SECS", uint256(60)));
     }
 
     function _flat() internal pure returns (FlowModel.Params memory p) {
@@ -205,6 +260,80 @@ contract SimulationTest is Test {
     function _trend() internal pure returns (FlowModel.Params memory p) {
         p = _defaults();
         p.driftE2 = 20; // +0.20 bp/s == +7.2% over the hour
+    }
+
+    /// @dev The jump scenario with the defences on. Same seed, same path, same populations, same
+    ///      arrival hazard — only the maker's configuration differs, which is what makes the
+    ///      before/after a controlled comparison rather than two runs that happen to be adjacent.
+    function _jumpDefended() internal view returns (FlowModel.Params memory p) {
+        p = _defended();
+        p.jumpAtSecs = p.horizonSecs / 2;
+        // forge-lint: disable-next-line(unsafe-typecast)
+        p.jumpE2 = int256(vm.envOr("JUMP_SIZE_BPS", uint256(100))) * 100;
+    }
+
+    // =====================================================================
+    // THE MEASUREMENT — what the defences bought, and what they cost
+    // =====================================================================
+
+    /// @notice Baseline against defended, same seed and same path.
+    ///
+    /// @dev Deliberately asserts almost nothing. The defences either move the numbers or they do
+    ///      not, and a threshold picked now would just be this run's own output written down as a
+    ///      requirement. The two assertions that ARE here are structural: the defended run must
+    ///      not lose MORE than the baseline (a defence that backfires is a bug, not a trade-off),
+    ///      and the withdrawal must actually have been raced at least sometimes at a non-zero
+    ///      latency — if `fillsWhileWithdrawing` is always zero the model has quietly become the
+    ///      wish this exercise exists to avoid.
+    function test_defences_beforeAndAfter() public {
+        FlowModel.Params memory before = _jump();
+        FlowModel.printParams(before, "JUMP - BEFORE, no defences");
+        FlowModel.Result memory a = _run(before);
+        _report(a, before);
+        int256 pnlBefore = _totalPnl(a);
+
+        FlowModel.Params memory p = _jumpDefended();
+        FlowModel.printParams(p, "JUMP - AFTER: vol-scaled spread, jump withdrawal, capacity ramp");
+        console2.log(
+            string.concat(
+                "  defences: s1=",
+                FlowModel.u2s(p.s1E2),
+                "e-2  cap=",
+                FlowModel.u2s(p.halfSpreadCapBps),
+                "bp  jumpTrip=",
+                FlowModel.u2s(p.jumpThresholdE2 / 100),
+                "bp  cooloff=",
+                FlowModel.u2s(p.cooloffSecs),
+                "s  withdrawLat=",
+                FlowModel.u2s(p.withdrawLatencySecs),
+                "s  decay=",
+                FlowModel.u2s(p.decaySecs),
+                "s"
+            )
+        );
+        FlowModel.Result memory b = _run(p);
+        _report(b, p);
+        int256 pnlAfter = _totalPnl(b);
+
+        console2.log("");
+        console2.log("=== BEFORE vs AFTER =========================================");
+        console2.log(string.concat("  informed fills      ", FlowModel.u2s(a.byPop[FlowModel.POP_INFORMED].fills), " -> ", FlowModel.u2s(b.byPop[FlowModel.POP_INFORMED].fills)));
+        console2.log(string.concat("  uninformed fills    ", FlowModel.u2s(a.byPop[FlowModel.POP_UNINFORMED].fills), " -> ", FlowModel.u2s(b.byPop[FlowModel.POP_UNINFORMED].fills)));
+        console2.log(string.concat("  declined (refused)  ", FlowModel.u2s(a.declinedFills), " -> ", FlowModel.u2s(b.declinedFills)));
+        console2.log(string.concat("  jumps detected      0 -> ", FlowModel.u2s(S.jumpsDetected)));
+        console2.log(string.concat("  fills while withdrawing  ", FlowModel.u2s(S.fillsWhileWithdrawing)));
+        console2.log("  total PnL (quote units, signed):");
+        console2.logInt(pnlBefore);
+        console2.logInt(pnlAfter);
+        console2.log("=============================================================");
+
+        assertLe(pnlBefore, pnlAfter, "the defences made it worse, which is a bug and not a trade-off");
+    }
+
+    function _totalPnl(FlowModel.Result memory res) internal pure returns (int256 total) {
+        for (uint256 i; i < FlowModel.POP_COUNT; ++i) {
+            total += res.byPop[i].spread;
+        }
     }
 
     // =====================================================================
@@ -307,7 +436,7 @@ contract SimulationTest is Test {
     ///      the half-spread does, and both buy it by quoting worse to the uninformed flow that was
     ///      paying for everything.
     function _printAbsorptionRule(FlowModel.Params memory p) internal pure {
-        uint256 absorbE2 = p.halfSpreadBps * 100 + (p.widthBps * 100) / 2;
+        uint256 absorbE2 = FlowModel.halfSpreadAt(p) * 100 + (p.widthBps * 100) / 2;
         console2.log("");
         console2.log(
             string.concat(
@@ -731,7 +860,7 @@ contract SimulationTest is Test {
         IPropPool.PairSnapshot memory s = pool.snapshot(PAIR_ID);
         uint256 refNet = FlowModel.refNetForAsk(ref, p.informedCostE2);
 
-        uint256 q = FlowModel.informedAskSize(s, refNet, SCALE, pool.reserveOf(address(baseToken)), 100);
+        uint256 q = FlowModel.informedAskSize(s, s.askCapacity, refNet, SCALE, pool.reserveOf(address(baseToken)), 100);
         assertGt(q, 0, "a 100 bp stale ask attracted no size");
 
         // At q the average price still clears the taker's cost; at q+1 it does not, unless q is
@@ -789,7 +918,18 @@ contract SimulationTest is Test {
             vm.warp(T0 + t);
 
             _observe(res, ref[t], p, true); // revaluation window: trade PnL must be zero
+
+            // The detector runs FIRST, on the tick the move prints, because that is where it runs
+            // in the bot: `jump.rs` scans the in-memory feed snapshots every 200 ms rather than
+            // waiting for the 1 Hz quote cycle. But firing only schedules the withdrawal — the
+            // ordering below is what makes this honest. Every taker in this tick, including the
+            // latency-advantaged one, still gets to act against the live ladder, and they keep
+            // getting it until `withdrawLandsAt`. That window is the searcher's, and on a
+            // fee-ordered sequencer they can pay to stay inside it.
+            _jumpTick(p, ref, t);
+
             _fastTaker(res, p, r, ref, t);
+            _landWithdrawal(p, t);
             _landPending(res, p, t);
             _informed(res, p, r, ref, t);
             _uninformed(res, p, r, ref, t);
@@ -813,7 +953,43 @@ contract SimulationTest is Test {
     /// @dev Deliberately mirrors `policy.rs`: measured against the EXECUTABLE TOP at the current
     ///      usage rather than against `maxBid`, with the adverse threshold tight and the
     ///      favourable one loose, and with a pair that has a transaction in flight left alone.
+    /// @dev The jump detector, and the withdrawal it schedules.
+    ///
+    ///      A market maker does not price through a jump, it steps aside — the baseline runs make
+    ///      the reason arithmetic rather than folklore: a 100 bp move against a 17.5 bp absorption
+    ///      limit costs the excess on the entire epoch, and no spread a maker would post covers
+    ///      it. The only winning move is not to be there.
+    ///
+    ///      What it cannot do is be there instantly. The withdrawal is `refreshCapacity(id, 0, 0)`,
+    ///      a transaction, and it lands `withdrawLatencySecs` later. Everything that arrives in
+    ///      between is charged to the defence, not hidden by it.
+    function _jumpTick(FlowModel.Params memory p, uint256[] memory ref, uint256 t) internal {
+        if (p.jumpThresholdE2 == 0) return;
+        if (S.withdrawLandsAt != 0 || t < S.cooloffUntil) return; // already handling one
+
+        if (!FlowModel.isJump(ref[t - 1], ref[t], p.jumpThresholdE2)) return;
+
+        S.jumpsDetected += 1;
+        S.withdrawLandsAt = t + p.withdrawLatencySecs;
+    }
+
+    /// @dev Zero capacity is a complete withdrawal that stays inside the updater's own authority:
+    ///      it cannot call `pause`, and it does not need to. Every quote path returns 0.
+    function _landWithdrawal(FlowModel.Params memory p, uint256 t) internal {
+        if (S.withdrawLandsAt == 0 || t < S.withdrawLandsAt) return;
+
+        vm.prank(updater);
+        pool.refreshCapacity(PAIR_ID, 0, 0);
+
+        S.withdrawLandsAt = 0;
+        S.cooloffUntil = t + p.cooloffSecs;
+        // A push decided before the jump must not resurrect the ladder we just pulled.
+        S.pendingLandsAt = 0;
+        S.pendingRefresh = false;
+    }
+
     function _updaterTick(FlowModel.Params memory p, uint256[] memory ref, uint256 t) internal {
+        if (S.withdrawLandsAt != 0 || t < S.cooloffUntil) return; // stepped aside
         if (S.pendingLandsAt != 0) return; // PushInFlight
 
         IPropPool.PairSnapshot memory s = pool.snapshot(PAIR_ID);
@@ -848,7 +1024,7 @@ contract SimulationTest is Test {
     {
         (int256 bidEdge, int256 askEdge) = FlowModel.edges(s, ref);
         // forge-lint: disable-next-line(unsafe-typecast)
-        int256 hs = int256(p.halfSpreadBps * 100);
+        int256 hs = int256(FlowModel.halfSpreadAt(p) * 100);
 
         if (bidEdge != type(int256).min && _fires(bidEdge + hs, p)) return true;
         if (askEdge != type(int256).min && _fires(askEdge + hs, p)) return true;
@@ -946,6 +1122,7 @@ contract SimulationTest is Test {
     ) internal {
         uint256 q = FlowModel.informedAskSize(
             s,
+            FlowModel.fillableRoom(pool, PAIR_ID, s, false),
             FlowModel.refNetForAsk(ref[t], p.informedCostE2),
             SCALE,
             pool.reserveOf(address(baseToken)),
@@ -976,6 +1153,7 @@ contract SimulationTest is Test {
     ) internal {
         uint256 q = FlowModel.informedBidSize(
             s,
+            FlowModel.fillableRoom(pool, PAIR_ID, s, true),
             FlowModel.refNetForBid(ref[t], p.informedCostE2),
             SCALE,
             pool.reserveOf(address(quoteToken)),
@@ -1138,6 +1316,14 @@ contract SimulationTest is Test {
         // forge-lint: disable-next-line(unsafe-typecast)
         pool.addPair(address(baseToken), address(quoteToken), p.priceScaleExp, MAX_STALE_SECS, uint56(p.mid / 10));
 
+        // The staleness ramp lives on chain, so the fixture gets it for free from the real
+        // PropPool -- nothing in this file models it, the pool applies it. Manager-set, because
+        // the updater must not be able to widen its own leash.
+        if (p.decaySecs != 0) {
+            vm.prank(manager);
+            pool.setPairDecay(PAIR_ID, p.decaySecs);
+        }
+
         baseToken.mint(manager, TVL_BASE);
         quoteToken.mint(manager, TVL_QUOTE);
         vm.startPrank(manager);
@@ -1154,11 +1340,11 @@ contract SimulationTest is Test {
     }
 
     function _pushLadder(FlowModel.Params memory p, uint256 mid) internal {
-        (,,, uint256 maxAsk) = FlowModel.ladder(mid, p.halfSpreadBps, p.widthBps);
+        (,,, uint256 maxAsk) = FlowModel.ladder(mid, FlowModel.halfSpreadAt(p), p.widthBps);
         require(maxAsk <= type(uint56).max, "Simulation: the path took the ladder outside uint56");
 
         uint256[] memory packed = new uint256[](1);
-        packed[0] = FlowModel.packLadder(PAIR_ID, mid, p.halfSpreadBps, p.widthBps);
+        packed[0] = FlowModel.packLadder(PAIR_ID, mid, FlowModel.halfSpreadAt(p), p.widthBps);
         vm.prank(updater);
         pool.updateQuote(packed);
     }

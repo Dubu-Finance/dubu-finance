@@ -277,6 +277,196 @@ gamma = 1000.0
 max_positive_bps = 30
 max_negative_bps = 10
 
+[spread]
+# ---------------------------------------------------------------------------
+# THE VOLATILITY-SCALED HALF-SPREAD.
+#
+#   half_spread = min(s0 + s1 * sigma, cap) + degraded_extra
+#
+# s0 is each pair's own `half_spread_bps` below; sigma is the SAME 300s estimate
+# the skew above uses — there is exactly one volatility estimator in this crate.
+#
+# WHY THE CONSTANT HAD TO GO. Adverse selection here is entirely a JUMP
+# phenomenon: the simulator's pure-diffusion paths produced ZERO informed fills,
+# because at 1 bp/s with 2s of quote latency the posted quote is never wrong by
+# more than ~1.4 bp against a 5 bp half-spread. Every dollar of the measured
+# -$16,580 came from one 100 bp jump. Jumps cluster with volatility, so a
+# half-spread that does not move with volatility is a constant premium against a
+# hazard that is anything but.
+# ---------------------------------------------------------------------------
+
+# s1, IN BPS OF HALF-SPREAD PER BP OF SIGMA. DERIVED, NOT PICKED:
+#
+#   half-spread   5 bp      15 bp      30 bp      60 bp
+#   result     -$15,695   -$8,697     +$566      +$378      (one 100 bp jump, $2M epoch)
+#
+# 30 bp is the SMALLEST half-spread the sweep MEASURES to be positive — an
+# anchor, not a zero interpolated between neighbours, because the relationship is
+# not linear (e50 in the arrival hazard is itself tied to the half-spread). The
+# remaining question is WHEN the pool should pay it. Not always: a constant 30 bp
+# is UniV2's fee and a prop AMM quoting UniV2's fee has no reason to exist. It
+# should pay it when a 100 bp jump is a live possibility, and at ETHUSDT's
+# measured sigma(300s) of 10 bp a 100 bp gap is a 10-sigma move and is not. At 5x
+# that level it is a 2-sigma move and plainly is. So:
+#
+#   5 + s1 * (5 * 10) = 30   ->   s1 = 25 / 50 = 0.5
+#
+# What it produces:
+#                   sigma(300s)   half-spread   absorption (= hs + width/2)
+#   ETHUSDT  1x        10 bp        10.0 bp        22.5 bp
+#            2x        20 bp        15.0 bp        27.5 bp
+#            5x        50 bp        30.0 bp        42.5 bp   <- the measured point
+#   BTCUSDT  1x         3 bp         9.5 bp        29.5 bp
+#            2x         6 bp        11.0 bp        31.0 bp
+#            5x        15 bp        15.5 bp        35.5 bp
+#
+# BTC widens far less and should: it is a third as volatile, and its wider ladder
+# already absorbs 20 bp before the spread contributes anything. ONE s1 across both
+# pairs is only possible because the term is proportional to each pair's own sigma.
+#
+# THE HONEST COST: ETH's ordinary-market half-spread DOUBLES, 5 bp to 10 bp. The
+# simulator cannot see what that costs — it has no competing venue, so its
+# uninformed arrival rate does not respond to price, and its own documentation
+# says the spread sweep is biased in favour of wider for exactly that reason. So
+# this is chosen knowing the model flatters it, and it is the first number to
+# back-solve once there is fill data. Set it to 0.0 to restore the old constant
+# spread exactly. Every row logs s0, sigma, vol_decibps, half_spread_bps and
+# `capped` so the next correction is a back-solve and not another guess.
+vol_coefficient = 0.5
+
+# THE CAP, and it is 30 bp because that is both the measured-positive point AND
+# UniV2's fee. The rule that produces is worth stating plainly: the pool never
+# quotes worse than the constant-fee AMM it is trying to beat, it simply does not
+# quote 30 bp in a calm market. Above this point widening has stopped being a
+# defence at all — the sweep's 60 bp row earns LESS than its 30 bp row — and the
+# defence that does work is [jump] below, which stops quoting altogether.
+#
+# The degraded-chain widening is added AFTER this cap, deliberately: the two
+# defend against different failures (a market that is moving vs a chain view that
+# cannot be refreshed) and letting one swallow the other would disable the second
+# exactly when both are needed. Refused at startup if it is below any pair's own
+# half_spread_bps, because the cap bounds the volatility TERM and can never narrow
+# the configured spread.
+max_half_spread_bps = 30
+
+# STALENESS-SCALED SPREAD: CONSIDERED, NOT IMPLEMENTED. Two reasons, both
+# measurements rather than opinions. (1) The horizon already pays for it seventeen
+# times over: sigma is scaled to 300s while the loop pushes on a 0.5 bp adverse
+# trigger at a 1s cadence, so the 5 bp the term already adds for ETH is covering
+# 300 seconds of one-sigma diffusion against an exposure window of one. (2) The one
+# regime where staleness is genuinely long already has its own explicit widening,
+# chain.degraded_extra_half_spread_bps above — a staleness-scaled spread with a step
+# function instead of a ramp, aimed at the case that actually produces long
+# staleness. What would change the answer: the `quote_age_secs` field already in
+# every decision log line showing a fat tail past a few seconds. See src/spread.rs.
+
+[jump]
+# ---------------------------------------------------------------------------
+# JUMP DETECTION AND WITHDRAWAL — the first line of defence, and the only one
+# that beats a 100 bp gap.
+#
+#   absorption = half_spread + width/2 = 17.5 bp on pairId 1
+#   loss       = (reference error - absorption) x exposed depth
+#
+# Below the absorption limit the ladder absorbs the error and the pool profits.
+# Above it the pool pays the full excess across the whole epoch, and no spread a
+# market maker would post fixes that. So the pool STEPS ASIDE:
+# refreshCapacity(pairId, 0, 0), which makes PropPool._outFor return zero from
+# every quote path, held for a cool-off, then resumed.
+#
+# THERE IS NO BASIS-POINT THRESHOLD IN THIS TABLE, and that is deliberate. Both
+# bounds come from the pair's own half_spread_bps and width_bps:
+#
+#   threshold = clamp( sigma_k * sigma(dt),  half_spread,  half_spread + width/2 )
+#
+#   THE FLOOR is the pair's half-spread — the exact point at which the posted
+#   quote stops being on the right side of fair value, and comfortably above the
+#   measured feed noise (cross-venue MAD 0.1-1.0 bps, worst single-venue
+#   deviation 1.6 bps). 5 bp on ETH, 8 bp on BTC. A FIXED bp threshold would be
+#   wrong on one of the two pairs whichever value it took.
+#
+#   THE CEILING is the pair's absorption limit, and it is the answer to the
+#   failure a sigma-multiple has on its own. ONE 100 bp return entering a 60s
+#   EWMA at dt/tau = 1/60 raises ETH's sigma(1s) from 0.58 bp to ~12.9 bp; at
+#   sigma_k = 6 the sigma arm would then ask for a 77 bp move before firing
+#   again, so the SECOND LEG of a two-stage jump would sail straight through.
+#   Clamping at half_spread + width/2 bounds that numbness with a fact about the
+#   ladder rather than a fact about the market.
+#
+#   THE SIGMA ARM lives between them and its job is the opposite of the naive
+#   reading: in a calm market the floor binds and sigma does nothing; as
+#   volatility rises it RAISES the bar so the bot does not withdraw on every
+#   ordinary swing. For ETH it starts to bind past sigma(300s) ~14 bp (1.4x
+#   measured) and is capped out by ~50 bp (5x).
+#
+# FALSE POSITIVES are quoting outages and they are cheap by four orders of
+# magnitude: one 30s outage costs ~$0.48 of foregone spread at the modelled
+# uninformed rate (~$122k/h at 4.70 bp), one avoided pick-off is $16,580, so the
+# break-even rate is ~34,000:1. The accepted rate is a FEW TRIPS PER PAIR PER DAY,
+# about 0.1% of quoting time. At ETH's measured sigma(1s) a 5 bp trip is an
+# 8.7-sigma observation. What stops the bias running away is not the economics but
+# the mechanics: each withdrawal is a transaction and an in-flight transaction
+# blocks the pair, so the cool-off is retriggerable to keep each trip to one.
+# ---------------------------------------------------------------------------
+
+# Off restores the previous behaviour exactly: quote through everything.
+enabled = true
+
+# The sigma multiplier. It only ever acts BETWEEN the two derived bounds, so
+# raising it cannot make the detector numb past the absorption limit and lowering
+# it cannot make it fire inside the half-spread. That is why it is the only knob.
+sigma_k = 6.0
+
+# THE COOL-OFF, and it is NOT a timer that runs down. It ends when ALL of:
+#   1. at least this long has passed SINCE THE MOST RECENT TRIP — retriggerable,
+#      so a second leg restarts it rather than shortening it;
+#   2. the trailing window of observations has a peak-to-trough RANGE inside the
+#      current threshold — the reference has actually settled, which catches the
+#      staircase that walks 100 bp in twenty 5 bp steps and never trips the
+#      single-observation test;
+#   3. the newest observation is fresh, so a dead feed can never satisfy the
+#      settle test by having nothing to contradict it.
+# (1) is the floor and (3) is a liveness check; (2) is the load-bearing one.
+#
+# 30s = 30 GIWA blocks, and it is bounded on both sides. Below, it must cover the
+# second leg, which arrives in seconds to tens of seconds; a cool-off of one or two
+# blocks buys nothing because the ladder is already gone if it was going to be
+# taken. Above, it is a quoting outage. It is also half of vol_tau_ms, so a market
+# still hot at the end of it has an elevated sigma holding the threshold up.
+cooloff_secs = 30
+
+# ACROSS THE BOOK. A BTC jump is information about ETH: the two are 80-90%
+# correlated, and in the market-wide case — a macro print, a liquidation cascade,
+# an exchange outage — ETH's move is COMING and its feed has simply not printed it
+# yet. That window is the searcher's. The asymmetry decides it: contagion's false
+# positive is one cool-off of foregone spread on the other pair (~$0.48), its false
+# negative is (move - absorption) x $2M. The THRESHOLD stays per-pair; only the
+# withdrawal is shared. `pair` disables contagion.
+scope = "book"
+
+# THE REACTION TIME, and the one place in this crate where latency genuinely
+# matters. The quote loop wakes on newHeads at 1 Hz, which would put mean
+# detection latency at 500ms and worst case at 1s. This fast lane runs inside the
+# same task between wakes, reads only the in-memory feed snapshots, costs ZERO RPC
+# unless something trips, and does not consume a cycle or a chain read. Refused
+# above block_time_ms, where it would detect nothing sooner than the ordinary cycle
+# and only look like it did.
+scan_interval_ms = 200
+
+# THE FEE ON THE WITHDRAWAL, AND ONLY ON IT. tx.rs argues at length against a fee
+# escalator and that argument holds for QUOTE traffic: at 0.001 gwei the spread
+# between a minimal tip and an absurd one is worth less than a rounding error on
+# one quote. A jump withdrawal is the one transaction where the fee buys something
+# concrete. GIWA's sequencer has no public mempool and orders by HIGHEST FEE FIRST,
+# and the counterparty is by construction someone willing to outbid a quoting bot
+# paying a flat near-zero tip. Being 200ms earlier does not win a fee auction;
+# paying more does, and it is the difference between the withdrawal landing ahead
+# of the pick-off in the same block and landing behind it. At 0.001 gwei base and
+# ~29k gas, 0.5 gwei costs about five cents. Still not an escalator: one flat
+# number, one kind of transaction, never bumped and never retried higher.
+withdraw_priority_fee_per_gas_gwei = "0.5"
+withdraw_max_fee_per_gas_gwei = "2.0"
+
 [risk]
 # The killswitch latch. Written atomically after every change and read at startup: a halted book
 # STAYS DOWN across a restart. Delete this file deliberately to resume.

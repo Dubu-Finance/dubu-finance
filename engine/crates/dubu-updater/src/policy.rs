@@ -25,10 +25,11 @@
 //! # The trigger order, and why the asymmetry runs the way it does
 //!
 //! ```text
-//! 1. NeverQuoted          the pool has no usable ladder at all
-//! 2. AdverseDrift         the market moved AGAINST the posted quote
-//! 3. Heartbeat            the quote is approaching expiry
-//! 4. FavourableDrift      the posted quote has merely become conservative
+//! 1.  NeverQuoted                  the pool has no usable ladder at all
+//! 1b. LadderStaleWithoutCapacity   a side is at zero depth and the stored row has gone stale
+//! 2.  AdverseDrift                 the market moved AGAINST the posted quote
+//! 3.  Heartbeat                    the quote is approaching expiry
+//! 4.  FavourableDrift              the posted quote has merely become conservative
 //! ```
 //!
 //! archi_v2 §5.3 lifts a chase/retreat pair from a competing maker where the *chase* threshold is the
@@ -52,6 +53,10 @@
 //! ```text
 //! Halted -> ChainDown -> FeedNotLive -> ChainViewStale -> PoolPaused -> PushInFlight -> NoRow
 //! ```
+//!
+//! `JumpWithdrawn` sits alongside them but is **not** one of them, because it applies to only one
+//! of the two decisions. A pair inside a jump cool-off must not have its capacity re-armed, and
+//! must still keep its ladder current — see [`evaluate_capacity`] for the argument.
 //!
 //! `PushInFlight` deserves its own note: a pair with an unconfirmed transaction is **not**
 //! superseded. Sending a second `updateQuote` for the same pair while the first is in the
@@ -93,6 +98,18 @@ pub enum Trigger {
     /// No ladder has ever been posted, or the stored one no longer passes the pool's own
     /// validator (which can happen after the manager raises `minPrice`).
     NoUsableQuote,
+    /// The pool has no capacity on at least one side — it is standing aside, either because
+    /// [`crate::jump`] withdrew it or because the inventory could not settle an epoch — and the
+    /// stored ladder is not the one this cycle would post.
+    ///
+    /// This exists because [`drift`] cannot see it. A side with zero capacity is skipped there
+    /// (rightly: `executable_top_ask` returns an infinity sentinel at zero capacity, and reading it
+    /// as a price would produce a drift of ~10^36 bps), so a withdrawn pool measures zero drift
+    /// however far the market has moved. Without this trigger the cool-off would end with a stale
+    /// ladder still stored, capacity would be restored first, and the pool would spend a block
+    /// quoting the *pre-jump* price with a full epoch behind it — which is the exact fill the
+    /// withdrawal was for.
+    LadderStaleWithoutCapacity,
     /// The market moved against the posted quote.
     AdverseDrift {
         /// How far, in deci-bps (tenths of a bps) of the posted executable top.
@@ -126,6 +143,7 @@ impl Trigger {
     pub const fn label(self) -> &'static str {
         match self {
             Self::NoUsableQuote => "no_usable_quote",
+            Self::LadderStaleWithoutCapacity => "ladder_stale_without_capacity",
             Self::AdverseDrift { .. } => "adverse_drift",
             Self::Heartbeat { .. } => "heartbeat",
             Self::FavourableDrift { .. } => "favourable_drift",
@@ -163,6 +181,13 @@ pub enum Hold {
     PoolPaused,
     /// A transaction for this pair is unconfirmed.
     PushInFlight,
+    /// [`crate::jump`] is holding this pair's quotes down. **Blocks capacity only** — see
+    /// [`evaluate_capacity`].
+    JumpWithdrawn {
+        /// Milliseconds left on the minimum cool-off. Zero means the timer arm is satisfied and
+        /// the reference has not settled yet.
+        cooloff_remaining_ms: u64,
+    },
     /// No valid row could be built this cycle. The reason is logged where it was produced.
     NoRow,
     /// A trigger fired but the computed row is byte-identical to the stored one.
@@ -189,6 +214,7 @@ impl Hold {
             Self::ChainViewStale { .. } => "chain_view_stale",
             Self::PoolPaused => "pool_paused",
             Self::PushInFlight => "push_in_flight",
+            Self::JumpWithdrawn { .. } => "jump_withdrawn",
             Self::NoRow => "no_row",
             Self::Unchanged => "unchanged",
             Self::NoTrigger { .. } => "no_trigger",
@@ -388,6 +414,10 @@ pub struct Context<'a> {
     pub view_stale_secs: u64,
     /// A transaction for this pair is unconfirmed.
     pub in_flight: bool,
+    /// [`crate::jump`] is holding this pair's quotes down.
+    pub jump_withdrawn: bool,
+    /// Milliseconds left on the minimum cool-off, for the log line.
+    pub jump_cooloff_remaining_ms: u64,
     /// Configured heartbeat.
     pub heartbeat_secs: u64,
     /// Tight threshold, for a move against us, in deci-bps (tenths of a bps). Built from
@@ -431,6 +461,13 @@ impl Context<'_> {
         None
     }
 
+    /// Whether the pool is currently offering no depth on at least one side, and therefore
+    /// quoting nothing whatever ladder is stored.
+    #[must_use]
+    pub const fn withdrawn_on_chain(&self) -> bool {
+        self.snap.bid_capacity == 0 || self.snap.ask_capacity == 0
+    }
+
     /// The effective heartbeat: the configured one, but never so late that the pool's own
     /// freshness window expires first.
     ///
@@ -469,6 +506,15 @@ pub fn evaluate_quote(ctx: &Context<'_>) -> Result<Decision, CurveError> {
     let unusable = ctx.snap.never_quoted() || ctx.snap.ladder().validate(ctx.min_price).is_err();
     if unusable {
         return Ok(finish(Decision::Send(Trigger::NoUsableQuote), ctx, &planned));
+    }
+
+    // 1b. Standing aside with a stale ladder. Deliberately **not** gated on `jump_withdrawn`:
+    //     whatever put a side's capacity at zero, the pool is quoting nothing on it, so replacing
+    //     the stored row costs a nearly-free transaction and buys the property that capacity can
+    //     be restored in one step without a block of pre-jump prices in between. `finish` still
+    //     holds `Unchanged` when the row has not actually moved, so a quiet cool-off is silent.
+    if ctx.withdrawn_on_chain() && planned != ctx.snap.ladder() {
+        return Ok(finish(Decision::Send(Trigger::LadderStaleWithoutCapacity), ctx, &planned));
     }
 
     let d = drift(ctx.snap, &planned)?;
@@ -525,6 +571,22 @@ fn finish(decision: Decision, ctx: &Context<'_>, planned: &Ladder) -> Decision {
 pub fn evaluate_capacity(ctx: &Context<'_>) -> CapacityDecision {
     if let Some(h) = ctx.gates() {
         return CapacityDecision::Hold(h);
+    }
+    // The jump gate, and it is on **this** decision only.
+    //
+    // Capacity is the thing the withdrawal actually holds down — `refreshCapacity(pair, 0, 0)`
+    // makes `PropPool._outFor` return zero from every path — so without this gate the ordinary
+    // `NoEpoch` trigger would see zero capacity and re-arm the pool on the very next cycle,
+    // undoing the withdrawal a second after it landed.
+    //
+    // `evaluate_quote` is deliberately NOT gated. A ladder pushed against a zero epoch quotes
+    // nothing and costs a nearly-free transaction, and keeping it current through the cool-off is
+    // what lets the resume be a single `refreshCapacity` rather than a window in which the pool
+    // is armed at a pre-jump price.
+    if ctx.jump_withdrawn {
+        return CapacityDecision::Hold(Hold::JumpWithdrawn {
+            cooloff_remaining_ms: ctx.jump_cooloff_remaining_ms,
+        });
     }
     // A refresh that would post zero is not a refresh, it is a withdrawal, and withdrawal is
     // the killswitch's job rather than a routine trigger's.
@@ -618,6 +680,8 @@ mod tests {
             view_age_secs: 1,
             view_stale_secs: 20,
             in_flight: false,
+            jump_withdrawn: false,
+            jump_cooloff_remaining_ms: 0,
             heartbeat_secs: 2_400,
             adverse_drift_bps: 20,
             favourable_drift_bps: 80,
@@ -1022,6 +1086,89 @@ mod tests {
         s.bid_capacity = 0;
         let mut c = Context { halted: true, ..ctx(&s, Some(l)) };
         c.capacity = CapacityPlan { bid: 1_000, ask: 1_000, bid_cut_by_inventory: false, ask_cut_by_inventory: false };
+        assert_eq!(evaluate_capacity(&c), CapacityDecision::Hold(Hold::Halted));
+    }
+
+    // -----------------------------------------------------------------------
+    // The jump withdrawal
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn a_jump_cooloff_holds_capacity_down_and_lets_the_ladder_keep_moving() {
+        // The whole asymmetry in one test. The withdrawal IS the zero capacity epoch, so the
+        // capacity decision must be gated or the ordinary `NoEpoch` trigger re-arms the pool one
+        // second after the withdrawal lands. The quote decision must NOT be gated, or the ladder
+        // goes stale behind the zero epoch and the resume re-arms at the pre-jump price.
+        let l = ladder(1_000_000, 1_000_000, 2_000_000, 2_000_000);
+        let mut s = snap(l, 1_000, 0, 1_000);
+        s.bid_capacity = 0;
+        s.ask_capacity = 0;
+
+        let moved = ladder(990_000, 990_000, 1_990_000, 1_990_000);
+        let c = Context {
+            jump_withdrawn: true,
+            jump_cooloff_remaining_ms: 21_000,
+            // The epoch the pool *would* post: the withdrawal is a hold on this, not an absence
+            // of one, which is exactly why the gate has to be explicit.
+            capacity: CapacityPlan {
+                bid: 1_000,
+                ask: 1_000,
+                bid_cut_by_inventory: false,
+                ask_cut_by_inventory: false,
+            },
+            ..ctx(&s, Some(moved))
+        };
+        assert_eq!(
+            evaluate_capacity(&c),
+            CapacityDecision::Hold(Hold::JumpWithdrawn { cooloff_remaining_ms: 21_000 }),
+            "capacity must stay at zero for the whole cool-off"
+        );
+        assert_eq!(
+            evaluate_quote(&c).unwrap(),
+            Decision::Send(Trigger::LadderStaleWithoutCapacity),
+            "and the ladder must keep tracking the market behind it"
+        );
+
+        // A quiet cool-off is silent: the trigger needs the row to have actually moved, so this
+        // does not become one transaction per second for thirty seconds in a market that has
+        // stopped moving.
+        let quiet = Context { planned: Some(l), ..c };
+        assert!(!evaluate_quote(&quiet).unwrap().sends(), "an unchanged row must not be re-posted");
+
+        // Once the cool-off ends, the epoch comes back — in one transaction, against a ladder that
+        // is already current.
+        let resumed = Context { jump_withdrawn: false, ..c };
+        assert_eq!(
+            evaluate_capacity(&resumed),
+            CapacityDecision::Send(CapacityTrigger::NoEpoch { side: Side::Bid })
+        );
+    }
+
+    #[test]
+    fn drift_is_blind_to_a_withdrawn_pool_which_is_why_the_new_trigger_exists() {
+        // The reason `LadderStaleWithoutCapacity` is a trigger and not a special case of adverse
+        // drift: with both capacities at zero, `drift` skips both sides and reports nothing,
+        // however far the market has moved.
+        let l = ladder(1_000_000, 1_000_000, 2_000_000, 2_000_000);
+        let mut s = snap(l, 1_000, 0, 1_000);
+        s.bid_capacity = 0;
+        s.ask_capacity = 0;
+        let moved = ladder(900_000, 900_000, 1_900_000, 1_900_000); // 1000 bp away
+        assert_eq!(drift(&s, &moved).unwrap(), Drift::default(), "drift genuinely cannot see it");
+        assert!(matches!(
+            evaluate_quote(&ctx(&s, Some(moved))).unwrap(),
+            Decision::Send(Trigger::LadderStaleWithoutCapacity)
+        ));
+    }
+
+    #[test]
+    fn a_halted_bot_outranks_the_jump_gate() {
+        // Precedence check: the shared gates run first, so a killswitch latch is still the reported
+        // reason rather than the cool-off. The operator needs the switch, not the symptom.
+        let l = ladder(900, 1_000, 1_100, 1_200);
+        let mut s = snap(l, 1_000, 0, 1_000);
+        s.bid_capacity = 0;
+        let c = Context { halted: true, jump_withdrawn: true, ..ctx(&s, Some(l)) };
         assert_eq!(evaluate_capacity(&c), CapacityDecision::Hold(Hold::Halted));
     }
 

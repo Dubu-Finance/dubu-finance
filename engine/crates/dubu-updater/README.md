@@ -9,13 +9,14 @@ quotes nothing at all. This is that something.
 
 ```
   Binance / OKX / Bybit (wss)   Nodit newHeads (wss) ──► wakes the loop, 1s
-           │                    GIWA flashblocks (http, `pending`) ──► state, ~200ms
-           ▼                                          ▼
-  feed ──► fair_value ──► skew ──► ladder ──► policy ──► tx ──► PropPool.updateQuote
-  n venues  MAD + quorum   A–S    dubu-core    send?           PropPool.refreshCapacity
-                                                 ▲
-                                                 │
-                                          risk (killswitches)
+   │       │                    GIWA flashblocks (http, `pending`) ──► state, ~200ms
+   │       ▼                                          ▼
+   │  fair_value ──► spread ──► skew ──► ladder ──► policy ──► tx ──► updateQuote
+   │  MAD + quorum   s0+s1·σ     A–S    dubu-core    send?           refreshCapacity
+   │                                                   ▲
+   ▼                                                   │
+  jump ─────────────────────────────────────────► tx   risk (killswitches)
+  fast lane, 200ms, no chain read, no gates
 ```
 
 ## Layout
@@ -28,6 +29,8 @@ quotes nothing at all. This is that something.
 | `feed/{binance,okx,bybit,coinbase}.rs` | one wire format each, and nothing else |
 | `fair_value.rs` | micro-price per venue, MAD outlier rejection, quorum, one reference |
 | `skew.rs` | EWMA volatility and the Avellaneda–Stoikov reservation price |
+| `spread.rs` | the volatility-scaled half-spread, `min(s0 + s1·σ, cap) + degraded_extra` |
+| `jump.rs` | jump detection, the withdrawal, and the cool-off that decides when to come back |
 | `chain/mod.rs` | JSON-RPC, the runaway guard, one `eth_call` per cycle, chain health |
 | `chain/heads.rs` | the `newHeads` subscription that drives the loop, and its watchdog |
 | `ladder.rs` | fair value + knobs → `SolveInput` → four `uint56` prices → packed word |
@@ -296,6 +299,55 @@ packed. There is no path by which a skew reaches the chain unvalidated. Resoluti
 because that is what `dubu-core` takes and sub-bp resolution here would mean a second
 implementation of the skew in this crate.
 
+## Adverse selection is a jump phenomenon, and there are two defences
+
+A simulator over this pool (`contracts/script/lib/FlowModel.sol`) found that **pure diffusion
+produces zero informed fills** — at 1 bp/s with 2 s of quote latency the posted quote is never
+wrong by more than ~1.4 bp against a 5 bp half-spread — and that one 100 bp jump produced the
+entire measured −$16,580 on a $2 M epoch. The controlling arithmetic is
+
+```
+absorption = half_spread + width/2          17.5 bp on pairId 1, 28 bp on pairId 2
+loss       = (reference error − absorption) × exposed depth
+```
+
+Below the absorption limit the ladder absorbs the error and the pool profits. Above it the pool
+pays the excess across the whole epoch. Latency does **not** fix this: the 1/2/5/10 s sweep left
+total loss roughly flat, because latency changes how many exposure windows exist and not the size
+of each pick-off. Volume does not fix it either: one 100 bp gap needs $28.3 M of uninformed
+notional to pay for it, 231 hours of flow at the modelled rate.
+
+**`spread.rs` — the half-spread moves with volatility.** `half_spread = min(s0 + s1·σ, cap) +
+degraded_extra`, off the same 300 s σ the skew uses. `s1 = 0.5` is derived rather than picked: the
+sweep's smallest measured-**positive** half-spread against a 100 bp jump is 30 bp, and it should be
+reached when a 100 bp jump is a live possibility — at 5× ETHUSDT's measured σ of 10 bp, where the
+gap is a 2σ move rather than a 10σ one. `5 + s1·50 = 30` gives `s1 = 0.5`. The cap is 30 bp,
+which is exactly UniV2's fee: the pool never quotes worse than the constant-fee AMM it is trying to
+beat, it simply does not quote 30 bp in a calm market.
+
+**`jump.rs` — above the absorption limit, stop quoting.** `refreshCapacity(pair, 0, 0)` makes
+`PropPool._outFor` return zero from every path. The trip threshold has no basis-point constant in
+it; both bounds come from the pair's own configuration:
+
+```
+threshold = clamp( sigma_k · σ(dt),  half_spread,  half_spread + width/2 )
+                                     ^ the floor    ^ the absorption ceiling
+```
+
+The floor is per-pair-correct where a fixed bp threshold could not be (5 bp on ETH, 8 bp on BTC,
+against measured σ of 10 bp and 3 bp). The ceiling is the answer to the failure a σ-multiple has on
+its own: one 100 bp return entering a 60 s EWMA raises ETH's σ(1s) from 0.58 bp to ~12.9 bp, so at
+`sigma_k = 6` the σ arm would ask for a **77 bp** move before firing again and the second leg of a
+two-stage jump would sail through. The cool-off is retriggerable and ends only when the trailing
+window's peak-to-trough range is inside the threshold, so resuming into the second leg — or into a
+staircase that never trips a single observation — is structurally prevented.
+
+The withdrawal runs on a **fast lane** between quote cycles at `jump.scan_interval_ms` (200 ms),
+off the in-memory feed snapshots, with no chain read and none of `policy`'s gates in front of it,
+at a raised priority fee. It is the one place in this crate where latency matters, because it is a
+race against a searcher — and against a sequencer that orders by fee, being earlier is worth less
+than paying more.
+
 ## Endpoints, and which one drives what
 
 Three endpoints, three jobs. This is not redundancy — it is three different freshness
@@ -426,13 +478,29 @@ when the width changes to compensate.
 
 ```
 gates    Halted → ChainDown → FeedNotLive → ChainViewStale → PoolPaused → PushInFlight → NoRow
-triggers 1. NoUsableQuote    never quoted, or the stored row no longer passes validateLadder
-         2. AdverseDrift     the market moved AGAINST the quote          (tight threshold)
-         3. Heartbeat        min(heartbeat_secs, 0.8 × maxStaleSecs)
-         4. FavourableDrift  the quote merely became conservative        (loose threshold)
+         JumpWithdrawn — CAPACITY ONLY, see below
+triggers 1.  NoUsableQuote    never quoted, or the stored row no longer passes validateLadder
+         1b. LadderStale…     a side is at zero depth and the stored row has gone stale
+         2.  AdverseDrift     the market moved AGAINST the quote         (tight threshold)
+         3.  Heartbeat        min(heartbeat_secs, 0.8 × maxStaleSecs)
+         4.  FavourableDrift  the quote merely became conservative       (loose threshold)
 last     Unchanged — a trigger fired but the row is identical. Only the heartbeat overrides it,
          because refreshing `updatedAt` is the whole point of the heartbeat.
 ```
+
+`JumpWithdrawn` gates **capacity and not the quote**, and the asymmetry is the whole design.
+Capacity is what the withdrawal holds down, so without the gate the ordinary `NoEpoch` trigger
+would re-arm the pool a second after the withdrawal landed. The quote is not gated because a
+ladder pushed against a zero epoch quotes nothing and costs a nearly-free transaction, and
+keeping it current through the cool-off is what lets the resume be a single `refreshCapacity`
+instead of a window in which the pool is armed at the pre-jump price.
+
+`LadderStaleWithoutCapacity` exists because `drift` genuinely cannot see a withdrawn pool: a side
+with zero capacity is skipped there (`executable_top_ask` returns an infinity sentinel at zero
+capacity, and reading it as a price is a drift of ~10³⁶ bps), so a pool standing aside measures
+zero drift however far the market has moved. The same reasoning reverses the send order — when the
+pool is already offering no depth, the **quote goes first** and capacity follows, because
+capacity-first would restore a full epoch behind whatever ladder is stored.
 
 The asymmetry **inverts archi_v2 §5.3's chase/retreat pair on purpose.** A maker competing for flow chases eagerly
 and retreats slowly because it is one maker among many and losing the flow is the dominant cost.
@@ -511,6 +579,20 @@ Listed because each one is a real gap, not because the list is decorative.
 - **A tuned γ.** The skew is live and `γ = 1000` was set from one measurement of σ on one quiet
   afternoon. archi_v2 §5.4 says thresholds come from a replay back-solve, and that applies here
   too. The `skew` log line exists to make that possible; nothing consumes it yet.
+- **A tuned `s1`, and a measured jump false-positive rate.** Both have the same defect as γ. `s1`
+  is anchored to a simulator whose own documentation says it has no competing venue and therefore
+  cannot price what a wider spread costs in volume — it is biased in favour of wider and the
+  choice was made knowing that. `jump.sigma_k = 6` has an *estimated* rate (a few trips per pair
+  per day) and no measured one. The `spread` and `jump` log lines carry every input either
+  back-solve needs; nothing consumes them yet.
+- **Staleness-scaled spread.** Considered and deliberately not built: σ at the 300 s horizon
+  already prices ~17× more staleness than the loop actually runs at, and the one regime where
+  staleness is genuinely long has its own explicit widening in
+  `chain.degraded_extra_half_spread_bps`. `src/spread.rs` records what measurement would change
+  the answer.
+- **A second signing key.** The jump withdrawal shares one nonce queue with quote traffic, so an
+  earlier transaction that never lands delays the withdrawal behind it. The raised priority fee
+  buys ordering inside a block and does nothing about nonce ordering; only a second key would.
 - **The derivative and integral terms** of the inventory controller. Deliberate, and the
   conditions that would justify each are written down above.
 - **Directional flow budget.** The leaky bucket where a bid fill debits the bid budget and

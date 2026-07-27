@@ -317,6 +317,15 @@ pub struct Pending {
     pub submitted_at: Instant,
 }
 
+/// A per-transaction fee override. See [`Sender::send_with_fees`] for the only thing that uses it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Fees {
+    /// `maxFeePerGas`, in wei.
+    pub max_fee: u128,
+    /// `maxPriorityFeePerGas`, in wei.
+    pub max_priority_fee: u128,
+}
+
 /// What a send did.
 #[derive(Debug, Clone)]
 pub enum Sent {
@@ -429,14 +438,21 @@ impl Sender {
         self.nonce = None;
     }
 
-    /// Build the envelope for an intent without signing or sending it.
+    /// Build the envelope for an intent without signing or sending it, at the configured fees.
     #[must_use]
     pub fn envelope(&self, intent: Intent, nonce: u64) -> Eip1559 {
+        self.envelope_with_fees(intent, nonce, None)
+    }
+
+    /// Build the envelope, optionally overriding the fees for this one transaction.
+    #[must_use]
+    pub fn envelope_with_fees(&self, intent: Intent, nonce: u64, fees: Option<Fees>) -> Eip1559 {
+        let f = fees.unwrap_or(Fees { max_fee: self.max_fee, max_priority_fee: self.max_priority_fee });
         Eip1559 {
             chain_id: self.chain_id,
             nonce,
-            max_priority_fee_per_gas: self.max_priority_fee,
-            max_fee_per_gas: self.max_fee,
+            max_priority_fee_per_gas: f.max_priority_fee,
+            max_fee_per_gas: f.max_fee,
             gas_limit: self.gas_limit,
             to: self.pool,
             value: U256::ZERO,
@@ -454,11 +470,38 @@ impl Sender {
     /// [`TxError`]. On any failure past the point where a nonce was consumed the local nonce is
     /// dropped, so the next attempt re-reads it rather than building on a guess.
     pub async fn send(&mut self, rpc: &Rpc, intent: Intent) -> Result<Sent, TxError> {
+        self.send_with_fees(rpc, intent, None).await
+    }
+
+    /// Submit an intent at fees other than the configured ones.
+    ///
+    /// # Why there is a second fee at all, when [`crate::tx`] argues against an escalator
+    ///
+    /// That argument is about *quote* traffic, and it holds: at 0.001 gwei the spread between a
+    /// minimal tip and an absurd one is worth less than a rounding error on one quote, so a
+    /// controller buys nothing. A **jump withdrawal** is the one transaction on this bot where the
+    /// fee buys something concrete. GIWA's sequencer orders by highest fee first, and the
+    /// counterparty is by construction someone willing to outbid a quoting bot that pays a flat
+    /// near-zero tip. Detecting 200 ms sooner does not win a fee auction; paying more does, and it
+    /// is the difference between the withdrawal landing ahead of the pick-off in the same block
+    /// and landing behind it.
+    ///
+    /// This is still not an escalator: one flat number from config, used for one kind of
+    /// transaction, never bumped and never retried at a higher price.
+    ///
+    /// # Errors
+    /// [`TxError`], exactly as [`Sender::send`].
+    pub async fn send_with_fees(
+        &mut self,
+        rpc: &Rpc,
+        intent: Intent,
+        fees: Option<Fees>,
+    ) -> Result<Sent, TxError> {
         if !self.transmit_allowed {
             // Dry run still signs when a key happens to be loaded, so that the encode-and-sign
             // path is exercised rather than merely assumed to work on the day it is switched on.
             let would_be = match (&self.signer, self.nonce) {
-                (Some(s), Some(n)) => Some(self.envelope(intent, n).sign(s)?.0),
+                (Some(s), Some(n)) => Some(self.envelope_with_fees(intent, n, fees).sign(s)?.0),
                 _ => None,
             };
             return Ok(Sent::DryRun {
@@ -480,16 +523,7 @@ impl Sender {
             }
         };
 
-        let tx = Eip1559 {
-            chain_id: self.chain_id,
-            nonce,
-            max_priority_fee_per_gas: self.max_priority_fee,
-            max_fee_per_gas: self.max_fee,
-            gas_limit: self.gas_limit,
-            to: self.pool,
-            value: U256::ZERO,
-            input: intent.calldata(),
-        };
+        let tx = self.envelope_with_fees(intent, nonce, fees);
         let (hash, raw) = tx.sign(signer)?;
 
         match rpc.call("eth_sendRawTransaction", json!([hex0x(&raw)])).await {

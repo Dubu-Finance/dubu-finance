@@ -28,13 +28,19 @@ interface IERC20Balance {
 /// | word | writer            | bits                                                              |
 /// |------|-------------------|-------------------------------------------------------------------|
 /// | 0    | `updateQuote`     | 0..55 minBid, 56..111 maxBid, 112..167 minAsk, 168..223 maxAsk, 224..255 updatedAt |
-/// | 1    | `refreshCapacity` | 0..95 bidCapacity, 96..191 askCapacity, 192..223 capGen, 224..239 flags |
+/// | 1    | `refreshCapacity` | 0..95 bidCapacity, 96..191 askCapacity, 192..223 capGen, 224..239 flags, 240..255 decaySecs |
 /// | 2    | `swap`            | 0..95 bidUsed, 96..191 askUsed, 192..223 usedGen                   |
 ///
 /// They are held as raw `uint256` words rather than packed structs so that the single-SSTORE
 /// property of each writer is a fact about the source, not a hope about the optimiser. Bit
 /// positions match the field order the design specifies (lowest bits = first field), so a
 /// struct with that field order is a drop-in reinterpretation of the same word.
+///
+/// Word 1's top two fields are **not** the updater's. `flags` bit 0 is the guardian's pause and
+/// `decaySecs` is the manager's staleness ramp; `refreshCapacity` preserves bits 224..255 with a
+/// read-modify-write for both, exactly as it already did for the pause flag alone. The word is
+/// shared because `_load` reads it anyway and a second mapping would put a cold SLOAD on the swap
+/// and quote paths; the writers are still separate functions behind separate roles.
 ///
 /// **Every capacity and usage field above is denominated in the pair's BASE token, on both
 /// sides.** `askCapacity` used to be quote-denominated; `PropCurve`'s amendment 1 moved it to
@@ -179,19 +185,143 @@ interface IERC20Balance {
 /// the owner, not a timelock — can set `feedId` to zero and restore pushes in one transaction if
 /// Pyth is durably down. Recovery does not require the slowest role.
 ///
+/// ## Capacity that decays with quote age
+///
+/// The reference bound above answers "is this ladder at the right level *when it is written*".
+/// It says nothing about what happens afterwards, and its own coverage note names the gap: the
+/// interval between the last successful push and the staleness cliff — a ladder that stops being
+/// re-pushed while the market moves under it. Until now that interval was defended by exactly one
+/// mechanism, `maxStaleSecs`, and `maxStaleSecs` is a step: full depth right up to the edge, no
+/// depth one second later.
+///
+/// That step is the wrong shape for the risk, and the simulator says why. `test/Simulation.t.sol`
+/// and `script/lib/FlowModel.sol` measure the pool against informed flow and reduce the loss to
+///
+///     absorption limit = halfSpread + width/2                  (17.5 bp as configured)
+///     loss             = (reference error - absorption) x EXPOSED DEPTH
+///
+/// Both factors matter and only one of them was ever bounded. The reference error is not ours to
+/// choose — it is set by whatever the market did since the last push, and the sweeps show it is
+/// almost entirely a *jump* phenomenon: pure diffusion at 1 bp/s against a 5 bp half-spread
+/// produced **zero** informed fills, because the quote is never wrong by more than ~1.4 bp inside
+/// the latency window. So the term the pool can act on is the second one, exposed depth, and
+/// exposed depth is a decision the contract makes every block.
+///
+/// Holding it constant claims that a ladder pushed one second ago and a ladder pushed thirty
+/// seconds ago deserve the same size. They do not. The probability that at least one jump has
+/// landed since the last push is `1 - e^{-λa} ≈ λa` — linear in the age `a` — while the loss
+/// *given* a jump does not depend on the age at all. Expected loss is therefore linear in
+/// `age × depth`, and a constant ladder integrates that with no ceiling except `maxStaleSecs`.
+///
+///     effectiveCapacity = capacity * (decaySecs - age) / decaySecs,  0 at and past decaySecs
+///
+/// ### Why linear, and why not the alternatives
+///
+/// **Linear to zero at `decaySecs`.** It is the shape of the hazard it is paid to cancel. Over the
+/// whole window it halves integrated exposure against a constant ladder (`∫₀^D (1 - a/D) da = D/2`),
+/// and — the number that actually matters, because a jump is one event and the winner takes the
+/// whole exposed depth in one transaction — it drives the worst single pick-off from "the entire
+/// epoch" to `capacity/decaySecs`, one capacity-second. It also composes with the cliff already
+/// there rather than duplicating it: at `decaySecs == maxStaleSecs` the depth reaches zero exactly
+/// where `_load` stops quoting, so depth is continuous across the whole window *and* at its end.
+///
+/// **A step function** is cheaper by a few gas and worse in kind. Every step is a discontinuity in
+/// depth, and a discontinuity in depth is a race: a searcher who lands one block before a halving
+/// takes twice what one who lands one block after can. That is a new MEV surface manufactured by
+/// the defence itself, which is a poor trade for the gas.
+///
+/// **A convex shape** protects the tail harder and is wrong at the near end, which is where the
+/// flow that pays for everything lives. Convexity cuts most aggressively at small `a`, exactly
+/// where the hazard is smallest, and it needs a second parameter to say how convex. The 16 bits
+/// this field has are better spent on a window an operator can reason about than on a curvature
+/// nobody can calibrate.
+///
+/// **No floor.** A residual floor would keep some depth exposed at every age, and a permanently
+/// exposed slice is a permanent leak: the thesis the simulator arrives at is that a large jump
+/// cannot be priced profitably at any spread a market maker would post, so the only winning move
+/// is not to be there. Zero is the point.
+///
+/// ### Where it lives, and where it deliberately does not
+///
+/// **In the capacity guard, never in `PropCurve`.** `PairState` now carries two numbers:
+/// `capacity`, the nominal epoch size, which is what every `PropCurve` call still receives; and
+/// `available`, the decayed bound, which is what `_maxAmountIn` / `_maxAmountOut` measure the
+/// remaining room against. Feeding the decayed number to the curve instead would re-slope the
+/// ladder — the same width consumed over less capacity — which changes the *price* with age, forces
+/// a matching change in the Rust mirror in `dubu-core`, and breaks the property the next section
+/// rests on. Keeping it a bound costs one multiply and one divide and touches no shared algebra.
+///
+/// ### What this does to the quote/execution contract, stated precisely
+///
+/// `IPropPool` promises the views return 0 rather than reverting, and
+/// `PropPool.invariant.t.sol`'s `invariant_quoteEqualsExecution` asserts the view quote and the
+/// executed swap agree exactly for identical state. `effectiveCapacity` is a function of
+/// `block.timestamp`, so that needs saying more carefully than it did — though note the views were
+/// already timestamp-dependent through the staleness cliff, and a quote taken one second before
+/// the cliff against a swap one second after it already disagreed.
+///
+///   1. **At a fixed `block.timestamp`, view and swap agree exactly, as before.** Both compute
+///      `available` from the same `_load`, from the same words, with the same arithmetic. Nothing
+///      about that is weakened, and the existing invariant is unchanged and still passes: the
+///      handler quotes and swaps inside one block, which is the only thing the property ever
+///      meant.
+///   2. **Across timestamps the quote can only shrink to zero, never move to a different number.**
+///      This is the part that makes (1) safe to read as a same-block statement, and it is a direct
+///      consequence of the decay being a bound rather than a curve argument. Ageing changes
+///      `available`; it does not change `capacity`, `used`, or any of the four prices. So for a
+///      fixed `amountIn` the curve is evaluated on identical arguments at every age, and the only
+///      thing age can do is push `amountIn` past `_maxAmountIn` — which turns the quote into 0 and
+///      the swap into `InsufficientCapacity`. The quote is therefore **either the same number or
+///      zero**, monotonically, for as long as the ladder stands.
+///
+/// Quote-spoofing — the surface `invariant_quoteEqualsExecution` exists to catch, measured at
+/// 5-10 bp per trade on Solana prop AMMs — is "shown X, filled at Y, Y worse than X". Property 2
+/// says the only reachable outcomes are Y == X and no fill at all. A taker can be refused by an
+/// ageing ladder; a taker can never be *filled worse* by one. A decay applied inside the curve
+/// would have failed exactly here, which is the sharpest argument for where it was put.
+///
+/// ### Cost, disabling, and who holds the dial
+///
+/// `decaySecs == 0` disables the mechanism entirely and is the default for every pair, so a pair
+/// with no volume does not watch its depth bleed away between heartbeats, and so this change is
+/// inert until an operator turns it on. It is **manager**-set, via `setPairDecay`, for the same
+/// reason `maxDeviationBps` is: the updater is the hot key, and a key that could lengthen its own
+/// decay window would be bounded by nothing. `refreshCapacity` preserves the field rather than
+/// writing it.
+///
+/// Gas is the reason the field sits in word 1 rather than in `PairConfig` (whose return tuple the
+/// Rust updater mirrors positionally, so it cannot grow) or in a mapping of its own (a cold 2,100
+/// on every swap and every quote). Word 1 is already read by `_load` for the pause flag and the
+/// capacities, so **no path gains an SLOAD** and the whole cost is a shift, a compare and, when the
+/// ramp is on, one mul-div. Measured cold in `test/PropPoolStaleness.t.sol`:
+///
+///   | call                            | ramp off | ramp on | delta |
+///   |---------------------------------|----------|---------|-------|
+///   | `swap`, exact-in bid            | 90,859   | 91,094  | +235  |
+///   | `getAmountOut`                  | 24,167   | 24,404  | +237  |
+///   | `getAmountIn`                   | 63,328   | 63,565  | +237  |
+///   | `getAmountOut`, warm            |  6,182   |  6,418  | +237  |
+///   | `effectiveCapacity` (new view)  | —        | 26,610  | —     |
+///
+/// The warm row is the one comparable with the table further up this header (6,085); the cold rows
+/// are not, and the delta is the same +237 either way, because the ramp is arithmetic and not
+/// storage. A whole swap stays at 91k against the 110k target. A pair that never opts in pays the
+/// one compare at the top of `_decayed` and nothing else.
+///
 /// ## Roles
 ///
 /// - `owner`    — rotates every role, adds pairs, withdraws inventory, sets the Pyth address.
 ///                Destined for a timelock.
-/// - `manager`  — per-pair configuration, including the whole reference bound, and inventory
-///                top-ups.
+/// - `manager`  — per-pair configuration, including the whole reference bound, the capacity decay
+///                window, and inventory top-ups.
 /// - `updater`  — `updateQuote` / `refreshCapacity` and nothing else. **Hard invariant: no
 ///                function reachable by the updater transfers a token or touches `_reserve`.**
 ///                This key signs many times a minute from a hot process; assume it leaks.
 ///                It can still cause loss by posting bad-but-coherent prices, and bounding *that*
 ///                is the reference bound above. Note which role owns which dial: the updater
-///                cannot set a feed id, a deviation limit, a staleness window or the Pyth address,
-///                so it cannot widen its own leash — only push ladders that fit inside it.
+///                cannot set a feed id, a deviation limit, a staleness window, a decay window or
+///                the Pyth address, so it cannot widen its own leash — only push ladders that fit
+///                inside it and capacity epochs that decay on the manager's schedule.
 /// - `guardian` — pause only, held on separate hardware from the updater.
 contract PropPool is IPropPool {
     using SafeTransfer for address;
@@ -254,6 +384,8 @@ contract PropPool is IPropPool {
     event PairOracleUpdated(
         uint16 indexed pairId, bytes32 feedId, uint16 maxDeviationBps, uint32 maxPythStaleSecs, int8 refExpo
     );
+    /// @dev `decaySecs == 0` in this event means the ramp was switched off for the pair.
+    event PairDecayUpdated(uint16 indexed pairId, uint16 decaySecs);
 
     // ---------------------------------------------------------------------
     // Bit layout constants
@@ -284,13 +416,24 @@ contract PropPool is IPropPool {
     uint256 private constant SHIFT_GEN = 192;
     uint256 private constant SHIFT_FLAGS = 224;
 
-    /// @dev flags bit 0 (word bit 224) = paused. Bits 1..14 are reserved; the natural next
+    /// @dev Bits 240..255 of the capacity word: `decaySecs`, the manager's staleness ramp. Zero
+    ///      disables. It sits in the updater's word but is not the updater's field — see
+    ///      `_refreshCapacity`, which preserves everything from bit 224 up.
+    uint256 private constant SHIFT_DECAY = 240;
+
+    /// @dev Everything at or above bit 224 of the capacity word: the guardian's flags and the
+    ///      manager's `decaySecs`. `_refreshCapacity` carries this mask across untouched, which is
+    ///      what keeps the updater from writing either.
+    uint256 private constant CAP_WORD_PRESERVED = ~((uint256(1) << SHIFT_FLAGS) - 1);
+
+    /// @dev flags bit 0 (word bit 224) = paused. Bits 1..13 are reserved; the natural next
     ///      occupants are `bidDisabled` / `askDisabled` for one-sided withdrawal.
     ///
-    ///      **Bit 15 is not a stored flag and never will be.** `snapshot` synthesizes it from the
-    ///      oracle config to report whether the pair is bounded — see `FLAG_SNAPSHOT_BOUNDED`. It
-    ///      is carved out of the top of the range rather than taken from the bottom precisely so
-    ///      that a future stored flag can claim bit 1 without colliding with it.
+    ///      **Bits 14 and 15 are not stored flags and never will be.** `snapshot` synthesizes both:
+    ///      bit 15 from the oracle config (`FLAG_SNAPSHOT_BOUNDED`) and bit 14 from `decaySecs`
+    ///      (`FLAG_SNAPSHOT_DECAYING`). They are carved out of the top of the range rather than
+    ///      taken from the bottom precisely so that a future stored flag can claim bit 1 without
+    ///      colliding with either.
     uint256 private constant FLAG_PAUSED = uint256(1) << SHIFT_FLAGS;
 
     /// @notice `snapshot().flags` bit 15: this pair has a reference-oracle feed configured.
@@ -298,6 +441,16 @@ contract PropPool is IPropPool {
     ///      legitimate configuration (see `setPairOracle`) and one an integrator should be able to
     ///      see without a second call. `pairOracle(pairId)` is the authoritative, detailed answer.
     uint16 internal constant FLAG_SNAPSHOT_BOUNDED = uint16(1) << 15;
+
+    /// @notice `snapshot().flags` bit 14: this pair's capacity decays with the age of its quote.
+    /// @dev Derived at read time from `decaySecs != 0`, never stored — the stored field is the
+    ///      window itself, in the capacity word's top 16 bits. The bit exists because
+    ///      `PairSnapshot` is a static tuple that off-chain decoders mirror positionally and must
+    ///      not grow a field (see `IPropPool`), while an integrator simulating off a snapshot needs
+    ///      to know that `bidCapacity`/`askCapacity` are the *curve's* capacity and no longer the
+    ///      fillable bound. `effectiveCapacity(pairId)` is the authoritative, detailed answer and
+    ///      returns the window alongside the two decayed numbers.
+    uint16 internal constant FLAG_SNAPSHOT_DECAYING = uint16(1) << 14;
 
     /// @dev `_route` value: bits 0..15 pairId (1-based), bit 16 set when `tokenIn` is the base.
     ///      A zero value therefore means "no such route" even for an ask on pair 1, which is why
@@ -329,15 +482,25 @@ contract PropPool is IPropPool {
     ///      in both cases the price at zero usage is the taker-favourable end, so the curve
     ///      argument order is identical and the two sides share one code path.
     ///
-    ///      `capacity` and `used` are BASE units on both sides. `reserveOut`/`minReserveOut` are in
-    ///      `tokenOut`, which is the quote token for a bid and the base token for an ask — so on the
-    ///      ask side they are directly comparable with `capacity`, and on the bid side they are not.
+    ///      `capacity`, `available` and `used` are BASE units on both sides.
+    ///      `reserveOut`/`minReserveOut` are in `tokenOut`, which is the quote token for a bid and
+    ///      the base token for an ask — so on the ask side they are directly comparable with
+    ///      `capacity`, and on the bid side they are not.
+    ///
+    ///      **`capacity` and `available` are two different numbers and the distinction is the whole
+    ///      of the staleness ramp.** `capacity` is the nominal epoch the updater posted and is the
+    ///      only one of the two that any `PropCurve` call ever sees, so the ladder's slope — and
+    ///      therefore the price of any given size — does not move as the quote ages. `available` is
+    ///      `capacity` scaled down by `_decayed`, and it is the number `_maxAmountIn` and
+    ///      `_maxAmountOut` measure the epoch's remaining room against. `available <= capacity`
+    ///      always, with equality when the pair's `decaySecs` is zero or the quote's age is zero.
     struct PairState {
         address tokenOut;
         uint8 priceScaleExp;
         uint256 pLow;
         uint256 pHigh;
         uint256 capacity;
+        uint256 available;
         uint256 used;
         uint256 reserveOut;
         uint256 minReserveOut;
@@ -684,6 +847,55 @@ contract PropPool is IPropPool {
         emit PairConfigUpdated(pairId, maxStaleSecs, minPrice, minBaseReserve, minQuoteReserve);
     }
 
+    /// @notice Set, retune, or disable one pair's capacity decay window.
+    ///
+    /// @dev The pair's fillable depth ramps linearly from the full posted capacity at age zero to
+    ///      nothing at age `decaySecs`, where age is `block.timestamp - updatedAt` on the stored
+    ///      ladder. See the contract header for why linear, why the bound and not the curve, and
+    ///      what it does to the quote/execution contract.
+    ///
+    ///      **Manager-gated, and that is the point of it.** The whole mechanism exists to bound the
+    ///      loss a stale ladder can take, and a stale ladder is what a failed, wedged or leaked
+    ///      updater produces. A key that could raise its own `decaySecs` — or zero it — could
+    ///      restore its own full exposure, which is the same hole `maxDeviationBps` is manager-held
+    ///      to close. `refreshCapacity` preserves this field; it does not write it.
+    ///
+    ///      Separate from `setPairConfig` rather than a fifth argument to it, for the reason
+    ///      `setPairOracle` gives: restating a parameter you did not mean to change is how
+    ///      parameters get changed by accident. It also leaves `setPairConfig`'s signature — and
+    ///      `pairConfig`'s return tuple, which the Rust updater mirrors positionally — untouched.
+    ///
+    ///      Nothing is validated, because there is nothing here that fails closed by being wrong.
+    ///      Every value in `uint16` names a coherent policy:
+    ///
+    ///        * `0` — disabled. Depth is constant across the whole staleness window, exactly as
+    ///          before this mechanism existed. This is the default for every pair, so the feature
+    ///          is inert until an operator opts in, and it is the right setting for a pair whose
+    ///          flow is thin enough that decaying depth on a heartbeat would cost more in missed
+    ///          fills than it saves in adverse selection.
+    ///        * `decaySecs == maxStaleSecs` — the ramp reaches zero exactly at the cliff, so depth
+    ///          is continuous everywhere including at the end of the window. The natural setting
+    ///          when the two are meant to describe one policy.
+    ///        * `decaySecs < maxStaleSecs` — a soft freshness requirement stricter than the hard
+    ///          one. The pair goes to zero depth at `decaySecs` and only starts *reverting* at
+    ///          `maxStaleSecs`. Useful because it is reversible without an outage: a single missed
+    ///          heartbeat costs a slice of depth rather than the whole book.
+    ///        * `decaySecs > maxStaleSecs` — the ramp never completes; depth at the cliff is
+    ///          `capacity * (decaySecs - maxStaleSecs) / decaySecs`. A partial haircut rather than
+    ///          a shutdown, for a pair where being present matters more than being small.
+    ///
+    ///      The two windows are deliberately independent, so retuning `maxStaleSecs` cannot silently
+    ///      revalidate or clamp this one.
+    /// @param decaySecs age at which fillable depth reaches zero, in seconds. **Zero disables.**
+    function setPairDecay(uint16 pairId, uint16 decaySecs) external onlyManager {
+        if (pairId == 0 || pairId > pairCount) revert UnknownPair();
+
+        uint256 word = _capacityWord[pairId];
+        _capacityWord[pairId] = (word & ~(MASK_16 << SHIFT_DECAY)) | (uint256(decaySecs) << SHIFT_DECAY);
+
+        emit PairDecayUpdated(pairId, decaySecs);
+    }
+
     // ---------------------------------------------------------------------
     // Reference-oracle administration
     //
@@ -727,13 +939,10 @@ contract PropPool is IPropPool {
     /// @param maxDeviationBps  tolerance on `maxBid` above and `minAsk` below the reference.
     /// @param maxPythStaleSecs our freshness window on Pyth's `publishTime`, not Pyth's own.
     /// @param refExpo          `priceScaleExp + quoteDecimals - baseDecimals`. See `PairOracle`.
-    function setPairOracle(
-        uint16 pairId,
-        bytes32 feedId,
-        uint16 maxDeviationBps,
-        uint32 maxPythStaleSecs,
-        int8 refExpo
-    ) external onlyManager {
+    function setPairOracle(uint16 pairId, bytes32 feedId, uint16 maxDeviationBps, uint32 maxPythStaleSecs, int8 refExpo)
+        external
+        onlyManager
+    {
         if (pairId == 0 || pairId > pairCount) revert UnknownPair();
 
         // Validated only when the bound is actually being switched on. Disabling a pair must not
@@ -749,10 +958,7 @@ contract PropPool is IPropPool {
         }
 
         _oracle[pairId] = PairOracle({
-            feedId: feedId,
-            maxDeviationBps: maxDeviationBps,
-            maxPythStaleSecs: maxPythStaleSecs,
-            refExpo: refExpo
+            feedId: feedId, maxDeviationBps: maxDeviationBps, maxPythStaleSecs: maxPythStaleSecs, refExpo: refExpo
         });
 
         emit PairOracleUpdated(pairId, feedId, maxDeviationBps, maxPythStaleSecs, refExpo);
@@ -879,18 +1085,20 @@ contract PropPool is IPropPool {
             uint256 word = packed[i];
             uint256 pairId = (word >> SHIFT_FLAGS) & MASK_16;
             if (pairId == 0 || pairId > n) revert UnknownPair();
-            _refreshCapacity(
-                uint16(pairId), uint96(word & MASK_96), uint96((word >> SHIFT_ASK_CAPACITY) & MASK_96)
-            );
+            _refreshCapacity(uint16(pairId), uint96(word & MASK_96), uint96((word >> SHIFT_ASK_CAPACITY) & MASK_96));
             unchecked {
                 ++i;
             }
         }
     }
 
-    /// @dev Read-modify-write because the paused flag lives in the same word and belongs to the
-    ///      guardian. Capacity refresh is deliberate and infrequent, so the extra SLOAD is not
-    ///      worth splitting the word for.
+    /// @dev Read-modify-write because the top 32 bits of the word are not the updater's: the paused
+    ///      flag belongs to the guardian and `decaySecs` to the manager. `CAP_WORD_PRESERVED` carries
+    ///      both across untouched, and widening that mask is what keeps `setPairDecay` a
+    ///      manager-only dial even though it writes into the word `refreshCapacity` owns. Capacity
+    ///      refresh is deliberate and infrequent, so the extra SLOAD is not worth splitting the word
+    ///      for — and splitting it would put a cold SLOAD on the swap path instead, which is the one
+    ///      place the cost is not ours to pay.
     ///
     ///      `capGen` wraps at 2^32 on purpose — only equality against `usedGen` matters. A wrap
     ///      that resurrected a stale `used` counter would need exactly 2^32 refreshes between a
@@ -937,7 +1145,7 @@ contract PropPool is IPropPool {
             gen = uint32(((word >> SHIFT_GEN) & MASK_32) + 1);
         }
         _capacityWord[pairId] = uint256(bidCapacity) | (uint256(askCapacity) << SHIFT_ASK_CAPACITY)
-            | (uint256(gen) << SHIFT_GEN) | (word & (MASK_16 << SHIFT_FLAGS));
+            | (uint256(gen) << SHIFT_GEN) | (word & CAP_WORD_PRESERVED);
 
         emit CapacityRefreshed(pairId, bidCapacity, askCapacity, gen);
     }
@@ -1088,12 +1296,52 @@ contract PropPool is IPropPool {
         // quoting views. `referencePrice` is the (also total) call for that question.
         if (_oracle[pairId].feedId != bytes32(0)) s.flags |= FLAG_SNAPSHOT_BOUNDED;
 
+        // Bit 14, likewise derived: does this pair's fillable depth shrink with the age of the
+        // ladder above? `bidCapacity` and `askCapacity` here are the NOMINAL epoch — the number
+        // `PropCurve` is priced on, which is what a simulator must feed the curve — and when this
+        // bit is set they are no longer the fillable bound. `effectiveCapacity(pairId)` returns
+        // that bound and the window it ramps over.
+        if ((c >> SHIFT_DECAY) & MASK_16 != 0) s.flags |= FLAG_SNAPSHOT_DECAYING;
+
         s.bidUsed = uint96(u & MASK_96);
         s.askUsed = uint96((u >> SHIFT_ASK_CAPACITY) & MASK_96);
         s.usedGen = uint32((u >> SHIFT_GEN) & MASK_32);
 
         s.priceScaleExp = cfg.priceScaleExp;
         s.maxStaleSecs = cfg.maxStaleSecs;
+    }
+
+    /// @inheritdoc IPropPool
+    ///
+    /// @dev Implemented on top of `_load`, twice, rather than by re-deriving the ramp from the raw
+    ///      words. That is two SLOAD-heavy calls in a view where one hand-rolled read would do, and
+    ///      it is the right trade: this function's entire value is that it reports **exactly** what
+    ///      the swap path will enforce, and the only way to guarantee that under future edits is for
+    ///      it to run the same code. A second copy of the freshness-and-ramp logic would be a second
+    ///      thing to keep in step, in the one place where being out of step means an integrator's
+    ///      router sizes a trade the pool then refuses.
+    ///
+    ///      Totality is inherited from `_load`, which returns a status rather than reverting for
+    ///      every reachable state, so this satisfies the same no-revert obligation as the quoting
+    ///      views: unknown pair, never-quoted pair, paused, globally paused and past the staleness
+    ///      cliff all read `(0, 0, decaySecs)`.
+    ///
+    ///      `decaySecs` is returned even when both capacities are zero, because "zero depth because
+    ///      the pair is paused" and "zero depth because the ramp completed" are different operator
+    ///      problems and the window is what distinguishes them. It is read straight from the word,
+    ///      so an unknown pair reports zero for it as well.
+    function effectiveCapacity(uint16 pairId)
+        external
+        view
+        returns (uint96 bidCapacity, uint96 askCapacity, uint16 decaySecs)
+    {
+        decaySecs = uint16((_capacityWord[pairId] >> SHIFT_DECAY) & MASK_16);
+
+        (uint256 bidStatus, PairState memory bid) = _load(pairId, true);
+        if (bidStatus == STATUS_OK) bidCapacity = uint96(bid.available);
+
+        (uint256 askStatus, PairState memory ask) = _load(pairId, false);
+        if (askStatus == STATUS_OK) askCapacity = uint96(ask.available);
     }
 
     /// @inheritdoc IPropPool
@@ -1241,7 +1489,11 @@ contract PropPool is IPropPool {
         // window would otherwise make a pair that has never been quoted look fresh.
         if (updatedAt == 0) return (STATUS_STALE, st);
         if (updatedAt > block.timestamp) return (STATUS_STALE, st);
-        if (block.timestamp - updatedAt > cfg.maxStaleSecs) return (STATUS_STALE, st);
+        uint256 age;
+        unchecked {
+            age = block.timestamp - updatedAt; // the line above establishes the direction
+        }
+        if (age > cfg.maxStaleSecs) return (STATUS_STALE, st);
 
         st.priceScaleExp = cfg.priceScaleExp;
         if (isBid) {
@@ -1258,12 +1510,43 @@ contract PropPool is IPropPool {
             st.minReserveOut = cfg.minBaseReserve;
         }
 
+        // The staleness ramp. One factor, applied to whichever side was just loaded, from one
+        // stamp — the ladder has a single `updatedAt` and both of its sides are equally old.
+        // `capacity` keeps the nominal number the curve is priced on; only the bound moves.
+        st.available = _decayed(st.capacity, age, (capWord >> SHIFT_DECAY) & MASK_16);
+
         uint256 uWord = _usedWord[pairId];
         if (((uWord >> SHIFT_GEN) & MASK_32) == ((capWord >> SHIFT_GEN) & MASK_32)) {
             st.used = isBid ? (uWord & MASK_96) : ((uWord >> SHIFT_ASK_CAPACITY) & MASK_96);
         }
 
         st.reserveOut = _reserve[st.tokenOut];
+    }
+
+    /// @dev The staleness ramp: `capacity * (decaySecs - age) / decaySecs`, floored, clamped to
+    ///      zero at and past `decaySecs`. The one place the decay shape is written down, shared by
+    ///      `_load` and therefore by every quote, every swap and `effectiveCapacity` alike, so the
+    ///      three cannot drift.
+    ///
+    ///      **Exact at both ends, and that is worth checking rather than assuming.** At `age == 0`
+    ///      it is `capacity * decaySecs / decaySecs == capacity` with no rounding loss at all, so a
+    ///      freshly pushed ladder is bit-for-bit the ladder it would have been before this
+    ///      mechanism existed. At `age == decaySecs` it is zero, not one unit of dust, because the
+    ///      comparison is `>=`. `decaySecs == 0` returns `capacity` untouched — the disabled path,
+    ///      and one branch, so a pair that never opts in pays a compare and nothing else.
+    ///
+    ///      Flooring is the pool-favourable direction: the ramp gives up depth slightly faster than
+    ///      the real line would. It is also exact integer arithmetic with no fixed-point library, so
+    ///      an off-chain simulator reproduces the same number from `snapshot` plus the window
+    ///      `effectiveCapacity` reports.
+    ///
+    ///      No overflow: `capacity` is drawn from a `uint96` field (< 2^96) and `decaySecs` from a
+    ///      `uint16` one (< 2^16), so the product is below 2^112. The subtraction is guarded by the
+    ///      `age >= decaySecs` arm above it.
+    function _decayed(uint256 capacity, uint256 age, uint256 decaySecs) private pure returns (uint256) {
+        if (decaySecs == 0) return capacity;
+        if (age >= decaySecs) return 0;
+        return (capacity * (decaySecs - age)) / decaySecs;
     }
 
     // ---------------------------------------------------------------------
@@ -1336,8 +1619,7 @@ contract PropPool is IPropPool {
         // stale in exactly the way a price published behind it is: a reference is only a reference
         // if it has been observed, and a future timestamp has not been.
         uint256 publishTime = quoted.publishTime;
-        uint256 age =
-            publishTime > block.timestamp ? publishTime - block.timestamp : block.timestamp - publishTime;
+        uint256 age = publishTime > block.timestamp ? publishTime - block.timestamp : block.timestamp - publishTime;
         if (age > o.maxPythStaleSecs) return (0, REF_STALE);
 
         // Rejected, not cast. `price` is `int64` and Pyth feeds for rates and spreads do go
@@ -1438,7 +1720,7 @@ contract PropPool is IPropPool {
     // ---------------------------------------------------------------------
 
     /// @dev The largest `amountIn` this side's epoch can accept, in the direction's INPUT token.
-    ///      Callers must have established `capacity > 0 && used < capacity`.
+    ///      Callers must have established `available > 0 && used < available`.
     ///
     ///      For a bid the input *is* the base leg, so this is just the remaining room. For an ask
     ///      the input is quote and the room is base, so the ceiling is the quote cost of all the
@@ -1447,27 +1729,75 @@ contract PropPool is IPropPool {
     ///      that revert into a 0, and it is the reason a plain `askUsed + amountIn > askCapacity`
     ///      test cannot be resurrected: those two are base units and `amountIn` is not.
     ///
+    ///      **The room is measured against `available`, the cost against `capacity`.** Those are the
+    ///      two halves of the staleness ramp and mixing them up is the way to get this wrong. The
+    ///      remaining base is `available - used`, because that is the depth the ladder's age still
+    ///      justifies; the *price* of that base is the nominal curve, because the ramp is a bound
+    ///      and not a repricing. `available <= capacity`, so the resulting ceiling is never above
+    ///      the one this function returned before the ramp existed.
+    ///
+    ///      ## Why the ramped ask ceiling is `cost(room + 1) - 1` and not `cost(room)`
+    ///
+    ///      This is the one place the ramp is not a one-line substitution, and the reason is worth
+    ///      stating because the obvious form is subtly wrong.
+    ///
+    ///      `amountOutAsk` answers `max{ q : cost(q) <= amountIn }`, and `cost` is *ceiled* into
+    ///      quote units. On a pair with more base decimals than quote decimals — the ordinary case,
+    ///      18/6 — one quote unit buys billions of base wei, so `cost` is a step function and many
+    ///      consecutive base amounts share a value. `cost(room)` is therefore usually **also** the
+    ///      cost of `room + 1`, `room + 2`, and so on, which means handing `cost(room)` to
+    ///      `amountOutAsk` buys strictly more than `room`.
+    ///
+    ///      Without the ramp this never surfaced: `room` was the epoch's whole remaining base, and
+    ///      `amountOutAsk` short-circuits `amountIn == cost(capacity - used)` to `capacity - used`
+    ///      exactly, so the ceiling was exact by that early return. With the ramp, `room` is
+    ///      strictly inside the epoch, the short-circuit does not fire, the bisection runs against
+    ///      the nominal bracket, and the overshoot is real — measured at ~1.7e8 base wei on a
+    ///      1000e18 epoch, worth about 3e-10 dollars and therefore economically nothing, but it
+    ///      would let `used` pass `available` and it would make "`effectiveCapacity` is the enforced
+    ///      bound" false as stated.
+    ///
+    ///      **The fix refuses the input rather than clamping the output, and that choice is the
+    ///      load-bearing one.** Clamping would deliver `min(curveOut, room)` for the same `amountIn`
+    ///      — a real fill at a rate the quote never showed, and a *third* possible value for an aged
+    ///      quote, which is exactly the property the contract header promises does not exist.
+    ///      Refusing keeps the outcome set at {the same number, zero}. `cost(room + 1) - 1` is the
+    ///      largest input that provably cannot reach `room + 1` base, and it is tight: one more
+    ///      quote unit is `cost(room + 1)`, which buys `room + 1`.
+    ///
+    ///      The `available == capacity` arm is not an optimisation. It is the un-ramped path,
+    ///      preserved bit-for-bit — `room + 1` would exceed the epoch there and `amountInAsk` would
+    ///      revert `AmountExceedsCapacity` — so a pair that never opts in behaves exactly as it did.
+    ///
     ///      **This call cannot itself revert, and the reason is not local.** `amountInAsk` raises
     ///      `AmountOutOfDomain` when the cost exceeds `PropCurve.MAX_AMOUNT_OUT`; the bound
-    ///      `_refreshCapacity` enforces when capacity is written keeps `cost(capacity)` inside that
-    ///      domain for every ladder the updater can post. `ZeroCapacity` is excluded by the
-    ///      caller's precondition and `AmountExceedsCapacity` by `used + room == capacity`.
-    ///      `ZeroPrice` needs `maxAsk == 0`, which `_load` cannot produce: it only returns
+    ///      `_refreshCapacity` enforces when capacity is written keeps `cost(capacity - used)`
+    ///      inside that domain for every ladder the updater can post, and `cost` is non-decreasing,
+    ///      so the cost of the no-larger `room + 1 <= capacity - used` is inside it too.
+    ///      `ZeroCapacity` is excluded by the caller's precondition via `0 < available <= capacity`,
+    ///      and `AmountExceedsCapacity` by `used + room == available <= capacity` on the first arm
+    ///      and by `used + room + 1 <= capacity` on the second, which is what `available < capacity`
+    ///      says. `ZeroPrice` needs `maxAsk == 0`, which `_load` cannot produce: it only returns
     ///      `STATUS_OK` for a pair whose stored ladder passed `validateLadder`, and that forces
-    ///      `maxAsk > minBid >= minPrice >= 1`.
+    ///      `maxAsk > minBid >= minPrice >= 1`. The `- 1` cannot underflow: `amountInAsk` of a
+    ///      non-zero base amount at a non-zero price ceils to at least 1.
     function _maxAmountIn(PairState memory st, bool isBid) private pure returns (uint256) {
-        uint256 room = st.capacity - st.used;
+        uint256 room = st.available - st.used;
         if (isBid) return room;
-        return PropCurve.amountInAsk(room, st.pLow, st.pHigh, st.capacity, st.used, st.priceScaleExp);
+        if (st.available == st.capacity) {
+            return PropCurve.amountInAsk(room, st.pLow, st.pHigh, st.capacity, st.used, st.priceScaleExp);
+        }
+        return PropCurve.amountInAsk(room + 1, st.pLow, st.pHigh, st.capacity, st.used, st.priceScaleExp) - 1;
     }
 
     /// @dev The largest `amountOut` this side's epoch can deliver, in the direction's OUTPUT token.
     ///      Mirror of `_maxAmountIn` — for an ask the output is the base leg and the room is the
     ///      answer, for a bid it is the quote the whole remaining room would fetch — and revert-free
-    ///      for the same reasons. Doubles as the fillability probe for the exact-output paths: a
+    ///      for the same reasons, with the same split between `available` for the room and
+    ///      `capacity` for the price. Doubles as the fillability probe for the exact-output paths: a
     ///      target above this is one the epoch cannot deliver at any input.
     function _maxAmountOut(PairState memory st, bool isBid) private pure returns (uint256) {
-        uint256 room = st.capacity - st.used;
+        uint256 room = st.available - st.used;
         if (!isBid) return room;
         return PropCurve.amountOutBid(room, st.pLow, st.pHigh, st.capacity, st.used, st.priceScaleExp);
     }
@@ -1485,9 +1815,16 @@ contract PropPool is IPropPool {
 
     /// @dev Exact input. `amountIn` is base for a bid and quote for an ask; the return is the other
     ///      token. 0 for every unfillable condition, so the view path never reverts.
+    ///
+    ///      The exhaustion test is against `available`, not `capacity`, which is what makes a fully
+    ///      decayed ladder quote zero rather than its nominal depth. Note that `used` is *not*
+    ///      scaled by the ramp — it is base the pool has genuinely already traded — so a side that
+    ///      spent most of its epoch while fresh reads as exhausted sooner as the quote ages, which
+    ///      is the correct direction: what the ramp bounds is the depth still exposed, and that is
+    ///      `available - used`.
     function _outFor(PairState memory st, bool isBid, uint256 amountIn) private pure returns (uint256) {
         if (amountIn == 0) return 0;
-        if (st.capacity == 0 || st.used >= st.capacity) return 0;
+        if (st.available == 0 || st.used >= st.available) return 0;
         if (amountIn > _maxAmountIn(st, isBid)) return 0;
 
         return isBid
@@ -1518,7 +1855,7 @@ contract PropPool is IPropPool {
     ///      Rounding is the curve's: up, i.e. the exact-output taker pays the sub-unit surplus.
     function _inFor(PairState memory st, bool isBid, uint256 amountOut) private pure returns (uint256) {
         if (amountOut == 0) return 0;
-        if (st.capacity == 0 || st.used >= st.capacity) return 0;
+        if (st.available == 0 || st.used >= st.available) return 0;
         // Fillability probe. It also bounds `amountOut` by `MAX_AMOUNT_OUT` on the bid side, which
         // is what keeps `amountInBid`'s domain check out of reach — see `_maxAmountOut`.
         if (amountOut > _maxAmountOut(st, isBid)) return 0;
@@ -1532,10 +1869,16 @@ contract PropPool is IPropPool {
     ///      taker learns why. The capacity test is `_maxAmountIn` on both sides — for an ask that is
     ///      the quote cost of the epoch's remaining base, so an over-sized ask still reverts
     ///      `InsufficientCapacity` rather than surfacing `PropCurve.AmountExceedsCapacity`.
+    ///
+    ///      A size refused because the ladder has aged past its `decaySecs` ramp reverts with the
+    ///      same `InsufficientCapacity`, and deliberately so rather than with a new error: the ramp
+    ///      *is* a capacity bound, the views return 0 for it exactly as they do for an exhausted
+    ///      epoch, and a distinct error would tell a taker which of the two refused him without
+    ///      changing what he can do about it. `effectiveCapacity(pairId)` is the diagnostic.
     function _resolveExactIn(uint16 pairId, bool isBid, uint256 amountIn) private view returns (uint256 amountOut) {
         PairState memory st = _loadChecked(pairId, isBid);
-        // Short-circuit order matters: `_maxAmountIn` requires `used < capacity`.
-        if (st.capacity == 0 || st.used >= st.capacity || amountIn > _maxAmountIn(st, isBid)) {
+        // Short-circuit order matters: `_maxAmountIn` requires `used < available`.
+        if (st.available == 0 || st.used >= st.available || amountIn > _maxAmountIn(st, isBid)) {
             revert InsufficientCapacity();
         }
         amountOut = isBid
@@ -1570,14 +1913,9 @@ contract PropPool is IPropPool {
     ///      upstream, directly for a bid (`_maxAmountIn`) and for an exact-output ask
     ///      (`_maxAmountOut`), and by construction for an exact-input ask, since
     ///      `PropCurve.amountOutAsk` never returns more base than the epoch's remaining room.
-    function _settle(
-        uint16 pairId,
-        bool isBid,
-        address tokenIn,
-        address tokenOut,
-        uint256 amountIn,
-        uint256 amountOut
-    ) private {
+    function _settle(uint16 pairId, bool isBid, address tokenIn, address tokenOut, uint256 amountIn, uint256 amountOut)
+        private
+    {
         uint256 gen = (_capacityWord[pairId] >> SHIFT_GEN) & MASK_32;
         uint256 uWord = _usedWord[pairId];
 
@@ -1596,7 +1934,6 @@ contract PropPool is IPropPool {
         _reserve[tokenIn] += amountIn;
         _reserve[tokenOut] -= amountOut;
     }
-
 }
 
 // RFQ (signed, one-shot maker orders with confidence decay) is a separate contract — a fork of
