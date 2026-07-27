@@ -42,6 +42,24 @@ rpc_url = "https://giwa-sepolia.nodit.io/${NODIT_API_KEY}"
 # go here — a nonce read from a preconfirmed state that reorganises is a stuck transaction.
 flashblocks_rpc_url = "https://sepolia-rpc-flashblocks.giwa.io"
 
+# EXTRA READ ENDPOINTS. Rotated with the flashblocks endpoint above, one per call, so the request
+# budget is the sum of the keys rather than the smallest of them.
+#
+# READS ONLY, and the restriction is structural. Transactions, the nonce and receipts all go to
+# `rpc_url` and stay pinned there however many of these exist: reading a nonce from a node that has
+# not yet seen the previous transaction leaves a gap nothing fills, which is the same hazard as
+# reading a nonce from the flashblocks `pending` tag, arriving by a different road.
+#
+# Templates, never literals. The values live in a gitignored `.env`.
+read_rpc_urls = [
+  "https://giwa-sepolia.nodit.io/${NODIT_API_KEY_2}",
+  "https://giwa-sepolia.nodit.io/${NODIT_API_KEY_3}",
+  "https://giwa-sepolia.nodit.io/${NODIT_API_KEY_4}",
+  "https://giwa-sepolia.nodit.io/${NODIT_API_KEY_5}",
+  "https://giwa-sepolia.nodit.io/${NODIT_API_KEY_6}",
+  "https://giwa-sepolia.nodit.io/${NODIT_API_KEY_7}",
+]
+
 chain_id = 91342
 pool = "0xBbE55E29BbC6d71EcAb1ac011c9Ac5206aB2Fe74"
 

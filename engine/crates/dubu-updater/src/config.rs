@@ -518,6 +518,19 @@ pub struct ChainConfig {
     /// ordinary endpoint by about two blocks, so reading `latest` here is strictly worse than
     /// reading `latest` there. See [`crate::chain`].
     pub flashblocks_rpc_url: EndpointUrl,
+    /// Extra read endpoints, rotated alongside [`Self::flashblocks_rpc_url`].
+    ///
+    /// Reads only, and the restriction is structural rather than a convention: a read is a
+    /// question about one block that any node can answer, whereas rotating the *transmit* path
+    /// would read a nonce from a node that has not seen the previous transaction. See
+    /// [`crate::chain::Selection`]. The transmit client stays pinned to [`Self::rpc_url`] however
+    /// many of these there are.
+    ///
+    /// Each is an [`EndpointUrl`], so each is a `${VAR}` template and each is redacted in logs.
+    /// Several keys against one provider multiply the request budget; several providers also buy
+    /// independence from one of them being down.
+    #[serde(default)]
+    pub read_rpc_urls: Vec<EndpointUrl>,
     /// EIP-155 chain id. 91342 for GIWA Sepolia.
     pub chain_id: u64,
     /// `PropPool` address.

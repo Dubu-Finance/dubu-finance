@@ -225,6 +225,22 @@ pub enum RpcError {
 }
 
 impl RpcError {
+    /// True when the failure is the *endpoint's*, so another endpoint is worth trying.
+    ///
+    /// [`Self::Node`] is deliberately excluded. A JSON-RPC error means this node parsed the
+    /// request and refused it — "execution reverted", "nonce too low", "already known" — and
+    /// every other node holding the same chain would refuse it identically. Retrying it elsewhere
+    /// would turn one refusal into several, and on the transmit path it would mean broadcasting
+    /// the same intent twice on the guess that the first one did not count.
+    #[must_use]
+    pub const fn is_endpoint_fault(&self) -> bool {
+        matches!(
+            self,
+            Self::Transport { .. } | Self::Http { .. } | Self::RateLimited { .. } | Self::BackingOff { .. }
+                | Self::BudgetExhausted { .. }
+        )
+    }
+
     /// Whether this is the rate limit rather than some other failure. Drives the health state
     /// machine's `reason` field and nothing else — both kinds count as a failed poll.
     #[must_use]
@@ -333,12 +349,41 @@ impl Limiter {
 // Transport
 // ---------------------------------------------------------------------------
 
-/// One JSON-RPC endpoint, with its own runaway guard.
+/// How a pooled client picks which endpoint answers a call.
+///
+/// The distinction is not a tuning knob. Spreading reads over several keys multiplies the request
+/// budget and costs nothing, because a read is a question about one block and any node can answer
+/// it. Spreading the *transmit* path over several nodes is a bug: `eth_getTransactionCount` on one
+/// node and `eth_sendRawTransaction` on another means the nonce was read from a node that has not
+/// seen the previous transaction, which produces a gap and a transaction that never lands. It is
+/// the same hazard as reading a nonce from the flashblocks `pending` tag, arriving by a different
+/// road.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Selection {
+    /// Round-robin over healthy endpoints. For reads.
+    Rotate,
+    /// Stay on the first healthy endpoint, and move only when it is genuinely failing. For the
+    /// nonce/submit/receipt path, where consecutive calls must reach the same node's view.
+    Pin,
+}
+
+/// One endpoint in a pool: a URL and the runaway guard that belongs to it.
+///
+/// The guard is per-endpoint rather than per-pool because a rate limit is a property of the key
+/// that hit it. One shared limiter would let a single throttled key back the whole pool off, which
+/// is the opposite of what having several keys is for.
+struct Endpoint {
+    url: EndpointUrl,
+    limiter: Mutex<Limiter>,
+}
+
+/// A JSON-RPC client over one or more interchangeable endpoints.
 pub struct Rpc {
     name: &'static str,
-    url: EndpointUrl,
+    endpoints: Vec<Endpoint>,
+    selection: Selection,
+    cursor: AtomicU64,
     client: reqwest::Client,
-    limiter: Mutex<Limiter>,
     next_id: AtomicU64,
     backoff_initial: Duration,
     backoff_max: Duration,
@@ -358,20 +403,56 @@ impl Rpc {
         url: &EndpointUrl,
         cfg: &crate::config::ChainConfig,
     ) -> Result<Self, RpcError> {
+        Self::pooled(name, std::slice::from_ref(url), Selection::Pin, cfg)
+    }
+
+    /// Build a client over several interchangeable endpoints.
+    ///
+    /// `urls` must all be the same chain — nothing here checks that, and nothing could cheaply.
+    /// A mismatched endpoint would answer with another chain's state and the failure would look
+    /// like a reorg, so the startup verification in [`verify_against_chain`] is what has to catch
+    /// it, and it runs against the pool.
+    ///
+    /// # Errors
+    /// [`RpcError::Transport`] if the HTTP client cannot be constructed, or if `urls` is empty —
+    /// a pool with no endpoints answers nothing, and failing at startup beats failing per call.
+    pub fn pooled(
+        name: &'static str,
+        urls: &[EndpointUrl],
+        selection: Selection,
+        cfg: &crate::config::ChainConfig,
+    ) -> Result<Self, RpcError> {
+        if urls.is_empty() {
+            return Err(decode_err(name, "no endpoints configured"));
+        }
         let client = reqwest::Client::builder()
             .timeout(Duration::from_millis(cfg.request_timeout_ms))
             .user_agent(concat!("dubu-updater/", env!("CARGO_PKG_VERSION")))
             .build()
             .map_err(|source| RpcError::Transport { endpoint: name, source })?;
+        let now = Instant::now();
         Ok(Self {
             name,
-            url: url.clone(),
+            endpoints: urls
+                .iter()
+                .map(|u| Endpoint {
+                    url: u.clone(),
+                    limiter: Mutex::new(Limiter::new(cfg.requests_per_sec, cfg.request_burst, now)),
+                })
+                .collect(),
+            selection,
+            cursor: AtomicU64::new(0),
             client,
-            limiter: Mutex::new(Limiter::new(cfg.requests_per_sec, cfg.request_burst, Instant::now())),
             next_id: AtomicU64::new(1),
             backoff_initial: Duration::from_millis(cfg.rate_limit_backoff_initial_ms),
             backoff_max: Duration::from_millis(cfg.rate_limit_backoff_max_ms),
         })
+    }
+
+    /// How many endpoints this client can fall back across.
+    #[must_use]
+    pub fn endpoint_count(&self) -> usize {
+        self.endpoints.len()
     }
 
     /// This endpoint's name, for logs.
@@ -380,20 +461,23 @@ impl Rpc {
         self.name
     }
 
-    /// This endpoint's URL in its redacted form, for logs. There is no accessor for the real one.
+    /// The first endpoint's URL in its redacted form, for logs. There is no accessor for the real
+    /// one.
     #[must_use]
     pub fn url(&self) -> &EndpointUrl {
-        &self.url
+        // Bounded by the empty check in `pooled`, which is the only constructor.
+        #[allow(clippy::indexing_slicing)]
+        &self.endpoints[0].url
     }
 
-    /// How many times this endpoint has rate-limited us.
+    /// How many times any endpoint in this pool has rate-limited us.
     #[must_use]
     pub fn rate_limit_events(&self) -> u64 {
-        self.lock().rate_limit_events
+        self.endpoints.iter().map(|e| Self::lock_of(e).rate_limit_events).sum()
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, Limiter> {
-        self.limiter.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    fn lock_of(e: &Endpoint) -> std::sync::MutexGuard<'_, Limiter> {
+        e.limiter.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// One JSON-RPC call.
@@ -402,17 +486,58 @@ impl Rpc {
     /// [`RpcError`]. Note that [`RpcError::BackingOff`] and [`RpcError::BudgetExhausted`] are
     /// returned *without opening a socket*, which is the point.
     pub async fn call(&self, method: &str, params: serde_json::Value) -> Result<serde_json::Value, RpcError> {
-        self.lock().try_take(self.name, Instant::now())?;
-
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let body = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
 
+        let n = self.endpoints.len();
+        let start = match self.selection {
+            // Advance the cursor once per call, so consecutive reads land on different keys and
+            // the pool's budget is the sum of its keys rather than the smallest of them.
+            Selection::Rotate => usize::try_from(self.cursor.fetch_add(1, Ordering::Relaxed)).unwrap_or(0) % n,
+            Selection::Pin => 0,
+        };
+
+        let mut last: Option<RpcError> = None;
+        for step in 0..n {
+            let idx = (start + step) % n;
+            // Bounded by the modulo above; `n` is the length of the vector being indexed.
+            #[allow(clippy::indexing_slicing)]
+            let endpoint = &self.endpoints[idx];
+
+            // The runaway guard is consulted per endpoint, so one throttled key steps aside
+            // instead of backing the whole pool off.
+            if let Err(e) = Self::lock_of(endpoint).try_take(self.name, Instant::now()) {
+                last = Some(e);
+                continue;
+            }
+
+            match self.call_one(endpoint, &body).await {
+                Ok(v) => return Ok(v),
+                Err(e) => {
+                    // Only *transport-level* failures are retried elsewhere. A `Node` error means
+                    // this node understood the request and refused it, so another node would
+                    // refuse it identically — and on the transmit path a retried submit is a
+                    // second broadcast of the same intent, which is exactly what must not be
+                    // guessed at.
+                    if !e.is_endpoint_fault() {
+                        return Err(e);
+                    }
+                    last = Some(e);
+                }
+            }
+        }
+
+        Err(last.unwrap_or_else(|| decode_err(self.name, "no endpoint available")))
+    }
+
+    /// One attempt against one endpoint.
+    async fn call_one(&self, endpoint: &Endpoint, body: &serde_json::Value) -> Result<serde_json::Value, RpcError> {
         // One of exactly two `expose()` call sites in the crate; the other is the websocket
         // connect in `heads`. Everything else — logs, errors, Debug output — sees the redaction.
         let resp = self
             .client
-            .post(self.url.expose())
-            .json(&body)
+            .post(endpoint.url.expose())
+            .json(body)
             .send()
             .await
             .map_err(|source| RpcError::Transport { endpoint: self.name, source })?;
@@ -425,7 +550,7 @@ impl Rpc {
         let looks_rate_limited = status.as_u16() == 429 || text.to_ascii_lowercase().contains("over rate limit");
         if looks_rate_limited {
             let backoff = {
-                let mut g = self.lock();
+                let mut g = Self::lock_of(endpoint);
                 g.on_rate_limited(Instant::now(), self.backoff_initial, self.backoff_max)
             };
             return Err(RpcError::RateLimited {
@@ -449,7 +574,7 @@ impl Rpc {
                 message: err.get("message").and_then(serde_json::Value::as_str).unwrap_or("(none)").to_string(),
             });
         }
-        self.lock().on_success();
+        Self::lock_of(endpoint).on_success();
         Ok(v.get("result").cloned().unwrap_or(serde_json::Value::Null))
     }
 

@@ -51,7 +51,7 @@ use tracing::{error, info, warn};
 use dubu_updater::chain::heads::{self, HeadShared};
 use alloy_primitives::Address;
 use dubu_updater::chain::swaps::SwapWatch;
-use dubu_updater::chain::{ChainFacts, ChainHealth, ChainReader, ChainStatus, ChainView, Rpc};
+use dubu_updater::chain::{ChainFacts, ChainHealth, ChainReader, ChainStatus, ChainView, Rpc, Selection};
 use dubu_updater::config::{Config, KeySource};
 use dubu_updater::now_unix;
 use dubu_updater::fair_value::{self, Reference, VenueQuote};
@@ -248,8 +248,22 @@ async fn run(args: &Args) -> Result<i32, Box<dyn std::error::Error>> {
         cfg.tx.transmit_allowed = false;
     }
 
+    // The transmit client is PINNED to one endpoint, and stays pinned however many read
+    // endpoints are configured. Nonce, submit and receipt must reach one node's view of the
+    // pending set; reading a nonce from a node that has not seen the previous transaction leaves
+    // a gap that nothing fills.
     let rpc = Rpc::new("rpc", &cfg.chain.rpc_url, &cfg.chain)?;
-    let flash = Rpc::new("flashblocks", &cfg.chain.flashblocks_rpc_url, &cfg.chain)?;
+
+    // Reads rotate. A read is a question about one block and any node can answer it, so the pool's
+    // budget is the sum of its keys rather than the smallest of them.
+    let mut read_urls = vec![cfg.chain.flashblocks_rpc_url.clone()];
+    read_urls.extend(cfg.chain.read_rpc_urls.iter().cloned());
+    let flash = Rpc::pooled("flashblocks", &read_urls, Selection::Rotate, &cfg.chain)?;
+    info!(
+        target: "chain", event = "read_pool", endpoints = flash.endpoint_count(),
+        transmit = %rpc.url(),
+        "read endpoints rotate; the transmit endpoint is pinned"
+    );
 
     // Every check that needs the chain, before the loop is allowed to compute anything.
     let facts = dubu_updater::chain::verify_against_chain(&rpc, cfg.chain.pool, cfg.chain.multicall3, &cfg).await?;
