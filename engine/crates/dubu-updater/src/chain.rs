@@ -1,0 +1,1121 @@
+//! Chain access: JSON-RPC transport, the request budget, and the poll that produces a
+//! [`ChainView`].
+//!
+//! # Two constraints shape this whole module
+//!
+//! **GIWA has no `eth_subscribe` and no websocket** — the endpoint answers 405. There is no
+//! subscription to fall back to and no point pretending otherwise, so chain state is *polled*,
+//! on a configurable interval, and everything downstream is written to expect a view that is
+//! some milliseconds old and occasionally much older than that. [`ChainView::at`] carries the
+//! age so a consumer can refuse to act on it.
+//!
+//! **The public RPC rate-limits.** We measured HTTP 429 "over rate limit" during a
+//! 203-transaction broadcast. Three separate mechanisms answer that:
+//!
+//! 1. *One request per poll cycle, whatever the pair count.* Multicall3 is preinstalled in
+//!    GIWA's genesis at the canonical address, so the block number, the block timestamp, every
+//!    pair's `snapshot`, and every token balance are one `aggregate3` `eth_call`. The naive
+//!    shape — two pairs plus three balances plus a block header — is six requests per cycle, and
+//!    at a 2s interval that is 3 req/s of pure polling before a single transaction is sent.
+//! 2. *A local token bucket*, [`Limiter`], sized in the config. Requests that would exceed it
+//!    fail locally instead of being sent, so the bot cannot be the thing that trips the limit.
+//!    [`crate::config::ChainConfig::validate`] refuses a poll interval whose steady-state rate
+//!    alone exceeds the budget.
+//! 3. *Backoff as a state, not a retry.* A 429 puts the endpoint into a penalty window during
+//!    which no socket is opened at all, doubling per consecutive 429. A sustained 429 is
+//!    therefore visible as [`ChainStatus::Degraded`] and then [`ChainStatus::Down`] — which
+//!    widens spreads and then halts — rather than disappearing into a retry loop.
+//!
+//! # Which endpoint, and which block tag
+//!
+//! | use | endpoint | tag |
+//! |---|---|---|
+//! | polling pool state | flashblocks | `pending` |
+//! | startup metadata | ordinary | `latest` |
+//! | nonce, fees, submit, receipts | ordinary | `pending` / `latest` |
+//!
+//! The flashblocks endpoint is only worth using under the `pending` tag: that is where the
+//! ~200ms preconfirmed state lives. Its `latest` **lags the ordinary RPC by about two blocks**,
+//! so reading `latest` from it is strictly worse than reading `latest` from the ordinary
+//! endpoint. Transactions go to the ordinary endpoint because that is the canonical view, and a
+//! nonce read from a preconfirmed state that later reorganises is a stuck transaction.
+
+use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
+
+use alloy_primitives::{Address, Bytes};
+use alloy_sol_types::SolCall;
+use dubu_core::curve::Ladder;
+use serde_json::json;
+
+/// Generated ABI bindings for everything this bot calls.
+///
+/// Struct field order is load-bearing: these are tuples on the wire, so a field in the wrong
+/// place decodes silently into the wrong meaning. They mirror `IPropPool.PairSnapshot` and
+/// `PropPool.PairConfig` exactly.
+#[allow(missing_docs)]
+pub mod abi {
+    alloy_sol_types::sol! {
+        #[derive(Debug)]
+        struct PairSnapshotAbi {
+            uint56 minBid;
+            uint56 maxBid;
+            uint56 minAsk;
+            uint56 maxAsk;
+            uint32 updatedAt;
+            uint96 bidCapacity;
+            uint96 askCapacity;
+            uint96 bidUsed;
+            uint96 askUsed;
+            uint32 capGen;
+            uint32 usedGen;
+            uint16 flags;
+            uint8 priceScaleExp;
+            uint32 maxStaleSecs;
+        }
+
+        #[derive(Debug)]
+        struct PairConfigAbi {
+            address base;
+            address quote;
+            uint8 priceScaleExp;
+            uint32 maxStaleSecs;
+            uint56 minPrice;
+            uint96 minBaseReserve;
+            uint96 minQuoteReserve;
+            bool exists;
+        }
+
+        #[derive(Debug)]
+        struct Call3 {
+            address target;
+            bool allowFailure;
+            bytes callData;
+        }
+
+        #[derive(Debug)]
+        struct Call3Result {
+            bool success;
+            bytes returnData;
+        }
+
+        function snapshot(uint16 pairId) external view returns (PairSnapshotAbi);
+        function pairConfig(uint16 pairId) external view returns (PairConfigAbi);
+        function pairCount() external view returns (uint16);
+        function updater() external view returns (address);
+
+        function updateQuote(uint256[] packed) external;
+        function refreshCapacity(uint16 pairId, uint96 bidCapacity, uint96 askCapacity) external;
+
+        function balanceOf(address account) external view returns (uint256);
+        function decimals() external view returns (uint8);
+
+        function aggregate3(Call3[] calls) external payable returns (Call3Result[]);
+        function getBlockNumber() external view returns (uint256);
+        function getCurrentBlockTimestamp() external view returns (uint256);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Errors
+// ---------------------------------------------------------------------------
+
+/// Anything that can go wrong talking to a node.
+#[derive(Debug, thiserror::Error)]
+pub enum RpcError {
+    /// The endpoint answered HTTP 429. A liveness event, not noise.
+    #[error("{endpoint}: rate limited (HTTP 429); backing off for {backoff_ms}ms")]
+    RateLimited {
+        /// Which endpoint.
+        endpoint: &'static str,
+        /// How long the penalty window is.
+        backoff_ms: u64,
+    },
+    /// A request was refused locally because a rate-limit penalty is still running. No socket
+    /// was opened.
+    #[error("{endpoint}: in rate-limit backoff for another {remaining_ms}ms; request not sent")]
+    BackingOff {
+        /// Which endpoint.
+        endpoint: &'static str,
+        /// Time left in the penalty window.
+        remaining_ms: u64,
+    },
+    /// A request was refused locally because the token bucket is empty.
+    #[error("{endpoint}: local request budget exhausted; request not sent")]
+    BudgetExhausted {
+        /// Which endpoint.
+        endpoint: &'static str,
+    },
+    /// The HTTP request failed outright.
+    #[error("{endpoint}: transport failure: {source}")]
+    Transport {
+        /// Which endpoint.
+        endpoint: &'static str,
+        /// Underlying reqwest failure.
+        source: reqwest::Error,
+    },
+    /// A non-2xx status that is not 429.
+    #[error("{endpoint}: HTTP {status}: {body}")]
+    Http {
+        /// Which endpoint.
+        endpoint: &'static str,
+        /// Status code.
+        status: u16,
+        /// Truncated response body.
+        body: String,
+    },
+    /// A well-formed JSON-RPC error object.
+    #[error("{endpoint}: node error {code}: {message}")]
+    Node {
+        /// Which endpoint.
+        endpoint: &'static str,
+        /// JSON-RPC error code.
+        code: i64,
+        /// JSON-RPC error message.
+        message: String,
+    },
+    /// The response did not decode.
+    #[error("could not decode {what}: {detail}")]
+    Decode {
+        /// What was being decoded.
+        what: &'static str,
+        /// Why it failed.
+        detail: String,
+    },
+}
+
+impl RpcError {
+    /// Whether this is the rate limit rather than some other failure. Drives the health state
+    /// machine's `reason` field and nothing else — both kinds count as a failed poll.
+    #[must_use]
+    pub const fn is_rate_limit(&self) -> bool {
+        matches!(self, Self::RateLimited { .. } | Self::BackingOff { .. } | Self::BudgetExhausted { .. })
+    }
+}
+
+fn decode_err(what: &'static str, detail: impl std::fmt::Display) -> RpcError {
+    RpcError::Decode { what, detail: detail.to_string() }
+}
+
+// ---------------------------------------------------------------------------
+// Request budget
+// ---------------------------------------------------------------------------
+
+/// Token bucket plus a rate-limit penalty window.
+///
+/// Deliberately not a queue. A queue in front of a rate-limited endpoint converts a burst into
+/// latency, and latency in a quoting loop converts into adverse selection: the quote we would
+/// have sent lands three seconds late, against a market that has moved. Failing the request
+/// locally lets the caller decide — the poll loop skips a cycle, the transmit path aborts the
+/// push and logs why — which is always the better outcome than a stale action taken on time.
+#[derive(Debug)]
+struct Limiter {
+    tokens: f64,
+    burst: f64,
+    refill_per_sec: f64,
+    last_refill: Instant,
+    penalty_until: Option<Instant>,
+    consecutive_429: u32,
+    rate_limit_events: u64,
+}
+
+impl Limiter {
+    fn new(requests_per_sec: f64, burst: f64, now: Instant) -> Self {
+        Self {
+            tokens: burst,
+            burst,
+            refill_per_sec: requests_per_sec,
+            last_refill: now,
+            penalty_until: None,
+            consecutive_429: 0,
+            rate_limit_events: 0,
+        }
+    }
+
+    fn refill(&mut self, now: Instant) {
+        let elapsed = now.saturating_duration_since(self.last_refill).as_secs_f64();
+        if elapsed > 0.0 {
+            self.tokens = (self.tokens + elapsed * self.refill_per_sec).min(self.burst);
+            self.last_refill = now;
+        }
+    }
+
+    fn try_take(&mut self, endpoint: &'static str, now: Instant) -> Result<(), RpcError> {
+        if let Some(until) = self.penalty_until {
+            if now < until {
+                let remaining_ms = u64::try_from(until.duration_since(now).as_millis()).unwrap_or(u64::MAX);
+                return Err(RpcError::BackingOff { endpoint, remaining_ms });
+            }
+            self.penalty_until = None;
+        }
+        self.refill(now);
+        if self.tokens < 1.0 {
+            return Err(RpcError::BudgetExhausted { endpoint });
+        }
+        self.tokens -= 1.0;
+        Ok(())
+    }
+
+    /// Enter (or extend) the penalty window. Returns its length.
+    fn on_rate_limited(&mut self, now: Instant, initial: Duration, max: Duration) -> Duration {
+        self.rate_limit_events += 1;
+        // Exponential in the number of *consecutive* 429s, so an isolated one costs the initial
+        // delay and a sustained squeeze walks up to the ceiling instead of hammering.
+        let shift = self.consecutive_429.min(16);
+        let backoff = initial.saturating_mul(1u32 << shift).min(max);
+        self.consecutive_429 = self.consecutive_429.saturating_add(1);
+        self.penalty_until = Some(now + backoff);
+        // Spend the bucket too: the endpoint has told us we are over, and the local budget was
+        // evidently too generous for the current conditions.
+        self.tokens = 0.0;
+        backoff
+    }
+
+    fn on_success(&mut self) {
+        self.consecutive_429 = 0;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Transport
+// ---------------------------------------------------------------------------
+
+/// One JSON-RPC endpoint, with its own budget.
+pub struct Rpc {
+    name: &'static str,
+    url: String,
+    client: reqwest::Client,
+    limiter: Mutex<Limiter>,
+    next_id: AtomicU64,
+    backoff_initial: Duration,
+    backoff_max: Duration,
+}
+
+impl Rpc {
+    /// Build a client for one endpoint.
+    ///
+    /// # Errors
+    /// [`RpcError::Transport`] if the HTTP client cannot be constructed.
+    pub fn new(name: &'static str, url: String, cfg: &crate::config::ChainConfig) -> Result<Self, RpcError> {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_millis(cfg.request_timeout_ms))
+            .user_agent(concat!("dubu-updater/", env!("CARGO_PKG_VERSION")))
+            .build()
+            .map_err(|source| RpcError::Transport { endpoint: name, source })?;
+        Ok(Self {
+            name,
+            url,
+            client,
+            limiter: Mutex::new(Limiter::new(cfg.requests_per_sec, cfg.request_burst, Instant::now())),
+            next_id: AtomicU64::new(1),
+            backoff_initial: Duration::from_millis(cfg.rate_limit_backoff_initial_ms),
+            backoff_max: Duration::from_millis(cfg.rate_limit_backoff_max_ms),
+        })
+    }
+
+    /// This endpoint's name, for logs.
+    #[must_use]
+    pub const fn name(&self) -> &'static str {
+        self.name
+    }
+
+    /// How many times this endpoint has rate-limited us.
+    #[must_use]
+    pub fn rate_limit_events(&self) -> u64 {
+        self.lock().rate_limit_events
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Limiter> {
+        self.limiter.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// One JSON-RPC call.
+    ///
+    /// # Errors
+    /// [`RpcError`]. Note that [`RpcError::BackingOff`] and [`RpcError::BudgetExhausted`] are
+    /// returned *without opening a socket*, which is the point.
+    pub async fn call(&self, method: &str, params: serde_json::Value) -> Result<serde_json::Value, RpcError> {
+        self.lock().try_take(self.name, Instant::now())?;
+
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let body = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
+
+        let resp = self
+            .client
+            .post(&self.url)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|source| RpcError::Transport { endpoint: self.name, source })?;
+
+        let status = resp.status();
+        let text = resp.text().await.map_err(|source| RpcError::Transport { endpoint: self.name, source })?;
+
+        // The observed shape is a 429 with an "over rate limit" body, but some gateways answer
+        // 200 with the same text, so the body is checked either way.
+        let looks_rate_limited = status.as_u16() == 429 || text.to_ascii_lowercase().contains("over rate limit");
+        if looks_rate_limited {
+            let backoff = {
+                let mut g = self.lock();
+                g.on_rate_limited(Instant::now(), self.backoff_initial, self.backoff_max)
+            };
+            return Err(RpcError::RateLimited {
+                endpoint: self.name,
+                backoff_ms: u64::try_from(backoff.as_millis()).unwrap_or(u64::MAX),
+            });
+        }
+        if !status.is_success() {
+            return Err(RpcError::Http {
+                endpoint: self.name,
+                status: status.as_u16(),
+                body: text.chars().take(300).collect(),
+            });
+        }
+
+        let v: serde_json::Value = serde_json::from_str(&text).map_err(|e| decode_err("json-rpc envelope", e))?;
+        if let Some(err) = v.get("error") {
+            return Err(RpcError::Node {
+                endpoint: self.name,
+                code: err.get("code").and_then(serde_json::Value::as_i64).unwrap_or(0),
+                message: err.get("message").and_then(serde_json::Value::as_str).unwrap_or("(none)").to_string(),
+            });
+        }
+        self.lock().on_success();
+        Ok(v.get("result").cloned().unwrap_or(serde_json::Value::Null))
+    }
+
+    /// `eth_call` against `to` with `data`, at a block tag.
+    ///
+    /// # Errors
+    /// [`RpcError`].
+    pub async fn eth_call(&self, to: Address, data: &[u8], tag: &str) -> Result<Vec<u8>, RpcError> {
+        let params = json!([{ "to": to.to_string(), "data": hex0x(data) }, tag]);
+        let result = self.call("eth_call", params).await?;
+        let s = result.as_str().ok_or_else(|| decode_err("eth_call result", "not a string"))?;
+        unhex(s).ok_or_else(|| decode_err("eth_call result", "not hex"))
+    }
+
+    /// A `u64` from a hex-quantity-returning method.
+    ///
+    /// # Errors
+    /// [`RpcError`].
+    pub async fn quantity(&self, method: &str, params: serde_json::Value) -> Result<u64, RpcError> {
+        let r = self.call(method, params).await?;
+        let s = r.as_str().ok_or_else(|| decode_err("quantity", "not a string"))?;
+        u64::from_str_radix(s.trim_start_matches("0x"), 16).map_err(|e| decode_err("quantity", e))
+    }
+}
+
+/// Lower-case `0x`-prefixed hex.
+#[must_use]
+pub fn hex0x(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(2 + bytes.len() * 2);
+    s.push_str("0x");
+    for b in bytes {
+        s.push_str(&format!("{b:02x}"));
+    }
+    s
+}
+
+/// Parse `0x`-prefixed hex. `None` on an odd length or a non-hex digit.
+#[must_use]
+pub fn unhex(s: &str) -> Option<Vec<u8>> {
+    let t = s.strip_prefix("0x").unwrap_or(s);
+    if t.len() % 2 != 0 {
+        return None;
+    }
+    (0..t.len() / 2).map(|i| u8::from_str_radix(&t[i * 2..i * 2 + 2], 16).ok()).collect()
+}
+
+// ---------------------------------------------------------------------------
+// Health
+// ---------------------------------------------------------------------------
+
+/// What the chain connection is doing, as the quote loop sees it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChainStatus {
+    /// Polling is succeeding.
+    Healthy,
+    /// Polling has been failing for a while. Quoting continues with widened spreads.
+    Degraded {
+        /// How long since the last successful poll.
+        stale_secs: u64,
+    },
+    /// Polling has been failing long enough to stop. Withdraw quotes and exit.
+    Down {
+        /// How long since the last successful poll.
+        stale_secs: u64,
+    },
+}
+
+impl ChainStatus {
+    /// Short stable string for structured logs.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Healthy => "healthy",
+            Self::Degraded { .. } => "degraded",
+            Self::Down { .. } => "down",
+        }
+    }
+}
+
+/// Rolling health of the chain connection.
+#[derive(Debug)]
+pub struct ChainHealth {
+    last_success: Option<Instant>,
+    since: Instant,
+    consecutive_failures: u32,
+    last_error: Option<String>,
+    degraded_after: Duration,
+    halt_after: Duration,
+}
+
+impl ChainHealth {
+    /// Start a health tracker. The clock runs from construction, so a bot that never manages a
+    /// single successful poll still halts on schedule instead of waiting forever.
+    #[must_use]
+    pub fn new(now: Instant, degraded_after_secs: u64, halt_after_secs: u64) -> Self {
+        Self {
+            last_success: None,
+            since: now,
+            consecutive_failures: 0,
+            last_error: None,
+            degraded_after: Duration::from_secs(degraded_after_secs),
+            halt_after: Duration::from_secs(halt_after_secs),
+        }
+    }
+
+    /// Record a successful poll.
+    pub fn on_success(&mut self, now: Instant) {
+        self.last_success = Some(now);
+        self.consecutive_failures = 0;
+        self.last_error = None;
+    }
+
+    /// Record a failed poll.
+    pub fn on_failure(&mut self, err: &RpcError) {
+        self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+        self.last_error = Some(err.to_string());
+    }
+
+    /// How many polls have failed in a row.
+    #[must_use]
+    pub const fn consecutive_failures(&self) -> u32 {
+        self.consecutive_failures
+    }
+
+    /// The most recent failure, if the last poll failed.
+    #[must_use]
+    pub fn last_error(&self) -> Option<&str> {
+        self.last_error.as_deref()
+    }
+
+    /// Current status.
+    #[must_use]
+    pub fn status(&self, now: Instant) -> ChainStatus {
+        let reference = self.last_success.unwrap_or(self.since);
+        let elapsed = now.saturating_duration_since(reference);
+        let stale_secs = elapsed.as_secs();
+        if elapsed >= self.halt_after {
+            ChainStatus::Down { stale_secs }
+        } else if elapsed >= self.degraded_after {
+            ChainStatus::Degraded { stale_secs }
+        } else {
+            ChainStatus::Healthy
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Decoded state
+// ---------------------------------------------------------------------------
+
+/// One pair's on-chain state, converted out of the ABI types.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Snap {
+    /// Worst bid.
+    pub min_bid: u128,
+    /// Best bid.
+    pub max_bid: u128,
+    /// Best ask.
+    pub min_ask: u128,
+    /// Worst ask.
+    pub max_ask: u128,
+    /// Unix seconds of the last `updateQuote`. Zero means never quoted.
+    pub updated_at: u64,
+    /// Base the pool will buy this epoch.
+    pub bid_capacity: u128,
+    /// Base the pool will sell this epoch.
+    pub ask_capacity: u128,
+    /// Raw stored bid usage — meaningless unless the generations match.
+    pub bid_used_raw: u128,
+    /// Raw stored ask usage — meaningless unless the generations match.
+    pub ask_used_raw: u128,
+    /// Capacity epoch generation.
+    pub cap_gen: u32,
+    /// Generation the usage counters were stamped with.
+    pub used_gen: u32,
+    /// Flags word; bit 0 is paused.
+    pub flags: u16,
+    /// Decimal alignment for this pair.
+    pub price_scale_exp: u8,
+    /// How long a quote stays fillable.
+    pub max_stale_secs: u32,
+}
+
+impl Snap {
+    /// Effective bid usage.
+    ///
+    /// `PropPool` only treats the stored counters as real while `usedGen == capGen`; otherwise
+    /// they belong to a superseded epoch and read as zero. Reproducing that rule here rather
+    /// than reading `bidUsed` directly is not a detail — on the live pool right now `capGen` is
+    /// 14 and `usedGen` is 13, so the raw ask counter says 499 mWETH has been sold this epoch
+    /// and the truth is zero. A policy that compared against the raw counter would compute the
+    /// executable top at the wrong point on the ladder.
+    #[must_use]
+    pub const fn bid_used(&self) -> u128 {
+        if self.used_gen == self.cap_gen {
+            self.bid_used_raw
+        } else {
+            0
+        }
+    }
+
+    /// Effective ask usage. See [`Snap::bid_used`].
+    #[must_use]
+    pub const fn ask_used(&self) -> u128 {
+        if self.used_gen == self.cap_gen {
+            self.ask_used_raw
+        } else {
+            0
+        }
+    }
+
+    /// Whether this pair is paused.
+    #[must_use]
+    pub const fn paused(&self) -> bool {
+        self.flags & 1 != 0
+    }
+
+    /// Whether a ladder has ever been posted.
+    #[must_use]
+    pub const fn never_quoted(&self) -> bool {
+        self.updated_at == 0
+    }
+
+    /// The stored four prices.
+    #[must_use]
+    pub const fn ladder(&self) -> Ladder {
+        Ladder { min_bid: self.min_bid, max_bid: self.max_bid, min_ask: self.min_ask, max_ask: self.max_ask }
+    }
+
+    /// Age of the stored quote against a block timestamp, saturating at zero for a clock skew.
+    #[must_use]
+    pub const fn quote_age_secs(&self, block_timestamp: u64) -> u64 {
+        block_timestamp.saturating_sub(self.updated_at)
+    }
+
+    fn from_abi(a: &abi::PairSnapshotAbi) -> Self {
+        Self {
+            min_bid: a.minBid.to::<u128>(),
+            max_bid: a.maxBid.to::<u128>(),
+            min_ask: a.minAsk.to::<u128>(),
+            max_ask: a.maxAsk.to::<u128>(),
+            updated_at: u64::from(a.updatedAt),
+            bid_capacity: a.bidCapacity.to::<u128>(),
+            ask_capacity: a.askCapacity.to::<u128>(),
+            bid_used_raw: a.bidUsed.to::<u128>(),
+            ask_used_raw: a.askUsed.to::<u128>(),
+            cap_gen: a.capGen,
+            used_gen: a.usedGen,
+            flags: a.flags,
+            price_scale_exp: a.priceScaleExp,
+            max_stale_secs: a.maxStaleSecs,
+        }
+    }
+}
+
+/// Immutable per-pair configuration, read once at startup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PairMeta {
+    /// Base token.
+    pub base: Address,
+    /// Quote token.
+    pub quote: Address,
+    /// Decimal alignment.
+    pub price_scale_exp: u8,
+    /// Freshness window the pool enforces.
+    pub max_stale_secs: u32,
+    /// Absolute floor on `minBid`, oracle-independent.
+    pub min_price: u128,
+    /// Base-token reserve floor.
+    pub min_base_reserve: u128,
+    /// Quote-token reserve floor.
+    pub min_quote_reserve: u128,
+    /// Base token decimals, read from the ERC-20 itself.
+    pub base_decimals: u8,
+    /// Quote token decimals, read from the ERC-20 itself.
+    pub quote_decimals: u8,
+}
+
+/// Everything one poll cycle produced.
+#[derive(Debug, Clone)]
+pub struct ChainView {
+    /// Block number the call was answered at.
+    pub block_number: u64,
+    /// Block timestamp the call was answered at. This — not the local clock — is what quote
+    /// staleness is measured against, because it is what `PropPool` compares to.
+    pub block_timestamp: u64,
+    /// One entry per configured pair.
+    pub snaps: BTreeMap<u16, Snap>,
+    /// Pool balances of every token involved.
+    pub balances: BTreeMap<Address, u128>,
+    /// When this view was received locally.
+    pub at: Instant,
+}
+
+impl ChainView {
+    /// How old this view is.
+    #[must_use]
+    pub fn age(&self, now: Instant) -> Duration {
+        now.saturating_duration_since(self.at)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The poll
+// ---------------------------------------------------------------------------
+
+/// Batches one poll cycle into a single `eth_call`.
+pub struct ChainPoller {
+    pool: Address,
+    multicall: Address,
+    pair_ids: Vec<u16>,
+    tokens: Vec<Address>,
+    calldata: Bytes,
+}
+
+impl ChainPoller {
+    /// Build the poller and precompute its calldata.
+    ///
+    /// The call list is fixed for the process lifetime, so it is encoded once: two Multicall3
+    /// helpers, then one `snapshot` per pair, then one `balanceOf` per token. Order is the
+    /// decode contract.
+    #[must_use]
+    pub fn new(pool: Address, multicall: Address, pair_ids: Vec<u16>, tokens: Vec<Address>) -> Self {
+        let mut calls = Vec::with_capacity(2 + pair_ids.len() + tokens.len());
+        calls.push(abi::Call3 {
+            target: multicall,
+            allowFailure: false,
+            callData: abi::getBlockNumberCall {}.abi_encode().into(),
+        });
+        calls.push(abi::Call3 {
+            target: multicall,
+            allowFailure: false,
+            callData: abi::getCurrentBlockTimestampCall {}.abi_encode().into(),
+        });
+        for &id in &pair_ids {
+            calls.push(abi::Call3 {
+                target: pool,
+                allowFailure: false,
+                callData: abi::snapshotCall { pairId: id }.abi_encode().into(),
+            });
+        }
+        for &t in &tokens {
+            calls.push(abi::Call3 {
+                target: t,
+                allowFailure: false,
+                callData: abi::balanceOfCall { account: pool }.abi_encode().into(),
+            });
+        }
+        let calldata = abi::aggregate3Call { calls }.abi_encode().into();
+        Self { pool, multicall, pair_ids, tokens, calldata }
+    }
+
+    /// The pool this poller reads.
+    #[must_use]
+    pub const fn pool(&self) -> Address {
+        self.pool
+    }
+
+    /// Run one cycle. Exactly one RPC request.
+    ///
+    /// Uses the `pending` tag, which on the flashblocks endpoint is the ~200ms preconfirmed
+    /// state. That matters here: a swap that has been preconfirmed but not yet included has
+    /// already moved `bidUsed`/`askUsed`, and quoting against the pre-swap usage would compute
+    /// the executable top at a point on the ladder the pool has already walked past.
+    ///
+    /// # Errors
+    /// [`RpcError`] — including the two that never leave the process.
+    pub async fn poll(&self, rpc: &Rpc) -> Result<ChainView, RpcError> {
+        let raw = rpc.eth_call(self.multicall, &self.calldata, "pending").await?;
+        let results = decode_batch(&raw, 2 + self.pair_ids.len() + self.tokens.len())?;
+
+        let block_number = abi::getBlockNumberCall::abi_decode_returns(&results[0].returnData)
+            .map_err(|e| decode_err("getBlockNumber", e))?;
+        let block_timestamp = abi::getCurrentBlockTimestampCall::abi_decode_returns(&results[1].returnData)
+            .map_err(|e| decode_err("getCurrentBlockTimestamp", e))?;
+
+        let mut snaps = BTreeMap::new();
+        for (i, &id) in self.pair_ids.iter().enumerate() {
+            let a = abi::snapshotCall::abi_decode_returns(&results[2 + i].returnData)
+                .map_err(|e| decode_err("PairSnapshot", e))?;
+            snaps.insert(id, Snap::from_abi(&a));
+        }
+
+        let mut balances = BTreeMap::new();
+        let base = 2 + self.pair_ids.len();
+        for (i, &t) in self.tokens.iter().enumerate() {
+            let v = abi::balanceOfCall::abi_decode_returns(&results[base + i].returnData)
+                .map_err(|e| decode_err("balanceOf", e))?;
+            balances.insert(t, u128::try_from(v).map_err(|_| decode_err("balanceOf", "exceeds u128"))?);
+        }
+
+        Ok(ChainView {
+            block_number: u64::try_from(block_number).unwrap_or(u64::MAX),
+            block_timestamp: u64::try_from(block_timestamp).unwrap_or(u64::MAX),
+            snaps,
+            balances,
+            at: Instant::now(),
+        })
+    }
+}
+
+/// Decode an `aggregate3` response and insist every sub-call succeeded.
+///
+/// `allowFailure` is `false` on every call this crate builds, so a revert should surface as a
+/// reverted `eth_call` rather than a `false` here — but a partial batch decoding into a
+/// zero-filled snapshot is the kind of silent wrong answer that ends up quoted, so the length
+/// and the success flags are both checked rather than assumed.
+fn decode_batch(raw: &[u8], expected: usize) -> Result<Vec<abi::Call3Result>, RpcError> {
+    let results = abi::aggregate3Call::abi_decode_returns(raw).map_err(|e| decode_err("aggregate3 results", e))?;
+    if results.len() != expected {
+        return Err(decode_err("aggregate3 results", format!("expected {expected} entries, got {}", results.len())));
+    }
+    if let Some(i) = results.iter().position(|r| !r.success) {
+        return Err(decode_err("aggregate3 results", format!("sub-call {i} reverted")));
+    }
+    Ok(results)
+}
+
+// ---------------------------------------------------------------------------
+// Startup verification
+// ---------------------------------------------------------------------------
+
+/// What the chain says about the configured pairs, and whether the config agrees.
+#[derive(Debug, Clone)]
+pub struct ChainFacts {
+    /// Per-pair immutable configuration.
+    pub pairs: BTreeMap<u16, PairMeta>,
+    /// The address `PropPool` will accept `updateQuote` from.
+    pub updater: Address,
+    /// Every token the bot needs a balance for.
+    pub tokens: Vec<Address>,
+    /// The shared quote token NAV is denominated in.
+    pub nav_token: Address,
+    /// Decimals of [`ChainFacts::nav_token`].
+    pub nav_decimals: u8,
+}
+
+/// Read the immutable facts and check the config against them.
+///
+/// This is where every check that needs the chain lives, and it runs before the loop starts.
+/// The checks are the ones whose failure mode is silent:
+///
+/// * a `pair_id` that does not exist would poll a zeroed snapshot forever;
+/// * `base_decimals` off by one prices the pair by a factor of ten;
+/// * a `heartbeat_secs` at or above the pool's own `maxStaleSecs` means the quote expires
+///   before the heartbeat re-posts it, so the pool stops quoting between pushes — the exact
+///   condition this bot exists to prevent;
+/// * pairs with different quote tokens cannot share one NAV, so the killswitches would be
+///   measuring an incoherent number.
+///
+/// # Errors
+/// [`RpcError`] for a failed read, or [`RpcError::Decode`] carrying the mismatch.
+pub async fn verify_against_chain(
+    rpc: &Rpc,
+    pool: Address,
+    multicall: Address,
+    cfg: &crate::config::Config,
+) -> Result<ChainFacts, RpcError> {
+    // Round one: pairCount, updater, and every pairConfig.
+    let mut calls = vec![
+        abi::Call3 { target: pool, allowFailure: false, callData: abi::pairCountCall {}.abi_encode().into() },
+        abi::Call3 { target: pool, allowFailure: false, callData: abi::updaterCall {}.abi_encode().into() },
+    ];
+    for p in &cfg.pairs {
+        calls.push(abi::Call3 {
+            target: pool,
+            allowFailure: false,
+            callData: abi::pairConfigCall { pairId: p.pair_id }.abi_encode().into(),
+        });
+    }
+    let raw = rpc.eth_call(multicall, &abi::aggregate3Call { calls }.abi_encode(), "latest").await?;
+    let res = decode_batch(&raw, 2 + cfg.pairs.len())?;
+
+    let pair_count =
+        abi::pairCountCall::abi_decode_returns(&res[0].returnData).map_err(|e| decode_err("pairCount", e))?;
+    let updater = abi::updaterCall::abi_decode_returns(&res[1].returnData).map_err(|e| decode_err("updater", e))?;
+
+    let mut configs = BTreeMap::new();
+    for (i, p) in cfg.pairs.iter().enumerate() {
+        if p.pair_id > pair_count {
+            return Err(decode_err(
+                "pair id",
+                format!("config lists pair_id {} but the pool has {pair_count} pairs", p.pair_id),
+            ));
+        }
+        let c = abi::pairConfigCall::abi_decode_returns(&res[2 + i].returnData)
+            .map_err(|e| decode_err("PairConfig", e))?;
+        if !c.exists {
+            return Err(decode_err("pair id", format!("pair {} does not exist on chain", p.pair_id)));
+        }
+        configs.insert(p.pair_id, c);
+    }
+
+    // Round two: decimals() for every distinct token.
+    let mut tokens: Vec<Address> = Vec::new();
+    for c in configs.values() {
+        for t in [c.base, c.quote] {
+            if !tokens.contains(&t) {
+                tokens.push(t);
+            }
+        }
+    }
+    let calls: Vec<_> = tokens
+        .iter()
+        .map(|&t| abi::Call3 { target: t, allowFailure: false, callData: abi::decimalsCall {}.abi_encode().into() })
+        .collect();
+    let raw = rpc.eth_call(multicall, &abi::aggregate3Call { calls }.abi_encode(), "latest").await?;
+    let res = decode_batch(&raw, tokens.len())?;
+    let mut decimals = BTreeMap::new();
+    for (i, &t) in tokens.iter().enumerate() {
+        let d = abi::decimalsCall::abi_decode_returns(&res[i].returnData).map_err(|e| decode_err("decimals", e))?;
+        decimals.insert(t, d);
+    }
+
+    // Now the cross-checks.
+    let mut pairs = BTreeMap::new();
+    let mut nav_token: Option<Address> = None;
+    for p in &cfg.pairs {
+        let c = &configs[&p.pair_id];
+        let bd = decimals[&c.base];
+        let qd = decimals[&c.quote];
+        if bd != p.base_decimals || qd != p.quote_decimals {
+            return Err(decode_err(
+                "token decimals",
+                format!(
+                    "pair {}: config says base/quote = {}/{} but the chain says {bd}/{qd}",
+                    p.pair_id, p.base_decimals, p.quote_decimals
+                ),
+            ));
+        }
+        if u64::from(c.maxStaleSecs) <= p.heartbeat_secs {
+            return Err(decode_err(
+                "heartbeat",
+                format!(
+                    "pair {}: heartbeat_secs {} is not inside the pool's maxStaleSecs {}; \
+                     the quote would expire before the heartbeat re-posted it",
+                    p.pair_id, p.heartbeat_secs, c.maxStaleSecs
+                ),
+            ));
+        }
+        match nav_token {
+            None => nav_token = Some(c.quote),
+            Some(q) if q != c.quote => {
+                return Err(decode_err(
+                    "quote token",
+                    "configured pairs do not share a quote token, so a single NAV is not well defined",
+                ))
+            }
+            Some(_) => {}
+        }
+        pairs.insert(
+            p.pair_id,
+            PairMeta {
+                base: c.base,
+                quote: c.quote,
+                price_scale_exp: c.priceScaleExp,
+                max_stale_secs: c.maxStaleSecs,
+                min_price: c.minPrice.to::<u128>(),
+                min_base_reserve: c.minBaseReserve.to::<u128>(),
+                min_quote_reserve: c.minQuoteReserve.to::<u128>(),
+                base_decimals: bd,
+                quote_decimals: qd,
+            },
+        );
+    }
+
+    let nav_token = nav_token.ok_or_else(|| decode_err("quote token", "no pairs"))?;
+    let nav_decimals = decimals[&nav_token];
+    if nav_decimals != cfg.risk.nav_decimals {
+        return Err(decode_err(
+            "risk.nav_decimals",
+            format!("config says {} but the quote token reports {nav_decimals}", cfg.risk.nav_decimals),
+        ));
+    }
+
+    Ok(ChainFacts { pairs, updater, tokens, nav_token, nav_decimals })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn snap(cap_gen: u32, used_gen: u32, bid_used: u128, ask_used: u128) -> Snap {
+        Snap {
+            min_bid: 1_994_002_500_000_000,
+            max_bid: 1_999_000_000_000_000,
+            min_ask: 2_001_000_000_000_000,
+            max_ask: 2_006_002_500_000_000,
+            updated_at: 1_785_114_691,
+            bid_capacity: 1_000_000_000_000_000_000_000,
+            ask_capacity: 1_000_000_000_000_000_000_000,
+            bid_used_raw: bid_used,
+            ask_used_raw: ask_used,
+            cap_gen,
+            used_gen,
+            flags: 0,
+            price_scale_exp: 24,
+            max_stale_secs: 3_600,
+        }
+    }
+
+    #[test]
+    fn usage_reads_as_zero_across_a_generation_boundary() {
+        // Exactly the live pool's shape: capGen 14, usedGen 13, and a large raw ask counter
+        // that the pool itself ignores.
+        let stale = snap(14, 13, 0, 499_438_326_634_891_408_781);
+        assert_eq!(stale.ask_used(), 0, "a superseded epoch's usage must read as zero");
+        assert_eq!(stale.bid_used(), 0);
+
+        let current = snap(14, 14, 0, 499_438_326_634_891_408_781);
+        assert_eq!(current.ask_used(), 499_438_326_634_891_408_781);
+    }
+
+    #[test]
+    fn flags_bit_zero_is_paused() {
+        let mut s = snap(1, 1, 0, 0);
+        assert!(!s.paused());
+        s.flags = 1;
+        assert!(s.paused());
+        // Reserved bits must not be read as paused.
+        s.flags = 2;
+        assert!(!s.paused());
+    }
+
+    #[test]
+    fn quote_age_saturates_rather_than_underflowing() {
+        let s = snap(1, 1, 0, 0);
+        assert_eq!(s.quote_age_secs(1_785_114_691 + 100), 100);
+        // A pending-tag timestamp behind the stored one is possible across a reorg.
+        assert_eq!(s.quote_age_secs(1_785_114_000), 0);
+    }
+
+    #[test]
+    fn never_quoted_is_a_zero_timestamp() {
+        let mut s = snap(1, 1, 0, 0);
+        assert!(!s.never_quoted());
+        s.updated_at = 0;
+        assert!(s.never_quoted());
+    }
+
+    #[test]
+    fn the_token_bucket_refuses_rather_than_queues() {
+        let t0 = Instant::now();
+        let mut l = Limiter::new(1.0, 2.0, t0);
+        assert!(l.try_take("rpc", t0).is_ok());
+        assert!(l.try_take("rpc", t0).is_ok());
+        assert!(matches!(l.try_take("rpc", t0), Err(RpcError::BudgetExhausted { .. })));
+        // One second later, one token.
+        let t1 = t0 + Duration::from_secs(1);
+        assert!(l.try_take("rpc", t1).is_ok());
+        assert!(matches!(l.try_take("rpc", t1), Err(RpcError::BudgetExhausted { .. })));
+    }
+
+    #[test]
+    fn a_429_opens_no_further_sockets_until_the_penalty_expires() {
+        let t0 = Instant::now();
+        let mut l = Limiter::new(100.0, 100.0, t0);
+        let b = l.on_rate_limited(t0, Duration::from_millis(1_000), Duration::from_millis(60_000));
+        assert_eq!(b, Duration::from_millis(1_000));
+        assert!(matches!(l.try_take("rpc", t0), Err(RpcError::BackingOff { .. })));
+        assert!(matches!(
+            l.try_take("rpc", t0 + Duration::from_millis(999)),
+            Err(RpcError::BackingOff { .. })
+        ));
+        assert!(l.try_take("rpc", t0 + Duration::from_millis(1_001)).is_ok());
+    }
+
+    #[test]
+    fn consecutive_rate_limits_back_off_exponentially_and_cap() {
+        let t0 = Instant::now();
+        let mut l = Limiter::new(100.0, 100.0, t0);
+        let init = Duration::from_millis(1_000);
+        let max = Duration::from_millis(8_000);
+        assert_eq!(l.on_rate_limited(t0, init, max), Duration::from_millis(1_000));
+        assert_eq!(l.on_rate_limited(t0, init, max), Duration::from_millis(2_000));
+        assert_eq!(l.on_rate_limited(t0, init, max), Duration::from_millis(4_000));
+        assert_eq!(l.on_rate_limited(t0, init, max), Duration::from_millis(8_000));
+        assert_eq!(l.on_rate_limited(t0, init, max), Duration::from_millis(8_000), "must cap");
+        // A success resets the ladder, so an isolated 429 an hour later is cheap again.
+        l.on_success();
+        assert_eq!(l.on_rate_limited(t0, init, max), Duration::from_millis(1_000));
+        assert_eq!(l.rate_limit_events, 6);
+    }
+
+    #[test]
+    fn health_walks_healthy_to_degraded_to_down() {
+        let t0 = Instant::now();
+        let mut h = ChainHealth::new(t0, 30, 300);
+        assert_eq!(h.status(t0), ChainStatus::Healthy);
+        h.on_success(t0);
+
+        assert_eq!(h.status(t0 + Duration::from_secs(29)), ChainStatus::Healthy);
+        assert_eq!(h.status(t0 + Duration::from_secs(30)), ChainStatus::Degraded { stale_secs: 30 });
+        assert_eq!(h.status(t0 + Duration::from_secs(299)), ChainStatus::Degraded { stale_secs: 299 });
+        assert_eq!(h.status(t0 + Duration::from_secs(300)), ChainStatus::Down { stale_secs: 300 });
+
+        // A success at any point returns to healthy.
+        h.on_success(t0 + Duration::from_secs(300));
+        assert_eq!(h.status(t0 + Duration::from_secs(301)), ChainStatus::Healthy);
+    }
+
+    #[test]
+    fn health_counts_from_start_when_no_poll_has_ever_succeeded() {
+        // Otherwise a bot that never reaches the node would sit `Healthy` forever.
+        let t0 = Instant::now();
+        let h = ChainHealth::new(t0, 30, 300);
+        assert_eq!(h.status(t0 + Duration::from_secs(300)), ChainStatus::Down { stale_secs: 300 });
+    }
+
+    #[test]
+    fn hex_round_trips() {
+        assert_eq!(hex0x(&[0x00, 0xff, 0x10]), "0x00ff10");
+        assert_eq!(hex0x(&[]), "0x");
+        assert_eq!(unhex("0x00ff10"), Some(vec![0x00, 0xff, 0x10]));
+        assert_eq!(unhex("00ff10"), Some(vec![0x00, 0xff, 0x10]));
+        assert_eq!(unhex("0xfff"), None);
+        assert_eq!(unhex("0xzz"), None);
+    }
+
+    #[test]
+    fn the_poll_encodes_one_call_per_thing_it_needs() {
+        let pool = Address::repeat_byte(0xaa);
+        let mc = Address::repeat_byte(0xbb);
+        let p = ChainPoller::new(pool, mc, vec![1, 2], vec![Address::repeat_byte(1), Address::repeat_byte(2)]);
+        // Decoding our own calldata proves the layout the poll's decoder assumes.
+        let decoded = abi::aggregate3Call::abi_decode(&p.calldata).unwrap();
+        assert_eq!(decoded.calls.len(), 6, "2 helpers + 2 pairs + 2 tokens");
+        assert_eq!(decoded.calls[0].target, mc);
+        assert_eq!(decoded.calls[2].target, pool);
+        assert_eq!(decoded.calls[4].target, Address::repeat_byte(1));
+        assert!(decoded.calls.iter().all(|c| !c.allowFailure), "a reverting sub-call must fail the batch");
+        // And the pair ids landed in the right slots.
+        assert_eq!(abi::snapshotCall::abi_decode(&decoded.calls[2].callData).unwrap().pairId, 1);
+        assert_eq!(abi::snapshotCall::abi_decode(&decoded.calls[3].callData).unwrap().pairId, 2);
+    }
+}

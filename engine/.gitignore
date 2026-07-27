@@ -2,3 +2,8 @@
 **/*.rs.bk
 Cargo.lock.orig
 proptest-regressions/*.txt.orig
+
+# dubu-updater runtime state: the killswitch latch, written wherever `risk.state_path` points.
+# Committing it would ship one machine's halt decision to every other, and a commit that reset
+# it would silently resume a halted book — which is the one thing the latch exists to prevent.
+/state/

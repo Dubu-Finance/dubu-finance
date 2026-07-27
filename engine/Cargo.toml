@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/dubu-core"]
+members = ["crates/dubu-core", "crates/dubu-updater"]
 
 [workspace.package]
 edition = "2021"
@@ -13,6 +13,39 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 proptest = "1"
 num-bigint = "0.4"
+
+# --- dubu-updater only -------------------------------------------------------
+# Kept in the workspace table so a future second bot cannot pick a different
+# alloy minor and end up with two incompatible `Address` types.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "signal", "sync"] }
+tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "handshake", "rustls-tls-webpki-roots"] }
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+#
+# alloy-CORE only — `alloy-primitives`, `alloy-sol-types`, `alloy-rlp` — and deliberately NOT
+# the `alloy-consensus` / `alloy-signer-local` transaction stack, which does not currently
+# resolve here:
+#
+#   * the installed toolchain is rustc 1.88, and every alloy release from 1.2 up declares
+#     `rust-version = 1.90`/`1.91`, so cargo's MSRV-aware resolver refuses them outright;
+#   * every alloy release at or below that ceiling calls `serde::__private::de::Content` in
+#     `alloy-consensus`'s transaction-envelope deserialiser, and serde deleted `__private` in
+#     1.0.229. Pinning serde back is blocked in turn by `serde_with`, which `alloy-consensus`
+#     itself pulls in and which needs the newer `serde_json`.
+#
+# The two windows have no overlap at any version, so `tx.rs` encodes the EIP-1559 envelope
+# from the RLP field list directly and signs the prehash with `k256`. That is ~70 lines of a
+# fully specified wire format with a byte-exact test against a published vector — a smaller
+# risk than an unresolvable dependency graph, and it drops six crates. Raising the toolchain
+# to >= 1.91 makes `alloy-consensus` available again and `tx.rs` can shrink to `TxEip1559`.
+alloy-primitives = { version = "1", features = ["k256", "rlp", "serde"] }
+alloy-sol-types = "1"
+alloy-rlp = "0.3"
+k256 = { version = "0.13", default-features = false, features = ["ecdsa", "std"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+toml = "0.8"
+thiserror = "2"
 
 # The engine is a latency-tolerant (1-5 Hz) but correctness-critical process. Optimise
 # release builds for the differential fuzzers and backtests, not for the quote loop.

@@ -1,0 +1,38 @@
+[package]
+name = "dubu-updater"
+version = "0.1.0"
+description = "Quote updater bot for the DuBu prop AMM on GIWA: exchange market data in, packed updateQuote rows out."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+dubu-core = { path = "../dubu-core" }
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+thiserror = { workspace = true }
+
+tokio = { workspace = true }
+tokio-tungstenite = { workspace = true }
+futures-util = { workspace = true }
+reqwest = { workspace = true }
+
+# ABI encode/decode, RLP, and signing. Deliberately NOT `alloy`'s provider stack: the
+# rate-limit requirement needs the raw HTTP status of every RPC response (a 429 is a liveness
+# event here, not a transport retry to be swallowed), and a provider abstraction hides it.
+# `chain::Rpc` is JSON-RPC over `reqwest` for exactly that reason. See the workspace manifest
+# for why `alloy-consensus` is absent and `tx.rs` encodes the envelope itself.
+alloy-primitives = { workspace = true }
+alloy-sol-types = { workspace = true }
+alloy-rlp = { workspace = true }
+k256 = { workspace = true }
+
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[[bin]]
+name = "dubu-updater"
+path = "src/main.rs"
