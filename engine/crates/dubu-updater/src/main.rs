@@ -1,11 +1,31 @@
 //! The quote loop.
 //!
 //! ```text
-//! startup   config -> chain facts -> killswitch latch -> key -> feed
-//! cycle     poll chain (1 request) -> per pair: fair value -> row -> decision -> maybe send
+//! startup   config -> chain facts -> killswitch latch -> key -> feed -> newHeads subscription
+//! wake      a newHeads notification, or the fallback timer if heads have gone quiet
+//! cycle     read chain (1 request) -> per pair: fair value -> row -> decision -> maybe send
 //!           -> mark NAV -> killswitches
 //! shutdown  withdraw quotes, then exit
 //! ```
+//!
+//! # What wakes this loop
+//!
+//! A `newHeads` notification off the Nodit websocket, which arrives at the chain's 1s cadence.
+//! Underneath it sits a fallback timer at `chain.fallback_poll_interval_ms`, and the two are in
+//! the same `select!` — so the loop cannot stall whatever the subscription does, and no mode
+//! switch is needed to move between them. At a healthy head cadence the timer essentially never
+//! wins the race; when heads stop it becomes the driver, and the wake reason is in every cycle's
+//! log line as `woke_on`.
+//!
+//! The head watchdog is the interesting half. A subscription that *errors* is easy — the socket
+//! closes and the task reconnects with backoff. A subscription that reconnects and then silently
+//! delivers nothing is the dangerous one, because the bot would sit believing the chain had
+//! stopped. So when no head has arrived for `chain.head_stale_blocks` block times, the loop says
+//! so once, loudly, and keeps reading on the timer. It deliberately does **not** declare the
+//! chain down on that alone: the *read* answers that question, because
+//! [`ChainHealth`] escalates on the block number as well as on request success. A silent socket
+//! over a live chain keeps quoting; a silent socket over a frozen chain walks
+//! `Degraded -> Down` and withdraws.
 //!
 //! # Withdrawing quotes
 //!
@@ -28,7 +48,8 @@ use std::time::{Duration, Instant};
 use tokio::sync::watch;
 use tracing::{error, info, warn};
 
-use dubu_updater::chain::{ChainFacts, ChainHealth, ChainPoller, ChainStatus, ChainView, Rpc};
+use dubu_updater::chain::heads::{self, HeadShared};
+use dubu_updater::chain::{ChainFacts, ChainHealth, ChainReader, ChainStatus, ChainView, Rpc};
 use dubu_updater::config::{Config, KeySource, PairConfig};
 use dubu_updater::fair_value::FairValueTracker;
 use dubu_updater::feed::{binance, FeedShared, FeedStatus};
@@ -48,24 +69,30 @@ struct Args {
     config: String,
     once: bool,
     force_dry_run: bool,
+    cycles: Option<u64>,
 }
 
 fn parse_args() -> Result<Args, String> {
-    let mut a = Args { config: "updater.toml".into(), once: false, force_dry_run: false };
+    let mut a = Args { config: "updater.toml".into(), once: false, force_dry_run: false, cycles: None };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
         match arg.as_str() {
             "--config" | "-c" => a.config = it.next().ok_or("--config needs a path")?,
             "--once" => a.once = true,
+            "--cycles" => {
+                let v = it.next().ok_or("--cycles needs a count")?;
+                a.cycles = Some(v.parse::<u64>().map_err(|_| format!("--cycles: `{v}` is not a number"))?);
+            }
             // A command-line override that can only ever make the bot safer. There is
             // deliberately no `--transmit` counterpart: broadcasting is a config decision, made
             // in a file that gets reviewed, not a flag someone can add to a command.
             "--dry-run" => a.force_dry_run = true,
             "--help" | "-h" => {
                 println!(
-                    "dubu-updater [--config <path>] [--once] [--dry-run]\n\n\
+                    "dubu-updater [--config <path>] [--once] [--cycles <n>] [--dry-run]\n\n\
                      --config   path to the TOML config (default: updater.toml)\n\
                      --once     run a single evaluation cycle and exit\n\
+                     --cycles   run n cycles and exit; wakes on newHeads like a normal run\n\
                      --dry-run  force dry run regardless of config (there is no --transmit)\n"
                 );
                 std::process::exit(0);
@@ -76,8 +103,14 @@ fn parse_args() -> Result<Args, String> {
     Ok(a)
 }
 
-#[tokio::main]
-async fn main() {
+/// Not `#[tokio::main]`, and the reason is the `.env` load.
+///
+/// `std::env::set_var` mutates process-global state that other threads may be reading, so it is
+/// only sound while the process is still single-threaded. `#[tokio::main]` builds a multi-thread
+/// runtime *before* the body runs, which would put the dotenv load after the worker threads
+/// exist. Building the runtime by hand keeps the ordering explicit: parse, load `.env`, start
+/// logging, and only then spin up anything concurrent.
+fn main() {
     let args = match parse_args() {
         Ok(a) => a,
         Err(e) => {
@@ -85,6 +118,14 @@ async fn main() {
             std::process::exit(EXIT_STARTUP);
         }
     };
+
+    // `.env` before the config, because the config's endpoint URLs are `${VAR}` templates that
+    // are expanded during parsing. Real environment variables always win over the file; see
+    // `config::load_dotenv`. Values are never logged — only how many were set.
+    let mut dotenv_vars = dubu_updater::config::load_dotenv(std::path::Path::new(".env"));
+    if let Some(dir) = std::path::Path::new(&args.config).parent() {
+        dotenv_vars += dubu_updater::config::load_dotenv(&dir.join(".env"));
+    }
 
     tracing_subscriber::fmt()
         .json()
@@ -98,7 +139,20 @@ async fn main() {
         )
         .init();
 
-    match run(&args).await {
+    if dotenv_vars > 0 {
+        info!(target: "startup", event = "dotenv", variables = dotenv_vars,
+              "loaded variables from .env (values are never logged)");
+    }
+
+    let runtime = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("dubu-updater: cannot start the async runtime: {e}");
+            std::process::exit(EXIT_STARTUP);
+        }
+    };
+
+    match runtime.block_on(run(&args)) {
         Ok(code) => std::process::exit(code),
         Err(e) => {
             error!(target: "startup", event = "fatal", error = %e, "cannot start");
@@ -111,10 +165,14 @@ async fn main() {
 struct Runtime {
     cfg: Config,
     facts: ChainFacts,
+    /// Ordinary RPC: transactions, nonce, receipts, startup metadata. Canonical.
     rpc: Rpc,
+    /// Flashblocks RPC: every state read, `pending` tag, ~200ms preconfirmed. Freshest.
     flash: Rpc,
-    poller: ChainPoller,
+    reader: ChainReader,
     feed: Arc<FeedShared>,
+    /// State of the `newHeads` subscription that drives the loop.
+    heads: Arc<HeadShared>,
     /// Keyed by pair id rather than positionally: a `Vec` indexed in lock-step with
     /// `cfg.pairs` is an invariant nothing enforces, and getting it wrong prices one pair
     /// off another's outlier history.
@@ -124,6 +182,35 @@ struct Runtime {
     health: ChainHealth,
 }
 
+/// Why this cycle is running. Logged on every cycle, because "the fallback timer has been the
+/// only thing waking this loop for an hour" is invisible otherwise.
+#[derive(Debug, Clone, Copy)]
+enum Wake {
+    /// First cycle, before any head could have arrived.
+    Startup,
+    /// A `newHeads` notification. The normal case.
+    Head(u64),
+    /// The fallback timer. Normal only while heads are absent.
+    Fallback,
+}
+
+impl Wake {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Startup => "startup",
+            Self::Head(_) => "head",
+            Self::Fallback => "fallback_timer",
+        }
+    }
+
+    const fn head_number(self) -> Option<u64> {
+        match self {
+            Self::Head(n) => Some(n),
+            _ => None,
+        }
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 async fn run(args: &Args) -> Result<i32, Box<dyn std::error::Error>> {
     let mut cfg = Config::load(std::path::Path::new(&args.config))?;
@@ -131,8 +218,8 @@ async fn run(args: &Args) -> Result<i32, Box<dyn std::error::Error>> {
         cfg.tx.transmit_allowed = false;
     }
 
-    let rpc = Rpc::new("rpc", cfg.chain.rpc_url.clone(), &cfg.chain)?;
-    let flash = Rpc::new("flashblocks", cfg.chain.flashblocks_rpc_url.clone(), &cfg.chain)?;
+    let rpc = Rpc::new("rpc", &cfg.chain.rpc_url, &cfg.chain)?;
+    let flash = Rpc::new("flashblocks", &cfg.chain.flashblocks_rpc_url, &cfg.chain)?;
 
     // Every check that needs the chain, before the loop is allowed to compute anything.
     let facts = dubu_updater::chain::verify_against_chain(&rpc, cfg.chain.pool, cfg.chain.multicall3, &cfg).await?;
@@ -195,6 +282,9 @@ async fn run(args: &Args) -> Result<i32, Box<dyn std::error::Error>> {
         cfg.tx.max_priority_fee_wei()?,
     );
 
+    // Every URL here is an `EndpointUrl`, whose `Display` is redacted — the Nodit API key is a
+    // path segment, so this line prints `https://giwa-sepolia.nodit.io/***` and there is no
+    // spelling of it that would print the key.
     info!(
         target: "startup",
         event = "configured",
@@ -204,7 +294,13 @@ async fn run(args: &Args) -> Result<i32, Box<dyn std::error::Error>> {
         updater = %facts.updater,
         signing_as = ?sender.address(),
         pairs = cfg.pairs.len(),
-        poll_interval_ms = cfg.chain.poll_interval_ms,
+        ws_url = %cfg.chain.ws_url,
+        rpc_url = %cfg.chain.rpc_url,
+        flashblocks_rpc_url = %cfg.chain.flashblocks_rpc_url,
+        driver = "newHeads",
+        block_time_ms = cfg.chain.block_time_ms,
+        head_watchdog_ms = cfg.chain.head_stale_after().as_millis(),
+        fallback_poll_interval_ms = cfg.chain.fallback_poll_interval_ms,
         requests_per_sec = cfg.chain.requests_per_sec,
         nav_token = %facts.nav_token,
         "dubu-updater starting"
@@ -234,7 +330,20 @@ async fn run(args: &Args) -> Result<i32, Box<dyn std::error::Error>> {
     let streams: Vec<String> = cfg.pairs.iter().map(PairConfig::stream_name).collect();
     let feed_task = tokio::spawn(binance::run(cfg.feed.clone(), streams, Arc::clone(&feed), shutdown_rx.clone()));
 
-    let poller = ChainPoller::new(
+    // The `newHeads` subscription: what drives the loop. A `watch` channel rather than an `mpsc`
+    // because it coalesces — two heads landing during one cycle should produce one more cycle
+    // against the newer state, not two, the second of which would compute a ladder for state
+    // that is already superseded.
+    let heads = Arc::new(HeadShared::new(cfg.chain.head_stale_after()));
+    let (head_tx, head_rx) = watch::channel(0_u64);
+    let heads_task = tokio::spawn(heads::run(
+        cfg.chain.clone(),
+        Arc::clone(&heads),
+        head_tx,
+        shutdown_rx.clone(),
+    ));
+
+    let reader = ChainReader::new(
         cfg.chain.pool,
         cfg.chain.multicall3,
         cfg.pairs.iter().map(|p| p.pair_id).collect(),
@@ -247,14 +356,17 @@ async fn run(args: &Args) -> Result<i32, Box<dyn std::error::Error>> {
         .collect();
 
     let health = ChainHealth::new(Instant::now(), cfg.chain.degraded_after_secs, cfg.chain.halt_after_secs);
-    let mut rt = Runtime { cfg, facts, rpc, flash, poller, feed, trackers, sender, kill, health };
+    let mut rt = Runtime { cfg, facts, rpc, flash, reader, feed, heads, trackers, sender, kill, health };
 
     wait_for_feed(&rt).await;
+    wait_for_first_head(&rt).await;
 
-    let code = quote_loop(&mut rt, args.once, shutdown_rx).await;
+    let limit = if args.once { Some(1) } else { args.cycles };
+    let code = quote_loop(&mut rt, limit, head_rx, shutdown_rx).await;
 
     let _ = shutdown_tx.send(true);
     let _ = tokio::time::timeout(Duration::from_secs(3), feed_task).await;
+    let _ = tokio::time::timeout(Duration::from_secs(3), heads_task).await;
     Ok(code)
 }
 
@@ -281,51 +393,131 @@ async fn wait_for_feed(rt: &Runtime) {
     }
 }
 
-async fn quote_loop(rt: &mut Runtime, once: bool, mut shutdown: watch::Receiver<bool>) -> i32 {
+/// Give the subscription a moment to establish before the first cycle, so the opening cycle is
+/// driven by a real head rather than by the fallback timer.
+///
+/// Bounded, and **not** fatal on timeout. A bot that cannot subscribe must still start and still
+/// quote — the fallback timer is exactly the mechanism for that, and refusing to start would
+/// turn a degraded mode into an outage.
+async fn wait_for_first_head(rt: &Runtime) {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let snap = rt.heads.snapshot(Instant::now());
+        if snap.status.is_live() {
+            info!(target: "heads", event = "ready", head = ?snap.last.map(|h| h.number),
+                  "newHeads is delivering; the loop will wake on heads");
+            return;
+        }
+        if Instant::now() >= deadline {
+            warn!(target: "heads", event = "not_ready", status = snap.status.label(),
+                  fallback_poll_interval_ms = rt.cfg.chain.fallback_poll_interval_ms,
+                  "no head yet; starting on the fallback timer and continuing to reconnect");
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// The quote loop, woken by `newHeads` with the fallback timer underneath it.
+///
+/// `limit` caps the number of cycles (`--once` is `Some(1)`); `None` runs until a signal.
+async fn quote_loop(
+    rt: &mut Runtime,
+    limit: Option<u64>,
+    mut head_rx: watch::Receiver<u64>,
+    mut shutdown: watch::Receiver<bool>,
+) -> i32 {
     let mut last_view: Option<ChainView> = None;
-    let interval = Duration::from_millis(rt.cfg.chain.poll_interval_ms);
+    let fallback = Duration::from_millis(rt.cfg.chain.fallback_poll_interval_ms);
     let mut halted = false;
+    let mut wake = Wake::Startup;
+    // Edge-triggered, so a sustained outage logs once rather than once per cycle. A watchdog
+    // that repeats itself every two seconds is a watchdog nobody reads.
+    let mut watchdog_open = false;
+    let mut cycles: u64 = 0;
+
+    // Mark whatever head arrived during startup as seen. Without this the first cycle runs as
+    // `Startup` and is immediately followed by a duplicate for the head it already covered —
+    // harmless, but it burns a request and puts two cycles at the same block in the log.
+    head_rx.borrow_and_update();
 
     loop {
         let cycle_start = Instant::now();
+        cycles += 1;
 
-        match rt.poller.poll(&rt.flash).await {
+        // --- the head watchdog -------------------------------------------------------------
+        //
+        // This reports that heads stopped. It does NOT conclude that the chain stopped — the
+        // read below answers that, because `ChainHealth` escalates on the block number as well
+        // as on request success. A silent socket over a live chain must keep quoting; a silent
+        // socket over a frozen chain must walk Degraded -> Down and withdraw. Deciding here
+        // would get one of those two wrong.
+        let head = rt.heads.snapshot(cycle_start);
+        if head.status.is_live() {
+            if watchdog_open {
+                info!(target: "heads", event = "watchdog_clear", head = ?head.last.map(|h| h.number),
+                      "heads are arriving again; the subscription is driving the loop once more");
+                watchdog_open = false;
+            }
+        } else if !watchdog_open {
+            watchdog_open = true;
+            warn!(
+                target: "heads", event = "watchdog", status = head.status.label(),
+                head_age_ms = ?head.age_ms, last_head = ?head.last.map(|h| h.number),
+                watchdog_ms = rt.heads.stale_after().as_millis(),
+                reconnects = head.reconnects, subscriptions = head.subscriptions,
+                fallback_poll_interval_ms = rt.cfg.chain.fallback_poll_interval_ms,
+                "NO HEADS: the subscription has stopped delivering. Falling back to polling. \
+                 Whether the CHAIN is down is decided by the block number the next read returns, \
+                 not by this"
+            );
+        }
+
+        // --- the read ----------------------------------------------------------------------
+        match rt.reader.read(&rt.flash).await {
             Ok(v) => {
-                rt.health.on_success(Instant::now());
+                rt.health.on_read(Instant::now(), v.block_number);
                 last_view = Some(v);
             }
             Err(e) => {
                 rt.health.on_failure(&e);
                 let level_is_rate_limit = e.is_rate_limit();
                 warn!(
-                    target: "chain", event = "poll_failed", error = %e,
+                    target: "chain", event = "read_failed", error = %e,
                     rate_limit = level_is_rate_limit,
                     consecutive_failures = rt.health.consecutive_failures(),
                     status = rt.health.status(Instant::now()).label(),
-                    "chain poll failed"
+                    "chain read failed"
                 );
             }
         }
 
-        let status = rt.health.status(Instant::now());
+        let now = Instant::now();
+        let status = rt.health.status(now);
+        let stall = rt.health.stall(now);
         if let ChainStatus::Down { stale_secs } = status {
             let halt = Halt::Liveness {
                 reason: format!(
-                    "no successful chain poll for {stale_secs}s (limit {}s); \
-                     last error: {}",
+                    "chain liveness lost for {stale_secs}s (limit {}s); stalled signal: {}; \
+                     best block {}; heads: {}; last error: {}",
                     rt.cfg.chain.halt_after_secs,
+                    stall.label(),
+                    rt.health.best_block(),
+                    head.status.label(),
                     rt.health.last_error().unwrap_or("(none)")
                 ),
             };
             error!(target: "risk", event = "halt", switch = halt.label(), reason = %halt,
-                   "chain connection is down; halting and withdrawing quotes");
+                   stall = stall.label(), best_block = rt.health.best_block(),
+                   heads = head.status.label(),
+                   "chain liveness is gone; halting and withdrawing quotes");
             let _ = rt.kill.halt(&halt, now_unix());
             halted = true;
         }
 
         if !halted {
             if let Some(view) = &last_view {
-                halted = run_cycle(rt, view, status).await;
+                halted = run_cycle(rt, view, status, wake, &head).await;
             }
         }
 
@@ -334,20 +526,36 @@ async fn quote_loop(rt: &mut Runtime, once: bool, mut shutdown: watch::Receiver<
             return EXIT_HALTED;
         }
 
-        if once {
-            info!(target: "loop", event = "once_complete", "single cycle requested; shutting down");
+        if limit.is_some_and(|n| cycles >= n) {
+            info!(target: "loop", event = "cycles_complete", cycles,
+                  "requested cycle count reached; shutting down");
             withdraw_quotes(&rt.cfg, &rt.rpc, &mut rt.sender).await;
             return 0;
         }
 
-        let elapsed = cycle_start.elapsed();
-        let sleep_for = interval.saturating_sub(elapsed);
-        tokio::select! {
+        // --- the wake ----------------------------------------------------------------------
+        //
+        // A head and the fallback timer race in one `select!`. There is no mode flag and no
+        // switch between them: when the subscription is healthy the head always wins, and when
+        // it is not the timer does. That is the whole fallback mechanism, and it cannot get
+        // stuck in the wrong mode because there is no mode.
+        let sleep_for = fallback.saturating_sub(cycle_start.elapsed());
+        wake = tokio::select! {
             biased;
             _ = shutdown.changed() => break,
             () = wait_for_signal() => break,
-            () = tokio::time::sleep(sleep_for) => {}
-        }
+            r = head_rx.changed() => match r {
+                Ok(()) => Wake::Head(*head_rx.borrow_and_update()),
+                // The subscription task is gone for good. Not fatal: the timer is now the only
+                // driver, which is the case this loop is built to survive. Sleep out the
+                // interval here so the dead channel cannot spin.
+                Err(_) => {
+                    tokio::time::sleep(sleep_for).await;
+                    Wake::Fallback
+                }
+            },
+            () = tokio::time::sleep(sleep_for) => Wake::Fallback,
+        };
     }
 
     info!(target: "loop", event = "shutdown", "shutdown signal received; withdrawing quotes");
@@ -356,7 +564,13 @@ async fn quote_loop(rt: &mut Runtime, once: bool, mut shutdown: watch::Receiver<
 }
 
 /// One evaluation over every pair. Returns `true` if a killswitch latched.
-async fn run_cycle(rt: &mut Runtime, view: &ChainView, status: ChainStatus) -> bool {
+async fn run_cycle(
+    rt: &mut Runtime,
+    view: &ChainView,
+    status: ChainStatus,
+    wake: Wake,
+    head: &heads::HeadSnapshot,
+) -> bool {
     // Settle anything outstanding first, so `in_flight` is current when the gates run.
     for (pair_id, pending, settled) in rt.sender.poll_pending(&rt.rpc).await {
         match settled {
@@ -381,6 +595,23 @@ async fn run_cycle(rt: &mut Runtime, view: &ChainView, status: ChainStatus) -> b
     }
 
     let view_age = view.age(Instant::now()).as_secs();
+
+    // One line per cycle saying what woke it and how far the read got ahead of the head. The
+    // delta is the flashblocks endpoint earning its place: `pending` there is typically at or
+    // ahead of the confirmed head that triggered the read, which is the freshness the split
+    // exists for. A persistently negative delta would mean the read source has fallen behind
+    // the head source and the endpoints want revisiting.
+    info!(
+        target: "loop", event = "cycle", woke_on = wake.label(), head = ?wake.head_number(),
+        heads_status = head.status.label(), head_age_ms = ?head.age_ms,
+        head_reconnects = head.reconnects,
+        read_block = view.block_number, block_timestamp = view.block_timestamp,
+        read_ahead_of_head = head.last.map(|h| i64::try_from(view.block_number).unwrap_or(i64::MAX)
+            - i64::try_from(h.number).unwrap_or(i64::MAX)),
+        chain = status.label(), view_age_secs = view_age,
+        "cycle"
+    );
+
     let degraded_extra = if matches!(status, ChainStatus::Degraded { .. }) {
         rt.cfg.chain.degraded_extra_half_spread_bps
     } else {

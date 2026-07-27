@@ -1,44 +1,79 @@
-//! Chain access: JSON-RPC transport, the request budget, and the poll that produces a
+//! Chain access: JSON-RPC transport, the runaway guard, and the batched read that produces a
 //! [`ChainView`].
 //!
-//! # Two constraints shape this whole module
+//! # The loop is driven by `newHeads`, not by a timer
 //!
-//! **GIWA has no `eth_subscribe` and no websocket** — the endpoint answers 405. There is no
-//! subscription to fall back to and no point pretending otherwise, so chain state is *polled*,
-//! on a configurable interval, and everything downstream is written to expect a view that is
-//! some milliseconds old and occasionally much older than that. [`ChainView::at`] carries the
-//! age so a consumer can refuse to act on it.
+//! This module used to open with "GIWA has no `eth_subscribe` and no websocket — the endpoint
+//! answers 405", and everything below it was shaped by that. A dedicated Nodit endpoint removed
+//! the constraint: `eth_subscribe("newHeads")` over its WSS works, and heads arrive at the
+//! chain's 1s cadence. [`heads`] owns that subscription and the quote loop wakes on it, doing
+//! the reads a cycle needs when there is actually new state rather than on an arbitrary tick.
 //!
-//! **The public RPC rate-limits.** We measured HTTP 429 "over rate limit" during a
-//! 203-transaction broadcast. Three separate mechanisms answer that:
+//! Reads still produce a view with an age, and [`ChainView::at`] still carries it, because that
+//! never depended on how the read was triggered.
 //!
-//! 1. *One request per poll cycle, whatever the pair count.* Multicall3 is preinstalled in
-//!    GIWA's genesis at the canonical address, so the block number, the block timestamp, every
-//!    pair's `snapshot`, and every token balance are one `aggregate3` `eth_call`. The naive
-//!    shape — two pairs plus three balances plus a block header — is six requests per cycle, and
-//!    at a 2s interval that is 3 req/s of pure polling before a single transaction is sent.
-//! 2. *A local token bucket*, [`Limiter`], sized in the config. Requests that would exceed it
-//!    fail locally instead of being sent, so the bot cannot be the thing that trips the limit.
-//!    [`crate::config::ChainConfig::validate`] refuses a poll interval whose steady-state rate
-//!    alone exceeds the budget.
-//! 3. *Backoff as a state, not a retry.* A 429 puts the endpoint into a penalty window during
-//!    which no socket is opened at all, doubling per consecutive 429. A sustained 429 is
-//!    therefore visible as [`ChainStatus::Degraded`] and then [`ChainStatus::Down`] — which
-//!    widens spreads and then halts — rather than disappearing into a retry loop.
+//! # What survived the rewrite, and why
+//!
+//! Three things look like leftovers from the polling design and are not. They are here on their
+//! own merits, and a later reader should not mistake them for debris:
+//!
+//! 1. **Multicall3 batching.** One `eth_call` per head instead of six, whatever the pair count:
+//!    block number, block timestamp, every pair's `snapshot` and every token balance in one
+//!    `aggregate3`. This was *motivated* by the rate limit and is *justified* without it — six
+//!    round trips where one would do is worse on latency, and worse on consistency, because a
+//!    batch is answered at one block while six separate calls can straddle a block boundary and
+//!    produce a view that never existed.
+//! 2. **Backoff**, in [`Limiter`]. A dedicated endpoint is not an infinite one. More to the
+//!    point, the failure this defends against is *ours*: with no penalty window, any transient
+//!    upstream error turns the bot into a retry flood, which is how a small outage becomes a
+//!    large one.
+//! 3. **The health state machine**, [`ChainHealth`] — same thresholds, one new input. See below.
+//!
+//! What did **not** survive: the poll timer as the primary driver, demoted to
+//! [`crate::config::ChainConfig::fallback_poll_interval_ms`], a floor under the subscription
+//! rather than the thing that runs the bot; and the token-bucket *sizing* that assumed a hostile
+//! budget, along with the config cross-check that refused a poll interval whose steady-state
+//! rate exceeded it. [`Limiter`] remains as a fuse against a runaway loop, not as a budget the
+//! normal path is expected to press against.
+//!
+//! # Liveness has two signals now, and they fail differently
+//!
+//! [`ChainHealth`] escalates `Healthy -> Degraded -> Down` on the same thresholds it always
+//! did. What changed is what feeds it:
+//!
+//! * **Reads landing.** A failing `eth_call` is a failing endpoint. This is the original signal.
+//! * **The block number advancing.** New, and it closes a real hole: an endpoint that answers
+//!   every request cheerfully about a chain that has stopped used to read as perfectly healthy
+//!   forever, because "the RPC replied" was the only thing being measured. Progress is taken
+//!   from the block number the read itself returns, so a frozen chain escalates on exactly the
+//!   same ladder as an unreachable one.
+//!
+//! The head watchdog in [`heads`] deliberately does **not** feed this directly. When heads stop,
+//! the loop falls back to its timer and the *next read* answers the question that matters: if
+//! the block number is still climbing, only the socket died and quoting continues; if it is
+//! frozen too, the chain is genuinely down and the ladder escalates to a halt. Wiring a silent
+//! websocket straight to `Down` would withdraw quotes over a quiet socket on a healthy chain,
+//! which is the wrong trade — and never noticing would be the worse one.
 //!
 //! # Which endpoint, and which block tag
 //!
 //! | use | endpoint | tag |
 //! |---|---|---|
-//! | polling pool state | flashblocks | `pending` |
-//! | startup metadata | ordinary | `latest` |
-//! | nonce, fees, submit, receipts | ordinary | `pending` / `latest` |
+//! | `newHeads`, the loop's clock | Nodit WSS | — |
+//! | every state read | flashblocks | `pending` |
+//! | startup metadata | ordinary (Nodit HTTPS) | `latest` |
+//! | nonce, fees, submit, receipts | ordinary (Nodit HTTPS) | `pending` / `latest` |
 //!
-//! The flashblocks endpoint is only worth using under the `pending` tag: that is where the
-//! ~200ms preconfirmed state lives. Its `latest` **lags the ordinary RPC by about two blocks**,
-//! so reading `latest` from it is strictly worse than reading `latest` from the ordinary
-//! endpoint. Transactions go to the ordinary endpoint because that is the canonical view, and a
-//! nonce read from a preconfirmed state that later reorganises is a stuck transaction.
+//! Heads say *when* to look; they are not what is read. The flashblocks endpoint is still the
+//! freshest source of state and is still only worth using under the `pending` tag, where the
+//! ~200ms preconfirmed state lives — fresher than the 1s confirmed head that triggered the read,
+//! which is exactly why the split is worth keeping. Its `latest` **lags the ordinary RPC by
+//! about two blocks**, so reading `latest` from it is strictly worse than reading `latest` from
+//! the ordinary endpoint. Transactions go to the ordinary endpoint because that is the canonical
+//! view, and a nonce read from a preconfirmed state that later reorganises is a stuck
+//! transaction.
+
+pub mod heads;
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -49,6 +84,8 @@ use alloy_primitives::{Address, Bytes};
 use alloy_sol_types::SolCall;
 use dubu_core::curve::Ladder;
 use serde_json::json;
+
+use crate::config::EndpointUrl;
 
 /// Generated ABI bindings for everything this bot calls.
 ///
@@ -200,16 +237,29 @@ fn decode_err(what: &'static str, detail: impl std::fmt::Display) -> RpcError {
 }
 
 // ---------------------------------------------------------------------------
-// Request budget
+// Runaway guard
 // ---------------------------------------------------------------------------
 
 /// Token bucket plus a rate-limit penalty window.
 ///
-/// Deliberately not a queue. A queue in front of a rate-limited endpoint converts a burst into
-/// latency, and latency in a quoting loop converts into adverse selection: the quote we would
-/// have sent lands three seconds late, against a market that has moved. Failing the request
-/// locally lets the caller decide — the poll loop skips a cycle, the transmit path aborts the
-/// push and logs why — which is always the better outcome than a stale action taken on time.
+/// **This is a fuse, not a budget.** It was originally sized to keep the bot underneath a
+/// hostile public endpoint's rate limit — the measured 429s during a 203-transaction broadcast.
+/// The dedicated endpoint took 20 rapid `eth_blockNumber` calls without one, so that sizing is
+/// gone: the defaults in [`crate::config::ChainConfig`] are now loose enough that normal
+/// operation never approaches them, and the config no longer refuses an interval on the grounds
+/// that its steady-state rate would exhaust the budget.
+///
+/// What is left is worth keeping on its own terms. A bug — a reconnect storm, a loop that stops
+/// awaiting, a retry with no ceiling — should hit a local limit before it hits the endpoint's,
+/// and an endpoint that starts failing should not be answered with a flood. Both are about this
+/// process misbehaving rather than the provider being stingy, and neither went away.
+///
+/// Deliberately not a queue, and that reasoning is unchanged. A queue in front of a limited
+/// endpoint converts a burst into latency, and latency in a quoting loop converts into adverse
+/// selection: the quote we would have sent lands three seconds late, against a market that has
+/// moved. Failing the request locally lets the caller decide — the loop skips a cycle, the
+/// transmit path aborts the push and logs why — which is always better than a stale action
+/// taken on time.
 #[derive(Debug)]
 struct Limiter {
     tokens: f64,
@@ -282,10 +332,10 @@ impl Limiter {
 // Transport
 // ---------------------------------------------------------------------------
 
-/// One JSON-RPC endpoint, with its own budget.
+/// One JSON-RPC endpoint, with its own runaway guard.
 pub struct Rpc {
     name: &'static str,
-    url: String,
+    url: EndpointUrl,
     client: reqwest::Client,
     limiter: Mutex<Limiter>,
     next_id: AtomicU64,
@@ -296,9 +346,17 @@ pub struct Rpc {
 impl Rpc {
     /// Build a client for one endpoint.
     ///
+    /// Takes an [`EndpointUrl`] rather than a `String` so that the credential in the path cannot
+    /// reach a log line: every error this type produces carries the endpoint's *name*
+    /// (`"rpc"`, `"flashblocks"`), never its URL.
+    ///
     /// # Errors
     /// [`RpcError::Transport`] if the HTTP client cannot be constructed.
-    pub fn new(name: &'static str, url: String, cfg: &crate::config::ChainConfig) -> Result<Self, RpcError> {
+    pub fn new(
+        name: &'static str,
+        url: &EndpointUrl,
+        cfg: &crate::config::ChainConfig,
+    ) -> Result<Self, RpcError> {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_millis(cfg.request_timeout_ms))
             .user_agent(concat!("dubu-updater/", env!("CARGO_PKG_VERSION")))
@@ -306,7 +364,7 @@ impl Rpc {
             .map_err(|source| RpcError::Transport { endpoint: name, source })?;
         Ok(Self {
             name,
-            url,
+            url: url.clone(),
             client,
             limiter: Mutex::new(Limiter::new(cfg.requests_per_sec, cfg.request_burst, Instant::now())),
             next_id: AtomicU64::new(1),
@@ -319,6 +377,12 @@ impl Rpc {
     #[must_use]
     pub const fn name(&self) -> &'static str {
         self.name
+    }
+
+    /// This endpoint's URL in its redacted form, for logs. There is no accessor for the real one.
+    #[must_use]
+    pub fn url(&self) -> &EndpointUrl {
+        &self.url
     }
 
     /// How many times this endpoint has rate-limited us.
@@ -342,9 +406,11 @@ impl Rpc {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let body = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
 
+        // One of exactly two `expose()` call sites in the crate; the other is the websocket
+        // connect in `heads`. Everything else — logs, errors, Debug output — sees the redaction.
         let resp = self
             .client
-            .post(&self.url)
+            .post(self.url.expose())
             .json(&body)
             .send()
             .await
@@ -434,18 +500,22 @@ pub fn unhex(s: &str) -> Option<Vec<u8>> {
 // ---------------------------------------------------------------------------
 
 /// What the chain connection is doing, as the quote loop sees it.
+///
+/// `stale_secs` measures the *older* of the two liveness signals — the last landed read and the
+/// last block-number advance — so either one going quiet escalates on the same ladder. See
+/// [`ChainHealth`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChainStatus {
-    /// Polling is succeeding.
+    /// Reads are landing and the chain is advancing.
     Healthy,
-    /// Polling has been failing for a while. Quoting continues with widened spreads.
+    /// A liveness signal has been quiet for a while. Quoting continues with widened spreads.
     Degraded {
-        /// How long since the last successful poll.
+        /// How long since the quieter of the two signals last moved.
         stale_secs: u64,
     },
-    /// Polling has been failing long enough to stop. Withdraw quotes and exit.
+    /// A liveness signal has been quiet long enough to stop. Withdraw quotes and exit.
     Down {
-        /// How long since the last successful poll.
+        /// How long since the quieter of the two signals last moved.
         stale_secs: u64,
     },
 }
@@ -462,10 +532,54 @@ impl ChainStatus {
     }
 }
 
-/// Rolling health of the chain connection.
+/// Which liveness signal has gone quiet. Purely for the log line that accompanies an escalation
+/// — the two cases have completely different diagnoses and saying "chain unhealthy" for both
+/// wastes the only signal an operator gets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stall {
+    /// Neither. Reads are landing and the block number is climbing.
+    None,
+    /// Reads are failing: timeouts, 429s, node errors. The endpoint is the problem.
+    Reads,
+    /// Reads succeed and the block number has not moved. **The chain has stopped**, or this
+    /// endpoint is serving a frozen view of it. Either way, quoting into it is quoting into a
+    /// market whose state cannot change but whose fair value can.
+    Progress {
+        /// The block number everything is stuck at.
+        at_block: u64,
+    },
+}
+
+impl Stall {
+    /// Short stable string for structured logs.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Reads => "reads",
+            Self::Progress { .. } => "progress",
+        }
+    }
+}
+
+/// Rolling health of the chain connection, on two signals.
+///
+/// The thresholds and the `Healthy -> Degraded -> Down` ladder are exactly what they were under
+/// polling. The change is that `Down` is now reachable two ways:
+///
+/// * **reads stop landing** — the original signal, and the one a dead endpoint trips;
+/// * **the block number stops advancing** — new. An RPC that answers every call about a chain
+///   that has halted used to read `Healthy` indefinitely, because the only thing measured was
+///   whether the socket replied. That is the same class of bug as a websocket that reconnects
+///   and delivers nothing: everything looks fine and the state is frozen.
+///
+/// [`ChainHealth::status`] takes the **older** of the two references, so whichever signal has
+/// been quiet longest is the one that drives the escalation, and neither can mask the other.
 #[derive(Debug)]
 pub struct ChainHealth {
-    last_success: Option<Instant>,
+    last_read: Option<Instant>,
+    last_progress: Option<Instant>,
+    best_block: u64,
     since: Instant,
     consecutive_failures: u32,
     last_error: Option<String>,
@@ -475,11 +589,13 @@ pub struct ChainHealth {
 
 impl ChainHealth {
     /// Start a health tracker. The clock runs from construction, so a bot that never manages a
-    /// single successful poll still halts on schedule instead of waiting forever.
+    /// single successful read still halts on schedule instead of waiting forever.
     #[must_use]
     pub fn new(now: Instant, degraded_after_secs: u64, halt_after_secs: u64) -> Self {
         Self {
-            last_success: None,
+            last_read: None,
+            last_progress: None,
+            best_block: 0,
             since: now,
             consecutive_failures: 0,
             last_error: None,
@@ -488,36 +604,72 @@ impl ChainHealth {
         }
     }
 
-    /// Record a successful poll.
-    pub fn on_success(&mut self, now: Instant) {
-        self.last_success = Some(now);
+    /// Record a successful read at the block number it was answered at.
+    ///
+    /// The block number is what separates "the endpoint is up" from "the chain is moving". Only
+    /// a **strictly greater** number counts as progress: a repeated number is a chain that has
+    /// not produced a block, and a lower one is a reorg or a lagging replica, neither of which is
+    /// forward motion.
+    pub fn on_read(&mut self, now: Instant, block_number: u64) {
+        self.last_read = Some(now);
         self.consecutive_failures = 0;
         self.last_error = None;
+        if block_number > self.best_block {
+            self.best_block = block_number;
+            self.last_progress = Some(now);
+        }
     }
 
-    /// Record a failed poll.
+    /// Record a failed read.
     pub fn on_failure(&mut self, err: &RpcError) {
         self.consecutive_failures = self.consecutive_failures.saturating_add(1);
         self.last_error = Some(err.to_string());
     }
 
-    /// How many polls have failed in a row.
+    /// How many reads have failed in a row.
     #[must_use]
     pub const fn consecutive_failures(&self) -> u32 {
         self.consecutive_failures
     }
 
-    /// The most recent failure, if the last poll failed.
+    /// The highest block number any read has returned.
+    #[must_use]
+    pub const fn best_block(&self) -> u64 {
+        self.best_block
+    }
+
+    /// The most recent failure, if the last read failed.
     #[must_use]
     pub fn last_error(&self) -> Option<&str> {
         self.last_error.as_deref()
     }
 
+    /// Which signal is the quiet one, for the escalation log line.
+    #[must_use]
+    pub fn stall(&self, now: Instant) -> Stall {
+        if self.quiet_for(now) < self.degraded_after {
+            return Stall::None;
+        }
+        let read_ref = self.last_read.unwrap_or(self.since);
+        let progress_ref = self.last_progress.unwrap_or(self.since);
+        if read_ref <= progress_ref {
+            Stall::Reads
+        } else {
+            Stall::Progress { at_block: self.best_block }
+        }
+    }
+
+    /// How long the quieter of the two signals has been quiet.
+    fn quiet_for(&self, now: Instant) -> Duration {
+        let read_ref = self.last_read.unwrap_or(self.since);
+        let progress_ref = self.last_progress.unwrap_or(self.since);
+        now.saturating_duration_since(read_ref.min(progress_ref))
+    }
+
     /// Current status.
     #[must_use]
     pub fn status(&self, now: Instant) -> ChainStatus {
-        let reference = self.last_success.unwrap_or(self.since);
-        let elapsed = now.saturating_duration_since(reference);
+        let elapsed = self.quiet_for(now);
         let stale_secs = elapsed.as_secs();
         if elapsed >= self.halt_after {
             ChainStatus::Down { stale_secs }
@@ -686,11 +838,15 @@ impl ChainView {
 }
 
 // ---------------------------------------------------------------------------
-// The poll
+// The read
 // ---------------------------------------------------------------------------
 
-/// Batches one poll cycle into a single `eth_call`.
-pub struct ChainPoller {
+/// Batches everything one cycle needs into a single `eth_call`.
+///
+/// Named for what it does rather than when it runs: this used to be `ChainPoller` and it is no
+/// longer driven by a poll. It runs on a `newHeads` notification, and on the fallback timer when
+/// heads have gone quiet.
+pub struct ChainReader {
     pool: Address,
     multicall: Address,
     pair_ids: Vec<u16>,
@@ -698,8 +854,8 @@ pub struct ChainPoller {
     calldata: Bytes,
 }
 
-impl ChainPoller {
-    /// Build the poller and precompute its calldata.
+impl ChainReader {
+    /// Build the reader and precompute its calldata.
     ///
     /// The call list is fixed for the process lifetime, so it is encoded once: two Multicall3
     /// helpers, then one `snapshot` per pair, then one `balanceOf` per token. Order is the
@@ -735,22 +891,24 @@ impl ChainPoller {
         Self { pool, multicall, pair_ids, tokens, calldata }
     }
 
-    /// The pool this poller reads.
+    /// The pool this reader reads.
     #[must_use]
     pub const fn pool(&self) -> Address {
         self.pool
     }
 
-    /// Run one cycle. Exactly one RPC request.
+    /// Read everything one cycle needs. Exactly one RPC request, whatever the pair count.
     ///
     /// Uses the `pending` tag, which on the flashblocks endpoint is the ~200ms preconfirmed
-    /// state. That matters here: a swap that has been preconfirmed but not yet included has
-    /// already moved `bidUsed`/`askUsed`, and quoting against the pre-swap usage would compute
-    /// the executable top at a point on the ladder the pool has already walked past.
+    /// state. That is *fresher than the head that triggered this call* — the head is a confirmed
+    /// block at 1s, and preconfirmed state at 200ms already reflects swaps that block does not.
+    /// It matters concretely: a swap that has been preconfirmed but not yet included has already
+    /// moved `bidUsed`/`askUsed`, and quoting against the pre-swap usage would compute the
+    /// executable top at a point on the ladder the pool has already walked past.
     ///
     /// # Errors
     /// [`RpcError`] — including the two that never leave the process.
-    pub async fn poll(&self, rpc: &Rpc) -> Result<ChainView, RpcError> {
+    pub async fn read(&self, rpc: &Rpc) -> Result<ChainView, RpcError> {
         let raw = rpc.eth_call(self.multicall, &self.calldata, "pending").await?;
         let results = decode_batch(&raw, 2 + self.pair_ids.len() + self.tokens.len())?;
 
@@ -1072,24 +1230,78 @@ mod tests {
         let t0 = Instant::now();
         let mut h = ChainHealth::new(t0, 30, 300);
         assert_eq!(h.status(t0), ChainStatus::Healthy);
-        h.on_success(t0);
+        h.on_read(t0, 1_000);
 
         assert_eq!(h.status(t0 + Duration::from_secs(29)), ChainStatus::Healthy);
         assert_eq!(h.status(t0 + Duration::from_secs(30)), ChainStatus::Degraded { stale_secs: 30 });
         assert_eq!(h.status(t0 + Duration::from_secs(299)), ChainStatus::Degraded { stale_secs: 299 });
         assert_eq!(h.status(t0 + Duration::from_secs(300)), ChainStatus::Down { stale_secs: 300 });
 
-        // A success at any point returns to healthy.
-        h.on_success(t0 + Duration::from_secs(300));
+        // A read at a new block at any point returns to healthy.
+        h.on_read(t0 + Duration::from_secs(300), 1_001);
         assert_eq!(h.status(t0 + Duration::from_secs(301)), ChainStatus::Healthy);
     }
 
     #[test]
-    fn health_counts_from_start_when_no_poll_has_ever_succeeded() {
+    fn health_counts_from_start_when_no_read_has_ever_succeeded() {
         // Otherwise a bot that never reaches the node would sit `Healthy` forever.
         let t0 = Instant::now();
         let h = ChainHealth::new(t0, 30, 300);
         assert_eq!(h.status(t0 + Duration::from_secs(300)), ChainStatus::Down { stale_secs: 300 });
+    }
+
+    #[test]
+    fn a_frozen_chain_escalates_even_though_every_read_succeeds() {
+        // The hole the block-number signal closes. Every `eth_call` lands, so the old
+        // "did the RPC reply" test says Healthy forever, while the chain has not produced a
+        // block in ten minutes and the bot happily quotes into it.
+        let t0 = Instant::now();
+        let mut h = ChainHealth::new(t0, 30, 300);
+        h.on_read(t0, 5_000);
+        assert_eq!(h.status(t0), ChainStatus::Healthy);
+
+        // Reads keep succeeding, once a second, at the SAME block.
+        for s in 1..=310 {
+            h.on_read(t0 + Duration::from_secs(s), 5_000);
+        }
+        let now = t0 + Duration::from_secs(310);
+        assert_eq!(h.consecutive_failures(), 0, "nothing failed; that is the point");
+        assert_eq!(h.status(now), ChainStatus::Down { stale_secs: 310 });
+        assert_eq!(h.stall(now), Stall::Progress { at_block: 5_000 });
+
+        // One new block clears it immediately.
+        h.on_read(now, 5_001);
+        assert_eq!(h.status(now), ChainStatus::Healthy);
+        assert_eq!(h.stall(now), Stall::None);
+    }
+
+    #[test]
+    fn a_failing_endpoint_escalates_on_the_read_signal_and_says_so() {
+        let t0 = Instant::now();
+        let mut h = ChainHealth::new(t0, 30, 300);
+        h.on_read(t0, 5_000);
+        h.on_failure(&RpcError::BudgetExhausted { endpoint: "rpc" });
+
+        let now = t0 + Duration::from_secs(40);
+        assert_eq!(h.status(now), ChainStatus::Degraded { stale_secs: 40 });
+        // Both references are the same instant here, so the tie must resolve to the endpoint
+        // rather than accusing the chain of stopping.
+        assert_eq!(h.stall(now), Stall::Reads);
+        assert_eq!(h.consecutive_failures(), 1);
+        assert!(h.last_error().is_some());
+    }
+
+    #[test]
+    fn a_reorg_backwards_is_not_progress_and_does_not_lower_the_best_block() {
+        let t0 = Instant::now();
+        let mut h = ChainHealth::new(t0, 30, 300);
+        h.on_read(t0, 5_000);
+        h.on_read(t0 + Duration::from_secs(1), 4_998);
+        assert_eq!(h.best_block(), 5_000, "a lagging replica must not rewind the high-water mark");
+        // Staleness runs from the QUIETER signal, which is progress at t0 rather than the read
+        // at t0+1s — so a stream of reads that never advance cannot mask a stalled chain.
+        assert_eq!(h.status(t0 + Duration::from_secs(40)), ChainStatus::Degraded { stale_secs: 40 });
+        assert_eq!(h.stall(t0 + Duration::from_secs(40)), Stall::Progress { at_block: 5_000 });
     }
 
     #[test]
@@ -1103,11 +1315,11 @@ mod tests {
     }
 
     #[test]
-    fn the_poll_encodes_one_call_per_thing_it_needs() {
+    fn the_read_encodes_one_call_per_thing_it_needs() {
         let pool = Address::repeat_byte(0xaa);
         let mc = Address::repeat_byte(0xbb);
-        let p = ChainPoller::new(pool, mc, vec![1, 2], vec![Address::repeat_byte(1), Address::repeat_byte(2)]);
-        // Decoding our own calldata proves the layout the poll's decoder assumes.
+        let p = ChainReader::new(pool, mc, vec![1, 2], vec![Address::repeat_byte(1), Address::repeat_byte(2)]);
+        // Decoding our own calldata proves the layout the read's decoder assumes.
         let decoded = abi::aggregate3Call::abi_decode(&p.calldata).unwrap();
         assert_eq!(decoded.calls.len(), 6, "2 helpers + 2 pairs + 2 tokens");
         assert_eq!(decoded.calls[0].target, mc);

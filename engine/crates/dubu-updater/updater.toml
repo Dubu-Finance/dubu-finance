@@ -4,41 +4,96 @@
 # than quoting a spread nobody chose. Amounts are decimal strings in HUMAN units (TOML integers
 # are i64 and a thousand mWETH is 10^21).
 #
+# NO SECRETS IN THIS FILE. The endpoint URLs are `${VAR}` templates expanded from the
+# environment at load; copy `.env.example` to `.env` (gitignored) and put the key there. An
+# unset variable is a startup error naming the variable. Every URL is redacted to
+# `scheme://host/***` in every log line — see `config::EndpointUrl`.
+#
 # Run it dry:   cargo run -p dubu-updater -- --config crates/dubu-updater/updater.toml --once
 
 [chain]
-rpc_url = "https://sepolia-rpc.giwa.io"
+# ---------------------------------------------------------------------------
+# THREE ENDPOINTS, THREE JOBS. This is not redundancy; it is three different
+# freshness guarantees, and using the wrong one for a job is a real bug.
+#
+#   ws_url               newHeads -> DRIVES THE LOOP        1s, confirmed
+#   flashblocks_rpc_url  every state read, `pending` tag    ~200ms, preconfirmed
+#   rpc_url              transactions, nonce, receipts      canonical/final
+# ---------------------------------------------------------------------------
 
-# Read-only, and only under the `pending` tag: that is where the ~200ms preconfirmed state
-# lives. Its `latest` LAGS the ordinary RPC by about two blocks, so reading `latest` here would
-# be strictly worse than reading `latest` there. Transactions go to `rpc_url`, which is
-# canonical — a nonce read from a preconfirmed state that reorganises is a stuck transaction.
+# THE DRIVER. `eth_subscribe("newHeads")` over this socket is what wakes the quote loop;
+# measured delivery is 904/1050/966/997ms against a 1s block time. The public GIWA RPC cannot do
+# this at all — it answers 405 to a websocket upgrade — which is why the loop used to be a timer.
+# Pointing this at an https:// URL is refused at startup: that endpoint answers
+# "notifications not supported" and the loop would silently run on its fallback forever.
+ws_url = "wss://giwa-sepolia.nodit.io/${NODIT_API_KEY}"
+
+# TRANSACTIONS AND ANYTHING CANONICAL: nonce, receipts, startup metadata. Defaults to Nodit now
+# that it exists — 20 rapid eth_blockNumber calls returned 200 every time, where the public
+# endpoint gave us HTTP 429 during a 203-transaction broadcast.
+rpc_url = "https://giwa-sepolia.nodit.io/${NODIT_API_KEY}"
+
+# THE FRESHEST READ, and still worth a separate endpoint. Read-only, and only under the
+# `pending` tag: that is where the ~200ms preconfirmed state lives, which is FRESHER than the 1s
+# confirmed head that triggered the read. A preconfirmed swap has already moved bidUsed/askUsed,
+# and quoting against the pre-swap usage computes the executable top at a point on the ladder the
+# pool has already walked past. Its `latest` LAGS the ordinary RPC by about two blocks, so
+# reading `latest` here would be strictly worse than reading `latest` there. Transactions do NOT
+# go here — a nonce read from a preconfirmed state that reorganises is a stuck transaction.
 flashblocks_rpc_url = "https://sepolia-rpc-flashblocks.giwa.io"
 
 chain_id = 91342
 pool = "0xA629071E606F425dB93310c3ecc35E00Fbe16358"
 
-# Preinstalled in GIWA's genesis at the canonical address. This is what makes a whole poll
-# cycle — block number, block timestamp, both snapshots, three balances — one `eth_call`.
+# Preinstalled in GIWA's genesis at the canonical address. This is what makes a whole read
+# cycle — block number, block timestamp, both snapshots, three balances — one `eth_call`. KEPT
+# after the move to newHeads, and not out of inertia: one round trip per head still beats six
+# regardless of any rate limit, and a batch is answered at ONE block where six separate calls
+# can straddle a boundary and produce a view that never existed.
 multicall3 = "0xcA11bde05977b3631167028862bE2a173976CA11"
 
-# 1s blocks, so 2s is every other block. Each cycle is exactly one request; the validator
-# refuses an interval whose steady-state rate alone would exceed `requests_per_sec`.
-poll_interval_ms = 2000
+# GIWA's cadence. Not a tuning knob — a fact about the chain, and the unit the watchdog below is
+# expressed in.
+block_time_ms = 1000
 
-# The public endpoint rate-limits — we measured HTTP 429 during a 203-transaction broadcast.
-# The bucket refuses locally rather than queueing, so this bot cannot be what trips the limit.
-# The burst covers a send: nonce, submit, and a few receipt polls in quick succession.
-requests_per_sec = 3.0
-request_burst = 8.0
+# THE HEAD WATCHDOG. No head for this many block times (10s here) means the subscription has
+# gone quiet. That is worse than one that errors: a socket which reconnects and then silently
+# delivers nothing looks healthy from every angle while the bot sits believing the chain has
+# stopped. Tripping it logs loudly and falls back to polling. It deliberately does NOT declare
+# the chain down by itself — the block number the next read returns decides that, so a dead
+# socket over a live chain keeps quoting and a dead socket over a frozen chain halts.
+head_stale_blocks = 10
+
+# Reconnect backoff for the head subscription. A subscription that dies must not become a hot
+# reconnect loop against the endpoint.
+ws_reconnect_initial_ms = 500
+ws_reconnect_max_ms = 30000
+
+# FALLBACK ONLY — this is not the driver any more. It is the floor underneath the subscription,
+# so a dead or silent socket degrades into polling rather than stalling. At a healthy 1s head
+# cadence it essentially never fires. Sizing it like a primary poll interval is a misreading;
+# below `block_time_ms` it is refused at startup precisely because it would quietly become one.
+fallback_poll_interval_ms = 2000
+
+# A RUNAWAY GUARD, NOT A BUDGET. This used to be sized against a hostile public endpoint. The
+# dedicated endpoint took 20 rapid calls without a 429, so the numbers are now loose enough that
+# normal operation never touches them, and the validator no longer refuses an interval on the
+# grounds that its steady-state rate would exhaust the budget. What is left is a ceiling on a
+# BUG — a reconnect storm or a spinning loop should hit a local limit before the provider's.
+requests_per_sec = 25.0
+request_burst = 50.0
 request_timeout_ms = 8000
 
-# A 429 is a liveness event, not noise. No socket is opened at all during the penalty window,
-# and it doubles per consecutive 429 up to the ceiling.
+# KEPT. A dedicated endpoint is not an infinite one, and with no penalty window any transient
+# upstream failure turns this bot into a retry flood — which is how a small outage becomes a
+# large one. No socket is opened at all during the window, doubling per consecutive 429.
 rate_limit_backoff_initial_ms = 2000
 rate_limit_backoff_max_ms = 120000
 
-# Sustained polling failure: widen first, halt second.
+# Sustained loss of chain liveness: widen first, halt second. "Liveness" is now two signals —
+# reads landing AND the block number advancing — on the same thresholds. The second is new and
+# closes a real hole: an endpoint that answers every call about a chain that has stopped used to
+# read healthy forever.
 degraded_after_secs = 30
 degraded_extra_half_spread_bps = 25
 halt_after_secs = 600

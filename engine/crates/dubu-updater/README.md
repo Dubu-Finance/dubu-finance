@@ -8,8 +8,8 @@ pushes a new ladder, the one it holds is the one it quotes, until `maxStaleSecs`
 quotes nothing at all. This is that something.
 
 ```
-  Binance bookTicker (ws)                    GIWA (http, polled)
-           │                                          │
+  Binance bookTicker (wss)      Nodit newHeads (wss) ──► wakes the loop, 1s
+           │                    GIWA flashblocks (http, `pending`) ──► state, ~200ms
            ▼                                          ▼
   feed ──► fair_value ──► ladder ──► policy ──► tx ──► PropPool.updateQuote
            micro-price    dubu-core   send?           PropPool.refreshCapacity
@@ -22,16 +22,17 @@ quotes nothing at all. This is that something.
 
 | module | what it owns |
 |---|---|
-| `config.rs` | TOML, unknown fields rejected, every range checked at load |
+| `config.rs` | TOML, unknown fields rejected, every range checked at load; redacted endpoint URLs |
 | `feed/` | Binance `bookTicker` websocket: reconnect, sequence regression, staleness |
 | `fair_value.rs` | size-weighted micro-price, outlier filter |
-| `chain.rs` | JSON-RPC, the request budget, one `eth_call` per poll cycle |
+| `chain/mod.rs` | JSON-RPC, the runaway guard, one `eth_call` per cycle, chain health |
+| `chain/heads.rs` | the `newHeads` subscription that drives the loop, and its watchdog |
 | `ladder.rs` | fair value + knobs → `SolveInput` → four `uint56` prices → packed word |
 | `policy.rs` | the decision to push, and mostly the decision not to |
 | `risk.rs` | two latching killswitches and the NAV decomposition behind them |
 | `tx.rs` | EIP-1559 build/sign/send, nonce, pending intents |
 | `units.rs` | the only place a decimal string becomes a number |
-| `main.rs` | the loop, and the shutdown that withdraws quotes first |
+| `main.rs` | the loop, its wake sources, and the shutdown that withdraws quotes first |
 
 ## Four things that are load-bearing
 
@@ -63,17 +64,21 @@ turns it on.
 
 ```
 cd engine
-cargo run -p dubu-updater -- --config crates/dubu-updater/updater.toml --once
+cp crates/dubu-updater/.env.example crates/dubu-updater/.env   # then fill in NODIT_API_KEY
+cargo run -p dubu-updater -- --config crates/dubu-updater/updater.toml --cycles 4 --dry-run
 ```
 
-No key is needed. A configured-but-missing key is a warning in dry run and fatal only when
-transmitting.
+No signing key is needed. A configured-but-missing key is a warning in dry run and fatal only
+when transmitting. `NODIT_API_KEY` *is* needed even for a dry run, because the endpoints require
+it — `.env` is read from the working directory and from the config's own directory, and a real
+environment variable beats both.
 
 ```
 --config <path>   default: updater.toml
 --once            one evaluation cycle, then shut down
+--cycles <n>      n cycles, then shut down; wakes on newHeads like a normal run
 --dry-run         force dry run regardless of config
-RUST_LOG=debug    per-tick feed detail
+RUST_LOG=debug    per-tick feed detail, and every head as it arrives
 ```
 
 Everything is JSON on stdout: every fair value, every ladder with the packed word, every
@@ -99,39 +104,133 @@ to start otherwise, because signing as anyone else means every transaction rever
   otherwise be a five-basis-point quote whose author believes it is fifty.
 - **Amounts are decimal strings in human units.** TOML integers are `i64`; a thousand mWETH is
   `10^21`. `capacity = "1000"` means 1000 mWETH.
-- **Ranges are checked at load, and cross-checks too.** Polling faster than the request budget,
-  a loss budget below the bleed limit, `adverse_drift_bps` above `favourable_drift_bps`, a
-  capture above capacity, a zero half-spread — all refused at startup with the field named.
+- **No secrets, only `${VAR}` templates.** See [Secrets](#secrets). A missing variable fails at
+  startup naming the variable.
+- **Ranges are checked at load, and cross-checks too.** A fallback interval below the block time,
+  a head watchdog window that could never fire before the halt timer, an `http(s)` `ws_url`, a
+  loss budget below the bleed limit, `adverse_drift_bps` above `favourable_drift_bps`, a capture
+  above capacity, a zero half-spread — all refused at startup with the field named.
 - **Chain checks run before the loop.** That a pair exists, that `base_decimals` matches the
   deployed ERC-20, that `heartbeat_secs` fits inside the pool's own `maxStaleSecs`, that all
   pairs share a quote token. Each of those failing silently would be expensive.
 
-## Polling and the rate limit
+## Endpoints, and which one drives what
 
-Two measured constraints shape this.
+Three endpoints, three jobs. This is not redundancy — it is three different freshness
+guarantees, and using the wrong one for a job is a real bug.
 
-**GIWA has no `eth_subscribe` and no websocket** — the endpoint answers 405. Chain state is
-polled on a configurable interval and every consumer treats the view as something with an age;
-`view_stale_secs` blocks a push on a view that is too old.
+| config field | endpoint | job | freshness | why that one |
+|---|---|---|---|---|
+| `ws_url` | Nodit WSS | `newHeads` — **drives the loop** | 1s, confirmed | the only one that answers `eth_subscribe` at all |
+| `flashblocks_rpc_url` | GIWA flashblocks | every state read, `pending` tag | **~200ms, preconfirmed** | fresher than the head that triggered the read |
+| `rpc_url` | Nodit HTTPS | transactions, nonce, receipts, startup metadata | canonical | a nonce must come from state that cannot reorganise |
 
-**The public RPC rate-limits.** We saw HTTP 429 "over rate limit" during a 203-transaction
-broadcast. Three mechanisms answer it:
+Heads say *when* to look; they are not what is read. The flashblocks `pending` tag is ~200ms
+preconfirmed state, which is **fresher than the 1s confirmed head that woke the cycle** — that
+gap is the whole reason the split survives. A preconfirmed swap has already moved
+`bidUsed`/`askUsed`, and quoting against the pre-swap usage computes the executable top at a
+point on the ladder the pool has already walked past. Its `latest` lags the ordinary RPC by about
+two blocks, so it is only ever read under `pending`. Transactions go to whichever endpoint
+`rpc_url` names, now defaulting to Nodit.
 
-1. **One request per poll cycle**, whatever the pair count. Multicall3 is preinstalled in GIWA's
-   genesis, so the block number, block timestamp, both `snapshot`s and all three token balances
-   are a single `aggregate3` `eth_call`. The naive shape is six requests per cycle.
-2. **A local token bucket that refuses rather than queues.** A queue in front of a rate-limited
-   endpoint converts a burst into latency, and latency in a quoting loop converts into adverse
-   selection. Failing locally lets the caller skip the cycle instead.
-3. **Backoff as a state, not a retry.** A 429 opens no further sockets until the penalty window
-   expires, doubling per consecutive 429. Sustained failure becomes `Degraded` (every
-   half-spread widens by `degraded_extra_half_spread_bps`) and then `Down` (halt, withdraw,
-   exit non-zero) rather than disappearing into a retry loop.
+Measured on the Nodit endpoint: `newHeads` delivers at 904 / 1050 / 966 / 997 ms against a 1s
+block time; 20 rapid `eth_blockNumber` calls returned 200 every time; `eth_subscribe` over its
+*HTTPS* endpoint correctly reports `notifications not supported`, which is why an `http(s)`
+`ws_url` is refused at startup rather than silently degrading. `debug_traceTransaction` needs a
+higher plan tier and `trace_block` does not exist; nothing here calls either.
 
-Reads use the flashblocks endpoint under the **`pending`** tag only, where the ~200ms
-preconfirmed state lives — its `latest` lags the ordinary RPC by about two blocks. Transactions
-go to the ordinary endpoint, which is canonical; a nonce read from a preconfirmed state that
-later reorganises is a stuck transaction.
+### One thing worth knowing if you touch `heads.rs`
+
+**Nodit sends JSON-RPC over WebSocket *binary* frames.** Binance's market-data feed sends text.
+Both are legal — RFC 6455 leaves the choice to the application — and a client that matches on
+the opcode instead of the payload silently drops every frame from the other one. The failure
+gives no signal pointing at the cause: the handshake returns 101, frames arrive on schedule,
+and it presents as "the endpoint never replied". `heads::payload` handles both and a test pins it.
+
+## The loop is event-driven, and what is left of the polling machinery
+
+The loop wakes on a `newHeads` notification and does its reads then. That is strictly better
+than a timer twice over: fewer requests, and the reads happen when there is actually new state
+rather than on an arbitrary cadence that either fires between blocks or drifts past one.
+
+Underneath sits a **fallback timer** at `fallback_poll_interval_ms`, in the same `select!` as the
+head. There is no mode flag and no switch: when the subscription is healthy the head always wins
+the race, and when it is not the timer does. Every cycle logs `woke_on`.
+
+Some of the polling-era machinery is still here. It stays on its own merits, and the code says so
+at each site so a later reader does not delete it as debris:
+
+- **Multicall3 batching — kept.** One `eth_call` per head instead of six, whatever the pair
+  count. The rate limit *motivated* it; it is justified without one, because a batch is answered
+  at a single block where six separate calls can straddle a boundary and build a view that never
+  existed.
+- **Backoff — kept.** A dedicated endpoint is not an infinite one, and the failure this really
+  guards against is ours: with no penalty window any transient upstream error turns the bot into
+  a retry flood, which is how a small outage becomes a large one.
+- **The killswitches, the intent lifecycle, the pre-send gates — untouched.** This change did not
+  reach them.
+- **The token bucket — demoted.** It survives as a *fuse*, not a budget: `requests_per_sec` is
+  now loose enough that normal operation never approaches it, and it exists so a reconnect storm
+  or a spinning loop hits a local ceiling before the provider's.
+- **The poll timer as primary driver — gone.** Renamed to `fallback_poll_interval_ms`, and the
+  config now refuses a value *below* the block time, because that would quietly make it the
+  driver again.
+- **The budget cross-check — deleted.** `poll_interval_ms` used to be refused if its steady-state
+  rate exceeded `requests_per_sec`. That check only made sense against a hostile budget.
+
+## The head watchdog, and why it does not decide the chain is down
+
+A subscription that **errors** is the easy case: the socket closes, the task reconnects with
+exponential backoff, the fallback timer covers the gap.
+
+A subscription that reconnects and then **silently stops delivering** is the dangerous one. Every
+visible signal says healthy — the connection is open, nothing errored, the last head looks like a
+real block — while the bot sits believing the chain has stopped and quotes a frozen view into a
+moving market. So head liveness is a first-class state, exactly as feed liveness is:
+`Live / Stale / Down / NoData`, with `Stale` meaning *connected and silent*.
+
+When no head has arrived for `head_stale_blocks × block_time_ms` (10s by default), the loop says
+so once — edge-triggered, because a watchdog that repeats every two seconds is one nobody reads —
+and keeps reading on the timer.
+
+What it deliberately does **not** do is conclude that the chain is down. That question is answered
+by the *next read*, because chain health now escalates on **two** signals over the same
+`Healthy → Degraded → Down` thresholds:
+
+| | reads landing | block number advancing | verdict |
+|---|---|---|---|
+| socket died, chain fine | yes | yes | keep quoting on the timer, log the watchdog |
+| endpoint unreachable | **no** | no | `Degraded` → `Down` → withdraw |
+| chain frozen, RPC answering | yes | **no** | `Degraded` → `Down` → withdraw |
+
+The third row is new and it closes a real hole. "The RPC replied" used to be the only thing
+measured, so an endpoint answering cheerfully about a chain that had stopped read as perfectly
+healthy forever — the same class of bug as the silent websocket, one layer down. Progress is
+taken from the block number the read itself returns, and only a strictly greater number counts.
+
+Wiring a silent socket straight to `Down` would withdraw quotes over a quiet websocket on a
+healthy chain. Ignoring it would be worse. Splitting the two signals is how both are avoided.
+
+`view_stale_secs` still blocks a push on a view that is too old, independently of all of this.
+
+## Secrets
+
+**The endpoint URL *is* the credential.** Nodit puts the API key in the path
+(`https://giwa-sepolia.nodit.io/<KEY>`), so it is not a string that happens to contain a secret.
+
+- `updater.toml` holds `${NODIT_API_KEY}` templates and never a literal. An unset or empty
+  variable is a startup error naming the **variable**, never the value.
+- The value comes from the real environment, or from a **gitignored `.env`** next to the config
+  (`.env.example` is the committed template). A variable already set in the real environment
+  always wins over the file.
+- `config::EndpointUrl` makes redaction structural rather than a rule to remember: `Display` and
+  `Debug` both emit `scheme://host/***`, so `url = %cfg.chain.ws_url` in a `tracing` macro cannot
+  print the key and neither can a `{:?}` dump of the whole config. The real string is reachable
+  only through `expose()` — grep for it to audit every use; there are two, the HTTP client and
+  the websocket connect. Query strings and `user:pass@` userinfo are redacted too.
+
+The signing key is unchanged: an environment variable or a file path, never a literal, never
+logged.
 
 ## The trigger rules
 
@@ -239,7 +338,11 @@ Listed because each one is a real gap, not because the list is decorative.
 - **Batching.** `updateQuote` takes an array and `refreshCapacityBatch` exists; this sends one
   pair per transaction. Two pairs make that a rounding error, and a batch means one pair's
   invalid row reverts the other's.
-- **A second RPC endpoint.** `halt_after_secs` on a single provider is the whole liveness story.
+- **A failover RPC provider.** Three endpoints are configured but they are three *roles*, not
+  three replicas: if Nodit goes away, the head subscription and the transaction path both go with
+  it. What exists is graceful degradation within one provider — heads to fallback polling, and a
+  liveness ladder that distinguishes a dead endpoint from a frozen chain. What does not exist is
+  a second provider to fail over *to*.
 
 ## Dependency pins
 
@@ -256,7 +359,7 @@ retires all of it.
 ## Tests
 
 ```
-cargo test --all                              # 113 in this crate
+cargo test --all                              # 138 in this crate
 cargo clippy --all-targets -- -D warnings
 ```
 
@@ -264,6 +367,15 @@ No test touches the network. The feed and chain are mocked by *constructing the 
 directly* rather than by a mock object, so there is no mock that can drift from the real thing.
 The load-bearing ones:
 
+- **heads** — a real `newHeads` frame parsed out of **both** a text and a binary frame; a
+  notification from *another* subscription not counting as our liveness; a replayed header not
+  resetting the watchdog; a connected-but-silent subscription reading `Stale` rather than `Live`
+  or `Down`; a reconnect clearing the stored head rather than resurrecting it.
+- **chain health** — a frozen chain escalating to `Down` **while every read succeeds**, and the
+  stall reason naming which of the two signals went quiet.
+- **config** — the API key surviving no formatter: `Display`, `Debug`, and a `{:?}` dump of the
+  whole config; `${VAR}` expansion naming the variable and never the value; `.env` never
+  overriding the real environment.
 - **policy** — every gate aborts and aborts in order; each trigger fires at its threshold and
   **not one basis point below it**; the two executable-top cases a `maxBid` comparison gets
   wrong; the heartbeat re-posting an identical row and nothing else doing so; a superseded usage

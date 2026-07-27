@@ -24,6 +24,17 @@
 //! There is no private key in this file and there is no field that could hold one. [`KeySource`]
 //! names either an environment variable or a path; the value is read at startup and never
 //! logged. See [`crate::tx`].
+//!
+//! The endpoint URLs are the second secret, and a less obvious one. Nodit puts the API key in
+//! the **path** — `https://giwa-sepolia.nodit.io/<KEY>` — so the URL *is* the credential. Two
+//! mechanisms keep it out of everything:
+//!
+//! 1. The config file holds `${NODIT_API_KEY}`, never a literal. [`EndpointUrl`] expands it from
+//!    the environment at load; an unset variable is a startup error naming the *variable*.
+//! 2. [`EndpointUrl`]'s `Display` and `Debug` are both **redacted** to `scheme://host/***`. The
+//!    real string is reachable only through [`EndpointUrl::expose`], which the transport calls
+//!    and nothing else does. That makes "never log the key" a property of the type rather than a
+//!    rule every future `info!` has to remember.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -57,6 +68,191 @@ pub enum ConfigError {
 
 fn invalid(msg: impl Into<String>) -> ConfigError {
     ConfigError::Invalid(msg.into())
+}
+
+// ---------------------------------------------------------------------------
+// Endpoint URLs, which are credentials
+// ---------------------------------------------------------------------------
+
+/// A URL that may carry a credential, and therefore may never be printed.
+///
+/// Nodit's endpoint is `https://giwa-sepolia.nodit.io/<KEY>`: the API key is a path segment, so
+/// the URL is not "a string that happens to contain a secret", it *is* the secret. This wrapper
+/// makes that structural instead of a convention:
+///
+/// * `Display` and `Debug` both emit the **redacted** form, so `url = %cfg.chain.rpc_url` in a
+///   `tracing` macro logs `https://giwa-sepolia.nodit.io/***` and there is no spelling of it
+///   that logs anything else.
+/// * The real string comes out of [`EndpointUrl::expose`] only, which is called by the reqwest
+///   client and the websocket connect and nowhere else. Grep for it to audit every use.
+///
+/// Redaction keeps the scheme and the host — those are the useful half of a log line, and they
+/// are not secret — and replaces any path, query or userinfo with `***`. Over-redacting a
+/// key-free path costs nothing; under-redacting one costs the key.
+#[derive(Clone, PartialEq, Eq)]
+pub struct EndpointUrl {
+    raw: String,
+    redacted: String,
+}
+
+impl EndpointUrl {
+    /// Build from an already-resolved URL string, expanding any `${VAR}` references.
+    ///
+    /// # Errors
+    /// [`ConfigError::Invalid`] if a referenced variable is unset or empty. The message names
+    /// the **variable**, never the value.
+    pub fn resolve(field: &str, template: &str) -> Result<Self, ConfigError> {
+        let raw = expand_env(field, template)?;
+        let redacted = redact_url(&raw);
+        Ok(Self { raw, redacted })
+    }
+
+    /// The real URL. **The only way to get it**, and the only callers are the HTTP client and
+    /// the websocket connect.
+    #[must_use]
+    pub fn expose(&self) -> &str {
+        &self.raw
+    }
+
+    /// The safe-to-log form: `scheme://host/***`.
+    #[must_use]
+    pub fn redacted(&self) -> &str {
+        &self.redacted
+    }
+
+    /// The scheme, lower-cased, or `""` for a string with no `://`.
+    #[must_use]
+    pub fn scheme(&self) -> &str {
+        self.raw.split_once("://").map_or("", |(s, _)| s)
+    }
+
+    fn is_http(&self) -> bool {
+        matches!(self.scheme(), "http" | "https")
+    }
+
+    fn is_ws(&self) -> bool {
+        matches!(self.scheme(), "ws" | "wss")
+    }
+}
+
+/// Redacted, always. See the type docs — there is deliberately no un-redacted formatter.
+impl std::fmt::Display for EndpointUrl {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.redacted)
+    }
+}
+
+/// Redacted, always. `Debug` matters as much as `Display` here: `?url` in a tracing macro and
+/// `{:?}` on a struct that contains one both go through this.
+impl std::fmt::Debug for EndpointUrl {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:?}", self.redacted)
+    }
+}
+
+impl<'de> Deserialize<'de> for EndpointUrl {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(d)?;
+        // The field name is not available here, so the error carries the template shape rather
+        // than the field. `expand_env` puts the variable name in the message either way.
+        Self::resolve("<url>", &s).map_err(serde::de::Error::custom)
+    }
+}
+
+/// Expand every `${VAR}` in `template` from the environment.
+///
+/// An unset or empty variable is an error rather than an empty expansion: a URL with a blank key
+/// segment produces a 401 at the first request, which is a much worse place to discover a
+/// missing `.env` than startup.
+fn expand_env(field: &str, template: &str) -> Result<String, ConfigError> {
+    let mut out = String::with_capacity(template.len());
+    let mut rest = template;
+    while let Some(start) = rest.find("${") {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 2..];
+        let end = after.find('}').ok_or_else(|| {
+            invalid(format!("{field}: unterminated `${{` in the URL template; expected `${{VAR}}`"))
+        })?;
+        let name = &after[..end];
+        match std::env::var(name) {
+            Ok(v) if !v.trim().is_empty() => out.push_str(v.trim()),
+            _ => {
+                return Err(invalid(format!(
+                    "{field}: environment variable `{name}` is unset or empty. \
+                     Put it in the crate's `.env` (gitignored) or export it; \
+                     see `.env.example`. The value is never read from the config file."
+                )))
+            }
+        }
+        rest = &after[end + 1..];
+    }
+    out.push_str(rest);
+    Ok(out)
+}
+
+/// `scheme://host/***`, keeping only what is safe and useful in a log.
+fn redact_url(url: &str) -> String {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        // Not a URL shape at all. Whatever it is, it is not going in a log intact.
+        return "***".to_string();
+    };
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let (authority, tail) = rest.split_at(end);
+    // `user:pass@host` is userinfo, which is also a credential.
+    let authority = match authority.rsplit_once('@') {
+        Some((_, host)) => format!("***@{host}"),
+        None => authority.to_string(),
+    };
+    if tail.is_empty() || tail == "/" {
+        format!("{scheme}://{authority}{tail}")
+    } else {
+        format!("{scheme}://{authority}/***")
+    }
+}
+
+// ---------------------------------------------------------------------------
+// .env
+// ---------------------------------------------------------------------------
+
+/// Load `KEY=VALUE` pairs from a dotenv-style file into the process environment.
+///
+/// Deliberately tiny and deliberately hand-rolled — the same reasoning as `tx.rs` encoding its
+/// own EIP-1559 envelope. Three rules, all of which matter:
+///
+/// * **A variable already set in the real environment always wins.** The file is a convenience
+///   for local runs, never an override of what an operator or a systemd unit set on purpose.
+/// * **Nothing from the file is ever logged**, including key *names* being fine but values
+///   never. The return value is a count, not the contents.
+/// * A missing file is not an error. Production sets real environment variables and has no
+///   `.env` at all.
+///
+/// Returns how many variables this file actually set.
+pub fn load_dotenv(path: &Path) -> usize {
+    let Ok(text) = std::fs::read_to_string(path) else { return 0 };
+    let mut set = 0;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let line = line.strip_prefix("export ").unwrap_or(line);
+        let Some((key, value)) = line.split_once('=') else { continue };
+        let key = key.trim();
+        if key.is_empty() || std::env::var_os(key).is_some() {
+            continue;
+        }
+        let value = value.trim();
+        // Strip one layer of matching quotes, so a value with trailing whitespace can be written
+        // explicitly. Anything more (escapes, interpolation) is out of scope on purpose.
+        let value = value
+            .strip_prefix('"')
+            .and_then(|v| v.strip_suffix('"'))
+            .or_else(|| value.strip_prefix('\'').and_then(|v| v.strip_suffix('\'')))
+            .unwrap_or(value);
+        std::env::set_var(key, value);
+        set += 1;
+    }
+    set
 }
 
 // ---------------------------------------------------------------------------
@@ -134,52 +330,104 @@ impl Config {
 // Chain
 // ---------------------------------------------------------------------------
 
-/// RPC endpoints, polling cadence, and the request budget that keeps us under the public
-/// endpoint's rate limit.
+/// The three endpoints, the head-subscription watchdog, and the liveness thresholds.
+///
+/// # Which endpoint does what, and why
+///
+/// | field | endpoint | used for | why that one |
+/// |---|---|---|---|
+/// | `ws_url` | Nodit WSS | `newHeads`, which **drives the loop** | the only one that answers `eth_subscribe`; 1s confirmed heads |
+/// | `flashblocks_rpc_url` | GIWA flashblocks | every state read, `pending` tag | ~200ms preconfirmed state — fresher than any confirmed head |
+/// | `rpc_url` | Nodit HTTPS | transactions, nonce, receipts, startup metadata | canonical, and no longer rate-limited |
+///
+/// The split is not redundancy, it is three different freshness guarantees. Heads say *when* to
+/// look, flashblocks says *what is true right now* including preconfirmed swaps that have
+/// already moved `bidUsed`, and the ordinary RPC says *what is final* — which is the only
+/// acceptable basis for a nonce.
+///
+/// All three are [`EndpointUrl`], so they are redacted in every log line. Write them in the TOML
+/// as `${NODIT_API_KEY}` templates; a literal key in a config file is the thing this type exists
+/// to prevent.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ChainConfig {
+    /// Websocket RPC carrying the `newHeads` subscription that drives the quote loop. Must be a
+    /// `ws://` or `wss://` URL — pointing this at an HTTPS endpoint gets
+    /// `"notifications not supported"` from the node, which the subscription task logs by name.
+    pub ws_url: EndpointUrl,
     /// Ordinary RPC. Transactions are submitted here, because this is the canonical view.
-    pub rpc_url: String,
+    pub rpc_url: EndpointUrl,
     /// Flashblocks RPC. **Read only, and only under the `pending` tag** — its `latest` lags the
     /// ordinary endpoint by about two blocks, so reading `latest` here is strictly worse than
     /// reading `latest` there. See [`crate::chain`].
-    pub flashblocks_rpc_url: String,
+    pub flashblocks_rpc_url: EndpointUrl,
     /// EIP-155 chain id. 91342 for GIWA Sepolia.
     pub chain_id: u64,
     /// `PropPool` address.
     pub pool: Address,
     /// Multicall3. Preinstalled at the canonical address in GIWA's genesis, which is what lets
-    /// a whole poll cycle be one request.
+    /// a whole read cycle be one request.
     pub multicall3: Address,
-    /// How often to poll. Every cycle costs exactly one `eth_call`.
-    pub poll_interval_ms: u64,
+    /// The chain's block cadence. GIWA is 1s, and measured heads arrive at 904-1050ms. This is
+    /// the unit the head watchdog is expressed in, so it is a fact about the chain rather than a
+    /// tuning knob.
+    #[serde(default = "d_block_time_ms")]
+    pub block_time_ms: u64,
+    /// **The head watchdog.** No head for this many block times means the subscription has gone
+    /// quiet, and a quiet subscription is more dangerous than a broken one — the bot would sit
+    /// believing the chain had stopped. Tripping it forces the fallback read immediately and
+    /// hands the liveness question to [`crate::chain::ChainHealth`], which decides from the
+    /// *block number* whether the chain stopped or only the socket did.
+    #[serde(default = "d_head_stale_blocks")]
+    pub head_stale_blocks: u32,
+    /// First reconnect delay for the head subscription. Doubles per consecutive failure.
+    /// A subscription that dies must not become a hot reconnect loop.
+    #[serde(default = "d_ws_reconnect_initial_ms")]
+    pub ws_reconnect_initial_ms: u64,
+    /// Reconnect delay ceiling for the head subscription.
+    #[serde(default = "d_ws_reconnect_max_ms")]
+    pub ws_reconnect_max_ms: u64,
+    /// **Fallback only.** The loop is driven by `newHeads`; this timer is the floor underneath
+    /// it, so a subscription that dies or goes silent degrades into polling instead of stalling.
+    /// It is not the primary driver and sizing it like one is a misreading — at a healthy 1s
+    /// head cadence this timer essentially never fires.
+    #[serde(default = "d_fallback_poll_interval_ms")]
+    pub fallback_poll_interval_ms: u64,
     /// Per-request HTTP timeout.
     #[serde(default = "d_request_timeout_ms")]
     pub request_timeout_ms: u64,
-    /// Sustained request budget, requests per second, across *all* RPC use.
+    /// Runaway guard, requests per second, across *all* RPC use on one endpoint.
+    ///
+    /// This used to be a budget sized against a hostile public endpoint. It is not that any
+    /// more — the dedicated endpoint took 20 rapid `eth_blockNumber` calls without a single 429 —
+    /// and the default is now loose enough that normal operation never touches it. What it still
+    /// buys is a ceiling on a *bug*: a reconnect storm or a spinning loop cannot turn into an
+    /// unbounded request flood against the endpoint. Sized as a fuse, not as a budget.
     #[serde(default = "d_requests_per_sec")]
     pub requests_per_sec: f64,
-    /// How many requests may be spent at once before the sustained rate binds. A send needs
-    /// four or five in quick succession (nonce, fee, submit, receipt polls), so this must be
-    /// bigger than one.
+    /// Burst allowance before the sustained rate binds. A send needs four or five requests in
+    /// quick succession (nonce, submit, receipt polls), so this must be comfortably above one.
     #[serde(default = "d_request_burst")]
     pub request_burst: f64,
     /// First backoff after an HTTP 429. Doubles per consecutive 429, capped below.
+    ///
+    /// Kept, and not because 429s are expected: a dedicated endpoint is not an infinite one, and
+    /// a bot with no backoff at all turns any transient upstream failure into a flood.
     #[serde(default = "d_rl_backoff_initial_ms")]
     pub rate_limit_backoff_initial_ms: u64,
     /// Backoff ceiling.
     #[serde(default = "d_rl_backoff_max_ms")]
     pub rate_limit_backoff_max_ms: u64,
-    /// After this long with no successful poll, the chain view is `Degraded`: quoting continues
-    /// with [`ChainConfig::degraded_extra_half_spread_bps`] added to every half-spread.
+    /// After this long with no successful read **and no new block**, the chain view is
+    /// `Degraded`: quoting continues with [`ChainConfig::degraded_extra_half_spread_bps`] added
+    /// to every half-spread.
     #[serde(default = "d_degraded_after_secs")]
     pub degraded_after_secs: u64,
-    /// After this long with no successful poll, the bot halts and withdraws quotes. Must exceed
-    /// `degraded_after_secs`.
+    /// After this long with no successful read and no new block, the bot halts and withdraws
+    /// quotes. Must exceed `degraded_after_secs`.
     #[serde(default = "d_halt_after_secs")]
     pub halt_after_secs: u64,
-    /// A chain view older than this is stale and blocks a push, even if polling has not yet
+    /// A chain view older than this is stale and blocks a push, even if reads have not yet
     /// been failing long enough to count as degraded.
     #[serde(default = "d_view_stale_secs")]
     pub view_stale_secs: u64,
@@ -190,14 +438,29 @@ pub struct ChainConfig {
     pub degraded_extra_half_spread_bps: u16,
 }
 
+fn d_block_time_ms() -> u64 {
+    1_000
+}
+fn d_head_stale_blocks() -> u32 {
+    10
+}
+fn d_ws_reconnect_initial_ms() -> u64 {
+    500
+}
+fn d_ws_reconnect_max_ms() -> u64 {
+    30_000
+}
+fn d_fallback_poll_interval_ms() -> u64 {
+    2_000
+}
 fn d_request_timeout_ms() -> u64 {
     8_000
 }
 fn d_requests_per_sec() -> f64 {
-    3.0
+    25.0
 }
 fn d_request_burst() -> f64 {
-    8.0
+    50.0
 }
 fn d_rl_backoff_initial_ms() -> u64 {
     2_000
@@ -219,11 +482,32 @@ fn d_degraded_extra_bps() -> u16 {
 }
 
 impl ChainConfig {
+    /// How long without a `newHeads` delivery counts as a silent subscription.
+    ///
+    /// `block_time_ms * head_stale_blocks`. Expressed as a multiple rather than an absolute so
+    /// that it stays correct if the chain's cadence changes.
+    #[must_use]
+    pub const fn head_stale_after(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(self.block_time_ms.saturating_mul(self.head_stale_blocks as u64))
+    }
+
     fn validate(&self) -> Result<(), ConfigError> {
-        for (name, url) in [("rpc_url", &self.rpc_url), ("flashblocks_rpc_url", &self.flashblocks_rpc_url)] {
-            if !(url.starts_with("http://") || url.starts_with("https://")) {
+        for (name, url) in
+            [("rpc_url", &self.rpc_url), ("flashblocks_rpc_url", &self.flashblocks_rpc_url)]
+        {
+            if !url.is_http() {
                 return Err(invalid(format!("chain.{name}: must be an http(s) URL, got `{url}`")));
             }
+        }
+        // A websocket URL is not optional and an http one will never subscribe: the endpoint
+        // answers `notifications not supported` and the loop would fall back to polling forever
+        // while looking configured. Caught here instead.
+        if !self.ws_url.is_ws() {
+            return Err(invalid(format!(
+                "chain.ws_url: must be a ws(s) URL, got `{}`; an http(s) endpoint answers \
+                 `notifications not supported` to eth_subscribe and would never drive the loop",
+                self.ws_url
+            )));
         }
         if self.chain_id == 0 {
             return Err(invalid("chain.chain_id: must be non-zero"));
@@ -234,32 +518,45 @@ impl ChainConfig {
         if self.multicall3.is_zero() {
             return Err(invalid("chain.multicall3: must not be the zero address"));
         }
-        // 250ms is already 4 requests/sec against a public endpoint we have measured 429s on.
-        // Anything faster is asking for the failure mode this bot is built to survive.
-        if !(250..=600_000).contains(&self.poll_interval_ms) {
+        if !(100..=60_000).contains(&self.block_time_ms) {
+            return Err(invalid("chain.block_time_ms: must be 100..=60000"));
+        }
+        // One missed head is ordinary jitter — the measured cadence is 904-1050ms, so a window
+        // of one block time would trip constantly and a watchdog that cries wolf gets ignored.
+        if self.head_stale_blocks < 2 {
+            return Err(invalid(
+                "chain.head_stale_blocks: must be >= 2; a one-block window trips on ordinary jitter",
+            ));
+        }
+        if !(250..=600_000).contains(&self.fallback_poll_interval_ms) {
             return Err(invalid(format!(
-                "chain.poll_interval_ms: must be 250..=600000, got {}",
-                self.poll_interval_ms
+                "chain.fallback_poll_interval_ms: must be 250..=600000, got {}",
+                self.fallback_poll_interval_ms
+            )));
+        }
+        // The fallback exists to catch a dead subscription, not to race a live one. Set below
+        // the block time it would fire between every pair of heads and quietly become the
+        // primary driver again, which is the design this endpoint made unnecessary.
+        if self.fallback_poll_interval_ms < self.block_time_ms {
+            return Err(invalid(format!(
+                "chain.fallback_poll_interval_ms ({}) is below chain.block_time_ms ({}); \
+                 the fallback would fire between heads and silently become the primary driver",
+                self.fallback_poll_interval_ms, self.block_time_ms
             )));
         }
         if !(500..=120_000).contains(&self.request_timeout_ms) {
             return Err(invalid("chain.request_timeout_ms: must be 500..=120000"));
         }
-        if !(self.requests_per_sec.is_finite() && self.requests_per_sec > 0.0 && self.requests_per_sec <= 100.0) {
-            return Err(invalid("chain.requests_per_sec: must be a finite value in (0, 100]"));
+        if !(self.requests_per_sec.is_finite() && self.requests_per_sec > 0.0 && self.requests_per_sec <= 1_000.0) {
+            return Err(invalid("chain.requests_per_sec: must be a finite value in (0, 1000]"));
         }
-        if !(self.request_burst.is_finite() && self.request_burst >= 1.0 && self.request_burst <= 200.0) {
-            return Err(invalid("chain.request_burst: must be a finite value in [1, 200]"));
+        if !(self.request_burst.is_finite() && self.request_burst >= 1.0 && self.request_burst <= 2_000.0) {
+            return Err(invalid("chain.request_burst: must be a finite value in [1, 2000]"));
         }
-        // One poll per cycle, so the poll loop alone must fit inside the budget with room for
-        // the four-or-five request send path. Caught here rather than discovered as a 429.
-        let poll_rate = 1_000.0 / self.poll_interval_ms as f64;
-        if poll_rate > self.requests_per_sec {
-            return Err(invalid(format!(
-                "chain.poll_interval_ms {}ms is {poll_rate:.2} req/s, above chain.requests_per_sec {:.2}; \
-                 the poll loop alone would exhaust the budget",
-                self.poll_interval_ms, self.requests_per_sec
-            )));
+        if self.ws_reconnect_initial_ms == 0 || self.ws_reconnect_max_ms < self.ws_reconnect_initial_ms {
+            return Err(invalid(
+                "chain.ws_reconnect_max_ms must be >= ws_reconnect_initial_ms, which must be non-zero",
+            ));
         }
         if self.rate_limit_backoff_initial_ms == 0 || self.rate_limit_backoff_max_ms < self.rate_limit_backoff_initial_ms
         {
@@ -275,6 +572,18 @@ impl ChainConfig {
                 "chain.halt_after_secs ({}) must exceed chain.degraded_after_secs ({}); \
                  otherwise the bot halts without ever widening",
                 self.halt_after_secs, self.degraded_after_secs
+            )));
+        }
+        // The watchdog has to have room to fire, be logged, and let the fallback prove whether
+        // the chain is actually down — all before the halt timer expires. A window at or beyond
+        // `halt_after_secs` means the bot withdraws quotes without the watchdog ever having said
+        // anything, and the operator is left diagnosing a halt with no signal explaining it.
+        let watchdog_secs = self.head_stale_after().as_secs();
+        if watchdog_secs >= self.halt_after_secs {
+            return Err(invalid(format!(
+                "chain.head_stale_blocks x block_time_ms is {watchdog_secs}s, at or beyond \
+                 chain.halt_after_secs ({}); the head watchdog would never fire before the halt",
+                self.halt_after_secs
             )));
         }
         if self.view_stale_secs == 0 {
@@ -752,12 +1061,13 @@ mod tests {
     fn good() -> &'static str {
         r#"
 [chain]
-rpc_url = "https://sepolia-rpc.giwa.io"
+ws_url = "wss://giwa-sepolia.nodit.io/TESTKEY"
+rpc_url = "https://giwa-sepolia.nodit.io/TESTKEY"
 flashblocks_rpc_url = "https://sepolia-rpc-flashblocks.giwa.io"
 chain_id = 91342
 pool = "0xA629071E606F425dB93310c3ecc35E00Fbe16358"
 multicall3 = "0xcA11bde05977b3631167028862bE2a173976CA11"
-poll_interval_ms = 2000
+fallback_poll_interval_ms = 2000
 
 [feed]
 ws_url = "wss://stream.binance.com:9443/stream"
@@ -839,9 +1149,48 @@ capacity_divergence_pct = 30
     }
 
     #[test]
-    fn polling_faster_than_the_request_budget_is_refused() {
-        let s = good().replace("poll_interval_ms = 2000", "poll_interval_ms = 250\nrequests_per_sec = 2.0");
-        assert!(matches!(parse(&s), Err(ConfigError::Invalid(m)) if m.contains("exhaust the budget")));
+    fn a_fallback_faster_than_the_block_time_is_refused() {
+        // The fallback exists to catch a dead subscription, not to race a live one. Below the
+        // block time it fires between heads and quietly becomes the primary driver again —
+        // which is the design the dedicated endpoint made unnecessary.
+        let s = good().replace("fallback_poll_interval_ms = 2000", "fallback_poll_interval_ms = 500");
+        assert!(matches!(parse(&s), Err(ConfigError::Invalid(m)) if m.contains("silently become the primary driver")));
+    }
+
+    #[test]
+    fn an_http_ws_url_is_refused_because_it_would_never_subscribe() {
+        // Measured: the HTTPS endpoint answers `notifications not supported`. The loop would
+        // then run on its fallback forever while every log line said it was configured for
+        // heads, which is exactly the silent degradation this rewrite is about.
+        let s = good().replace(
+            r#"ws_url = "wss://giwa-sepolia.nodit.io/TESTKEY""#,
+            r#"ws_url = "https://giwa-sepolia.nodit.io/TESTKEY""#,
+        );
+        assert!(matches!(parse(&s), Err(ConfigError::Invalid(m)) if m.contains("notifications not supported")));
+    }
+
+    #[test]
+    fn a_one_block_watchdog_window_is_refused() {
+        let s = good().replace("fallback_poll_interval_ms = 2000", "fallback_poll_interval_ms = 2000\nhead_stale_blocks = 1");
+        assert!(matches!(parse(&s), Err(ConfigError::Invalid(m)) if m.contains("ordinary jitter")));
+    }
+
+    #[test]
+    fn a_watchdog_window_beyond_the_halt_timer_is_refused() {
+        // Otherwise the bot withdraws quotes without the watchdog ever having said anything,
+        // and the operator diagnoses a halt with no signal explaining it.
+        let s = good().replace(
+            "fallback_poll_interval_ms = 2000",
+            "fallback_poll_interval_ms = 2000\nhead_stale_blocks = 900\nhalt_after_secs = 600",
+        );
+        assert!(matches!(parse(&s), Err(ConfigError::Invalid(m)) if m.contains("never fire before the halt")));
+    }
+
+    #[test]
+    fn the_watchdog_window_is_a_multiple_of_the_block_time() {
+        let cfg = parse(good()).unwrap();
+        assert_eq!(cfg.chain.block_time_ms, 1_000, "GIWA is a 1s chain");
+        assert_eq!(cfg.chain.head_stale_after(), std::time::Duration::from_secs(10));
     }
 
     #[test]
@@ -889,7 +1238,128 @@ capacity_divergence_pct = 30
 
     #[test]
     fn halting_before_widening_is_refused() {
-        let s = good().replace("poll_interval_ms = 2000", "poll_interval_ms = 2000\nhalt_after_secs = 10");
+        let s = good().replace(
+            "fallback_poll_interval_ms = 2000",
+            "fallback_poll_interval_ms = 2000\ndegraded_after_secs = 30\nhalt_after_secs = 20",
+        );
         assert!(matches!(parse(&s), Err(ConfigError::Invalid(m)) if m.contains("must exceed")));
+    }
+
+    // -----------------------------------------------------------------------
+    // The API key must not leak
+    // -----------------------------------------------------------------------
+
+    /// A **fake** key with the same shape as a real Nodit one — 32 characters of base64-ish
+    /// alphabet including the `~` and `-` that appear in real ones, since those are exactly the
+    /// characters a naive URL parser mishandles. Never a real key: this file is committed, and
+    /// the whole point of `EndpointUrl` is that a credential never lands in source.
+    const KEY: &str = "EXAMPLEexample0~ExampleKey-000000";
+    const KEYED: &str = "https://giwa-sepolia.nodit.io/EXAMPLEexample0~ExampleKey-000000";
+
+    #[test]
+    fn a_keyed_url_is_redacted_by_every_formatter() {
+        let u = EndpointUrl::resolve("chain.rpc_url", KEYED).unwrap();
+        // The two ways a URL reaches a log: `%url` and `?url`.
+        let displayed = format!("{u}");
+        let debugged = format!("{u:?}");
+        for rendered in [&displayed, &debugged] {
+            assert!(!rendered.contains(KEY), "the API key reached a formatter: {rendered}");
+        }
+        assert_eq!(displayed, "https://giwa-sepolia.nodit.io/***");
+        // ... and the host survives, because a redaction that hides which endpoint failed is
+        // useless for diagnosis.
+        assert!(displayed.contains("giwa-sepolia.nodit.io"));
+        // The real value is still reachable, but only through the one accessor.
+        assert_eq!(u.expose(), KEYED);
+    }
+
+    #[test]
+    fn redaction_covers_query_strings_and_userinfo_too() {
+        // Other providers put the key in a query parameter or in userinfo. Neither shape is
+        // used here, and both must still be safe if someone points the config at one.
+        let q = EndpointUrl::resolve("chain.rpc_url", "https://rpc.example.com/v1?apikey=SECRET").unwrap();
+        assert_eq!(q.to_string(), "https://rpc.example.com/***");
+        let ui = EndpointUrl::resolve("chain.rpc_url", "https://user:SECRET@rpc.example.com").unwrap();
+        assert_eq!(ui.to_string(), "https://***@rpc.example.com");
+        for u in [&q, &ui] {
+            assert!(!u.to_string().contains("SECRET"));
+        }
+        // A key-free URL is left legible.
+        let plain = EndpointUrl::resolve("chain.rpc_url", "https://sepolia-rpc-flashblocks.giwa.io").unwrap();
+        assert_eq!(plain.to_string(), "https://sepolia-rpc-flashblocks.giwa.io");
+    }
+
+    #[test]
+    fn a_url_template_expands_from_the_environment() {
+        std::env::set_var("DUBU_TEST_KEY_OK", KEY);
+        let u = EndpointUrl::resolve("chain.ws_url", "wss://giwa-sepolia.nodit.io/${DUBU_TEST_KEY_OK}").unwrap();
+        assert_eq!(u.expose(), format!("wss://giwa-sepolia.nodit.io/{KEY}"));
+        assert_eq!(u.to_string(), "wss://giwa-sepolia.nodit.io/***");
+        assert_eq!(u.scheme(), "wss");
+        std::env::remove_var("DUBU_TEST_KEY_OK");
+    }
+
+    #[test]
+    fn an_unset_variable_names_the_variable_and_never_the_value() {
+        std::env::remove_var("DUBU_TEST_KEY_MISSING");
+        let err = EndpointUrl::resolve("chain.rpc_url", "https://h/${DUBU_TEST_KEY_MISSING}").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("DUBU_TEST_KEY_MISSING"), "must name the variable: {msg}");
+        assert!(msg.contains(".env"), "must say where to put it: {msg}");
+    }
+
+    #[test]
+    fn an_empty_variable_is_refused_rather_than_expanded_to_nothing() {
+        // `.env` with a blank `NODIT_API_KEY=` is the likely mistake, and a URL with an empty
+        // key segment fails as a 401 at the first request — a much worse place to find out.
+        std::env::set_var("DUBU_TEST_KEY_BLANK", "   ");
+        let err = EndpointUrl::resolve("chain.rpc_url", "https://h/${DUBU_TEST_KEY_BLANK}").unwrap_err();
+        assert!(err.to_string().contains("unset or empty"));
+        std::env::remove_var("DUBU_TEST_KEY_BLANK");
+    }
+
+    #[test]
+    fn the_config_carries_a_template_and_never_a_literal_key() {
+        std::env::set_var("DUBU_TEST_NODIT", KEY);
+        let s = good()
+            .replace("wss://giwa-sepolia.nodit.io/TESTKEY", "wss://giwa-sepolia.nodit.io/${DUBU_TEST_NODIT}")
+            .replace("https://giwa-sepolia.nodit.io/TESTKEY", "https://giwa-sepolia.nodit.io/${DUBU_TEST_NODIT}");
+        let cfg = parse(&s).unwrap();
+        assert!(cfg.chain.ws_url.expose().ends_with(KEY));
+        // The whole config Debug-printed — the shape a panic or a `{:?}` dump would produce —
+        // must not contain the key anywhere.
+        assert!(!format!("{cfg:?}").contains(KEY), "the key survived a Debug dump of the config");
+        std::env::remove_var("DUBU_TEST_NODIT");
+    }
+
+    #[test]
+    fn dotenv_never_overrides_the_real_environment() {
+        let dir = std::env::temp_dir().join(format!("dubu-dotenv-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(".env");
+        std::fs::write(
+            &path,
+            "# a comment\n\nexport DUBU_TEST_DOTENV_A=from_file\nDUBU_TEST_DOTENV_B=\"quoted\"\nDUBU_TEST_DOTENV_C=from_file\nnot_a_pair\n",
+        )
+        .unwrap();
+
+        // C is already set: an operator or a systemd unit set it deliberately and the file must
+        // not silently win.
+        std::env::set_var("DUBU_TEST_DOTENV_C", "from_env");
+        std::env::remove_var("DUBU_TEST_DOTENV_A");
+        std::env::remove_var("DUBU_TEST_DOTENV_B");
+
+        assert_eq!(load_dotenv(&path), 2, "only the two unset variables");
+        assert_eq!(std::env::var("DUBU_TEST_DOTENV_A").unwrap(), "from_file");
+        assert_eq!(std::env::var("DUBU_TEST_DOTENV_B").unwrap(), "quoted", "one layer of quotes is stripped");
+        assert_eq!(std::env::var("DUBU_TEST_DOTENV_C").unwrap(), "from_env");
+
+        // A missing file is not an error: production sets real variables and has no `.env`.
+        assert_eq!(load_dotenv(&dir.join("nope.env")), 0);
+
+        for k in ["DUBU_TEST_DOTENV_A", "DUBU_TEST_DOTENV_B", "DUBU_TEST_DOTENV_C"] {
+            std::env::remove_var(k);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

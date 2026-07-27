@@ -6,8 +6,8 @@
 //! expires and it quotes nothing at all. This crate is that something.
 //!
 //! ```text
-//!   Binance bookTicker (ws)                 GIWA (http, polled)
-//!            |                                      |
+//!   Binance bookTicker (wss)      Nodit newHeads (wss) ──> wakes the loop, 1s
+//!            |                    GIWA flashblocks (http, `pending`) ──> state, ~200ms
 //!            v                                      v
 //!   feed ──> fair_value ──> ladder ──> policy ──> tx ──> PropPool.updateQuote
 //!            (micro-price)  (dubu-core)  (send?)         PropPool.refreshCapacity
@@ -35,13 +35,29 @@
 //! 2 follows `BTCUSDT` — which is what makes the demo move and what will make a markout study
 //! mean anything. See [`config::PairConfig`].
 //!
-//! # Two measured constraints shape the design
+//! # The loop is event-driven
 //!
-//! 1. **No `eth_subscribe`, no websocket.** GIWA's RPC answers 405. Chain state is polled, on a
-//!    configurable interval, and every consumer treats the view as something that has an age.
-//! 2. **The public RPC rate-limits.** One `eth_call` per poll cycle via Multicall3, a local
-//!    token bucket that refuses rather than queues, and a 429 that becomes a liveness state
-//!    (widen, then halt) rather than a retry. See [`chain`].
+//! A `newHeads` subscription over a dedicated Nodit websocket wakes the loop at the chain's 1s
+//! cadence; the reads a cycle needs then happen against the flashblocks endpoint's `pending`
+//! tag, which is ~200ms preconfirmed state and therefore fresher than the head that triggered
+//! it. See [`chain`] for the endpoint table and [`chain::heads`] for the subscription.
+//!
+//! This replaced a polling timer, which existed only because GIWA's public RPC answers 405 to a
+//! websocket upgrade and rate-limits. What remains of that design is kept on its own merits and
+//! labelled as such: Multicall3 batching (one `eth_call` per head, whatever the pair count),
+//! backoff (a dedicated endpoint is not an infinite one), and a fallback timer underneath the
+//! subscription so a dead or *silent* socket degrades into polling instead of stalling.
+//!
+//! Liveness is two signals on one ladder — reads landing, and the block number advancing. The
+//! second is what stops an endpoint that answers cheerfully about a stopped chain from reading
+//! as healthy forever.
+//!
+//! # No secret is ever printed
+//!
+//! The endpoint URLs carry the API key in their path, so [`config::EndpointUrl`] makes them
+//! unprintable: `Display` and `Debug` are both redacted to `scheme://host/***`, and the real
+//! string is reachable only through `expose()`. The config file holds `${NODIT_API_KEY}`
+//! templates, never a literal, and the value comes from the environment or a gitignored `.env`.
 //!
 //! # Every integer path is `dubu-core`'s
 //!
