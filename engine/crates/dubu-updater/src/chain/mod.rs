@@ -73,17 +73,26 @@
 //! ```text
 //!   flash `pending`  vs  ordinary `latest`     ordinary lags  ~871ms   <- the TAG
 //!   flash `pending`  vs  ordinary `pending`    ordinary lags   ~82ms   <- the HOST
-//!   send             ->  visible on `pending`             as low as 5ms
+//!   send             ->  included in a preconfirmation   296/440/508ms (min/median/max)
+//!   flashblock cadence                          327ms median, 3.0 per 1s block
 //! ```
 //!
 //! So `pending` over `latest` is worth most of a block, and the flashblocks host is worth a
 //! further ~82ms on top of that. Both are worth having for a maker, but the second is a tenth of
 //! what the first is, and the earlier framing credited the host with all of it.
 //!
-//! The 5ms floor is the one that matters for how this bot behaves: a preconfirmation can carry our
-//! new ladder almost immediately, so the quote is effective long before any receipt exists for it.
-//! Anything that waits for a *confirmed* receipt before quoting again is therefore waiting on
-//! bookkeeping rather than on the chain — see `tx::Sender`'s in-flight gate.
+//! The 440ms is the one that matters for how this bot behaves. It is measured by timing how long
+//! after `eth_sendRawTransaction` returns the sender's nonce advances on the `pending` tag, over
+//! six transactions — a direct observation rather than a correlation, which an earlier attempt got
+//! wrong by matching a send against a state change some *other* send had caused and concluding a
+//! physically impossible 5ms. Seoul to the sequencer is ~70ms of round trip on its own.
+//!
+//! 440ms against a 327ms flashblock is roughly half an interval of waiting plus propagation, which
+//! is what arriving at a uniformly random point in the interval predicts.
+//!
+//! What follows from it: the quote is effective in ~440ms and a confirmed receipt takes about a
+//! second, so anything gating on a *confirmed* receipt is waiting about twice as long as the chain
+//! requires. See `tx::Sender`'s in-flight gate.
 //!
 //! Its `latest` **lags the ordinary RPC by about two blocks**, so reading `latest` from it is
 //! strictly worse than reading `latest` from the ordinary endpoint. Transactions go to the ordinary endpoint because that is the canonical
