@@ -92,8 +92,16 @@
     font-family:ui-sans-serif,system-ui,sans-serif }
   .lvr-row { display:flex; justify-content:space-between; gap:12px; font-family:var(--mono);
     padding:4px 0 }
-  .lvr .why { color:var(--text-2); font-size:12px; margin-top:9px; line-height:1.55;
+  .lvr .why, .tp .why { color:var(--text-2); font-size:12px; margin-top:9px; line-height:1.55;
     font-family:ui-sans-serif,system-ui,sans-serif }
+
+  .tp { margin-top:12px; padding:13px 15px; border:1px dashed var(--border); border-radius:8px;
+    font-size:12.5px }
+  .tp h3 { margin:0 0 8px; font-size:12px; font-weight:620;
+    font-family:ui-sans-serif,system-ui,sans-serif }
+  .tp-row { display:flex; justify-content:space-between; gap:12px; padding:4px 0;
+    font-family:var(--mono) }
+  .tp-row a { color:var(--text-1) }
 
   .note { margin-top:26px; padding:16px 18px; background:var(--surface-1);
     border:1px solid var(--border); border-left:3px solid var(--warn); border-radius:8px;
@@ -163,7 +171,25 @@ const MARKETS = [
 ];
 const SIZES = [1_000, 10_000, 100_000, 1_000_000];   // notional, in whole quote units
 
-const SEL = { getAmountOut:'0x4aa06652', snapshot:'0x082af76c', getReserves:'0x0902f1ac' };
+// Third-party venues already on this chain, keyed to the market whose asset they price.
+//
+// These are NOT ours and we cannot route to them: they hold different token instances (real
+// WBTC and USDC, where our pool holds mocks), so there is no path between the two. What they
+// give is a far better foil than our own comparison pool. Ours is a UniV2 we deployed and then
+// left alone, so it drifts; this one is a real Uniswap V3 that somebody else is actively
+// arbitraging, and it is the strongest available answer to "did you just build a strawman".
+//
+// The comparison is legitimate because all three venues are pricing the same underlying asset
+// against the same reference. It is a price comparison, not an executable route, and the page
+// says so.
+const THIRD_PARTY = {
+  2: { pool:'0x98e5d56f4844cb510ce62cf8e2479b8cbf18acfc', kind:'Uniswap V3', fee:'0.30%',
+       t0:'0x1C3c0af23c627ee742eCE45846E22CE5346DbF53', d0:8, s0:'WBTC',
+       t1:'0x46ee2447366ab4D86c23E7eF47E5c932Fc3a4298', d1:6, s1:'USDC' },
+};
+
+const SEL = { getAmountOut:'0x4aa06652', snapshot:'0x082af76c', getReserves:'0x0902f1ac',
+              slot0:'0x3850c7bd', balanceOf:'0x70a08231' };
 const w  = v => BigInt(v).toString(16).padStart(64,'0');
 const wa = a => a.toLowerCase().replace('0x','').padStart(64,'0');
 const words = h => { const s=h.slice(2), o=[]; for(let i=0;i<s.length;i+=64) o.push(BigInt('0x'+s.slice(i,i+64))); return o };
@@ -254,8 +280,31 @@ document.getElementById('markets').innerHTML = MARKETS.map(m=>`
         <span id="dprop${m.id}">—</span></div>
       <div class="lvr-row"><span><span class="swatch" style="background:var(--univ2)"></span>UniV2</span>
         <span id="duni${m.id}">—</span></div>
+      ${THIRD_PARTY[m.id] ? `<div class="lvr-row"><span><span class="swatch"
+        style="background:var(--text-3)"></span>${THIRD_PARTY[m.id].kind} · third party</span>
+        <span id="dtp${m.id}">—</span></div>` : ''}
       <div class="why" id="dwhy${m.id}"></div>
     </div>
+
+    ${THIRD_PARTY[m.id] ? `
+    <div class="tp">
+      <h3>Somebody else's pool, same asset</h3>
+      <div class="tp-row">
+        <span><a href="https://sepolia-explorer.giwa.io/address/${THIRD_PARTY[m.id].pool}"
+                 target="_blank" rel="noopener">${THIRD_PARTY[m.id].pool.slice(0,10)}…</a>
+          <span class="dim">${THIRD_PARTY[m.id].kind}, fee ${THIRD_PARTY[m.id].fee},
+          ${THIRD_PARTY[m.id].s0}/${THIRD_PARTY[m.id].s1}</span></span>
+        <span id="tpx${m.id}">—</span>
+      </div>
+      <div class="tp-row"><span class="dim">inventory</span><span id="tpv${m.id}" class="dim">—</span></div>
+      <div class="why">
+        Not ours, and not routable — it holds real ${THIRD_PARTY[m.id].s0} and
+        ${THIRD_PARTY[m.id].s1} where this pool holds mocks, so there is no path between them.
+        It is here because it is the honest foil: the UniV2 above is one we deployed and left
+        alone, while this is a live pool somebody else is actively arbitraging. All three price
+        the same underlying asset against the same reference.
+      </div>
+    </div>` : ''}
   </div>`).join('');
 
 async function tick(){
@@ -269,6 +318,12 @@ async function tick(){
     for(const m of MARKETS){
       calls.push({to:POOL,data:SEL.snapshot+w(m.id)});
       calls.push({to:m.v2,data:SEL.getReserves});
+      const tp = THIRD_PARTY[m.id];
+      if(tp){
+        calls.push({to:tp.pool, data:SEL.slot0});
+        calls.push({to:tp.t0,   data:SEL.balanceOf+wa(tp.pool)});
+        calls.push({to:tp.t1,   data:SEL.balanceOf+wa(tp.pool)});
+      }
       // Two directions per size: quote in (buy base) and base in (sell base). The base leg is
       // sized off the reference so both venues are asked for the same notional.
       for(const s of SIZES){
@@ -283,6 +338,8 @@ async function tick(){
     let i=0, worstAge=null, anyCap=false;
     for(const m of MARKETS){
       const snap=out[i++], resRaw=out[i++];
+      const tp = THIRD_PARTY[m.id];
+      const tpSlot0 = tp ? out[i++] : null, tpBal0 = tp ? out[i++] : null, tpBal1 = tp ? out[i++] : null;
       const legs=[]; for(let k=0;k<SIZES.length;k++) legs.push([out[i++],out[i++]]);
       const r = ref[m.sym];
       document.getElementById('r'+m.id).textContent = r?f(r,m.dp):'—';
@@ -384,6 +441,29 @@ async function tick(){
           `and it repeats on every price move. This pool has none of it by construction: it reprices `+
           `instead of waiting to be arbitraged. The UniV2 bp columns above include this drift, so at `+
           `small size most of what they show is staleness rather than curve shape.`;
+      }
+
+      // Third-party venue. Its price comes straight out of slot0, so this is exact rather than
+      // an estimate — no tick traversal is involved in reading where the pool currently sits.
+      if(tp && tpSlot0 && r){
+        const sq = words(tpSlot0)[0];                       // sqrtPriceX96
+        // price = (sq / 2**96)**2, i.e. sq**2 / 2**192, in raw token1-per-token0. Shift 160 bits
+        // in BigInt first: sq**2 is ~4e60 and would lose precision as a Number, but sq**2 >> 160
+        // lands near 2.8e12, comfortably exact, and the remaining 2**32 divides cleanly.
+        const raw = Number((sq * sq) >> 160n) / 2 ** 32;
+        const px  = raw * Number(pow10(tp.d0)) / Number(pow10(tp.d1));
+        const drift = (px - r) / r * 1e4;
+        document.getElementById('tpx'+m.id).innerHTML =
+          `<b>${f(px, m.dp)}</b> <span class="dim">· ${sgn(drift)} bp vs market</span>`;
+        document.getElementById('dtp'+m.id).innerHTML =
+          `<span style="color:var(--text-2);font-weight:600">${sgn(drift)} bp</span>
+           <span class="dim">· actively arbitraged by someone</span>`;
+        if(tpBal0 && tpBal1){
+          const b0 = Number(words(tpBal0)[0]) / Number(pow10(tp.d0));
+          const b1 = Number(words(tpBal1)[0]) / Number(pow10(tp.d1));
+          document.getElementById('tpv'+m.id).textContent =
+            `${f(b0, 4)} ${tp.s0} + ${f(b1, 0)} ${tp.s1}  ≈ $${f(b0 * r + b1, 0)}`;
+        }
       }
     }
 
