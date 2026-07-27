@@ -934,12 +934,13 @@ pub struct PairConfig {
     pub heartbeat_secs: u64,
     /// Drift threshold, in bps, when the market has moved **against** the posted quote — our
     /// bid is now above fair, or our ask below it. This is the pick-off direction; keep it
-    /// small. See [`crate::policy`].
-    pub adverse_drift_bps: u32,
+    /// small. See [`crate::policy`]. Fractional bps are supported to one decimal place (e.g.
+    /// `0.5`); [`Self::adverse_drift_decibps`] is what `policy` actually compares against.
+    pub adverse_drift_bps: f64,
     /// Drift threshold, in bps, when the posted quote has merely become conservative. Costs
     /// volume, not money; keep it larger than `adverse_drift_bps` so a quiet market does not
-    /// churn gas.
-    pub favourable_drift_bps: u32,
+    /// churn gas. Same one-decimal-place precision as `adverse_drift_bps`.
+    pub favourable_drift_bps: f64,
     /// Refresh the capacity epoch once remaining capacity has fallen this far, in percent,
     /// below the configured capacity.
     pub capacity_divergence_pct: u32,
@@ -974,6 +975,19 @@ impl PairConfig {
     #[must_use]
     pub fn stream_name(&self) -> String {
         format!("{}@bookTicker", self.symbol.to_lowercase())
+    }
+
+    /// [`Self::adverse_drift_bps`] in deci-bps (tenths of a bps), which is the precision
+    /// [`crate::policy`] actually measures drift at.
+    #[must_use]
+    pub fn adverse_drift_decibps(&self) -> u32 {
+        (self.adverse_drift_bps * 10.0).round() as u32
+    }
+
+    /// [`Self::favourable_drift_bps`] in deci-bps. See [`Self::adverse_drift_decibps`].
+    #[must_use]
+    pub fn favourable_drift_decibps(&self) -> u32 {
+        (self.favourable_drift_bps * 10.0).round() as u32
     }
 
     fn validate(&self) -> Result<(), ConfigError> {
@@ -1036,7 +1050,10 @@ impl PairConfig {
         if self.heartbeat_secs == 0 {
             return Err(invalid(format!("pairs[{id}].heartbeat_secs: must be non-zero")));
         }
-        if self.adverse_drift_bps == 0 || self.favourable_drift_bps == 0 {
+        if !self.adverse_drift_bps.is_finite() || !self.favourable_drift_bps.is_finite() {
+            return Err(invalid(format!("pairs[{id}]: drift thresholds must be finite")));
+        }
+        if self.adverse_drift_bps <= 0.0 || self.favourable_drift_bps <= 0.0 {
             return Err(invalid(format!("pairs[{id}]: drift thresholds must be non-zero")));
         }
         if self.adverse_drift_bps > self.favourable_drift_bps {

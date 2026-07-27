@@ -754,8 +754,8 @@ async fn run_cycle(
             view_stale_secs: rt.cfg.chain.view_stale_secs,
             in_flight: rt.sender.in_flight(pair.pair_id),
             heartbeat_secs: pair.heartbeat_secs,
-            adverse_drift_bps: pair.adverse_drift_bps,
-            favourable_drift_bps: pair.favourable_drift_bps,
+            adverse_drift_bps: pair.adverse_drift_decibps(),
+            favourable_drift_bps: pair.favourable_drift_decibps(),
             capacity_divergence_pct: pair.capacity_divergence_pct,
         };
 

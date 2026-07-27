@@ -95,11 +95,11 @@ pub enum Trigger {
     NoUsableQuote,
     /// The market moved against the posted quote.
     AdverseDrift {
-        /// How far, in bps of the posted executable top.
+        /// How far, in deci-bps (tenths of a bps) of the posted executable top.
         bps: u128,
         /// Which side moved furthest against us.
         side: Side,
-        /// Threshold that was crossed.
+        /// Threshold that was crossed, in deci-bps.
         threshold_bps: u32,
     },
     /// The quote is approaching expiry.
@@ -111,11 +111,11 @@ pub enum Trigger {
     },
     /// The posted quote has become conservative.
     FavourableDrift {
-        /// How far, in bps.
+        /// How far, in deci-bps.
         bps: u128,
         /// Which side.
         side: Side,
-        /// Threshold that was crossed.
+        /// Threshold that was crossed, in deci-bps.
         threshold_bps: u32,
     },
 }
@@ -169,9 +169,9 @@ pub enum Hold {
     Unchanged,
     /// Everything is healthy and nothing needs doing. The common case.
     NoTrigger {
-        /// Largest adverse drift seen, for the log.
+        /// Largest adverse drift seen, in deci-bps, for the log.
         adverse_bps: u128,
-        /// Largest favourable drift seen.
+        /// Largest favourable drift seen, in deci-bps.
         favourable_bps: u128,
         /// Quote age.
         age_secs: u64,
@@ -282,11 +282,11 @@ impl CapacityDecision {
 /// How far the planned row's executable top has moved from the posted one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Drift {
-    /// Largest move against us, in bps.
+    /// Largest move against us, in deci-bps (tenths of a bps): `10` is one bps.
     pub adverse_bps: u128,
     /// Which side that was.
     pub adverse_side: Option<Side>,
-    /// Largest move in our favour, in bps.
+    /// Largest move in our favour, in deci-bps.
     pub favourable_bps: u128,
     /// Which side that was.
     pub favourable_side: Option<Side>,
@@ -335,7 +335,9 @@ pub fn drift(snap: &Snap, planned: &Ladder) -> Result<Drift, CurveError> {
         let posted = executable_top_bid(snap.min_bid, snap.max_bid, snap.bid_capacity, used)?;
         let want = executable_top_bid(planned.min_bid, planned.max_bid, snap.bid_capacity, used)?;
         if posted > 0 {
-            let bps = mul_div_floor(posted.abs_diff(want), 10_000, posted).unwrap_or(u128::MAX);
+            // 100_000, not 10_000: this measures deci-bps (tenths of a bps) rather than whole
+            // bps, so a threshold like 0.5 bps has something finer than 1 bp to compare against.
+            let bps = mul_div_floor(posted.abs_diff(want), 100_000, posted).unwrap_or(u128::MAX);
             note(bps, Side::Bid, want < posted, &mut d);
         }
     }
@@ -347,7 +349,7 @@ pub fn drift(snap: &Snap, planned: &Ladder) -> Result<Drift, CurveError> {
         // `NO_ASK` is an infinity sentinel, never a price; `ask_capacity > 0` excludes it, but
         // the guard stays because reading it as a number is a silent, enormous error.
         if posted > 0 && posted != NO_ASK && want != NO_ASK {
-            let bps = mul_div_floor(posted.abs_diff(want), 10_000, posted).unwrap_or(u128::MAX);
+            let bps = mul_div_floor(posted.abs_diff(want), 100_000, posted).unwrap_or(u128::MAX);
             note(bps, Side::Ask, want > posted, &mut d);
         }
     }
@@ -388,9 +390,11 @@ pub struct Context<'a> {
     pub in_flight: bool,
     /// Configured heartbeat.
     pub heartbeat_secs: u64,
-    /// Tight threshold, for a move against us.
+    /// Tight threshold, for a move against us, in deci-bps (tenths of a bps). Built from
+    /// [`crate::config::PairConfig::adverse_drift_decibps`], which is where the fractional-bps
+    /// config value gets fixed to this precision.
     pub adverse_drift_bps: u32,
-    /// Loose threshold, for a move in our favour.
+    /// Loose threshold, for a move in our favour, in deci-bps.
     pub favourable_drift_bps: u32,
     /// Capacity divergence threshold, in percent.
     pub capacity_divergence_pct: u32,
@@ -615,8 +619,8 @@ mod tests {
             view_stale_secs: 20,
             in_flight: false,
             heartbeat_secs: 2_400,
-            adverse_drift_bps: 2,
-            favourable_drift_bps: 8,
+            adverse_drift_bps: 20,
+            favourable_drift_bps: 80,
             capacity_divergence_pct: 30,
         }
     }
@@ -638,10 +642,10 @@ mod tests {
         assert_eq!(planned.max_bid, s.max_bid, "the naive comparison is blind here by construction");
 
         let d = drift(&s, &planned).unwrap();
-        assert_eq!(d.favourable_bps, 1_111);
+        assert_eq!(d.favourable_bps, 11_111);
         assert_eq!(d.favourable_side, Some(Side::Bid));
 
-        let c = Context { adverse_drift_bps: 2, favourable_drift_bps: 8, ..ctx(&s, Some(planned)) };
+        let c = Context { adverse_drift_bps: 20, favourable_drift_bps: 80, ..ctx(&s, Some(planned)) };
         assert!(matches!(
             evaluate_quote(&c).unwrap(),
             Decision::Send(Trigger::FavourableDrift { side: Side::Bid, .. })
@@ -675,7 +679,7 @@ mod tests {
         let down = ladder(800, 900, 1_000, 1_100);
         let d = drift(&s, &down).unwrap();
         assert_eq!(d.adverse_side, Some(Side::Bid), "a lower planned bid means we are overpaying");
-        assert_eq!(d.adverse_bps, 1_000);
+        assert_eq!(d.adverse_bps, 10_000);
         assert_eq!(d.favourable_side, Some(Side::Ask));
 
         // Market rose: our posted ask is now too low, our bid is conservative.
@@ -726,15 +730,34 @@ mod tests {
 
         // 1 bp under: below the 2 bp threshold, and the ask side did not move. Hold.
         let just_under = 1_000_000 - 100;
-        assert_eq!(drift(&s, &ladder(just_under, just_under, 2_000_000, 2_000_000)).unwrap().adverse_bps, 1);
+        assert_eq!(drift(&s, &ladder(just_under, just_under, 2_000_000, 2_000_000)).unwrap().adverse_bps, 10);
         assert!(!evaluate_quote(&c(just_under)).unwrap().sends());
 
         // Exactly 2 bp: fires.
         let at = 1_000_000 - 200;
-        assert_eq!(drift(&s, &ladder(at, at, 2_000_000, 2_000_000)).unwrap().adverse_bps, 2);
+        assert_eq!(drift(&s, &ladder(at, at, 2_000_000, 2_000_000)).unwrap().adverse_bps, 20);
         assert!(matches!(
             evaluate_quote(&c(at)).unwrap(),
-            Decision::Send(Trigger::AdverseDrift { bps: 2, side: Side::Bid, threshold_bps: 2 })
+            Decision::Send(Trigger::AdverseDrift { bps: 20, side: Side::Bid, threshold_bps: 20 })
+        ));
+    }
+
+    #[test]
+    fn a_sub_one_bp_threshold_fires_where_a_whole_bp_threshold_would_not() {
+        // The whole point of deci-bps resolution: 0.5 bp (5 deci-bps) and 1 bp (10 deci-bps) must
+        // be distinguishable, which integer-bps measurement could never do.
+        let s = snap(ladder(1_000_000, 1_000_000, 2_000_000, 2_000_000), 100, 0, 1_000);
+        let moved = 1_000_000 - 50; // 0.5 bp move.
+        let planned = ladder(moved, moved, 2_000_000, 2_000_000);
+        assert_eq!(drift(&s, &planned).unwrap().adverse_bps, 5);
+
+        let loose = Context { adverse_drift_bps: 10, ..ctx(&s, Some(planned)) };
+        assert!(!evaluate_quote(&loose).unwrap().sends(), "5 deci-bps must not clear a 10 deci-bps threshold");
+
+        let tight = Context { adverse_drift_bps: 5, ..ctx(&s, Some(planned)) };
+        assert!(matches!(
+            evaluate_quote(&tight).unwrap(),
+            Decision::Send(Trigger::AdverseDrift { bps: 5, threshold_bps: 5, .. })
         ));
     }
 
@@ -746,7 +769,7 @@ mod tests {
         let better = 1_000_000 + 500;
         let c = ctx(&s, Some(ladder(better, better, 2_000_000, 2_000_000)));
         let d = drift(&s, c.planned.as_ref().unwrap()).unwrap();
-        assert_eq!((d.adverse_bps, d.favourable_bps), (0, 5));
+        assert_eq!((d.adverse_bps, d.favourable_bps), (0, 50));
         assert!(matches!(evaluate_quote(&c).unwrap(), Decision::Hold(Hold::NoTrigger { .. })));
 
         // 8 bp: fires.
@@ -754,7 +777,7 @@ mod tests {
         let c = ctx(&s, Some(ladder(better, better, 2_000_000, 2_000_000)));
         assert!(matches!(
             evaluate_quote(&c).unwrap(),
-            Decision::Send(Trigger::FavourableDrift { bps: 8, threshold_bps: 8, .. })
+            Decision::Send(Trigger::FavourableDrift { bps: 80, threshold_bps: 80, .. })
         ));
     }
 

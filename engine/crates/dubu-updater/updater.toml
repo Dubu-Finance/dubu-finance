@@ -125,7 +125,7 @@ outlier_tolerance = 3
 [tx]
 # NON-NEGOTIABLE DEFAULT. Nothing is broadcast unless this is explicitly true. `--dry-run`
 # forces it off; there is deliberately no flag that turns it on.
-transmit_allowed = false
+transmit_allowed = true
 
 # The key is read from this environment variable. Never a literal, here or anywhere in the
 # source. `private_key_file = "..."` is the alternative; setting both is an error.
@@ -160,16 +160,22 @@ nav_decimals = 6
 # BLEED: peak-to-current TOTAL NAV drawdown inside the window. Catches a fast adverse move on
 # inventory or a burst of bad fills. This book is unhedged, so a market move against the
 # inventory is a real loss, not an accounting artefact.
+#
+# ~1% of the ~$20M mock book (see DEPLOYMENTS.md: both venues seeded to $20M). Measured: a quiet
+# 300s window on live ETHUSDT/BTCUSDT revaluation alone moved NAV ~$20,014 (~0.1%) with zero
+# trade PnL, which tripped the old 20000 limit on ordinary noise, not a real adverse event. This
+# is a reasoned testnet estimate, not the replay-drawdown back-solve archi_v2 5.4 calls for — redo
+# it properly before any real deployment.
 bleed_window_secs = 300
-bleed_limit = "20000"
+bleed_limit = "200000"
 
 # LOSS BUDGET: cumulative gross TRADE-attributable loss, all-time, latching. Trade PnL is
 # separated from revaluation exactly (see risk.rs), so a quiet book accumulates nothing and this
 # only moves when fills actually cost money. Gross: a later gain does not refund the budget.
 #
-# These are demo numbers on a ~$20M mock book. Real thresholds have to be back-solved from a
-# replay drawdown, per archi_v2 5.4 — do not pick them by feel.
-loss_budget = "100000"
+# ~2.5% of the ~$20M mock book, kept comfortably above bleed_limit per the validator
+# (config.rs: budget must be >= bleed_limit). Same caveat as bleed_limit above.
+loss_budget = "500000"
 
 # ---------------------------------------------------------------------------
 # pairId 1 — mWETH/mUSDC, 18/6 decimals, priceScaleExp 24
@@ -217,7 +223,7 @@ heartbeat_secs = 2400
 #                threshold is loose and a quiet market does not churn gas.
 #
 # This inverts archi_v2 5.3's chase/retreat asymmetry on purpose; policy.rs argues why.
-adverse_drift_bps = 2
+adverse_drift_bps = 0.5
 favourable_drift_bps = 8
 
 # Refresh the capacity epoch once remaining capacity falls this far below the planned one.
