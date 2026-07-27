@@ -28,13 +28,64 @@ import {PropCurve} from "../../src/libraries/PropCurve.sol";
 /// therefore no information at all. So the flow here contains traders who look at the price.
 ///
 /// =====================================================================================
+/// THE TWO CLOCKS — read this before reading any latency number this model produces
+/// =====================================================================================
+///
+/// EVM `block.timestamp` is denominated in **whole seconds**. `vm.warp` cannot express 200 ms,
+/// and `PropPool`'s staleness cliff and capacity ramp both read `block.timestamp`. A single clock
+/// therefore cannot be made sub-second, so this model runs two and never conflates them:
+///
+///   * **MODEL time** — a tick of [`Params.tickMs`] milliseconds (default 200, matching GIWA's
+///     flashblock preconfirmation cadence). The reference path, taker arrivals, maker decisions
+///     and *every latency* are denominated in these ticks. This clock is as fine as `tickMs`.
+///   * **BLOCK time** — still whole seconds, advanced by the harness once every `1000 / tickMs`
+///     model ticks. Everything the *contract* reads — `updatedAt`, the staleness ramp, the epoch
+///     — sees this clock and only this clock.
+///
+/// **The consequence, stated plainly because a reader has to know which of the two they are
+/// looking at: this model measures sub-second LATENCY faithfully and sub-second STALENESS not at
+/// all.** A ladder pushed at t=1,200 ms and one pushed at t=1,800 ms carry the same on-chain
+/// `updatedAt` of 1 s, so `PropPool`'s decay ramp cannot tell them apart and a `decaySecs` of 60
+/// is a 60-step staircase no matter how fine the tick is. Two specific residues follow:
+///
+///   1. **The ramp quantises.** At `tickMs = 200` the depth available to a picker-off falls in
+///      five equal jumps per `decaySecs/60`th of the ramp instead of continuously, and a
+///      withdrawal that lands 200 ms after the push is indistinguishable on chain from one that
+///      lands instantly. Sub-second *decay* is not measured here and no number below should be
+///      read as if it were.
+///   2. **Same-second pushes collide.** Two `updateQuote` calls inside one block second both
+///      write the same `updatedAt`. That is what really happens on a 1 s chain, so it is right —
+///      but it means the model cannot represent a quote that is 200 ms fresher than another.
+///
+/// What *is* faithful at 200 ms is the thing this was built for: how long a wrong quote stays up,
+/// who gets to trade against it in the meantime, and whether shortening that window pays.
+///
+/// **Rescaling.** Changing `tickMs` must change the model's *resolution* and not its *experiment*,
+/// which needs two different rescalings that are easy to confuse:
+///
+///   * **Volatility takes the square root.** `sigma_tick = sigma_sec * sqrt(tickMs / 1000)`,
+///     because variance is what adds over independent increments. Applying the linear factor here
+///     would make a 200 ms run 2.2x less volatile per second than the 1 s run it is meant to
+///     reproduce.
+///   * **Arrivals do not.** They scale in tick *duration*. For the uninformed population that is
+///     exactly linear in the rate, because it is a counting process and its invariant is the
+///     expected number of fills per hour. For the informed population the invariant is different
+///     and so is the arithmetic — see [`informedHazardPerTick`].
+///
+/// [`Params.tickMs`] must divide 1000, and `tickMs = 1000` reproduces the one-second model
+/// **bit for bit**: identical amplitude, identical RNG draws, identical run. That is the
+/// regression control, and it is exact rather than statistical on purpose.
+///
+/// =====================================================================================
 /// THE THREE POPULATIONS
 /// =====================================================================================
 ///
-/// **UNINFORMED** — a Bernoulli arrival on each 1-second tick at
-/// `uninformedPerHour / 3600`, direction a fair coin, size from the heavy-tailed distribution
-/// in [`drawNotional`]. It never looks at the pool's price and never declines a fill. This is
-/// the flow a market maker wants and the only flow that pays for anything.
+/// **UNINFORMED** — a Bernoulli arrival on each model tick at
+/// `uninformedPerHour * tickMs / 3_600_000`, direction a fair coin, size from the heavy-tailed
+/// distribution in [`drawNotional`]. It never looks at the pool's price and never declines a
+/// fill. This is the flow a market maker wants and the only flow that pays for anything. Its
+/// arrival rate is linear in the tick, so the expected fills per wall-clock hour is invariant to
+/// the resolution — see [`uninformedRatePerTick`].
 ///
 /// **INFORMED** — arrives only when the pool's executable quote is wrong relative to the
 /// reference, and takes the side that profits from the error. Its arrival rate is
@@ -75,12 +126,14 @@ import {PropCurve} from "../../src/libraries/PropCurve.sol";
 ///    gives a smooth, roughly logistic CDF shape; `n = 1` would be too flat near the threshold
 ///    and would have a fat left tail of takers acting on edges that do not pay them.
 ///
-/// 3. **Saturating, at one per block.** `informedMaxPerSec` defaults to 1.0, and the block time
-///    is 1 second. This is a hard fact about the chain, not a taste: the pick-off is a race, the
-///    winner takes the whole profitable depth in one transaction, and the second-place finisher
-///    finds nothing left. Making the rate unbounded in the edge would claim that a 500 bp error
-///    draws ten times the flow of a 50 bp error, which is false — both draw exactly one winner,
-///    and the pool loses its whole exposed depth either way.
+/// 3. **Saturating, at one per second.** `informedMaxPerSec` defaults to 1.0, which at a 1 s
+///    block time is one per block. This is a hard fact about the chain, not a taste: the pick-off
+///    is a race, the winner takes the whole profitable depth in one transaction, and the
+///    second-place finisher finds nothing left. Making the rate unbounded in the edge would claim
+///    that a 500 bp error draws ten times the flow of a 50 bp error, which is false — both draw
+///    exactly one winner, and the pool loses its whole exposed depth either way. The rate is
+///    quoted per *second* and stays that way at every tick size; [`informedHazardPerTick`] does
+///    the conversion, and the conversion is deliberately not the obvious one.
 ///
 /// 4. **`e50` is tied to the pool's own half-spread, not picked.** The default is
 ///    `2 * halfSpreadBps`, i.e. the point at which the error is as large again as the protection
@@ -112,11 +165,13 @@ import {PropCurve} from "../../src/libraries/PropCurve.sol";
 /// WHAT IS MEASURED
 /// =====================================================================================
 ///
-/// Per fill, from the pool's side, in quote units:
+/// Per fill, from the pool's side, in quote units. `h` is in wall-clock seconds and the index is
+/// in model ticks, so the lookup is `k + h * ticksPerSec` — a "+60s" column is sixty seconds at
+/// every `tickMs` rather than sixty ticks:
 ///
 /// ```text
-///   ask (pool sold q base for x quote):  pnl(h) = x - q * ref[t+h] / scale
-///   bid (pool bought q base for x quote): pnl(h) = q * ref[t+h] / scale - x
+///   ask (pool sold q base for x quote):  pnl(h) = x - q * ref[k + h*n] / scale
+///   bid (pool bought q base for x quote): pnl(h) = q * ref[k + h*n] / scale - x
 /// ```
 ///
 /// `pnl(0)` is the **realised spread** against the reference at fill time. `pnl(1)`, `pnl(10)`
@@ -152,6 +207,14 @@ import {PropCurve} from "../../src/libraries/PropCurve.sol";
 ///  * **No mempool.** Ordering inside a tick is a fixed rule (fast taker, then the landing
 ///    update, then informed, then uninformed), not an auction. A real sequencer would sometimes
 ///    order the update first, which is strictly better for the pool than what is modelled.
+///  * **Sub-second STALENESS, as opposed to sub-second latency.** See THE TWO CLOCKS above. The
+///    pool's `updatedAt`, its staleness cliff and its capacity ramp all read `block.timestamp`
+///    and so quantise to one second at every value of `tickMs`. A result about how fast the
+///    updater reacts is measured at the tick; a result about how the ramp decays is not.
+///  * **Sub-tick ordering.** Everything inside one model tick is simultaneous, so at
+///    `tickMs = 200` the model cannot represent a searcher who is 50 ms faster than another. The
+///    fast taker exists precisely to stand in for that, and it is a coin flip rather than a race
+///    that anyone could win by spending more.
 ///  * **Uniform, not Gaussian, diffusion increments.** The random walk's per-tick increment is
 ///    uniform with the stated standard deviation. A uniform has thinner tails than a normal, so
 ///    the diffusion paths *understate* the frequency of multi-sigma moves. The jump paths exist
@@ -190,11 +253,19 @@ library FlowModel {
     /// @notice Notional decades, in whole quote tokens: <1k, 1k-10k, 10k-100k, 100k-1M, >=1M.
     uint256 internal constant BUCKET_COUNT = 5;
 
-    /// @notice The three markout horizons, in seconds. The path is built with this much extra
-    ///         tail so `ref[t + MARKOUT_LONG]` is defined for every fill.
+    /// @notice The three markout horizons, in **wall-clock seconds**. Seconds rather than ticks
+    ///         deliberately: a markout is an economic horizon, not a simulation artefact, and
+    ///         "+60s" has to mean the same thing at every resolution or two runs at different
+    ///         `tickMs` would not be comparable. [`markoutTicks`] converts.
+    ///
+    /// @dev The path is built with `MARKOUT_LONG` seconds of extra tail so `ref[k + 60s]` is
+    ///      defined for every fill.
     uint256 internal constant MARKOUT_SHORT = 1;
     uint256 internal constant MARKOUT_MID = 10;
     uint256 internal constant MARKOUT_LONG = 60;
+
+    /// @notice Milliseconds in a second. The only place the two clocks meet.
+    uint256 internal constant MS_PER_SEC = 1_000;
 
     // =====================================================================
     // Types
@@ -215,15 +286,25 @@ library FlowModel {
         uint8 priceScaleExp;
         uint8 baseDecimals;
         uint8 quoteDecimals;
+        /// @dev The run's length in **wall-clock seconds**, which is what it has always meant.
+        ///      Changing `tickMs` changes how many model ticks that is, never how long the run is.
         uint256 horizonSecs;
         uint256 seed;
+        /// @dev **The model clock**, in milliseconds. Must divide 1000. Default 200, matching
+        ///      GIWA's flashblock preconfirmation cadence; 1000 is the regression control and
+        ///      reproduces the one-second model bit for bit. See THE TWO CLOCKS in the header,
+        ///      and in particular what it says about what does *not* get finer when this does.
+        uint256 tickMs;
         // --- the reference path ---
-        /// @dev Per-second volatility, hundredths of a bp. ETHUSDT at ~55% annualised is ~1 bp
-        ///      per second: 0.55 / sqrt(365*24*3600) = 9.8e-5.
+        /// @dev Per-**second** volatility, hundredths of a bp. ETHUSDT at ~55% annualised is ~1 bp
+        ///      per second: 0.55 / sqrt(365*24*3600) = 9.8e-5. Per second at every `tickMs`:
+        ///      [`buildPath`] applies the `sqrt(tickMs/1000)` rescaling, so this number keeps one
+        ///      meaning and a run at a finer tick is not quietly a calmer market.
         uint256 sigmaE2;
         /// @dev Per-second drift, hundredths of a bp, signed.
         int256 driftE2;
-        /// @dev Second at which the jump lands. 0 disables it.
+        /// @dev **Second** at which the jump lands. 0 disables it. A jump is a gap, so it lands
+        ///      entirely inside one model tick however fine the tick is.
         uint256 jumpAtSecs;
         /// @dev Jump size, hundredths of a bp, signed.
         int256 jumpE2;
@@ -232,9 +313,49 @@ library FlowModel {
         uint256 widthBps;
         uint96 bidCapacity;
         uint96 askCapacity;
-        /// @dev Seconds between the updater deciding to push and the push landing. This is the
-        ///      window the free option lives in, and it is the parameter the pool controls.
-        uint256 quoteLatencySecs;
+        /// @dev **Milliseconds** between the updater deciding to push and the push landing. This
+        ///      is the window the free option lives in, it is the parameter the pool controls,
+        ///      and it is the reason this model has a sub-second clock at all.
+        ///
+        ///      Milliseconds rather than seconds because the whole open question is whether the
+        ///      2,000 ms round trip the bot has today (wake on `newHeads` at 1 Hz, land a block
+        ///      later) is worth replacing with the ~400 ms one that polling GIWA's flashblocks
+        ///      `pending` tag at 200 ms would give. A parameter denominated in seconds cannot
+        ///      express the alternative, which is exactly why every latency conclusion this file
+        ///      produced before now was bounded at one second.
+        ///
+        ///      Rounded DOWN to whole ticks, but never to zero: a latency below one tick is one
+        ///      tick, because a transaction that has to be signed and land cannot take no time.
+        uint256 quoteLatencyMs;
+        /// @dev **Milliseconds between the updater WAKING UP**, as distinct from how long its
+        ///      transaction then takes to land. Default 1,000: `dubu-updater` subscribes to
+        ///      `newHeads` and evaluates its triggers once a block.
+        ///
+        ///      This parameter exists because without it a finer `tickMs` would silently upgrade
+        ///      the bot. The old loop evaluated the trigger policy on every tick, which at one
+        ///      second a tick happened to be the bot's real cadence; carry that rule to a 200 ms
+        ///      tick and the modelled bot starts polling five times a second for free, shortening
+        ///      its response by up to 800 ms with no code written and no round trip changed. The
+        ///      200 ms run would then beat the 1,000 ms run for a reason that is not latency, and
+        ///      it would look exactly like a finding.
+        ///
+        ///      Keep it at 1,000 to change resolution only. Set it to 200 to model the build that
+        ///      polls GIWA's flashblocks `pending` tag instead of waiting for `newHeads` — that is
+        ///      a different bot, and it should have to earn its result against this one.
+        ///
+        ///      Floored at one tick, so a coarse clock cannot represent a bot faster than itself.
+        uint256 decisionIntervalMs;
+        /// @dev Milliseconds between runs of the jump detector. Default 200, because `jump.rs`
+        ///      already scans its in-memory feed snapshots at that cadence rather than waiting for
+        ///      the 1 Hz quote cycle — the detector is the one part of the bot that is *already*
+        ///      sub-second in production.
+        ///
+        ///      Floored at one tick, which means the 1,000 ms control necessarily runs the
+        ///      detector at 1 Hz and so handicaps it against the real thing. That handicap is not
+        ///      a bug in the control, it is the coarse clock's limit showing through, and it is
+        ///      one of the reasons the defended run improves at 200 ms. Setting this to 1,000
+        ///      isolates how much of that improvement is the detector rather than the clock.
+        uint256 detectorIntervalMs;
         uint256 adverseDriftE2;
         uint256 favourableDriftE2;
         uint256 heartbeatSecs;
@@ -249,23 +370,37 @@ library FlowModel {
         /// @dev Ceiling on the scaled half-spread. An unbounded spread in a volatility spike is a
         ///      quoting outage wearing a disguise.
         uint256 halfSpreadCapBps;
-        /// @dev A one-second reference move at or above this trips the jump detector, in
-        ///      hundredths of a bp. Zero disables it.
+        /// @dev A reference move at or above this over a trailing **one-second** window trips the
+        ///      jump detector, in hundredths of a bp. Zero disables it.
+        ///
+        ///      The window is one second at every `tickMs`, not one tick, and that is a
+        ///      correctness requirement rather than a convenience: a threshold applied to
+        ///      consecutive 200 ms ticks is a five-times-higher bar in sigma than the same
+        ///      threshold applied to consecutive seconds, so a detector defined per-tick would
+        ///      get quietly harder to trip every time the clock got finer. Trailing-window also
+        ///      matches `jump.rs`, which scans a feed history rather than a pair of samples.
         uint256 jumpThresholdE2;
-        /// @dev How long quotes stay withdrawn after a jump. The cost of a false positive is one
-        ///      of these in foregone spread.
+        /// @dev How long quotes stay withdrawn after a jump, in seconds. The cost of a false
+        ///      positive is one of these in foregone spread.
         uint256 cooloffSecs;
-        /// @dev Seconds between the detector firing and the withdrawal LANDING. This is the whole
-        ///      question: a withdrawal is a transaction, it races the searcher, and on a
+        /// @dev **Milliseconds** between the detector firing and the withdrawal LANDING. This is
+        ///      the whole question: a withdrawal is a transaction, it races the searcher, and on a
         ///      fee-ordered sequencer the searcher can outbid it. A value of zero would model a
-        ///      wish rather than a defence.
-        uint256 withdrawLatencySecs;
-        /// @dev PropPool's staleness ramp, seconds. Depth falls linearly from full at the moment
-        ///      of the push to zero at this age. Zero disables it, which is the pool's default.
+        ///      wish rather than a defence — and note that zero is now *representable but still
+        ///      wrong*, because the floor is one tick rather than one second.
+        uint256 withdrawLatencyMs;
+        /// @dev PropPool's staleness ramp, **seconds, and seconds is not a rounding of something
+        ///      finer**. The contract computes the ramp from `block.timestamp - updatedAt`, both
+        ///      of which are whole seconds, so this stays quantised at every `tickMs`. Depth falls
+        ///      linearly from full at the moment of the push to zero at this age. Zero disables
+        ///      it, which is the pool's default.
         uint16 decaySecs;
         // --- the flow ---
+        /// @dev Arrivals per wall-clock hour, and per wall-clock hour at every `tickMs`.
         uint256 uninformedPerHour;
-        /// @dev Saturation arrival rate, per second, scaled by 1e6. 1e6 == one per block.
+        /// @dev Saturation arrival rate, per **second**, scaled by 1e6. 1e6 == one per second,
+        ///      which at a 1 s block time is one per block. Never per tick — see
+        ///      [`informedHazardPerTick`] for why the two must not be confused.
         uint256 informedMaxPerSecE6;
         /// @dev Net edge at which the hazard reaches half its saturation rate.
         uint256 informedHalfMaxE2;
@@ -316,7 +451,13 @@ library FlowModel {
         ///      line in the report.
         int256 worstFillMo60;
         uint256 worstFillNotional;
-        uint256 worstFillAt;
+        /// @dev MODEL tick, not second and not block. [`tickToMs`] turns it back into wall clock.
+        uint256 worstFillAtTick;
+        /// @dev How many whole block seconds the run advanced through. `horizonSecs` by
+        ///      construction, carried anyway so a report can state the two clocks side by side
+        ///      instead of asking the reader to trust that they line up.
+        uint256 blockSecsAdvanced;
+        uint256 ticksRun;
     }
 
     // =====================================================================
@@ -345,41 +486,161 @@ library FlowModel {
     }
 
     // =====================================================================
+    // The two clocks — every conversion between them, in one place
+    // =====================================================================
+
+    /// @notice Model ticks per whole block second.
+    ///
+    /// @dev `tickMs` must divide 1000. Not a convenience: if it did not, the number of ticks in a
+    ///      second would vary from second to second, the per-second arrival probability the
+    ///      informed hazard is defined by would vary with it, and two runs at the same nominal
+    ///      volatility would face different flow. A divisor keeps the block clock a strict
+    ///      coarsening of the model clock, which is the property everything below assumes.
+    function ticksPerSec(Params memory p) internal pure returns (uint256) {
+        require(
+            p.tickMs != 0 && p.tickMs <= MS_PER_SEC && MS_PER_SEC % p.tickMs == 0, "FlowModel: tickMs must divide 1000"
+        );
+        return MS_PER_SEC / p.tickMs;
+    }
+
+    /// @notice How many model ticks the run's wall-clock horizon is.
+    function totalTicks(Params memory p) internal pure returns (uint256) {
+        return p.horizonSecs * ticksPerSec(p);
+    }
+
+    function secsToTicks(uint256 secs, Params memory p) internal pure returns (uint256) {
+        return secs * ticksPerSec(p);
+    }
+
+    /// @notice The markout horizon `secs` expressed in ticks.
+    function markoutTicks(uint256 secs, Params memory p) internal pure returns (uint256) {
+        return secs * ticksPerSec(p);
+    }
+
+    /// @notice A latency in milliseconds, as whole model ticks.
+    ///
+    /// @dev Rounded DOWN, with a floor of one tick for any non-zero latency. Down because a
+    ///      latency the clock cannot resolve should not be inflated into one it can; the floor
+    ///      because rounding a 200 ms round trip to zero at a 1,000 ms tick would model
+    ///      instantaneous requoting, which is the wish this whole exercise exists to avoid. The
+    ///      floor is therefore also the honest statement of the coarse clock's limit: at
+    ///      `tickMs = 1000`, every latency below a second **is** one second, and that is precisely
+    ///      why the sub-second sweep has to be run at a finer tick to mean anything.
+    function msToTicks(uint256 ms, Params memory p) internal pure returns (uint256) {
+        if (ms == 0) return 0;
+        uint256 k = ms / p.tickMs;
+        return k == 0 ? 1 : k;
+    }
+
+    /// @notice The BLOCK second a model tick falls in — the only thing the contract can see.
+    /// @dev Tick `k` is the instant `k * tickMs` milliseconds into the run, so it belongs to block
+    ///      second `floor(k * tickMs / 1000)`. The first block second therefore carries one tick
+    ///      fewer than the rest (the tick at ms 0 is the pre-loop setup), which is a boundary
+    ///      artefact of one tick in the whole horizon and is left visible rather than papered over.
+    function tickToBlockSecs(uint256 k, Params memory p) internal pure returns (uint256) {
+        return (k * p.tickMs) / MS_PER_SEC;
+    }
+
+    /// @notice Wall-clock milliseconds at tick `k`. Exact — this is the clock that is fine.
+    function tickToMs(uint256 k, Params memory p) internal pure returns (uint256) {
+        return k * p.tickMs;
+    }
+
+    /// @notice `floor(sqrt(x))`, Babylonian. Needed because volatility rescales by a square root
+    ///         and this library carries no fixed-point maths dependency.
+    function isqrt(uint256 x) internal pure returns (uint256 y) {
+        if (x == 0) return 0;
+        uint256 z = (x + 1) / 2;
+        y = x;
+        while (z < y) {
+            y = z;
+            z = (x / z + z) / 2;
+        }
+    }
+
+    // =====================================================================
     // The reference path
     // =====================================================================
 
-    /// @notice Build the whole reference path up front, including `MARKOUT_LONG` seconds of tail.
+    /// @notice Build the whole reference path up front, on the MODEL clock, including
+    ///         `MARKOUT_LONG` seconds of tail.
     ///
-    /// @dev Precomputed rather than evaluated lazily because markout needs `ref[t + 60]` at the
-    ///      moment of the fill, and a random walk has no closed form to look that up with. The
-    ///      array is `horizon + 61` words, which is nothing in memory and turns every markout
-    ///      into an array read.
+    /// @dev Indexed by model tick, so `ref[k]` is the reference `k * tickMs` milliseconds into the
+    ///      run. Precomputed rather than evaluated lazily because markout needs `ref[k + 60s]` at
+    ///      the moment of the fill, and a random walk has no closed form to look that up with. The
+    ///      array is `(horizon + 60) * ticksPerSec + 1` words — 18,300 at the default hour and
+    ///      200 ms, still cheap, and it turns every markout into an array read.
     ///
     ///      Increments are multiplicative and **uniform**, not Gaussian: `inc` is uniform on
-    ///      `[-A, +A]` with `A = sigma * sqrt(3)`, which has standard deviation exactly `sigma`.
-    ///      A uniform has no tail at all beyond `sqrt(3)` sigma, so a diffusion-only path here
-    ///      systematically produces *fewer* large moves than a real one. That understates
-    ///      adverse selection, which is the safe direction for a tool whose job is to find it —
-    ///      and it is why the jump is a separate, explicit term rather than something the walk
-    ///      is hoped to generate.
+    ///      `[-A, +A]` with `A = sigma_tick * sqrt(3)`, which has standard deviation exactly
+    ///      `sigma_tick`. A uniform has no tail at all beyond `sqrt(3)` sigma, so a diffusion-only
+    ///      path here systematically produces *fewer* large moves than a real one. That
+    ///      understates adverse selection, which is the safe direction for a tool whose job is to
+    ///      find it — and it is why the jump is a separate, explicit term rather than something
+    ///      the walk is hoped to generate.
+    ///
+    ///      **The two rescalings, and why they are not the same one.**
+    ///
+    ///      *Volatility takes the square root.* `sigma_tick = sigma_sec * sqrt(tickMs / 1000)`,
+    ///      because the variance of a sum of independent increments adds while its standard
+    ///      deviation does not. Getting this wrong is not a cosmetic error: applying the linear
+    ///      factor would make the 200 ms path carry a fifth of the per-second variance of the 1 s
+    ///      path, the reference would gap less, the informed hazard would fire less, and the run
+    ///      would report that a finer clock is worth thousands of dollars — a conclusion entirely
+    ///      manufactured by the rescaling. `test_tickRescalingIsResolutionNotExperiment` measures
+    ///      the realised per-second volatility of the path at four tick sizes for exactly this
+    ///      reason, rather than trusting the algebra above.
+    ///
+    ///      *Drift does not.* It is differenced out of an exact cumulative
+    ///      (`drift * k * tickMs / 1000`) rather than divided per tick, so a drift too small to
+    ///      express in one tick still accumulates at the right rate over the horizon instead of
+    ///      truncating to nothing. At 0.20 bp/s and a 200 ms tick a naive per-tick division would
+    ///      be exact anyway; at 0.07 bp/s it would lose 29% of the trend.
+    ///
+    ///      **At `tickMs = 1000` this function is bit-for-bit what it was before it had a tick.**
+    ///      `isqrt(1000 * 1000)` is exactly 1000, so the amplitude reduces to `sigma * 1732/1000`
+    ///      with the same truncation as before; the differenced drift reduces to `driftE2`; and
+    ///      the RNG therefore draws from the same modulus in the same order. That is the control.
     function buildPath(Params memory p) internal pure returns (uint256[] memory ref) {
-        ref = new uint256[](p.horizonSecs + MARKOUT_LONG + 1);
+        uint256 tps = ticksPerSec(p);
+        ref = new uint256[]((p.horizonSecs + MARKOUT_LONG) * tps + 1);
         ref[0] = p.mid;
 
         Rng memory r = rng(p.seed ^ uint256(keccak256("path")));
-        uint256 amplitude = (p.sigmaE2 * 1_732) / 1_000; // sigma * sqrt(3)
+        // sigma_tick * sqrt(3), in hundredths of a bp. The sqrt is taken over `tickMs * 1000` so
+        // that the 1e6 divisor below carries both the 1732/1000 and the 1/1000 of the root's
+        // scaling in one integer division, and so that tickMs == 1000 lands on the old constant.
+        uint256 amplitude = (p.sigmaE2 * 1_732 * isqrt(p.tickMs * MS_PER_SEC)) / 1_000_000;
+        uint256 jumpAtTick = p.jumpAtSecs * tps;
 
-        for (uint256 t = 1; t < ref.length; ++t) {
-            int256 incE2 = p.driftE2;
+        for (uint256 k = 1; k < ref.length; ++k) {
+            int256 incE2 = _cumulativeDrift(p, k) - _cumulativeDrift(p, k - 1);
             if (amplitude != 0) {
                 // forge-lint: disable-next-line(unsafe-typecast)
                 incE2 += int256(uniform(r, 2 * amplitude + 1)) - int256(amplitude);
             }
-            if (p.jumpAtSecs != 0 && t == p.jumpAtSecs) incE2 += p.jumpE2;
+            // A jump is a gap: it lands entirely inside one tick at every resolution, which is
+            // what makes the 200 ms and 1 s runs face the same shock rather than a smeared one.
+            if (p.jumpAtSecs != 0 && k == jumpAtTick) incE2 += p.jumpE2;
 
-            ref[t] = applyBpsE2(ref[t - 1], incE2);
-            if (ref[t] == 0) ref[t] = 1; // a zero reference is not a market
+            ref[k] = applyBpsE2(ref[k - 1], incE2);
+            if (ref[k] == 0) ref[k] = 1; // a zero reference is not a market
         }
+    }
+
+    /// @notice Total drift from the start of the run to tick `k`, in hundredths of a bp.
+    ///
+    /// @dev [`buildPath`] differences this instead of dividing the per-second drift by
+    ///      `ticksPerSec`, so that the truncation is taken once against the whole horizon rather
+    ///      than once per tick. A drift of 0.07 bp/s at a 200 ms tick is 0.014 bp a tick, which
+    ///      truncates to zero and would make the trend path a flat one; differencing the
+    ///      cumulative gives the increments 0, 0, 1, 0, 1 and the trend arrives intact.
+    ///
+    ///      `k * tickMs` is at most a few tens of millions and `driftE2` is a bps figure, so the
+    ///      product cannot approach the int256 bound.
+    function _cumulativeDrift(Params memory p, uint256 k) private pure returns (int256) {
+        // forge-lint: disable-next-line(unsafe-typecast)
+        return (p.driftE2 * int256(k * p.tickMs)) / int256(MS_PER_SEC);
     }
 
     /// @notice `x * (1 + bpsE2 / BPS_E2)`, saturating at zero.
@@ -460,6 +721,86 @@ library FlowModel {
         return (p.informedMaxPerSecE6 * nn) / (nn + half);
     }
 
+    /// @notice The probability of an informed arrival in ONE MODEL TICK.
+    ///
+    /// @dev **This conversion is not `lambda * tickMs / 1000`, and the difference is the single
+    ///      place where a careless rescaling would have produced a flattering answer.**
+    ///
+    ///      The invariant that has to survive a change of clock is *the probability that a given
+    ///      wrong quote is picked off at all within a given second*. That is what the hazard is a
+    ///      statement about: the header's third property says the pick-off is a race with exactly
+    ///      one winner, so what the model claims is `P(somebody takes it)`, not a count. Preserve
+    ///      the survival probability and the clock is a resolution knob:
+    ///
+    ///      ```text
+    ///        (1 - q)^n = 1 - lambda        n = ticksPerSec,  q = per-tick probability
+    ///      ```
+    ///
+    ///      Scaling linearly instead — `q = lambda / n` — preserves the expected *count*, which is
+    ///      the wrong invariant for a race, and it does real damage at exactly the point the
+    ///      headline lives. At the saturated `lambda = 1.0/s` of a 100 bp gap, linear scaling gives
+    ///      `q = 0.2` and `P(taken within the second) = 1 - 0.8^5 = 67%`, against 100% at a 1 s
+    ///      tick. The 200 ms run would then show a smaller loss than the 1 s run because *the
+    ///      searcher had been weakened by a third*, and it would look exactly like a finding about
+    ///      latency. The survival form gives `q = 1 - (1-1)^(1/5) = 1`: the gap is taken in the
+    ///      first tick after it prints at both resolutions, which is what a saturated race means.
+    ///
+    ///      For small `lambda` the two agree to first order (`1 - (1-l)^(1/n) ~ l/n`), so this is
+    ///      still "linear in tick duration" everywhere except near saturation — it just does not
+    ///      stop being right there.
+    ///
+    ///      At `n == 1` it returns `lambda` unchanged, which is why the one-second control is bit
+    ///      identical rather than merely close.
+    function informedHazardPerTick(int256 edgeE2, Params memory p) internal pure returns (uint256) {
+        uint256 perSec = informedHazard(edgeE2, p);
+        uint256 n = ticksPerSec(p);
+        // The three cases that carry almost every tick of a real run, and the only ones that are
+        // hot: n == 1 is the control, a correct quote has no hazard at all, and a saturated race
+        // is certain at any resolution.
+        if (n == 1 || perSec == 0) return perSec;
+        if (perSec >= PROB_ONE) return PROB_ONE;
+        return PROB_ONE - _nthRootE6(PROB_ONE - perSec, n);
+    }
+
+    /// @dev Greatest `s` with `s^n <= v`, all in `PROB_ONE` fixed point. Bisected rather than
+    ///      closed-form because this library has no fixed-point exp/log and does not need one:
+    ///      the call is skipped entirely unless the quote is both wrong and unsaturated, which on
+    ///      a jump path is a handful of ticks out of thousands.
+    ///
+    ///      Flooring the root over-states the per-tick arrival probability by less than 1e-6,
+    ///      i.e. it rounds the searcher slightly stronger. That is the direction a risk tool
+    ///      should round.
+    function _nthRootE6(uint256 v, uint256 n) private pure returns (uint256) {
+        uint256 lo;
+        uint256 hi = PROB_ONE;
+        while (lo < hi) {
+            uint256 mid = lo + (hi - lo + 1) / 2;
+            if (_powE6(mid, n) <= v) lo = mid;
+            else hi = mid - 1;
+        }
+        return lo;
+    }
+
+    function _powE6(uint256 x, uint256 n) private pure returns (uint256 r) {
+        r = PROB_ONE;
+        for (uint256 i; i < n; ++i) {
+            r = (r * x) / PROB_ONE;
+        }
+    }
+
+    /// @notice Expected uninformed arrivals in one model tick, in `PROB_ONE` units.
+    ///
+    /// @dev Linear in the tick, and linear is right here for the reason it is wrong for the
+    ///      informed hazard: uninformed flow is a counting process whose invariant is the expected
+    ///      number of fills per wall-clock hour, not the probability that at least one shows up.
+    ///      The caller takes the integer part as a guaranteed count and Bernoullis the remainder,
+    ///      so the mean is preserved exactly — `uninformedPerHour` means the same thing at 1,000
+    ///      ms and at 200 ms, and the volume that pays for everything does not move when the clock
+    ///      does.
+    function uninformedRatePerTick(Params memory p) internal pure returns (uint256) {
+        return (p.uninformedPerHour * PROB_ONE * p.tickMs) / (SECS_PER_HOUR * MS_PER_SEC);
+    }
+
     // =====================================================================
     // The ladder — byte for byte DubuScript._ladder and IntegrationTest._pushLadder
     // =====================================================================
@@ -487,10 +828,18 @@ library FlowModel {
 
     /// @notice Did the reference move far enough in one second to count as a jump?
     ///
-    /// @dev Mirrors `jump.rs`'s detector, on the same input it sees: consecutive observations of
-    ///      the reference. The threshold is absolute rather than a sigma multiple here because
+    /// @dev Mirrors `jump.rs`'s detector, on the same input it sees: a trailing window of the
+    ///      reference feed. The threshold is absolute rather than a sigma multiple here because
     ///      the scripted paths hold sigma fixed, so the two are interchangeable within a run and
     ///      an absolute number is the one a reader can check against the jump they configured.
+    ///
+    ///      **`prevRef` is the reference one WALL-CLOCK SECOND ago, not one tick ago**, and the
+    ///      caller is responsible for reaching back `ticksPerSec` entries rather than one. A
+    ///      per-tick comparison would make the same `jumpThresholdE2` a 5x harder bar to clear at
+    ///      a 200 ms tick than at a 1 s tick — the detector would silently get less sensitive
+    ///      every time the clock got finer, and any comparison across `tickMs` would be measuring
+    ///      that instead of latency. A gap still trips it on the tick it prints, because a gap is
+    ///      inside the trailing window the instant it happens.
     function isJump(uint256 prevRef, uint256 nowRef, uint256 thresholdE2) internal pure returns (bool) {
         if (thresholdE2 == 0 || prevRef == 0) return false;
         uint256 diff = nowRef > prevRef ? nowRef - prevRef : prevRef - nowRef;
@@ -772,7 +1121,10 @@ library FlowModel {
     ///      legacy code generator's 16-slot stack limit.
     struct Fill {
         uint256 pop;
-        uint256 tSecs;
+        /// @dev MODEL tick, not second. The markout horizons below are converted to ticks so that
+        ///      "+60s" is sixty wall-clock seconds at every resolution — otherwise two runs at
+        ///      different `tickMs` would be reporting different columns under the same heading.
+        uint256 tTick;
         /// @dev True when the POOL bought base. The taker's side is the opposite.
         bool isBid;
         uint256 baseQty;
@@ -780,13 +1132,14 @@ library FlowModel {
     }
 
     /// @notice Fold one fill into a population accumulator and a size-bucket accumulator.
-    function record(Result memory res, Fill memory f, uint256[] memory ref, uint8 priceScaleExp) internal pure {
-        uint256 notional = value(f.baseQty, ref[f.tSecs], priceScaleExp);
+    function record(Result memory res, Fill memory f, uint256[] memory ref, Params memory p) internal pure {
+        uint8 exp = p.priceScaleExp;
+        uint256 notional = value(f.baseQty, ref[f.tTick], exp);
 
-        int256 s0 = fillPnl(f.isBid, f.baseQty, f.quoteQty, ref[f.tSecs], priceScaleExp);
-        int256 s1 = fillPnl(f.isBid, f.baseQty, f.quoteQty, refAt(ref, f.tSecs + MARKOUT_SHORT), priceScaleExp);
-        int256 s10 = fillPnl(f.isBid, f.baseQty, f.quoteQty, refAt(ref, f.tSecs + MARKOUT_MID), priceScaleExp);
-        int256 s60 = fillPnl(f.isBid, f.baseQty, f.quoteQty, refAt(ref, f.tSecs + MARKOUT_LONG), priceScaleExp);
+        int256 s0 = fillPnl(f.isBid, f.baseQty, f.quoteQty, ref[f.tTick], exp);
+        int256 s1 = fillPnl(f.isBid, f.baseQty, f.quoteQty, refAt(ref, f.tTick + markoutTicks(MARKOUT_SHORT, p)), exp);
+        int256 s10 = fillPnl(f.isBid, f.baseQty, f.quoteQty, refAt(ref, f.tTick + markoutTicks(MARKOUT_MID, p)), exp);
+        int256 s60 = fillPnl(f.isBid, f.baseQty, f.quoteQty, refAt(ref, f.tTick + markoutTicks(MARKOUT_LONG, p)), exp);
 
         _fold(res.byPop[f.pop], notional, s0, s1, s10, s60);
         _fold(res.byBucket[bucketOf(notional / (10 ** uint256(_quoteDecimalsOf(res))))], notional, s0, s1, s10, s60);
@@ -794,7 +1147,7 @@ library FlowModel {
         if (s60 < res.worstFillMo60) {
             res.worstFillMo60 = s60;
             res.worstFillNotional = notional;
-            res.worstFillAt = f.tSecs;
+            res.worstFillAtTick = f.tTick;
         }
     }
 
@@ -815,9 +1168,9 @@ library FlowModel {
         a.mo60 += s60;
     }
 
-    /// @notice `ref[t]`, clamped to the end of the path.
-    function refAt(uint256[] memory ref, uint256 t) internal pure returns (uint256) {
-        return t < ref.length ? ref[t] : ref[ref.length - 1];
+    /// @notice `ref[k]` at MODEL tick `k`, clamped to the end of the path.
+    function refAt(uint256[] memory ref, uint256 k) internal pure returns (uint256) {
+        return k < ref.length ? ref[k] : ref[ref.length - 1];
     }
 
     // =====================================================================
@@ -846,6 +1199,20 @@ library FlowModel {
         console2.log(
             string.concat(head, "   sigma ", sbps(int256(p.sigmaE2)), " bp/s   drift ", sbps(p.driftE2), " bp/s")
         );
+        console2.log(
+            string.concat(
+                "  CLOCKS: model tick ",
+                u2s(p.tickMs),
+                "ms (",
+                u2s(totalTicks(p)),
+                " ticks)   block time 1s (",
+                u2s(p.horizonSecs),
+                " warps, ",
+                u2s(ticksPerSec(p)),
+                " ticks per second)"
+            )
+        );
+        console2.log("          staleness and the capacity ramp read block.timestamp and stay quantised to 1s.");
         if (p.jumpAtSecs != 0) {
             console2.log(string.concat("  jump ", sbps(p.jumpE2), " bp at t=", u2s(p.jumpAtSecs), "s"));
         }
@@ -865,9 +1232,11 @@ library FlowModel {
                 head,
                 "  capacity ",
                 units(p.askCapacity, p.baseDecimals),
-                " base/epoch  latency ",
-                u2s(p.quoteLatencySecs),
-                "s"
+                " base/epoch  quote latency ",
+                u2s(p.quoteLatencyMs),
+                "ms (",
+                u2s(msToTicks(p.quoteLatencyMs, p)),
+                " ticks)"
             )
         );
         console2.log(
@@ -1006,6 +1375,11 @@ library FlowModel {
                 signedUnits(res.revaluation, quoteDecimals),
                 "   trade PnL ",
                 signedUnits(res.tradePnl, quoteDecimals)
+            )
+        );
+        console2.log(
+            string.concat(
+                "    clocks   ", u2s(res.ticksRun), " model ticks over ", u2s(res.blockSecsAdvanced), " block seconds"
             )
         );
         string memory pushes = string.concat(

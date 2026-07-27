@@ -40,19 +40,38 @@ import {MockERC20} from "../src/mocks/MockERC20.sol";
 /// a derivation attached instead of a shrug.
 ///
 /// =====================================================================================
-/// THE ORDERING INSIDE ONE SECOND, WHICH IS WHERE THE ANSWER LIVES
+/// TWO CLOCKS — what `-vv` output from this file does and does not entitle you to say
+/// =====================================================================================
+///
+/// The loop below runs on a **model tick** of `p.tickMs` milliseconds (default 200) and calls
+/// `vm.warp` once per `1000 / tickMs` ticks, because `block.timestamp` is denominated in whole
+/// seconds and no cheatcode changes that. `FlowModel`'s header states the design; the operational
+/// consequence for a reader of this file is one sentence:
+///
+///   **latency conclusions here are good to 200 ms; staleness conclusions are good to 1 s.**
+///
+/// Anything that comes out of the harness — how long the updater takes to requote, how long the
+/// withdrawal takes to land, when inside a second the searcher gets in — is measured at the tick.
+/// Anything the *contract* computes from `block.timestamp` — `maxStaleSecs`, the `decaySecs`
+/// capacity ramp, `updatedAt` — is measured at the second, at every `tickMs`, and a run at 200 ms
+/// says nothing new about it. The `decaySecs = 60` ramp in `_defended()` is a 60-step staircase
+/// whether the tick is 1,000 ms or 200 ms.
+///
+/// =====================================================================================
+/// THE ORDERING INSIDE ONE MODEL TICK, WHICH IS WHERE THE ANSWER LIVES
 /// =====================================================================================
 ///
 /// ```text
-///   1. the reference moves to ref[t]
+///   0. block time advances, but only on the ticks that cross a second boundary
+///   1. the reference moves to ref[k]
 ///   2. NAV observation A          -> revaluation only; trade PnL must be exactly 0
 ///   3. the LATENCY-ADVANTAGED taker acts, but only when an update is landing this
-///      second: it takes the last look at the about-to-be-replaced ladder
+///      tick: it takes the last look at the about-to-be-replaced ladder
 ///   4. the updater's pending updateQuote lands, if it is due
-///   5. the INFORMED taker acts, per the hazard, against the ladder that is now on chain
+///   5. the INFORMED taker acts, per the per-tick hazard, against the ladder now on chain
 ///   6. the UNINFORMED taker acts, per its Bernoulli arrival, indifferent to price
 ///   7. NAV observation B          -> trade PnL only; revaluation must be exactly 0
-///   8. the updater evaluates its triggers and may schedule a push for t + latency
+///   8. the updater evaluates its triggers and may schedule a push for k + latency ticks
 /// ```
 ///
 /// Step 3 is the whole point of separating the fast taker from the informed one, and step 8's
@@ -60,6 +79,10 @@ import {MockERC20} from "../src/mocks/MockERC20.sol";
 /// its quote can get and how long it stays wrong. `dubu-updater` runs at zero priority fee by
 /// design (`tx.rs` argues why at length, and at 0.001 gwei it is right about the economics), so
 /// on a sequencer that orders by fee, being outbid by a searcher is the ordinary case.
+///
+/// Step 0 is where the second clock shows: at `tickMs = 200` four ticks out of five leave
+/// `block.timestamp` exactly where it was, so four fills out of five in a burst are, to the pool,
+/// simultaneous. That is not a modelling shortcut. It is what a 1 s chain does.
 ///
 /// =====================================================================================
 /// WHAT IS ASSERTED, AS OPPOSED TO PRINTED
@@ -119,29 +142,43 @@ contract SimulationTest is Test {
     // default profile (foundry.toml). A test contract's storage costs nobody anything.
     // =====================================================================
 
+    /// @dev **Every instant in here is a MODEL TICK**, not a second and not a block. The
+    ///      conversions happen once, at the top of `_run`, so that no schedule inside the loop has
+    ///      to know what a millisecond is and so that a unit confusion cannot hide in one branch.
     struct RunState {
         /// @dev The ladder mid the updater has decided on but which has not landed yet.
         uint256 pendingMid;
-        /// @dev Second at which it lands. 0 means nothing is in flight, which is also the
+        /// @dev Tick at which it lands. 0 means nothing is in flight, which is also the
         ///      `PushInFlight` gate `dubu-updater`'s policy module applies: a pair with an
         ///      unconfirmed transaction is not superseded.
         uint256 pendingLandsAt;
         bool pendingRefresh;
         uint256 lastPushAt;
-        /// @dev Second at which a withdrawal triggered by the jump detector LANDS. Zero means none
+        /// @dev Tick at which a withdrawal triggered by the jump detector LANDS. Zero means none
         ///      is in flight. Deliberately a separate slot from `pendingLandsAt`: a withdrawal is
         ///      not subject to the ordinary update policy and must not be gated behind a push that
         ///      is already in flight, which is how `jump.rs` treats it.
         uint256 withdrawLandsAt;
-        /// @dev Second at which quotes may be reposted. While this is in the future the pool
+        /// @dev Tick at which quotes may be reposted. While this is in the future the pool
         ///      quotes nothing, and every arrival in that window is foregone volume — the cost
         ///      side of this defence, counted rather than assumed away.
         uint256 cooloffUntil;
         uint256 jumpsDetected;
         /// @dev Fills that landed after the detector fired but before the withdrawal took effect.
-        ///      This is the number that decides whether the defence is a defence or a wish.
+        ///      This is the number that decides whether the defence is a defence or a wish, and it
+        ///      is the number a sub-second clock exists to resolve: at a 1 s tick a 2 s withdrawal
+        ///      latency is a two-sample window, and "the searcher got in first" and "the searcher
+        ///      got in 1,800 ms before the withdrawal" are the same observation.
         uint256 fillsWhileWithdrawing;
         uint256 arrivalsRefusedInCooloff;
+        // --- the clock, resolved once per run ---
+        uint256 ticksPerSec;
+        uint256 quoteLatencyTicks;
+        uint256 withdrawLatencyTicks;
+        uint256 cooloffTicks;
+        uint256 heartbeatTicks;
+        uint256 decisionTicks;
+        uint256 detectorTicks;
         // The NAV walk's previous observation. Mirrors `risk.rs`'s `prev`.
         uint256 prevQuote;
         uint256 prevBase;
@@ -169,18 +206,25 @@ contract SimulationTest is Test {
     ///        WETH/USDC pool. It is **not** measurable on GIWA: the live pool has had 24 fills,
     ///        all of them ours. This single number decides the verdict more than any other, so
     ///        `test_breakEvenUninformedFlow` sweeps it rather than defending it.
-    ///      * `quoteLatencySecs = 2` — one block to decide plus one to land, at GIWA's 1s
+    ///      * `quoteLatencyMs = 2000` — one block to decide plus one to land, at GIWA's 1s
     ///        cadence. `updater.toml` measures newHeads delivery at 904-997ms, so the decision
     ///        is made on information up to a second old before the transaction is even signed.
+    ///        This is the number `test_sweep_quoteLatencyAcrossTheSecondBoundary` exists to
+    ///        question: GIWA preconfirms flashblocks at ~200 ms, and a bot that polled the
+    ///        `pending` tag instead of waiting for `newHeads` would be at ~400 ms instead.
+    ///      * `tickMs = 200` — the model clock, matching that flashblock cadence. It is a
+    ///        RESOLUTION, not a claim: see the two-clocks note above for what stays quantised at
+    ///        one second regardless. Set it to 1,000 to reproduce the pre-tick model exactly.
     ///      * `informedHalfMaxE2 = 2 * halfSpread` — see `FlowModel`'s header. Tied to the pool's
     ///        own parameter so it cannot be tuned to flatter, and swept anyway.
-    function _defaults() internal pure returns (FlowModel.Params memory p) {
+    function _defaults() internal view returns (FlowModel.Params memory p) {
         p.mid = REF_MID;
         p.priceScaleExp = PRICE_SCALE_EXP;
         p.baseDecimals = 18;
         p.quoteDecimals = 6;
         p.horizonSecs = 3_600;
         p.seed = 20_260_727;
+        p.tickMs = vm.envOr("TICK_MS", uint256(200));
 
         p.sigmaE2 = 100; // 1.00 bp/s
         p.driftE2 = 0;
@@ -191,7 +235,9 @@ contract SimulationTest is Test {
         p.widthBps = 25;
         p.bidCapacity = CAPACITY;
         p.askCapacity = CAPACITY;
-        p.quoteLatencySecs = 2;
+        p.quoteLatencyMs = 2_000;
+        p.decisionIntervalMs = 1_000; // newHeads, once a block. NOT the tick.
+        p.detectorIntervalMs = 200; // jump.rs already scans at 200ms
         p.adverseDriftE2 = 50; // 0.50 bp, from updater.toml
         p.favourableDriftE2 = 800; // 8.00 bp, from updater.toml
         p.heartbeatSecs = 2_400; // from updater.toml
@@ -213,7 +259,7 @@ contract SimulationTest is Test {
         p.halfSpreadCapBps = 0;
         p.jumpThresholdE2 = 0;
         p.cooloffSecs = 0;
-        p.withdrawLatencySecs = 0;
+        p.withdrawLatencyMs = 0;
         p.decaySecs = 0;
     }
 
@@ -232,9 +278,16 @@ contract SimulationTest is Test {
     ///                         above ordinary diffusion, which the baseline showed never produces
     ///                         an informed fill at all.
     ///        COOLOFF=30       from `updater.toml`, half of the volatility tau.
-    ///        WITHDRAW_LAT=2   the withdrawal is a transaction on the same 1s chain the push is.
-    ///                         Setting this to 0 models a wish; the sweep shows what it is worth.
-    ///        DECAY_SECS=60    PropPool's staleness ramp.
+    ///        WITHDRAW_LAT_MS=2000  the withdrawal is a transaction on the same 1s chain the push
+    ///                         is. Setting this to 0 models a wish; the sweep shows what it is
+    ///                         worth. Milliseconds now, because the interesting question is what
+    ///                         happens at 400 — it was `WITHDRAW_LAT` in seconds, and a seconds
+    ///                         parameter could not ask it.
+    ///        DECAY_SECS=60    PropPool's staleness ramp. Stays in SECONDS at every tick size,
+    ///                         because the contract computes it from `block.timestamp`.
+    ///        TICK_MS=200      the model clock. 1000 reproduces the pre-tick model exactly and is
+    ///                         the regression control; anything finer resolves latency and
+    ///                         nothing else. Read on `_defaults`, so it applies to every run.
     ///        JUMP_SIZE_BPS    overrides the scripted jump itself, for the size sweep.
     function _defended() internal view returns (FlowModel.Params memory p) {
         p = _defaults();
@@ -242,22 +295,22 @@ contract SimulationTest is Test {
         p.halfSpreadCapBps = vm.envOr("SPREAD_CAP_BPS", uint256(50));
         p.jumpThresholdE2 = vm.envOr("JUMP_BPS", uint256(25)) * 100;
         p.cooloffSecs = vm.envOr("COOLOFF", uint256(30));
-        p.withdrawLatencySecs = vm.envOr("WITHDRAW_LAT", uint256(2));
+        p.withdrawLatencyMs = vm.envOr("WITHDRAW_LAT_MS", uint256(2_000));
         p.decaySecs = uint16(vm.envOr("DECAY_SECS", uint256(60)));
     }
 
-    function _flat() internal pure returns (FlowModel.Params memory p) {
+    function _flat() internal view returns (FlowModel.Params memory p) {
         p = _defaults();
         p.sigmaE2 = 0;
     }
 
-    function _jump() internal pure returns (FlowModel.Params memory p) {
+    function _jump() internal view returns (FlowModel.Params memory p) {
         p = _defaults();
         p.jumpAtSecs = p.horizonSecs / 2;
-        p.jumpE2 = 10_000; // +100 bp in one second
+        p.jumpE2 = 10_000; // +100 bp in one second, landing inside a single model tick
     }
 
-    function _trend() internal pure returns (FlowModel.Params memory p) {
+    function _trend() internal view returns (FlowModel.Params memory p) {
         p = _defaults();
         p.driftE2 = 20; // +0.20 bp/s == +7.2% over the hour
     }
@@ -305,10 +358,10 @@ contract SimulationTest is Test {
                 "bp  cooloff=",
                 FlowModel.u2s(p.cooloffSecs),
                 "s  withdrawLat=",
-                FlowModel.u2s(p.withdrawLatencySecs),
-                "s  decay=",
+                FlowModel.u2s(p.withdrawLatencyMs),
+                "ms  decay=",
                 FlowModel.u2s(p.decaySecs),
-                "s"
+                "s (quantised to blocks)"
             )
         );
         FlowModel.Result memory b = _run(p);
@@ -317,9 +370,27 @@ contract SimulationTest is Test {
 
         console2.log("");
         console2.log("=== BEFORE vs AFTER =========================================");
-        console2.log(string.concat("  informed fills      ", FlowModel.u2s(a.byPop[FlowModel.POP_INFORMED].fills), " -> ", FlowModel.u2s(b.byPop[FlowModel.POP_INFORMED].fills)));
-        console2.log(string.concat("  uninformed fills    ", FlowModel.u2s(a.byPop[FlowModel.POP_UNINFORMED].fills), " -> ", FlowModel.u2s(b.byPop[FlowModel.POP_UNINFORMED].fills)));
-        console2.log(string.concat("  declined (refused)  ", FlowModel.u2s(a.declinedFills), " -> ", FlowModel.u2s(b.declinedFills)));
+        console2.log(
+            string.concat(
+                "  informed fills      ",
+                FlowModel.u2s(a.byPop[FlowModel.POP_INFORMED].fills),
+                " -> ",
+                FlowModel.u2s(b.byPop[FlowModel.POP_INFORMED].fills)
+            )
+        );
+        console2.log(
+            string.concat(
+                "  uninformed fills    ",
+                FlowModel.u2s(a.byPop[FlowModel.POP_UNINFORMED].fills),
+                " -> ",
+                FlowModel.u2s(b.byPop[FlowModel.POP_UNINFORMED].fills)
+            )
+        );
+        console2.log(
+            string.concat(
+                "  declined (refused)  ", FlowModel.u2s(a.declinedFills), " -> ", FlowModel.u2s(b.declinedFills)
+            )
+        );
         console2.log(string.concat("  jumps detected      0 -> ", FlowModel.u2s(S.jumpsDetected)));
         console2.log(string.concat("  fills while withdrawing  ", FlowModel.u2s(S.fillsWhileWithdrawing)));
         console2.log("  total PnL (quote units, signed):");
@@ -334,6 +405,129 @@ contract SimulationTest is Test {
         for (uint256 i; i < FlowModel.POP_COUNT; ++i) {
             total += res.byPop[i].spread;
         }
+    }
+
+    /// @notice Each defence on its own, then all three, against the same jump on the same path.
+    ///
+    /// @dev `test_defences_beforeAndAfter` gives the headline; this gives the attribution, which
+    ///      is the only way to tell a defence that works from one that is being carried by the
+    ///      others. Run it at both clocks and compare — the two are directly comparable because
+    ///      the path, the seed, the populations and the jump are identical and only the
+    ///      resolution differs:
+    ///
+    ///      ```
+    ///      TICK_MS=1000 forge test --match-test test_defenceIsolation -vv   # the control
+    ///      TICK_MS=200  forge test --match-test test_defenceIsolation -vv   # the finer clock
+    ///      ```
+    ///
+    ///      Expect the withdrawal and the ramp to look *worse* at 200 ms than at 1,000 ms, and
+    ///      expect that to be the honest number rather than a regression. Both are defences whose
+    ///      value is measured in how much of a race they win, and a one-second clock could only
+    ///      score that race to the nearest second — which rounds a searcher who got in 400 ms
+    ///      before the withdrawal into a searcher who did not get in at all.
+    function test_defenceIsolation() public {
+        _sweepHeader(
+            "DEFENCE ISOLATION", "defence", "3600s horizon, +100 bp jump at t=1800, $2M epoch, one defence at a time."
+        );
+        for (uint256 i; i < 5; ++i) {
+            FlowModel.Params memory p = _isolate(i);
+            FlowModel.Result memory res = _run(p);
+            _sweepRow(_isolateLabel(i), "", res, p);
+        }
+        console2.log("  The spread($) column is the number to read across the two clocks: it is the P&L");
+        console2.log("  booked at fill time, unpolluted by the 60s of diffusion that follows a fill.");
+        console2.log("");
+        console2.log("  ONE SEED PER ROW, so a row that moves by less than a thousand dollars has not");
+        console2.log("  moved. Two of these three defences are worth about that much, which is the point:");
+        console2.log("");
+        console2.log("  * The capacity ramp is arithmetically incapable of more. It haircuts depth by");
+        console2.log("    age/decaySecs, the bot requotes every ~2s, and 2/60 is a 3.3% ceiling on a 3.3%");
+        console2.log("    ceiling on a $16k pick-off -- about $520 at the very most, and only if the gap");
+        console2.log("    lands at the oldest moment of the cycle. Whether a given run gets 0% or 1.7% is");
+        console2.log("    decided by whether the pick-off tick coincides with a push landing, which is");
+        console2.log("    phase, not defence. DECAY_SECS=3 makes it bite properly (-$11,213 here, a $4,400");
+        console2.log("    saving) and is a different, much more expensive trade: it refuses depth to");
+        console2.log("    everyone, all the time, to be ready for a gap that arrives once an hour.");
+        console2.log("  * The jump withdrawal does nothing at a 2,000ms withdrawal latency, at either");
+        console2.log("    clock, because it loses a race it starts level in -- the detector and the");
+        console2.log("    searcher both fire on the tick the gap prints. Sub-second is the only version of");
+        console2.log("    it that works; test_theWithdrawalRaceAcrossTheSecondBoundary is that measurement");
+        console2.log("    and it is the one thing in this file the finer clock changed the answer to.");
+        console2.log("  * The vol-scaled spread is the only row that moves for a reason, and it moves the");
+        console2.log("    same ~$1,600 at both clocks -- it raises the absorption limit, which is a");
+        console2.log("    property of the ladder and has nothing to do with time at all.");
+    }
+
+    /// @dev Built by switching defences OFF a fully defended run rather than ON a bare one, so
+    ///      that every row uses the same values — including the environment overrides — and a
+    ///      tuned `S1_E2` cannot apply to the combined row while the isolated row silently keeps
+    ///      the old default.
+    function _isolate(uint256 i) internal view returns (FlowModel.Params memory p) {
+        p = _jumpDefended();
+        if (i != 1 && i != 4) {
+            p.s1E2 = 0;
+            p.halfSpreadCapBps = 0;
+        }
+        if (i != 2 && i != 4) {
+            p.jumpThresholdE2 = 0;
+            p.cooloffSecs = 0;
+            p.withdrawLatencyMs = 0;
+        }
+        if (i != 3 && i != 4) p.decaySecs = 0;
+    }
+
+    function _isolateLabel(uint256 i) internal pure returns (string memory) {
+        if (i == 0) return "control (none)";
+        if (i == 1) return "vol-scaled spread";
+        if (i == 2) return "jump withdrawal";
+        if (i == 3) return "capacity ramp";
+        return "all three";
+    }
+
+    /// @notice **The regression control.** At a 1,000 ms tick this model must be the model it was
+    ///         before it had a tick at all — not close, identical.
+    ///
+    /// @dev The two numbers below are today's measured output, hard-coded, which is a thing this
+    ///      file otherwise refuses to do on the grounds that writing down a run's own result turns
+    ///      it into a requirement. The exception is deliberate and narrow: these are not claims
+    ///      about the pool, they are claims about the *instrument*. Their job is to fail if a
+    ///      change to `tickMs` handling alters the experiment rather than its resolution, and a
+    ///      tolerance would let exactly the errors worth catching through.
+    ///
+    ///      Exact equality is available because the rescalings were built to collapse at
+    ///      `tickMs = 1000`: `isqrt(1000 * 1000)` is exactly 1,000 so the path amplitude reduces
+    ///      to the old `sigma * 1732/1000`; the differenced drift reduces to `driftE2`;
+    ///      `informedHazardPerTick` returns the per-second hazard unchanged at one tick per
+    ///      second; `uninformedRatePerTick` truncates to the same integer; `msToTicks` maps 2,000
+    ///      ms to 2 ticks; and the trailing-window jump detector reaches back exactly one entry.
+    ///      Every RNG draw therefore comes from the same modulus in the same order.
+    ///
+    ///      If this test fails, nothing else in this file means anything until it passes again.
+    function test_theOneSecondControlReproducesTheOldModel() public {
+        FlowModel.Params memory bare = _jump();
+        bare.tickMs = 1_000;
+        FlowModel.Result memory a = _run(bare);
+
+        FlowModel.Params memory defended = _jumpDefended();
+        defended.tickMs = 1_000;
+        FlowModel.Result memory b = _run(defended);
+
+        console2.log("");
+        FlowModel.rule();
+        console2.log(" ONE-SECOND CONTROL: this model at tickMs=1000 vs the model before it had ticks");
+        FlowModel.rule();
+        console2.log(
+            string.concat("  no defences, expected -15757.945680  got ", FlowModel.signedUnits(_totalPnl(a), 6))
+        );
+        console2.log(
+            string.concat("  all defences, expected -13940.431511  got ", FlowModel.signedUnits(_totalPnl(b), 6))
+        );
+        FlowModel.rule();
+
+        assertEq(_totalPnl(a), -15_757_945_680, "the 1s control no longer reproduces the pre-tick model (undefended)");
+        assertEq(_totalPnl(b), -13_940_431_511, "the 1s control no longer reproduces the pre-tick model (defended)");
+        assertEq(a.ticksRun, 3_600, "a 3600s horizon at a 1000ms tick is 3600 ticks");
+        assertEq(a.blockSecsAdvanced, 3_600, "the block clock did not advance once per tick at tickMs=1000");
     }
 
     // =====================================================================
@@ -391,7 +585,7 @@ contract SimulationTest is Test {
         assertLt(res.byPop[FlowModel.POP_FAST].mo60, 0, "a pick-off that made the pool money is not a pick-off");
     }
 
-    /// @notice Diffusion only, no jump. The quote is never more than `quoteLatencySecs` stale, so
+    /// @notice Diffusion only, no jump. The quote is never more than `quoteLatencyMs` stale, so
     ///         the pool is picked off only when the walk moves more than the half-spread inside
     ///         that window — a ~3.5 sigma event at these settings.
     function test_simulation_diffusionOnly() public {
@@ -491,20 +685,342 @@ contract SimulationTest is Test {
         console2.log("  is what that sentence costs when the number is set by how much volume you want.");
     }
 
-    /// @notice The other lever the pool controls: how long a wrong quote stays up.
-    function test_sweep_quoteLatency() public {
-        uint256[4] memory lat = [uint256(1), 2, 5, 10];
-        _sweepHeader("QUOTE LATENCY", "latency       ");
-        for (uint256 i; i < lat.length; ++i) {
-            FlowModel.Params memory p = _jump();
-            p.horizonSecs = 900;
-            p.jumpAtSecs = 450;
-            p.quoteLatencySecs = lat[i];
-            FlowModel.Result memory res = _run(p);
-            _sweepRow(string.concat(FlowModel.u2s(lat[i]), "s"), "", res, p);
+    /// @notice **The sub-second deliverable.** How long a wrong quote stays up, swept ACROSS the
+    ///         one-second boundary the old model could not see past.
+    ///
+    /// @dev This test is the reason `tickMs` exists. The previous version of it swept 1/2/5/10
+    ///     seconds, reported the total loss as "roughly flat", and that was read as "do not try to
+    ///     solve this with speed". **That conclusion was only ever valid at or above one second**,
+    ///     because the loop was `for t = 1..horizonSecs` with `vm.warp(T0 + t)` and one second was
+    ///     the finest thing the model could represent. A sweep cannot find an effect below its own
+    ///     resolution and then be quoted as evidence the effect is absent.
+    ///
+    ///     The rows below run at a 200 ms model tick so that 200 ms and 400 ms are real points
+    ///     rather than rounding artefacts, and they keep the 1 s / 2 s / 5 s points so the new
+    ///     numbers sit in the same table as the old conclusion. 2,000 ms is what the bot has
+    ///     today: wake on `newHeads` at 1 Hz, land a block later. ~400 ms is what polling GIWA's
+    ///     flashblocks `pending` tag at 200 ms would give.
+    ///
+    ///     **Two columns, because there are two different builds and only one of them is cheap.**
+    ///     `decisionIntervalMs` is how often the bot looks; `quoteLatencyMs` is how long its
+    ///     transaction then takes to land. Shortening the second without the first is a
+    ///     transaction-routing change; shortening both is a new event loop. Reporting one number
+    ///     would let the reader attribute the whole effect to whichever they had in mind.
+    function test_sweep_quoteLatencyAcrossTheSecondBoundary() public {
+        uint256[5] memory latMs = [uint256(200), 400, 1_000, 2_000, 5_000];
+
+        _latencyHeader("LANDING LATENCY ONLY -- 1 Hz newHeads polling held FIXED", LATENCY_SEEDS);
+        for (uint256 i; i < latMs.length; ++i) {
+            _latencyRow(
+                string.concat(FlowModel.u2s(latMs[i]), "ms"), _quoteLatCfg(latMs[i], 1_000, 1_000_000, LATENCY_SEEDS)
+            );
         }
-        console2.log("  Latency does not change the SIZE of the pick-off -- the first taker clears the");
-        console2.log("  epoch either way -- it changes how many separate windows exist to be picked off in.");
+        console2.log("  The tx lands faster; the bot still only looks once a second. This row set answers");
+        console2.log("  'is a better transaction path worth it on its own'.");
+
+        _latencyHeader("THE WHOLE LOOP AT THAT LATENCY -- polling MOVED WITH the landing latency", LATENCY_SEEDS);
+        for (uint256 i; i < latMs.length; ++i) {
+            _latencyRow(
+                string.concat(FlowModel.u2s(latMs[i]), "ms"), _quoteLatCfg(latMs[i], latMs[i], 1_000_000, LATENCY_SEEDS)
+            );
+        }
+        console2.log("  This is the flashblocks build: poll `pending` at 200ms AND land in a preconf.");
+
+        _printPickOffMechanism();
+
+        console2.log("");
+        console2.log("  READ THIS BEFORE QUOTING A ROW. The two tables agree with each other and with the");
+        console2.log("  mechanism: crossing the one-second boundary takes the pool from picked off on every");
+        console2.log("  seed to picked off on most of them, worth ~$2,200 of the ~$16,500 a gap costs. And");
+        console2.log("  200ms is indistinguishable from 400ms, so the whole of the available gain sits AT");
+        console2.log("  the boundary and nothing below it buys anything more. Moving the polling loop as");
+        console2.log("  well as the landing adds nothing measurable, because the requote is not what the");
+        console2.log("  searcher is racing -- it fires in the same tick the gap prints, before any requote");
+        console2.log("  decided on that gap could possibly land, at any latency. What a shorter window");
+        console2.log("  removes is the searcher's SECOND through Nth attempt, never its first.");
+        console2.log("");
+        console2.log("  So a 13% expected saving is the ceiling on what requoting faster is worth, it is");
+        console2.log("  bounded by a single draw of the hazard, and two other tests are needed before");
+        console2.log("  anyone spends a week on it: the withdrawal race, which is worth more, and the");
+        console2.log("  searcher's reaction rate, which decides whether either is worth anything at all.");
+    }
+
+    /// @notice **Where a sub-second clock actually changes an answer: the withdrawal race.**
+    ///
+    /// @dev The requote race cannot be won at any latency — the searcher acts in the same tick the
+    ///      gap prints. The WITHDRAWAL race is different in one specific way that matters: the
+    ///      detector also fires in that tick (`jump.rs` scans at 200 ms), so the two start
+    ///      together and the winner is decided by whether `refreshCapacity(id, 0, 0)` lands before
+    ///      the searcher's second attempt. At a one-second model tick that question could not be
+    ///      asked, because the smallest representable withdrawal latency was 1,000 ms and the
+    ///      searcher's first attempt already sat inside it.
+    ///
+    ///      Two blocks, and the second one is the point. Against a searcher that needs a second to
+    ///      react, a 400 ms withdrawal wins often enough to matter. Against one that reacts inside
+    ///      200 ms, it never wins, because it is not racing the searcher's second attempt any more
+    ///      — the first one already took the epoch.
+    function test_theWithdrawalRaceAcrossTheSecondBoundary() public {
+        uint256[4] memory wlat = [uint256(200), 400, 1_000, 2_000];
+        uint256 seeds = 6;
+
+        _latencyHeader("JUMP WITHDRAWAL vs a searcher reacting at 1.00/s", seeds);
+        _latencyRow("none", _quoteLatCfg(2_000, 1_000, 1_000_000, seeds));
+        for (uint256 i; i < wlat.length; ++i) {
+            _latencyRow(
+                string.concat(FlowModel.u2s(wlat[i]), "ms"),
+                LatCfg({
+                    quoteLatencyMs: 2_000,
+                    decisionIntervalMs: 1_000,
+                    withdrawLatencyMs: wlat[i],
+                    maxPerSecE6: 1_000_000,
+                    seeds: seeds
+                })
+            );
+        }
+
+        _latencyHeader("THE SAME, vs a searcher reacting at 5.00/s", seeds);
+        _latencyRow("none", _quoteLatCfg(2_000, 1_000, 5_000_000, seeds));
+        for (uint256 i; i < wlat.length; ++i) {
+            _latencyRow(
+                string.concat(FlowModel.u2s(wlat[i]), "ms"),
+                LatCfg({
+                    quoteLatencyMs: 2_000,
+                    decisionIntervalMs: 1_000,
+                    withdrawLatencyMs: wlat[i],
+                    maxPerSecE6: 5_000_000,
+                    seeds: seeds
+                })
+            );
+        }
+
+        console2.log("");
+        console2.log("  A single seed of the top block reported the 400ms withdrawal ELIMINATING adverse");
+        console2.log("  selection -- toxic share 92.76% -> 0.00%, a $15,600 loss turned into a $66 profit.");
+        console2.log("  It is not true, and the shape of the error is the one this file has made before:");
+        console2.log("  a number moved a very long way in the desired direction on one sample of a rare");
+        console2.log("  binary event. The seeded columns above are what it actually does.");
+    }
+
+    /// @dev Eight seeds per row, and the seed count is not decoration. The first cut of this sweep
+    ///      ran one seed and produced a 400 ms row showing a +$38 PROFIT sitting between two rows
+    ///      that each lost ~$16,000. Nothing about a maker's transaction landing 400 ms after it
+    ///      is signed rather than 200 ms makes a searcher walk away from a 100 bp gap on a $2M
+    ///      epoch, so the row was not a finding, it was a coin landing on its edge: at these
+    ///      settings a searcher gets one Bernoulli draw per 200 ms tick at ~60%, a 400 ms window
+    ///      is two draws, and two misses is a 16% event. A single-seed sweep of a rare, enormous,
+    ///      binary loss reports its own sampling noise with a straight face.
+    ///
+    ///      Eight seeds is still few. It is enough to separate "the pool is picked off almost
+    ///      always" from "the pool is picked off most of the time", which is the whole size of the
+    ///      effect on offer, and the `picked off` column reports the raw count so a reader can see
+    ///      the sample rather than infer it from an average.
+    uint256 internal constant LATENCY_SEEDS = 8;
+
+    /// @notice One row of a seed-averaged latency sweep.
+    /// @dev A struct rather than five arguments, for the reason `FlowModel.Solve` documents.
+    struct LatCfg {
+        uint256 quoteLatencyMs;
+        uint256 decisionIntervalMs;
+        /// @dev Non-zero turns the jump-withdrawal defence ON at that latency. Zero leaves the
+        ///      pool undefended, which is the baseline every latency row is measured against.
+        uint256 withdrawLatencyMs;
+        uint256 maxPerSecE6;
+        uint256 seeds;
+    }
+
+    function _latencyHeader(string memory title, uint256 seeds) internal pure {
+        console2.log("");
+        FlowModel.rule();
+        console2.log(string.concat(" SWEEP: ", title));
+        console2.log(
+            string.concat(
+                "   300s horizon, +100 bp jump at t=150, $2M epoch, 200ms model tick, ",
+                FlowModel.u2s(seeds),
+                " seeds a row."
+            )
+        );
+        FlowModel.rule();
+        console2.log("  latency      picked off   mean spread($)   mean MO+60s($)   worst seed($)");
+    }
+
+    function _latencyRow(string memory label, LatCfg memory c) internal {
+        int256 sumSpread;
+        int256 sumMo60;
+        int256 worst;
+        uint256 pickedOff;
+
+        for (uint256 s; s < c.seeds; ++s) {
+            FlowModel.Params memory p = _jump();
+            p.horizonSecs = 300;
+            p.jumpAtSecs = 150;
+            p.tickMs = 200;
+            p.quoteLatencyMs = c.quoteLatencyMs;
+            p.decisionIntervalMs = c.decisionIntervalMs;
+            p.informedMaxPerSecE6 = c.maxPerSecE6;
+            if (c.withdrawLatencyMs != 0) {
+                p.jumpThresholdE2 = 2_500; // 25 bp, the deployed trip
+                p.cooloffSecs = 30;
+                p.withdrawLatencyMs = c.withdrawLatencyMs;
+            }
+            p.seed = p.seed + s * 7_919; // a prime stride, so the streams do not overlap
+
+            FlowModel.Result memory res = _run(p);
+            FlowModel.Accum memory all = _total(res);
+
+            sumSpread += all.spread;
+            sumMo60 += all.mo60;
+            if (all.spread < worst) worst = all.spread;
+            if (res.byPop[FlowModel.POP_INFORMED].fills + res.byPop[FlowModel.POP_FAST].fills != 0) pickedOff += 1;
+        }
+
+        // forge-lint: disable-next-line(unsafe-typecast)
+        int256 n = int256(c.seeds);
+        console2.log(
+            string.concat(
+                "  ",
+                FlowModel.pad(label, 13),
+                FlowModel.pad(string.concat(FlowModel.u2s(pickedOff), "/", FlowModel.u2s(c.seeds)), 13),
+                FlowModel.pad(FlowModel.signedUnits(sumSpread / n, 6), 17),
+                FlowModel.pad(FlowModel.signedUnits(sumMo60 / n, 6), 17),
+                FlowModel.signedUnits(worst, 6)
+            )
+        );
+    }
+
+    function _quoteLatCfg(uint256 latMs, uint256 decisionMs, uint256 maxPerSecE6, uint256 seeds)
+        internal
+        pure
+        returns (LatCfg memory)
+    {
+        return LatCfg({
+            quoteLatencyMs: latMs,
+            decisionIntervalMs: decisionMs,
+            withdrawLatencyMs: 0,
+            maxPerSecE6: maxPerSecE6,
+            seeds: seeds
+        });
+    }
+
+    /// @notice The mechanism the tables above are a noisy sample of, computed exactly.
+    ///
+    /// @dev Printing this next to the simulation is the difference between a result and a number.
+    ///      The pick-off is a race between one searcher and one requote, and its outcome is a
+    ///      geometric trial: the searcher gets one draw per model tick at the per-tick hazard, the
+    ///      window is the latency, so `P(taken) = 1 - (1 - q)^L`. That is what the sweep measures,
+    ///      and it says where any sub-second gain would have to come from — not from a smaller
+    ///      loss, since the absorption rule fixes the loss GIVEN a pick-off at
+    ///      `(error - halfSpread - width/2) x depth` regardless of latency, but from a lower
+    ///      PROBABILITY of one happening at all.
+    ///
+    ///      It also says exactly what that gain is hostage to, which is the next test.
+    function _printPickOffMechanism() internal view {
+        FlowModel.Params memory p = _jump();
+        p.tickMs = 200;
+
+        // ~94 bp: a 100 bp gap measured against a ladder whose top ask sits 5 bp above the
+        // pre-jump mid, which is where the executable top lands at zero epoch usage.
+        uint256 q = FlowModel.informedHazardPerTick(9_400, p);
+
+        console2.log("");
+        FlowModel.rule();
+        console2.log(" THE MECHANISM, EXACTLY: P(picked off) = 1 - (1 - q)^L on a 94 bp gap");
+        console2.log(
+            string.concat(
+                "   per-200ms-tick hazard q = ",
+                FlowModel.pct2(q / 100),
+                "%    per-second = ",
+                FlowModel.pct2(FlowModel.informedHazard(9_400, p) / 100),
+                "%"
+            )
+        );
+        FlowModel.rule();
+        console2.log("   latency     window (ticks)   P(the pool is picked off at all)");
+
+        uint256[5] memory latMs = [uint256(200), 400, 1_000, 2_000, 5_000];
+        for (uint256 i; i < latMs.length; ++i) {
+            uint256 ticks = latMs[i] / 200;
+            uint256 survive = FlowModel.PROB_ONE;
+            for (uint256 j; j < ticks; ++j) {
+                survive = (survive * (FlowModel.PROB_ONE - q)) / FlowModel.PROB_ONE;
+            }
+            console2.log(
+                string.concat(
+                    "   ",
+                    FlowModel.pad(string.concat(FlowModel.u2s(latMs[i]), "ms"), 12),
+                    FlowModel.pad(FlowModel.u2s(ticks), 17),
+                    FlowModel.pct2((FlowModel.PROB_ONE - survive) / 100),
+                    "%"
+                )
+            );
+        }
+        FlowModel.rule();
+    }
+
+    /// @notice **The adversarial reading of the sweep above, and it does not survive it.**
+    ///
+    /// @dev Any sub-second gain in `test_sweep_quoteLatencyAcrossTheSecondBoundary` comes from one
+    ///      place: a 200 ms window is one draw at the per-tick hazard instead of five, so the
+    ///      searcher sometimes fails to arrive before the requote. That is entirely a statement
+    ///      about `informedMaxPerSecE6`, the ceiling on how fast the fastest searcher can react,
+    ///      and its default of 1.0/s means **the quickest arbitrageur on the chain takes about a
+    ///      second to notice a 100 bp gap and get a transaction in.**
+    ///
+    ///      At a one-second tick that assumption was invisible and harmless. It said "the pick-off
+    ///      happens in the tick where the gap appears", which is the same thing every faster
+    ///      assumption also says at that resolution — the model could not tell them apart, so the
+    ///      ceiling never had to be defended. A 200 ms clock makes it load-bearing and makes it
+    ///      say something much stronger and much less plausible. `FlowModel`'s own header derives
+    ///      the ceiling from "the block time is 1 second", which was a fact about how often a
+    ///      pick-off can *settle*, not about how fast a searcher can *see*. GIWA preconfirms
+    ///      flashblocks every 200 ms; if the maker is allowed to use them then so is the searcher,
+    ///      and the searcher is the one holding a five-figure option.
+    ///
+    ///      So the sweep is re-run against searchers that react at 1/s, 2/s and 5/s. If the
+    ///      sub-second advantage only exists against the slowest of the three, it is not a
+    ///      property of latency, it is a property of an unmeasured parameter that happened to be
+    ///      calibrated to the old tick size — and the correct engineering conclusion is the
+    ///      opposite of the encouraging one.
+    ///
+    ///      This is the same standard that caught "the defences eliminated adverse selection
+    ///      entirely, informed fills 1 -> 0": prefer a result you can explain to one you like.
+    function test_theSubSecondGainIsHostageToTheSearchersReactionRate() public {
+        uint256[3] memory rates = [uint256(1_000_000), 2_000_000, 5_000_000];
+        uint256[3] memory latMs = [uint256(200), 1_000, 5_000];
+
+        uint256 seeds = 6;
+        for (uint256 rr; rr < rates.length; ++rr) {
+            _latencyHeader(
+                string.concat(
+                    "SEARCHER REACTS AT ", FlowModel.pct2(rates[rr] / 10_000), "/s -- whole loop at the latency"
+                ),
+                seeds
+            );
+            for (uint256 i; i < latMs.length; ++i) {
+                _latencyRow(
+                    string.concat(FlowModel.u2s(latMs[i]), "ms"), _quoteLatCfg(latMs[i], latMs[i], rates[rr], seeds)
+                );
+            }
+        }
+
+        console2.log("");
+        FlowModel.rule();
+        console2.log(" WHAT THE THREE BLOCKS SAY, at 200ms of latency:");
+        FlowModel.rule();
+        console2.log("   1.00/s  the searcher needs a second to see a 100 bp gap. It gets one draw at ~59%");
+        console2.log("           inside the window, plus the latency-advantaged taker's coin flip on the");
+        console2.log("           tick the requote lands, so the pool escapes about one run in six.");
+        console2.log("   2.00/s  the searcher needs half a second. The per-tick hazard saturates and the");
+        console2.log("           escape is already gone: 6/6 picked off, and 200ms is worth $79 against");
+        console2.log("           1000ms -- a tenth of one percent of the loss, which is nothing.");
+        console2.log("   5.00/s  the searcher reacts within 200ms, the same preconfirmation cadence the");
+        console2.log("           maker would be buying. Identical to 2.00/s: the first tick after the gap");
+        console2.log("           is taken with certainty and latency stops mattering entirely.");
+        console2.log("");
+        console2.log("   So the sub-second gain does not survive a searcher twice as fast as the default,");
+        console2.log("   let alone one that uses the flashblocks the maker is proposing to buy. Nobody has");
+        console2.log("   measured this rate on GIWA. It is not a parameter of the pool, it is a property of");
+        console2.log("   the people watching it, and it is the entire case for spending money on speed.");
+        FlowModel.rule();
     }
 
     /// @notice The honesty requirement, executed. `e50` is the parameter that most directly sets
@@ -712,8 +1228,15 @@ contract SimulationTest is Test {
 
     /// @notice The arrival function's shape, printed so a reader can argue with it, and asserted
     ///         so it cannot silently change.
-    function test_informedArrivalFunctionShape() public pure {
+    ///
+    /// @dev The per-tick column is the one to look at after the two-clock change. It is NOT
+    ///      `lambda / 5`: the hazard describes a race with one winner, so what must survive a
+    ///      change of clock is the probability the gap is taken at all within the second, and the
+    ///      last column shows that it does. See `FlowModel.informedHazardPerTick`.
+    function test_informedArrivalFunctionShape() public view {
         FlowModel.Params memory p = _defaults();
+        p.tickMs = 200;
+        uint256 n = FlowModel.ticksPerSec(p);
 
         console2.log("");
         FlowModel.rule();
@@ -724,29 +1247,48 @@ contract SimulationTest is Test {
                 FlowModel.sbps(int256(p.informedHalfMaxE2)),
                 " bp    cost = ",
                 FlowModel.sbps(int256(p.informedCostE2)),
-                " bp    max = 1.00/s"
+                " bp    max = 1.00/s    tick = 200ms"
             )
         );
         FlowModel.rule();
-        console2.log("   edge (bp)   arrivals/sec   P(at least one within a 2s stale window)");
+        console2.log("   edge (bp)   arrivals/sec   P(per 200ms tick)   P(>=1 in one second)   naive lambda/5");
 
         uint256[9] memory edges = [uint256(0), 50, 100, 200, 500, 1_000, 2_000, 5_000, 20_000];
         for (uint256 i; i < edges.length; ++i) {
             // forge-lint: disable-next-line(unsafe-typecast)
             uint256 lambda = FlowModel.informedHazard(int256(edges[i]), p);
-            // 1 - (1-l)^2, in the same 1e6 units.
-            uint256 miss = ((FlowModel.PROB_ONE - lambda) * (FlowModel.PROB_ONE - lambda)) / FlowModel.PROB_ONE;
+            // forge-lint: disable-next-line(unsafe-typecast)
+            uint256 perTick = FlowModel.informedHazardPerTick(int256(edges[i]), p);
+
+            // P(at least one in a second) rebuilt from the per-tick probability. It must come back
+            // to lambda, which is the invariant the whole conversion exists to hold.
+            uint256 survive = FlowModel.PROB_ONE;
+            for (uint256 j; j < n; ++j) {
+                survive = (survive * (FlowModel.PROB_ONE - perTick)) / FlowModel.PROB_ONE;
+            }
+            assertApproxEqAbs(
+                FlowModel.PROB_ONE - survive, lambda, 20, "the per-tick hazard did not rebuild the per-second one"
+            );
+
             console2.log(
                 string.concat(
                     "   ",
                     // forge-lint: disable-next-line(unsafe-typecast)
                     FlowModel.pad(FlowModel.sbps(int256(edges[i])), 12),
                     FlowModel.pad(FlowModel.pct2(lambda / 10_000), 15),
-                    FlowModel.pct2((FlowModel.PROB_ONE - miss) / 100),
+                    FlowModel.pad(string.concat(FlowModel.pct2(perTick / 100), "%"), 20),
+                    FlowModel.pad(string.concat(FlowModel.pct2((FlowModel.PROB_ONE - survive) / 100), "%"), 23),
+                    FlowModel.pct2(lambda / n / 100),
                     "%"
                 )
             );
         }
+        FlowModel.rule();
+        console2.log("   The last two columns are the whole point. Column 4 is invariant to the tick by");
+        console2.log("   construction; column 5 is what a linear rescaling would have used, and at the");
+        console2.log("   saturated top row it is 20.00% per tick -- 67% per second against a true 100%.");
+        console2.log("   A 200ms run built on column 5 would show the pool losing less to a jump because");
+        console2.log("   the searcher had been quietly disabled, and it would read as a latency finding.");
         FlowModel.rule();
 
         // Zero at and below the taker's own cost. Not asymptotically zero -- zero.
@@ -768,6 +1310,118 @@ contract SimulationTest is Test {
         // forge-lint: disable-next-line(unsafe-typecast)
         uint256 atHalf = FlowModel.informedHazard(int256(p.informedCostE2 + p.informedHalfMaxE2), p);
         assertEq(atHalf, p.informedMaxPerSecE6 / 2, "e50 is not the half-max point");
+    }
+
+    /// @notice **The invariant the whole two-clock change rests on:** changing `tickMs` changes
+    ///         the model's resolution and not its experiment.
+    ///
+    /// @dev Three populations, three different right answers, and confusing any two of them would
+    ///      have silently changed what is being measured while looking like a finding about
+    ///      latency. So each is measured rather than argued:
+    ///
+    ///        1. **The reference path.** Per-second realised variance must be the same at every
+    ///           tick, which needs the SQUARE ROOT rescaling. Measured on a real path, not on the
+    ///           algebra that built it, because the algebra is what is being checked. A linear
+    ///           rescaling would show up here as a 200 ms path with a fifth of the variance.
+    ///        2. **Uninformed arrivals.** Expected fills per wall-clock hour must be the same at
+    ///           every tick, which needs a LINEAR rescaling. It is a counting process; its
+    ///           invariant is a mean.
+    ///        3. **Informed arrivals.** `P(the gap is taken within a second)` must be the same at
+    ///           every tick, which needs NEITHER — see `FlowModel.informedHazardPerTick`. It is a
+    ///           race with one winner; its invariant is a probability. Asserted in
+    ///           `test_informedArrivalFunctionShape`, where the table that shows it is printed.
+    function test_tickRescalingIsResolutionNotExperiment() public view {
+        uint256[4] memory ticks = [uint256(1_000), 500, 200, 100];
+
+        console2.log("");
+        FlowModel.rule();
+        console2.log(" RESCALING INVARIANTS ACROSS tickMs   (sigma 1.00 bp/s, 3600s of path)");
+        FlowModel.rule();
+        console2.log("   tickMs   ticks/s   realised sigma/s   uninformed fills/hr   informed P(>=1 in 1s) at 100bp");
+
+        for (uint256 i; i < ticks.length; ++i) {
+            FlowModel.Params memory p = _defaults();
+            p.tickMs = ticks[i];
+            p.jumpAtSecs = 0;
+            p.driftE2 = 0;
+
+            uint256 sigmaMeasured = _realisedSigmaPerSecE2(p);
+            uint256 fillsPerHourE6 = FlowModel.uninformedRatePerTick(p) * FlowModel.ticksPerSec(p) * 3_600;
+            uint256 takenInASecond = _informedProbPerSec(p, 10_000);
+            uint256 hazardPerSec = FlowModel.informedHazard(10_000, p);
+
+            console2.log(
+                string.concat(
+                    "   ",
+                    FlowModel.pad(FlowModel.u2s(ticks[i]), 9),
+                    FlowModel.pad(FlowModel.u2s(FlowModel.ticksPerSec(p)), 10),
+                    // forge-lint: disable-next-line(unsafe-typecast)
+                    FlowModel.pad(string.concat(FlowModel.sbps(int256(sigmaMeasured)), " bp"), 19),
+                    FlowModel.pad(FlowModel.pct2(fillsPerHourE6 / 10_000), 22),
+                    FlowModel.pct2(takenInASecond / 100),
+                    "%"
+                )
+            );
+
+            // 1. Volatility. A 10% band around the nominal 1.00 bp/s: wide enough to absorb the
+            //    integer truncation of a small per-tick amplitude and the sampling error of 3,600
+            //    observations, and nowhere near wide enough to hide a linear-instead-of-sqrt
+            //    rescaling, which would land at 0.45 bp/s (500 ms) or 0.32 bp/s (100 ms).
+            assertApproxEqAbs(sigmaMeasured, p.sigmaE2, p.sigmaE2 / 10, "per-second volatility moved with the tick");
+
+            // 2. Volume, to a tenth of a percent. The residual is the integer truncation of the
+            //    per-tick probability into `PROB_ONE` units — 16,666 rather than 16,666.67 at one
+            //    second, which is a rounding the pre-tick model already had and which the control
+            //    reproduces exactly. It grows with the number of ticks and is 0.04% at 100 ms.
+            assertApproxEqAbs(
+                fillsPerHourE6,
+                p.uninformedPerHour * FlowModel.PROB_ONE,
+                (p.uninformedPerHour * FlowModel.PROB_ONE) / 1_000,
+                "uninformed arrivals per hour moved with the tick"
+            );
+
+            // 3. The race. `informedHazard` IS the per-second probability by definition, so
+            //    rebuilding it from the per-tick draws is a closed loop: if these two disagree,
+            //    the per-tick conversion has changed how often the pool gets picked off.
+            //    A 100 bp edge is near saturation but not at it (0.9899/s), which makes this a
+            //    sharper check than a saturated edge would be — the ceiling would hide an error.
+            assertApproxEqAbs(takenInASecond, hazardPerSec, 20, "P(picked off within a second) moved with the tick");
+        }
+        FlowModel.rule();
+        console2.log("   If the volatility column drifts, every latency conclusion downstream of it is");
+        console2.log("   measuring the rescaling. That is why it is measured on a built path rather than");
+        console2.log("   asserted from the formula that builds it.");
+    }
+
+    /// @dev Realised standard deviation of the path's ONE-SECOND returns, in hundredths of a bp.
+    ///      Sampled at second boundaries so the statistic means the same thing at every `tickMs`
+    ///      — comparing per-tick moves across resolutions would compare different quantities.
+    function _realisedSigmaPerSecE2(FlowModel.Params memory p) internal pure returns (uint256) {
+        uint256[] memory ref = FlowModel.buildPath(p);
+        uint256 tps = FlowModel.ticksPerSec(p);
+        uint256 n = p.horizonSecs;
+
+        uint256 sumSq;
+        for (uint256 s = 1; s <= n; ++s) {
+            uint256 a = ref[(s - 1) * tps];
+            uint256 b = ref[s * tps];
+            uint256 d = b > a ? b - a : a - b;
+            uint256 rel = (d * FlowModel.BPS_E2) / a; // hundredths of a bp
+            sumSq += rel * rel;
+        }
+        // Mean zero by construction (no drift), so the second moment is the variance.
+        return FlowModel.isqrt(sumSq / n);
+    }
+
+    /// @dev `P(at least one informed arrival within one wall-clock second)`, rebuilt from the
+    ///      per-tick probability the run loop actually draws against.
+    function _informedProbPerSec(FlowModel.Params memory p, int256 edgeE2) internal pure returns (uint256) {
+        uint256 perTick = FlowModel.informedHazardPerTick(edgeE2, p);
+        uint256 survive = FlowModel.PROB_ONE;
+        for (uint256 j; j < FlowModel.ticksPerSec(p); ++j) {
+            survive = (survive * (FlowModel.PROB_ONE - perTick)) / FlowModel.PROB_ONE;
+        }
+        return FlowModel.PROB_ONE - survive;
     }
 
     /// @notice The size distribution really is heavy-tailed, and the tail index is the one
@@ -890,7 +1544,26 @@ contract SimulationTest is Test {
     // The run loop
     // =====================================================================
 
+    /// @notice One run, on the model clock, warping the block clock underneath it.
+    ///
+    /// @dev The loop index `k` is a MODEL TICK and every schedule inside `RunState` is denominated
+    ///      in the same unit. `vm.warp` is called with `T0 + tickToBlockSecs(k)`, which at
+    ///      `tickMs = 1000` is `T0 + k` — the old loop exactly — and at 200 ms leaves the
+    ///      timestamp alone on four ticks out of five.
+    ///
+    ///      Warping to the value it already holds is a no-op, so the call is made unconditionally
+    ///      rather than guarded. `blockSecsAdvanced` counts the transitions, so the report can
+    ///      state both clocks and a reader can check they line up instead of taking it on trust.
     function _run(FlowModel.Params memory p) internal returns (FlowModel.Result memory res) {
+        // Forge's default per-test gas limit is 2^30, and it is the right default: a test that
+        // burns a billion gas is usually a test with a bug in it. This one is not — an hour at a
+        // 200 ms tick is 18,000 iterations each driving several real swaps through a real
+        // `PropPool`, and the gas it consumes is a fact about the simulation's length rather than
+        // about the pool's efficiency. Nothing here measures gas, `PropPool`'s own cost is
+        // asserted in `Integration.t.sol` and `PropPool.t.sol` where it means something, and the
+        // alternative is raising the limit for all 425 tests in the repo to accommodate one file.
+        vm.pauseGasMetering();
+
         uint256[] memory ref = FlowModel.buildPath(p);
         _deployFixture(p);
 
@@ -899,6 +1572,13 @@ contract SimulationTest is Test {
         _refresh(p);
         delete S;
         S.lastPushAt = 0;
+        S.ticksPerSec = FlowModel.ticksPerSec(p);
+        S.quoteLatencyTicks = FlowModel.msToTicks(p.quoteLatencyMs, p);
+        S.withdrawLatencyTicks = FlowModel.msToTicks(p.withdrawLatencyMs, p);
+        S.cooloffTicks = FlowModel.secsToTicks(p.cooloffSecs, p);
+        S.heartbeatTicks = FlowModel.secsToTicks(p.heartbeatSecs, p);
+        S.decisionTicks = FlowModel.msToTicks(p.decisionIntervalMs, p);
+        S.detectorTicks = FlowModel.msToTicks(p.detectorIntervalMs, p);
 
         FlowModel.Rng memory r = FlowModel.rng(p.seed);
 
@@ -908,42 +1588,96 @@ contract SimulationTest is Test {
         res.baseMax = res.baseStart;
         res.navStart = res.quoteStart + FlowModel.value(res.baseStart, ref[0], p.priceScaleExp);
 
-        // Seed the walk at t=0 against `ref[0]`, so the very first revaluation step the loop
+        // Seed the walk at k=0 against `ref[0]`, so the very first revaluation step the loop
         // attributes is `ref[0] -> ref[1]`. Without this the decomposition would silently drop
-        // one second of price move and `navEnd - navStart` would not equal
+        // one tick of price move and `navEnd - navStart` would not equal
         // `revaluation + tradePnl` — which is the identity the whole reconciliation rests on.
         _observe(res, ref[0], p, false);
 
-        for (uint256 t = 1; t <= p.horizonSecs; ++t) {
-            vm.warp(T0 + t);
+        // ------------------------------------------------------------------
+        // The memory arena.
+        //
+        // Solidity never frees memory, and one tick of this loop allocates a `PairSnapshot`, the
+        // return buffers of a dozen external calls and a handful of assertion strings — call it
+        // 60 words. At one second a tick that was 3,600 iterations and nobody noticed. At 200 ms
+        // it is 18,000, twice over in a before/after test, and the run dies with `MemoryOOG`
+        // before it prints a number. Raising `memory_limit` in foundry.toml would fix the symptom
+        // for every one of this repo's 425 tests to fix it for one.
+        //
+        // So the loop body gets an arena: the free memory pointer is snapshotted here and
+        // restored at the top of every iteration, which reclaims exactly the garbage and nothing
+        // else. That is sound if and only if nothing allocated INSIDE an iteration has to survive
+        // it, so here is the audit, because "probably nothing does" is not good enough for a
+        // pointer write:
+        //
+        //   * `ref`, `res`, `r` and `p` are all allocated BEFORE this mark. `res` in particular is
+        //     a named return variable, so solc allocates its whole tree — both fixed-size `Accum`
+        //     arrays included — at function entry, and `FlowModel.record` only mutates cells that
+        //     already exist. `r.s` is the RNG state and is likewise mutated in place.
+        //   * `S` is contract storage and is untouched by this.
+        //   * Nothing inside an iteration returns a memory reference to its caller: the taker
+        //     helpers return nothing, and the snapshots they take are read and dropped.
+        //
+        // A later run allocates its own path above the previous run's mark, so an earlier run's
+        // `Result` — which its caller still holds — is below every subsequent reset and safe.
+        // ------------------------------------------------------------------
+        uint256 arena;
+        // forge-lint: disable-next-line(asm-keccak256)
+        assembly ("memory-safe") {
+            arena := mload(0x40)
+        }
 
-            _observe(res, ref[t], p, true); // revaluation window: trade PnL must be zero
+        uint256 nTicks = FlowModel.totalTicks(p);
+        uint256 prevSecs;
+        for (uint256 k = 1; k <= nTicks; ++k) {
+            // Not annotated `memory-safe`, and the annotation would be a lie: this deliberately
+            // moves the allocator backwards, which is precisely the assumption that annotation
+            // promises not to break.
+            assembly {
+                mstore(0x40, arena)
+            }
+
+            uint256 secs = FlowModel.tickToBlockSecs(k, p);
+            if (secs != prevSecs) {
+                res.blockSecsAdvanced += 1;
+                prevSecs = secs;
+            }
+            vm.warp(T0 + secs);
+
+            _observe(res, ref[k], p, true); // revaluation window: trade PnL must be zero
 
             // The detector runs FIRST, on the tick the move prints, because that is where it runs
             // in the bot: `jump.rs` scans the in-memory feed snapshots every 200 ms rather than
-            // waiting for the 1 Hz quote cycle. But firing only schedules the withdrawal — the
-            // ordering below is what makes this honest. Every taker in this tick, including the
-            // latency-advantaged one, still gets to act against the live ladder, and they keep
-            // getting it until `withdrawLandsAt`. That window is the searcher's, and on a
-            // fee-ordered sequencer they can pay to stay inside it.
-            _jumpTick(p, ref, t);
+            // waiting for the 1 Hz quote cycle. At `tickMs = 200` the model finally runs it at the
+            // same cadence the bot does; at 1,000 ms it ran a fifth as often and the model was
+            // giving the detector a handicap it does not have in production.
+            //
+            // But firing only schedules the withdrawal — the ordering below is what makes this
+            // honest. Every taker in this tick, including the latency-advantaged one, still gets
+            // to act against the live ladder, and they keep getting it until `withdrawLandsAt`.
+            // That window is the searcher's, and on a fee-ordered sequencer they can pay to stay
+            // inside it.
+            _jumpTick(p, ref, k);
 
-            _fastTaker(res, p, r, ref, t);
-            _landWithdrawal(p, t);
-            _landPending(res, p, t);
-            _informed(res, p, r, ref, t);
-            _uninformed(res, p, r, ref, t);
-            _observe(res, ref[t], p, false); // trade window: revaluation is zero by construction
-            _updaterTick(p, ref, t);
+            _fastTaker(res, p, r, ref, k);
+            _landWithdrawal(p, k);
+            _landPending(res, p, k);
+            _informed(res, p, r, ref, k);
+            _uninformed(res, p, r, ref, k);
+            _observe(res, ref[k], p, false); // trade window: revaluation is zero by construction
+            _updaterTick(p, ref, k);
 
             uint256 b = pool.reserveOf(address(baseToken));
             if (b < res.baseMin) res.baseMin = b;
             if (b > res.baseMax) res.baseMax = b;
         }
 
+        res.ticksRun = nTicks;
         res.baseEnd = pool.reserveOf(address(baseToken));
         res.quoteEnd = pool.reserveOf(address(quoteToken));
-        res.navEnd = res.quoteEnd + FlowModel.value(res.baseEnd, ref[p.horizonSecs], p.priceScaleExp);
+        res.navEnd = res.quoteEnd + FlowModel.value(res.baseEnd, ref[nTicks], p.priceScaleExp);
+
+        vm.resumeGasMetering();
     }
 
     // ---------------------------------------------------------------------
@@ -961,44 +1695,54 @@ contract SimulationTest is Test {
     ///      it. The only winning move is not to be there.
     ///
     ///      What it cannot do is be there instantly. The withdrawal is `refreshCapacity(id, 0, 0)`,
-    ///      a transaction, and it lands `withdrawLatencySecs` later. Everything that arrives in
+    ///      a transaction, and it lands `withdrawLatencyMs` later. Everything that arrives in
     ///      between is charged to the defence, not hidden by it.
-    function _jumpTick(FlowModel.Params memory p, uint256[] memory ref, uint256 t) internal {
+    /// @param k the current MODEL tick.
+    function _jumpTick(FlowModel.Params memory p, uint256[] memory ref, uint256 k) internal {
         if (p.jumpThresholdE2 == 0) return;
-        if (S.withdrawLandsAt != 0 || t < S.cooloffUntil) return; // already handling one
+        if (k % S.detectorTicks != 0) return; // the detector is asleep between scans
+        if (S.withdrawLandsAt != 0 || k < S.cooloffUntil) return; // already handling one
 
-        if (!FlowModel.isJump(ref[t - 1], ref[t], p.jumpThresholdE2)) return;
+        // A TRAILING ONE-SECOND window, not the previous tick. `FlowModel.isJump` documents why at
+        // length; in one line, a per-tick comparison would make the same threshold five times
+        // harder to trip at 200 ms than at 1 s, and every cross-resolution comparison in this file
+        // would then be measuring the detector's sensitivity rather than the pool's latency.
+        uint256 back = k > S.ticksPerSec ? k - S.ticksPerSec : 0;
+        if (!FlowModel.isJump(ref[back], ref[k], p.jumpThresholdE2)) return;
 
         S.jumpsDetected += 1;
-        S.withdrawLandsAt = t + p.withdrawLatencySecs;
+        S.withdrawLandsAt = k + S.withdrawLatencyTicks;
     }
 
     /// @dev Zero capacity is a complete withdrawal that stays inside the updater's own authority:
     ///      it cannot call `pause`, and it does not need to. Every quote path returns 0.
-    function _landWithdrawal(FlowModel.Params memory p, uint256 t) internal {
-        if (S.withdrawLandsAt == 0 || t < S.withdrawLandsAt) return;
+    function _landWithdrawal(FlowModel.Params memory, uint256 k) internal {
+        if (S.withdrawLandsAt == 0 || k < S.withdrawLandsAt) return;
 
         vm.prank(updater);
         pool.refreshCapacity(PAIR_ID, 0, 0);
 
         S.withdrawLandsAt = 0;
-        S.cooloffUntil = t + p.cooloffSecs;
+        S.cooloffUntil = k + S.cooloffTicks;
         // A push decided before the jump must not resurrect the ladder we just pulled.
         S.pendingLandsAt = 0;
         S.pendingRefresh = false;
     }
 
-    function _updaterTick(FlowModel.Params memory p, uint256[] memory ref, uint256 t) internal {
-        if (S.withdrawLandsAt != 0 || t < S.cooloffUntil) return; // stepped aside
+    function _updaterTick(FlowModel.Params memory p, uint256[] memory ref, uint256 k) internal {
+        // The bot is asleep between `newHeads` deliveries. Without this gate a finer tick would
+        // hand the updater a faster polling loop for free — see `Params.decisionIntervalMs`.
+        if (k % S.decisionTicks != 0) return;
+        if (S.withdrawLandsAt != 0 || k < S.cooloffUntil) return; // stepped aside
         if (S.pendingLandsAt != 0) return; // PushInFlight
 
         IPropPool.PairSnapshot memory s = pool.snapshot(PAIR_ID);
         bool capacityLow = _capacityIsLow(s, p);
 
-        if (!capacityLow && (t - S.lastPushAt) < p.heartbeatSecs && !_driftTriggers(s, p, ref[t])) return;
+        if (!capacityLow && (k - S.lastPushAt) < S.heartbeatTicks && !_driftTriggers(s, p, ref[k])) return;
 
-        S.pendingMid = ref[t];
-        S.pendingLandsAt = t + p.quoteLatencySecs;
+        S.pendingMid = ref[k];
+        S.pendingLandsAt = k + S.quoteLatencyTicks;
         S.pendingRefresh = capacityLow;
     }
 
@@ -1064,31 +1808,43 @@ contract SimulationTest is Test {
         FlowModel.Params memory p,
         FlowModel.Rng memory r,
         uint256[] memory ref,
-        uint256 t
+        uint256 k
     ) internal {
         if (p.fastHitPct == 0) return;
-        if (S.pendingLandsAt != t) return;
+        // Conditioned on a push landing, not on a rate, so it needs no rescaling: there are the
+        // same number of pushes per wall-clock hour at every tick size, because the push cadence
+        // is gated by the latency and the in-flight rule rather than by the clock.
+        if (S.pendingLandsAt != k) return;
         if (!FlowModel.bernoulli(r, p.fastHitPct * 10_000)) return;
-        _takeTheEdge(res, p, ref, t, FlowModel.POP_FAST);
+        _takeTheEdge(res, p, ref, k, FlowModel.POP_FAST);
     }
 
     /// @notice The ordinary informed taker, arriving per the hazard against whatever ladder is
     ///         on chain right now.
+    ///
+    /// @dev The hazard is quoted per second and converted to a per-tick probability by
+    ///      `FlowModel.informedHazardPerTick`, which preserves the probability that the gap is
+    ///      taken *within a second* rather than the expected count. That is the invariant a race
+    ///      has, and choosing the other one would have weakened the searcher by a third at
+    ///      saturation the moment the clock got finer. The rest of the function is unchanged: a
+    ///      finer tick gives the searcher more chances to arrive, each correspondingly less
+    ///      likely, arriving on average sooner within the second — which is the resolution
+    ///      improvement, and is the only thing that should differ.
     function _informed(
         FlowModel.Result memory res,
         FlowModel.Params memory p,
         FlowModel.Rng memory r,
         uint256[] memory ref,
-        uint256 t
+        uint256 k
     ) internal {
         if (p.informedMaxPerSecE6 == 0) return;
 
         IPropPool.PairSnapshot memory s = pool.snapshot(PAIR_ID);
-        (int256 bidEdge, int256 askEdge) = FlowModel.edges(s, ref[t]);
+        (int256 bidEdge, int256 askEdge) = FlowModel.edges(s, ref[k]);
         int256 best = bidEdge > askEdge ? bidEdge : askEdge;
-        if (!FlowModel.bernoulli(r, FlowModel.informedHazard(best, p))) return;
+        if (!FlowModel.bernoulli(r, FlowModel.informedHazardPerTick(best, p))) return;
 
-        _takeTheEdge(res, p, ref, t, FlowModel.POP_INFORMED);
+        _takeTheEdge(res, p, ref, k, FlowModel.POP_INFORMED);
     }
 
     /// @dev Shared by both informed populations: pick the profitable side, size it exactly, take
@@ -1099,16 +1855,16 @@ contract SimulationTest is Test {
         FlowModel.Result memory res,
         FlowModel.Params memory p,
         uint256[] memory ref,
-        uint256 t,
+        uint256 k,
         uint256 pop
     ) internal {
         IPropPool.PairSnapshot memory s = pool.snapshot(PAIR_ID);
-        (int256 bidEdge, int256 askEdge) = FlowModel.edges(s, ref[t]);
+        (int256 bidEdge, int256 askEdge) = FlowModel.edges(s, ref[k]);
         // forge-lint: disable-next-line(unsafe-typecast)
         if (bidEdge <= int256(p.informedCostE2) && askEdge <= int256(p.informedCostE2)) return;
 
-        if (askEdge >= bidEdge) _liftTheAsk(res, p, ref, t, pop, s);
-        else _hitTheBid(res, p, ref, t, pop, s);
+        if (askEdge >= bidEdge) _liftTheAsk(res, p, ref, k, pop, s);
+        else _hitTheBid(res, p, ref, k, pop, s);
     }
 
     /// @dev The pool is selling base below the reference. Buy the whole profitable interval.
@@ -1116,14 +1872,14 @@ contract SimulationTest is Test {
         FlowModel.Result memory res,
         FlowModel.Params memory p,
         uint256[] memory ref,
-        uint256 t,
+        uint256 k,
         uint256 pop,
         IPropPool.PairSnapshot memory s
     ) internal {
         uint256 q = FlowModel.informedAskSize(
             s,
             FlowModel.fillableRoom(pool, PAIR_ID, s, false),
-            FlowModel.refNetForAsk(ref[t], p.informedCostE2),
+            FlowModel.refNetForAsk(ref[k], p.informedCostE2),
             SCALE,
             pool.reserveOf(address(baseToken)),
             p.informedCapturePct
@@ -1137,9 +1893,7 @@ contract SimulationTest is Test {
         // forge-lint: disable-next-line(unsafe-typecast)
         pool.swap(address(quoteToken), address(baseToken), -int256(q), type(uint256).max, taker, 0, block.timestamp);
 
-        FlowModel.record(
-            res, FlowModel.Fill({pop: pop, tSecs: t, isBid: false, baseQty: q, quoteQty: cost}), ref, p.priceScaleExp
-        );
+        _record(res, FlowModel.Fill({pop: pop, tTick: k, isBid: false, baseQty: q, quoteQty: cost}), ref, p);
     }
 
     /// @dev The pool is buying base above the reference. Sell it the whole profitable interval.
@@ -1147,14 +1901,14 @@ contract SimulationTest is Test {
         FlowModel.Result memory res,
         FlowModel.Params memory p,
         uint256[] memory ref,
-        uint256 t,
+        uint256 k,
         uint256 pop,
         IPropPool.PairSnapshot memory s
     ) internal {
         uint256 q = FlowModel.informedBidSize(
             s,
             FlowModel.fillableRoom(pool, PAIR_ID, s, true),
-            FlowModel.refNetForBid(ref[t], p.informedCostE2),
+            FlowModel.refNetForBid(ref[k], p.informedCostE2),
             SCALE,
             pool.reserveOf(address(quoteToken)),
             p.informedCapturePct
@@ -1168,9 +1922,29 @@ contract SimulationTest is Test {
         // forge-lint: disable-next-line(unsafe-typecast)
         pool.swap(address(baseToken), address(quoteToken), int256(q), 0, taker, 0, block.timestamp);
 
-        FlowModel.record(
-            res, FlowModel.Fill({pop: pop, tSecs: t, isBid: true, baseQty: q, quoteQty: proceeds}), ref, p.priceScaleExp
-        );
+        _record(res, FlowModel.Fill({pop: pop, tTick: k, isBid: true, baseQty: q, quoteQty: proceeds}), ref, p);
+    }
+
+    /// @notice `FlowModel.record`, plus the one thing the library cannot see: whether this fill
+    ///         landed inside the window between the jump detector firing and its withdrawal
+    ///         taking effect.
+    ///
+    /// @dev Every fill site goes through here so the count cannot drift out of step with reality
+    ///      by someone adding a fifth one. `fillsWhileWithdrawing` was declared and printed but
+    ///      never incremented before this change, which made the one line of output that would
+    ///      have caught a defence that is secretly a wish read a constant zero. The file's own
+    ///      history has an instance of exactly that failure — informed fills reported as 1 -> 0
+    ///      because the size solver was bisecting against the wrong capacity — and the thing that
+    ///      caught it was a number that refused to move when it should have. A counter that is
+    ///      always zero cannot do that job.
+    function _record(
+        FlowModel.Result memory res,
+        FlowModel.Fill memory f,
+        uint256[] memory ref,
+        FlowModel.Params memory p
+    ) internal {
+        if (S.withdrawLandsAt != 0) S.fillsWhileWithdrawing += 1;
+        FlowModel.record(res, f, ref, p);
     }
 
     /// @notice Uninformed flow: arrivals on the 1-second grid, a fair-coin direction, and a
@@ -1193,16 +1967,16 @@ contract SimulationTest is Test {
         FlowModel.Params memory p,
         FlowModel.Rng memory r,
         uint256[] memory ref,
-        uint256 t
+        uint256 k
     ) internal {
-        uint256 rate = (p.uninformedPerHour * FlowModel.PROB_ONE) / FlowModel.SECS_PER_HOUR;
+        uint256 rate = FlowModel.uninformedRatePerTick(p);
         uint256 n = rate / FlowModel.PROB_ONE;
         if (FlowModel.bernoulli(r, rate % FlowModel.PROB_ONE)) n += 1;
 
         for (uint256 i; i < n; ++i) {
             uint256 raw = FlowModel.drawNotional(r) * (10 ** uint256(p.quoteDecimals));
-            if (FlowModel.next(r) % 2 == 0) _uninformedBuysBase(res, p, ref, t, raw);
-            else _uninformedSellsBase(res, p, ref, t, raw);
+            if (FlowModel.next(r) % 2 == 0) _uninformedBuysBase(res, p, ref, k, raw);
+            else _uninformedSellsBase(res, p, ref, k, raw);
         }
     }
 
@@ -1211,7 +1985,7 @@ contract SimulationTest is Test {
         FlowModel.Result memory res,
         FlowModel.Params memory p,
         uint256[] memory ref,
-        uint256 t,
+        uint256 k,
         uint256 raw
     ) internal {
         uint256 out = pool.getAmountOut(address(quoteToken), address(baseToken), raw);
@@ -1224,11 +1998,11 @@ contract SimulationTest is Test {
         vm.prank(taker);
         // forge-lint: disable-next-line(unsafe-typecast)
         pool.swap(address(quoteToken), address(baseToken), int256(raw), 0, taker, 0, block.timestamp);
-        FlowModel.record(
+        _record(
             res,
-            FlowModel.Fill({pop: FlowModel.POP_UNINFORMED, tSecs: t, isBid: false, baseQty: out, quoteQty: raw}),
+            FlowModel.Fill({pop: FlowModel.POP_UNINFORMED, tTick: k, isBid: false, baseQty: out, quoteQty: raw}),
             ref,
-            p.priceScaleExp
+            p
         );
     }
 
@@ -1236,10 +2010,10 @@ contract SimulationTest is Test {
         FlowModel.Result memory res,
         FlowModel.Params memory p,
         uint256[] memory ref,
-        uint256 t,
+        uint256 k,
         uint256 raw
     ) internal {
-        uint256 baseIn = (raw * SCALE) / ref[t];
+        uint256 baseIn = (raw * SCALE) / ref[k];
         uint256 out = pool.getAmountOut(address(baseToken), address(quoteToken), baseIn);
         if (out == 0) {
             res.declinedFills += 1;
@@ -1250,11 +2024,11 @@ contract SimulationTest is Test {
         vm.prank(taker);
         // forge-lint: disable-next-line(unsafe-typecast)
         pool.swap(address(baseToken), address(quoteToken), int256(baseIn), 0, taker, 0, block.timestamp);
-        FlowModel.record(
+        _record(
             res,
-            FlowModel.Fill({pop: FlowModel.POP_UNINFORMED, tSecs: t, isBid: true, baseQty: baseIn, quoteQty: out}),
+            FlowModel.Fill({pop: FlowModel.POP_UNINFORMED, tTick: k, isBid: true, baseQty: baseIn, quoteQty: out}),
             ref,
-            p.priceScaleExp
+            p
         );
     }
 
@@ -1377,8 +2151,8 @@ contract SimulationTest is Test {
                     " at +60s on ",
                     FlowModel.units(res.worstFillNotional, p.quoteDecimals),
                     " of notional, at t=",
-                    FlowModel.u2s(res.worstFillAt),
-                    "s"
+                    FlowModel.u2s(FlowModel.tickToMs(res.worstFillAtTick, p)),
+                    "ms"
                 )
             );
         }

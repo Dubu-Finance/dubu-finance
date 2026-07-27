@@ -22,6 +22,16 @@ import {MintableToken} from "../src/mocks/MintableToken.sol";
 /// that belongs in CI. **Read it first — it is where the answer is.** This file is the other
 /// half: the same `FlowModel`, pointed at real deployed state.
 ///
+/// **MODE 1 has a sub-second model clock; this file has no clock at all.** `FlowModel.Params.tickMs`
+/// drives MODE 1's reference path, arrivals and latencies at 200 ms, which is what lets it answer
+/// questions about flashblock-speed requoting. Nothing here is affected: a script sees exactly one
+/// block and one reference price, so it has no time axis to make finer. The `FlowModel` entry
+/// points this file uses — the sizing solvers, `edges`, `room`, `fillableRoom`, `value` — are all
+/// functions of state rather than of time, and they are the same functions at either resolution.
+/// Where a latency does show up in this file's output it is the LIVE ladder's age in whole
+/// seconds, read off `block.timestamp - updatedAt`, and that is a real chain quantity rather than
+/// a modelled one.
+///
 /// =====================================================================================
 /// WHAT THIS MODE CAN AND CANNOT DO, STATED BEFORE THE OUTPUT RATHER THAN AFTER
 /// =====================================================================================
