@@ -148,6 +148,7 @@ pub mod abi {
         function refreshCapacity(uint16 pairId, uint96 bidCapacity, uint96 askCapacity) external;
 
         function balanceOf(address account) external view returns (uint256);
+        function allowance(address owner, address spender) external view returns (uint256);
         function decimals() external view returns (uint8);
 
         function aggregate3(Call3[] calls) external payable returns (Call3Result[]);
@@ -951,6 +952,15 @@ pub struct ChainView {
     pub snaps: BTreeMap<u16, Snap>,
     /// Pool balances of every token involved.
     pub balances: BTreeMap<Address, u128>,
+    /// What the RFQ maker could actually pay out per token: the **lesser** of its own balance and
+    /// its allowance to `PmmSettle`. Empty when no maker is configured.
+    ///
+    /// Separate from [`Self::balances`], and the separation is the point. `PmmSettle` custodies
+    /// nothing and pulls both legs with `transferFrom` from the *maker*, so the pool's inventory
+    /// says nothing about what an RFQ order can settle — they are different addresses. Sizing an
+    /// RFQ quote against the pool's balance means signing orders that revert at fill time, which
+    /// costs the taker gas and tells them nothing useful.
+    pub maker_deliverable: BTreeMap<Address, u128>,
     /// When this view was received locally.
     pub at: Instant,
 }
@@ -977,6 +987,9 @@ pub struct ChainReader {
     multicall: Address,
     pair_ids: Vec<u16>,
     tokens: Vec<Address>,
+    /// `(maker, settler)` when the RFQ leg is on. Its presence is what puts the two extra reads
+    /// per token at the end of the batch, so it is also what `read` dispatches on when decoding.
+    maker: Option<(Address, Address)>,
     calldata: Bytes,
 }
 
@@ -988,7 +1001,35 @@ impl ChainReader {
     /// decode contract.
     #[must_use]
     pub fn new(pool: Address, multicall: Address, pair_ids: Vec<u16>, tokens: Vec<Address>) -> Self {
-        let mut calls = Vec::with_capacity(2 + pair_ids.len() + tokens.len());
+        Self::build(pool, multicall, pair_ids, tokens, None)
+    }
+
+    /// The same reader, plus the two reads that say what the RFQ maker can deliver.
+    ///
+    /// Folded into the existing batch rather than fetched separately: it is the same block, and a
+    /// deliverable read at a different block than the inventory it is compared against would be a
+    /// view that never existed.
+    #[must_use]
+    pub fn with_maker(
+        pool: Address,
+        multicall: Address,
+        pair_ids: Vec<u16>,
+        tokens: Vec<Address>,
+        maker: Address,
+        settler: Address,
+    ) -> Self {
+        Self::build(pool, multicall, pair_ids, tokens, Some((maker, settler)))
+    }
+
+    fn build(
+        pool: Address,
+        multicall: Address,
+        pair_ids: Vec<u16>,
+        tokens: Vec<Address>,
+        maker: Option<(Address, Address)>,
+    ) -> Self {
+        let extra = if maker.is_some() { 2 * tokens.len() } else { 0 };
+        let mut calls = Vec::with_capacity(2 + pair_ids.len() + tokens.len() + extra);
         calls.push(abi::Call3 {
             target: multicall,
             allowFailure: false,
@@ -1013,8 +1054,22 @@ impl ChainReader {
                 callData: abi::balanceOfCall { account: pool }.abi_encode().into(),
             });
         }
+        if let Some((owner, spender)) = maker {
+            for &t in &tokens {
+                calls.push(abi::Call3 {
+                    target: t,
+                    allowFailure: false,
+                    callData: abi::balanceOfCall { account: owner }.abi_encode().into(),
+                });
+                calls.push(abi::Call3 {
+                    target: t,
+                    allowFailure: false,
+                    callData: abi::allowanceCall { owner, spender }.abi_encode().into(),
+                });
+            }
+        }
         let calldata = abi::aggregate3Call { calls }.abi_encode().into();
-        Self { pool, multicall, pair_ids, tokens, calldata }
+        Self { pool, multicall, pair_ids, tokens, maker, calldata }
     }
 
     /// The pool this reader reads.
@@ -1041,7 +1096,8 @@ impl ChainReader {
     #[allow(clippy::indexing_slicing)]
     pub async fn read(&self, rpc: &Rpc) -> Result<ChainView, RpcError> {
         let raw = rpc.eth_call(self.multicall, &self.calldata, "pending").await?;
-        let results = decode_batch(&raw, 2 + self.pair_ids.len() + self.tokens.len())?;
+        let extra = if self.maker.is_some() { 2 * self.tokens.len() } else { 0 };
+        let results = decode_batch(&raw, 2 + self.pair_ids.len() + self.tokens.len() + extra)?;
 
         let block_number = abi::getBlockNumberCall::abi_decode_returns(&results[0].returnData)
             .map_err(|e| decode_err("getBlockNumber", e))?;
@@ -1063,11 +1119,29 @@ impl ChainReader {
             balances.insert(t, u128::try_from(v).map_err(|_| decode_err("balanceOf", "exceeds u128"))?);
         }
 
+        // What the RFQ maker could pay out, per token: the lesser of what it holds and what it has
+        // let `PmmSettle` pull. Either being short is the same failure, because the settler
+        // custodies nothing and issues a `transferFrom` against the maker's own balance.
+        let mut maker_deliverable = BTreeMap::new();
+        if self.maker.is_some() {
+            let base = 2 + self.pair_ids.len() + self.tokens.len();
+            for (i, &t) in self.tokens.iter().enumerate() {
+                let bal = abi::balanceOfCall::abi_decode_returns(&results[base + 2 * i].returnData)
+                    .map_err(|e| decode_err("maker balanceOf", e))?;
+                let allow = abi::allowanceCall::abi_decode_returns(&results[base + 2 * i + 1].returnData)
+                    .map_err(|e| decode_err("maker allowance", e))?;
+                let d = bal.min(allow);
+                maker_deliverable
+                    .insert(t, u128::try_from(d).map_err(|_| decode_err("maker deliverable", "exceeds u128"))?);
+            }
+        }
+
         Ok(ChainView {
             block_number: u64::try_from(block_number).unwrap_or(u64::MAX),
             block_timestamp: u64::try_from(block_timestamp).unwrap_or(u64::MAX),
             snaps,
             balances,
+            maker_deliverable,
             at: Instant::now(),
         })
     }

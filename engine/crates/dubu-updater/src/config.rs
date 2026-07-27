@@ -327,7 +327,8 @@ pub struct RfqConfig {
     pub max_notional_per_order: String,
     /// Decimals of the quote token these markets are denominated in.
     pub quote_decimals: u8,
-    /// How long a signed order stays fillable, and how long its inventory stays reserved.
+    /// How long a signed order stays fillable, how long its inventory stays reserved, and the
+    /// window whose option value the spread charges for. See `quoting::MakerParams`.
     pub ttl_secs: u64,
     /// Floor on a single fill, in bps of the maker leg.
     #[serde(default)]
@@ -384,13 +385,17 @@ impl RfqConfig {
     ///
     /// # Errors
     /// [`ConfigError::Units`] if the notional cap is not a decimal number.
-    pub fn params(&self) -> Result<crate::quoting::MakerParams, ConfigError> {
+    pub fn params(&self, vol_horizon_secs: u64) -> Result<crate::quoting::MakerParams, ConfigError> {
         Ok(crate::quoting::MakerParams {
             base_half_spread_e2: self.base_half_spread_e2,
             sigma_coefficient_e2: self.sigma_coefficient_e2,
             max_half_spread_e2: self.max_half_spread_e2,
             max_notional_per_order: self.max_notional_units()?,
             ttl_secs: self.ttl_secs,
+            // Taken from the skew estimator rather than configured twice. Two numbers meaning
+            // "the window sigma is measured over" is two things to keep in step and two ways to
+            // misprice the TTL.
+            sigma_horizon_secs: vol_horizon_secs,
             min_fill_bps: self.min_fill_bps,
         })
     }

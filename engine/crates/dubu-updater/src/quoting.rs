@@ -4,14 +4,27 @@
 //! that stays true. It reads the fair value, the volatility estimate and the inventory that
 //! `main`'s cycle already computed, and turns a size into a signed order.
 //!
-//! # Why RFQ may quote tighter than the curve, and why that is not an arbitrage
+//! # Why RFQ may quote tighter than the curve — and the half of that argument that was missing
 //!
 //! It is worth being precise, because "our own two venues disagree" sounds like a bug.
 //!
 //! The curve is a *standing* quote: it is posted before anyone asks, and its exposure is to being
 //! picked off by whoever notices a stale ladder first. RFQ is quoted *on request*, after the size
-//! is known and against a reference read at that moment. The second is a strictly better-informed
-//! quote, so it can be tighter, and being tighter is the point of having it.
+//! is known and against a reference read at that moment. On the **size** axis that is a strictly
+//! better-informed quote — the curve has to price a whole ladder, this prices one trade — and that
+//! is the advantage RFQ is here for.
+//!
+//! What that argument said nothing about is **time**, and on the time axis RFQ is strictly worse.
+//! A signed order is a firm price frozen for its whole TTL, and the taker chooses when inside that
+//! window to exercise it. That is an option we have written, and the curve does not write one: a
+//! standing quote is symmetric, it can be moved every block, and `jump` can withdraw it outright.
+//! A signed order can be neither moved nor recalled.
+//!
+//! So RFQ is not simply "tighter because better informed". It trades a size advantage against an
+//! optionality cost, and whether it comes out ahead depends on which is larger. The cost is not
+//! left as a judgement call: [`MakerParams::half_spread_e2`] charges it, from the same volatility
+//! estimate the curve uses and the TTL the operator chose. A longer TTL is automatically a wider
+//! quote, so the parameter cannot be tuned to something the spread does not cover.
 //!
 //! Nothing can be round-tripped between them. Buying from RFQ costs `fair + s_rfq` and selling to
 //! the curve pays `fair - s_curve`; the round trip loses `s_rfq + s_curve`, which is positive for
@@ -43,6 +56,20 @@ use alloy_primitives::Address;
 /// Spreads and sizes are in hundredths of a basis point, as everywhere else in this crate.
 pub const BPS_E2: u64 = 10_000;
 
+/// Integer square root by Newton's method.
+fn isqrt_u64(n: u64) -> u64 {
+    if n < 2 {
+        return n;
+    }
+    let mut x = n;
+    let mut y = x.div_ceil(2);
+    while y < x {
+        x = y;
+        y = (x + n / x) / 2;
+    }
+    x
+}
+
 /// How the RFQ side is priced and bounded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MakerParams {
@@ -63,24 +90,77 @@ pub struct MakerParams {
     /// in the risk one order can take. A limit a maker sets is a statement about money, so it is
     /// denominated in money and converted to base at the pair's own fair value.
     pub max_notional_per_order: u128,
-    /// How long a signed order stays fillable. Also how long its reservation is held.
+    /// How long a signed order stays fillable. Also how long its reservation is held, and the
+    /// window whose option value [`Self::ttl_premium_e2`] charges for.
     pub ttl_secs: u64,
+    /// The window `sigma_millibps` is measured over, so the TTL premium can rescale it.
+    ///
+    /// Must match the volatility estimator's own horizon. Zero disables the premium, which is a
+    /// decision to give the TTL away and therefore one that has to be typed out.
+    pub sigma_horizon_secs: u64,
     /// Floor on a single fill, in bps of the maker leg. Stops an order being nibbled into dust.
     pub min_fill_bps: u16,
 }
 
 impl MakerParams {
-    /// Half-spread for the current volatility, capped.
+    /// Half-spread for the current volatility, including what the TTL costs.
     ///
-    /// Saturating rather than checked. The cap is applied last and every intermediate only grows,
-    /// so an overflow and the cap give the same answer — whereas wrapping would turn a violent
-    /// market into a *narrow* spread, which is the one direction a volatility term must never fail
-    /// in. Debug builds would have panicked instead, which is not better on a live maker.
+    /// Three terms:
+    ///
+    /// ```text
+    ///   base  +  sigma_coefficient * sigma  +  TTL option premium
+    /// ```
+    ///
+    /// The first two are the curve's shape, shared so the two surfaces move together. The third is
+    /// RFQ's alone, and it exists because a signed order is an option we wrote.
+    ///
+    /// # Pricing the TTL
+    ///
+    /// A taker holding a firm quote for `ttl_secs` fills only if the market moves their way, so
+    /// what we handed them is worth roughly what a straddle over that window is worth. Taking the
+    /// standard `0.4 * sigma` approximation and scaling volatility by the square root of time:
+    ///
+    /// ```text
+    ///   premium ~= 0.4 * sigma_per_sqrt_second * sqrt(ttl_secs)
+    /// ```
+    ///
+    /// Approximate on purpose. The coefficient is a normal-distribution result and returns are not
+    /// normal; the estimator has its own error; and the taker's decision is not exactly optimal
+    /// exercise. What matters is not the second decimal but that the term *exists* and grows with
+    /// `sqrt(ttl)` — so a TTL nobody costed cannot quietly be given away. An operator who wants a
+    /// thirty-second quote now pays for a thirty-second quote.
+    ///
+    /// Saturating rather than checked throughout. The cap is applied last and every intermediate
+    /// only grows, so an overflow and the cap give the same answer — whereas wrapping would turn a
+    /// violent market into a *narrow* spread, which is the one direction a volatility term must
+    /// never fail in.
     #[must_use]
     pub fn half_spread_e2(&self, sigma_millibps: u64) -> u32 {
         let scaled = u64::from(self.base_half_spread_e2)
-            .saturating_add(u64::from(self.sigma_coefficient_e2).saturating_mul(sigma_millibps) / 1_000);
+            .saturating_add(u64::from(self.sigma_coefficient_e2).saturating_mul(sigma_millibps) / 1_000)
+            .saturating_add(self.ttl_premium_e2(sigma_millibps));
         u32::try_from(scaled).unwrap_or(u32::MAX).min(self.max_half_spread_e2)
+    }
+
+    /// What the TTL costs, in hundredths of a bp.
+    ///
+    /// `sigma_millibps` is sigma over [`Self::sigma_horizon_secs`], so it is rescaled to the TTL
+    /// by the square root of the ratio before the option coefficient is applied. Zero when the
+    /// horizon is unset, which is the only way to opt out and has to be typed.
+    #[must_use]
+    pub fn ttl_premium_e2(&self, sigma_millibps: u64) -> u64 {
+        if self.sigma_horizon_secs == 0 || self.ttl_secs == 0 {
+            return 0;
+        }
+        // sigma over the TTL, still in millibps: sigma_h * sqrt(ttl / horizon).
+        // Multiply before dividing so a TTL shorter than the horizon does not floor to zero.
+        let scaled_sq = sigma_millibps
+            .saturating_mul(sigma_millibps)
+            .saturating_mul(self.ttl_secs)
+            / self.sigma_horizon_secs.max(1);
+        let sigma_ttl_millibps = isqrt_u64(scaled_sq);
+        // 0.4 * sigma, and millibps -> hundredths of a bp is a further /10.
+        sigma_ttl_millibps.saturating_mul(4) / 100
     }
 }
 
@@ -104,9 +184,15 @@ pub struct MarketState {
     pub base_balance: u128,
     /// Quote the maker holds and may spend.
     pub quote_balance: u128,
-    /// Base the curve's epoch has already committed to selling, and to buying.
+    /// Base the curve's epoch has committed **out of the same balance this quote will draw on**.
+    ///
+    /// Zero when the RFQ maker and the pool are different accounts, which is the normal
+    /// deployment: `PmmSettle` pulls from the maker and the pool's epoch commits the pool's own
+    /// inventory, so they are separate balance sheets and subtracting one from the other compares
+    /// two accounts that never meet. Non-zero only when the maker *is* the pool, where the
+    /// double-commitment this guards against is real.
     pub epoch_ask_base: u128,
-    /// Base the curve's epoch has already committed to buying.
+    /// The bid side of the same. See [`Self::epoch_ask_base`].
     pub epoch_bid_base: u128,
 }
 
@@ -317,9 +403,9 @@ impl Book {
 
     /// Base still uncommitted on one side, after the curve's epoch and the open reservations.
     ///
-    /// The curve's epoch is subtracted rather than shared. Both surfaces draw on one balance, and
-    /// the epoch is a promise the pool has already published on chain — RFQ is the newer claim, so
-    /// RFQ is the one that yields.
+    /// The epoch is subtracted only when it draws on the same balance — see
+    /// [`MarketState::epoch_ask_base`]. When it does, RFQ yields to it: the epoch is a promise the
+    /// pool has already published on chain and RFQ is the newer claim.
     fn room(&self, state: &MarketState, sells_base: bool) -> Result<u128, Refusal> {
         let held = if sells_base {
             state.base_balance
@@ -358,6 +444,7 @@ mod tests {
             max_half_spread_e2: 2_000,
             max_notional_per_order: 100 * ONE_ETH_IN_USDC, // $200k
             ttl_secs: 30,
+            sigma_horizon_secs: 300,
             min_fill_bps: 1_000,
         }
     }
@@ -413,6 +500,36 @@ mod tests {
         let buy = book.quote(&params(), &state(), true, ONE_ETH_IN_USDC, 1_000).expect("quotable");
         let sell = book.quote(&params(), &state(), false, buy.maker_amount, 1_000).expect("quotable");
         assert!(sell.maker_amount < ONE_ETH_IN_USDC, "the round trip must not be free money");
+    }
+
+    /// The term that makes the TTL self-pricing: a longer quote is automatically a wider one, so
+    /// the parameter cannot be tuned to something the spread does not cover.
+    #[test]
+    fn a_longer_ttl_costs_more_spread() {
+        let sigma = 2_000; // millibps over the 300s horizon
+        let short = MakerParams { ttl_secs: 3, ..params() }.half_spread_e2(sigma);
+        let long = MakerParams { ttl_secs: 30, ..params() }.half_spread_e2(sigma);
+        assert!(long > short, "30s must cost more than 3s: {long} vs {short}");
+    }
+
+    /// Square-root-of-time, not linear. Ten times the window is about three times the premium —
+    /// which is why a 30s TTL is expensive and a 3s one is nearly free.
+    #[test]
+    fn the_ttl_premium_scales_with_the_square_root_of_time() {
+        let sigma = 10_000;
+        let p1 = MakerParams { ttl_secs: 3, ..params() }.ttl_premium_e2(sigma);
+        let p10 = MakerParams { ttl_secs: 30, ..params() }.ttl_premium_e2(sigma);
+        assert!(p1 > 0 && p10 > 0);
+        let ratio = (p10 * 100) / p1;
+        assert!((280..=380).contains(&ratio), "expected ~sqrt(10) = 3.16x, got {}x", ratio as f64 / 100.0);
+    }
+
+    /// Opting out has to be typed, not defaulted into.
+    #[test]
+    fn the_premium_is_only_zero_when_switched_off() {
+        assert_eq!(MakerParams { sigma_horizon_secs: 0, ..params() }.ttl_premium_e2(10_000), 0);
+        assert_eq!(MakerParams { ttl_secs: 0, ..params() }.ttl_premium_e2(10_000), 0);
+        assert!(params().ttl_premium_e2(10_000) > 0);
     }
 
     #[test]

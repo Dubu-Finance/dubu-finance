@@ -165,6 +165,7 @@ describe('expiry', () => {
   // be signed and mined is a route that reverts and a user who paid gas to find out.
   it('is refused when it expires inside the headroom, even though it is still valid', async () => {
     const barely = BigInt(NOW + MIN_EXPIRY_HEADROOM_SECS - 1);
+    expect(MIN_EXPIRY_HEADROOM_SECS).toBeGreaterThan(0);
     const r = await validateQuote(loadConfig(env()), req, await signed(baseOrder({ expiry: barely })));
     expect(r.rejected).toBe('expired');
   });

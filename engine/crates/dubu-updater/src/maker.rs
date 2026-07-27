@@ -170,6 +170,7 @@ mod tests {
             max_half_spread_e2: 2_000,
             max_notional_per_order: 100 * ONE_ETH_IN_USDC,
             ttl_secs: 30,
+            sigma_horizon_secs: 300,
             min_fill_bps: 1_000,
         }
     }

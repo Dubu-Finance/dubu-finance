@@ -644,7 +644,12 @@ max_half_spread_e2 = 2000
 # pair and 50 mWBTC on another, a fifty-fold difference in the risk one order can take.
 max_notional_per_order = "100000"
 quote_decimals = 6
-ttl_secs = 30
+# 5 seconds, not 30. A signed order is an option the taker exercises when it suits them, and its
+# value grows with sqrt(TTL) -- so the spread charges for it (see quoting::ttl_premium_e2) and a
+# long TTL is simply expensive rather than free. The floor is set by the chain, not by taste:
+# measured send-to-confirmed on GIWA is 950ms, so an order must live at least a few seconds or
+# nobody can fill it.
+ttl_secs = 5
 min_fill_bps = 1000
 
 [rfq.serve]

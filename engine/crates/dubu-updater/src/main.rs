@@ -210,6 +210,10 @@ struct Runtime {
     /// The state the RFQ endpoint quotes from, or `None` when the RFQ leg is off. Written once
     /// per pair per cycle; read by whoever is asking for a quote at the time.
     rfq: Option<Arc<RfqShared>>,
+    /// True when the RFQ maker and the pool are the same account, so the curve's epoch and an RFQ
+    /// order draw on one balance. Normally false — `PmmSettle` pulls from the maker, and the two
+    /// are separate balance sheets whose commitments must not be netted against each other.
+    rfq_shares_pool_inventory: bool,
 }
 
 /// Why this cycle is running. Logged on every cycle, because "the fallback timer has been the
@@ -430,12 +434,25 @@ async fn run(args: &Args) -> Result<i32, Box<dyn std::error::Error>> {
         shutdown_rx.clone(),
     ));
 
-    let reader = ChainReader::new(
-        cfg.chain.pool,
-        cfg.chain.multicall3,
-        cfg.pairs.iter().map(|p| p.pair_id).collect(),
-        facts.tokens.clone(),
-    );
+    // Started before the reader, because the reader's call list depends on whether there is a
+    // maker to read a deliverable for.
+    let RfqLeg { shared: rfq_shared, maker: rfq_maker } = start_rfq(&cfg)?;
+
+    // With the RFQ leg on, the batch also carries what the maker can deliver — its balance and its
+    // allowance to `PmmSettle`, per token. Folded in here rather than fetched separately so both
+    // are answered at the same block as the inventory they are compared against.
+    let pair_ids: Vec<u16> = cfg.pairs.iter().map(|p| p.pair_id).collect();
+    let reader = match (&rfq_shared, &cfg.rfq) {
+        (Some(_), Some(r)) => ChainReader::with_maker(
+            cfg.chain.pool,
+            cfg.chain.multicall3,
+            pair_ids,
+            facts.tokens.clone(),
+            rfq_maker,
+            r.pmm_settle.parse()?,
+        ),
+        _ => ChainReader::new(cfg.chain.pool, cfg.chain.multicall3, pair_ids, facts.tokens.clone()),
+    };
     let vol: BTreeMap<u16, Volatility> =
         cfg.pairs.iter().map(|p| (p.pair_id, Volatility::new(cfg.skew.vol_config()))).collect();
 
@@ -470,7 +487,6 @@ async fn run(args: &Args) -> Result<i32, Box<dyn std::error::Error>> {
 
     let health = ChainHealth::new(Instant::now(), cfg.chain.degraded_after_secs, cfg.chain.halt_after_secs);
     let cfg_pool = cfg.chain.pool;
-    let rfq_shared = start_rfq(&cfg)?;
     let mut rt = Runtime {
         cfg,
         facts,
@@ -488,6 +504,7 @@ async fn run(args: &Args) -> Result<i32, Box<dyn std::error::Error>> {
         health,
         swaps: SwapWatch::new(cfg_pool),
         markout: Markout::new(),
+        rfq_shares_pool_inventory: rfq_maker == cfg_pool,
         rfq: rfq_shared,
     };
 
@@ -820,6 +837,21 @@ async fn jump_scan(rt: &mut Runtime) {
 
 /// Post a zero capacity epoch on one pair, at the withdrawal fees.
 async fn withdraw_pair(rt: &mut Runtime, pair_id: u16, why: &str) {
+    // The RFQ leg goes dark first, and synchronously.
+    //
+    // `refreshCapacity(pair, 0, 0)` stops the curve, and until this existed it stopped nothing
+    // else: signed orders stayed fillable at pre-jump prices for their whole TTL, so the jump
+    // defence had a hole exactly the width of that TTL — against the single largest loss the flow
+    // simulator found. Retiring here is immediate and needs no transaction, because an order that
+    // was never signed cannot be filled.
+    //
+    // What it does not do is cancel orders already signed. Those are out in the world until they
+    // expire; `PmmSettle.cancelNonces` could reach them but costs a transaction and a block, which
+    // is the same race the withdrawal already loses. Keeping the TTL short is the real control,
+    // and `quoting` prices it.
+    if let Some(rfq) = &rt.rfq {
+        rfq.retire(pair_id);
+    }
     let intent = Intent::RefreshCapacity { pair_id, bid: 0, ask: 0 };
     let started = Instant::now();
     match rt.sender.send_with_fees(&rt.rpc, intent, Some(rt.withdraw_fees)).await {
@@ -844,6 +876,16 @@ async fn withdraw_pair(rt: &mut Runtime, pair_id: u16, why: &str) {
     }
 }
 
+/// The RFQ leg, once started: the state the endpoint quotes from, and the address it signs as.
+///
+/// The address is returned even though `Shared` does not carry it, because the chain reader needs
+/// it to ask what that account can deliver — and asking the *pool* instead is the bug this pair
+/// exists to make impossible to write again.
+struct RfqLeg {
+    shared: Option<Arc<RfqShared>>,
+    maker: Address,
+}
+
 /// Starts the RFQ maker endpoint, if one is configured.
 ///
 /// `Ok(None)` is the ordinary case and means the leg is off: the aggregator routes AMM-only, which
@@ -854,31 +896,36 @@ async fn withdraw_pair(rt: &mut Runtime, pair_id: u16, why: &str) {
 ///
 /// The key is loaded before the listener binds so a bad key fails at startup rather than at the
 /// first request.
-fn start_rfq(cfg: &Config) -> Result<Option<Arc<RfqShared>>, Box<dyn std::error::Error>> {
+fn start_rfq(cfg: &Config) -> Result<RfqLeg, Box<dyn std::error::Error>> {
     let Some(rfq) = cfg.rfq.clone() else {
         info!(target: "rfq", event = "disabled",
               "no [rfq] section; the RFQ leg is off and routing is AMM-only");
-        return Ok(None);
+        return Ok(RfqLeg { shared: None, maker: Address::ZERO });
     };
 
     let pmm_settle: Address = rfq.pmm_settle.parse()?;
     let key = Arc::new(maker::MakerKey::load(&rfq.key_source()?, cfg.chain.chain_id, pmm_settle)?);
+    let maker_address = key.address();
     let shared = Arc::new(RfqShared::new());
 
     // Both are logged, and both are worth checking against the chain before trusting a quote: the
     // maker address is what `PmmSettle` must have an allowance from, and the separator is what a
     // taker's own verification recomputes. A mismatch in either produces unfillable quotes and no
     // error on this side.
+    let params = rfq.params(cfg.skew.vol_horizon_secs)?;
     info!(
         target: "rfq", event = "enabled", maker = %key.address(), pmm_settle = %pmm_settle,
         chain_id = cfg.chain.chain_id,
         domain_separator = %format!("{:#x}", key.domain_separator()),
-        half_spread_e2 = rfq.base_half_spread_e2, ttl_secs = rfq.ttl_secs,
+        base_half_spread_e2 = rfq.base_half_spread_e2, ttl_secs = rfq.ttl_secs,
+        sigma_horizon_secs = params.sigma_horizon_secs,
+        // What the TTL costs at a representative volatility, so the trade-off is visible at
+        // startup rather than inferred from quotes later.
+        ttl_premium_e2_at_20bp = params.ttl_premium_e2(20_000),
         "RFQ maker enabled; verify the maker address holds the PmmSettle allowance and that the \
          domain separator matches PmmSettle.DOMAIN_SEPARATOR()"
     );
 
-    let params = rfq.params()?;
     let serve_shared = Arc::clone(&shared);
     let chain_id = cfg.chain.chain_id;
     tokio::spawn(async move {
@@ -891,7 +938,7 @@ fn start_rfq(cfg: &Config) -> Result<Option<Arc<RfqShared>>, Box<dyn std::error:
         }
     });
 
-    Ok(Some(shared))
+    Ok(RfqLeg { shared: Some(shared), maker: maker_address })
 }
 
 /// Read the fills that landed since the last cycle, mark the ones that have matured, and log both.
@@ -1216,6 +1263,11 @@ async fn run_cycle(
         // at least stops itself at `maxStaleSecs`.
         if let Some(rfq) = &rt.rfq {
             match fair {
+                // NOT `base_balance` / `quote_balance`. Those are the POOL's, and `PmmSettle`
+                // pulls from the MAKER — different address, and the binding constraint is usually
+                // the allowance rather than the balance. Sizing an RFQ quote against the pool's
+                // inventory means signing orders that revert inside a `transferFrom`, which costs
+                // the taker gas and leaves nothing useful in the trace.
                 Some(f) => rfq.publish(quoting::MarketState {
                     pair_id: pair.pair_id,
                     base: meta.base,
@@ -1223,10 +1275,16 @@ async fn run_cycle(
                     fair: f,
                     price_scale_exp: meta.price_scale_exp,
                     sigma_millibps,
-                    base_balance,
-                    quote_balance,
-                    epoch_ask_base: ask_cap,
-                    epoch_bid_base: bid_cap,
+                    base_balance: view.maker_deliverable.get(&meta.base).copied().unwrap_or(0),
+                    quote_balance: view.maker_deliverable.get(&meta.quote).copied().unwrap_or(0),
+                    // Subtract the curve's epoch only if it comes out of the same account. The
+                    // maker and the pool are normally different addresses holding different
+                    // tokens, and taking the pool's commitment off the maker's balance is
+                    // comparing two balance sheets that never meet — it made a maker holding 500
+                    // mWETH of allowance refuse a one-mWETH order because the *pool* had promised
+                    // 1000.
+                    epoch_ask_base: if rt.rfq_shares_pool_inventory { ask_cap } else { 0 },
+                    epoch_bid_base: if rt.rfq_shares_pool_inventory { bid_cap } else { 0 },
                 }),
                 None => rfq.retire(pair.pair_id),
             }

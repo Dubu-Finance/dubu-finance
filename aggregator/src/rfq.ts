@@ -49,8 +49,19 @@ import type { Config } from './config.js';
  * market is malfunctioning whatever its balance says.
  */
 
-/** A quote must still be valid this long after we return it. */
-export const MIN_EXPIRY_HEADROOM_SECS = 20;
+/**
+ * A quote must still be valid this long after we return it.
+ *
+ * Three seconds, against a measured 950ms median from `eth_sendRawTransaction` to a confirmed
+ * receipt on GIWA — roughly 3x margin over the thing it has to survive.
+ *
+ * It was 20s, which was picked for comfort rather than from a measurement, and comfort turned out
+ * to be expensive: the maker's TTL is an option it writes, priced by `quoting::ttl_premium_e2` and
+ * growing with sqrt(TTL), so every second of headroom demanded here forces a second of TTL and
+ * therefore a wider quote. A headroom larger than the chain needs is spread the taker pays for and
+ * nobody receives.
+ */
+export const MIN_EXPIRY_HEADROOM_SECS = 3;
 
 /**
  * How far past the best AMM quote an RFQ quote may claim to be, in bps, before it is refused.
