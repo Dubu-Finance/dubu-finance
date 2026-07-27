@@ -150,6 +150,14 @@ mod tests {
     const PMM_SETTLE: Address = address!("68CFa6E265AffD5D0DB2C49E4bb9DaEC5A920A9E");
     const CHAIN_ID: u64 = 91342;
     const ONE_ETH: u128 = 1_000_000_000_000_000_000;
+    /// Roughly one base token's worth of quote at the fair value below. The taker's leg is
+    /// denominated in whatever it hands over, so the two directions take different numbers.
+    const ONE_ETH_IN_USDC: u128 = 2_000_000_000;
+
+    /// What a taker hands over for a one-base-token trade, in the direction's own units.
+    const fn taker_leg(taker_buys_base: bool) -> u128 {
+        if taker_buys_base { ONE_ETH_IN_USDC } else { ONE_ETH }
+    }
 
     fn key() -> MakerKey {
         MakerKey::new(Signer::from_hex(KEY).expect("valid key"), CHAIN_ID, PMM_SETTLE)
@@ -160,7 +168,7 @@ mod tests {
             base_half_spread_e2: 300,
             sigma_coefficient_e2: 10,
             max_half_spread_e2: 2_000,
-            max_base_per_order: 100 * ONE_ETH,
+            max_notional_per_order: 100 * ONE_ETH_IN_USDC,
             ttl_secs: 30,
             min_fill_bps: 1_000,
         }
@@ -184,7 +192,7 @@ mod tests {
     fn signed(taker_buys_base: bool) -> SignedOrder {
         let mut book = Book::new();
         let q = book
-            .quote(&params(), &state(), taker_buys_base, ONE_ETH, 1_000)
+            .quote(&params(), &state(), taker_buys_base, taker_leg(taker_buys_base), 1_000)
             .expect("quotable");
         key().sign(&q, book.next_nonce()).expect("signable")
     }
@@ -246,7 +254,7 @@ mod tests {
     #[test]
     fn every_field_changes_the_digest() {
         let mut book = Book::new();
-        let q = book.quote(&params(), &state(), true, ONE_ETH, 1_000).expect("quotable");
+        let q = book.quote(&params(), &state(), true, ONE_ETH_IN_USDC, 1_000).expect("quotable");
         let base = key().sign(&q, 0).expect("signable");
 
         let mut bigger = q;
@@ -269,9 +277,9 @@ mod tests {
     fn consecutive_quotes_get_distinct_digests() {
         let mut book = Book::new();
         let k = key();
-        let a = book.quote(&params(), &state(), true, ONE_ETH, 1_000).expect("quotable");
+        let a = book.quote(&params(), &state(), true, ONE_ETH_IN_USDC, 1_000).expect("quotable");
         let sa = k.sign(&a, book.next_nonce()).expect("signable");
-        let b = book.quote(&params(), &state(), true, ONE_ETH, 1_000).expect("quotable");
+        let b = book.quote(&params(), &state(), true, ONE_ETH_IN_USDC, 1_000).expect("quotable");
         let sb = k.sign(&b, book.next_nonce()).expect("signable");
         assert_ne!(sa.digest, sb.digest);
         assert_ne!(sa.order.nonce, sb.order.nonce);
@@ -295,7 +303,7 @@ mod tests {
             address!("00000000000000000000000000000000000000BD"),
         );
         let mut book = Book::new();
-        let q = book.quote(&params(), &state(), true, ONE_ETH, 1_000).expect("quotable");
+        let q = book.quote(&params(), &state(), true, ONE_ETH_IN_USDC, 1_000).expect("quotable");
         assert_ne!(
             other.sign(&q, 0).expect("signable").digest,
             key().sign(&q, 0).expect("signable").digest
@@ -306,7 +314,7 @@ mod tests {
     fn a_different_chain_yields_a_different_digest() {
         let other = MakerKey::new(Signer::from_hex(KEY).expect("valid key"), 1, PMM_SETTLE);
         let mut book = Book::new();
-        let q = book.quote(&params(), &state(), true, ONE_ETH, 1_000).expect("quotable");
+        let q = book.quote(&params(), &state(), true, ONE_ETH_IN_USDC, 1_000).expect("quotable");
         assert_ne!(
             other.sign(&q, 0).expect("signable").digest,
             key().sign(&q, 0).expect("signable").digest

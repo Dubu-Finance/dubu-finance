@@ -34,3 +34,4 @@ contracts/lib/
 aggregator/node_modules/
 aggregator/.wrangler/
 aggregator/package-lock.json
+aggregator/.dev.vars

@@ -283,8 +283,117 @@ pub struct Config {
     pub jump: JumpConfig,
     /// Killswitches.
     pub risk: RiskConfig,
+    /// The RFQ maker endpoint. **Absent means off**, and off is the default.
+    ///
+    /// Not defaulted-on the way [`SpreadConfig`] and [`JumpConfig`] are. Those change how the pool
+    /// prices; this one hands out signatures that move tokens. A config written before this
+    /// existed must not acquire a signing endpoint merely by being loaded.
+    #[serde(default)]
+    pub rfq: Option<RfqConfig>,
     /// One entry per pair the bot quotes.
     pub pairs: Vec<PairConfig>,
+}
+
+/// The RFQ maker: its own key, the contract it signs for, and how it prices.
+///
+/// The key is deliberately separate from [`TxConfig`]'s. See `maker`'s module docs — a leaked
+/// updater key posts a wrong ladder the killswitches will notice, and a leaked RFQ key signs away
+/// the maker's balance up to its standing allowance with nothing to notice in time.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RfqConfig {
+    /// Environment variable holding the RFQ signing key. Exactly one of this and
+    /// [`Self::private_key_file`], and never the same key as `tx`.
+    #[serde(default)]
+    pub private_key_env: Option<String>,
+    /// File holding the RFQ signing key. The alternative to [`Self::private_key_env`].
+    #[serde(default)]
+    pub private_key_file: Option<PathBuf>,
+    /// The deployed `PmmSettle`. Pinned into the EIP-712 domain at startup, so a wrong address
+    /// here yields orders nobody can fill — which is why it is required rather than defaulted.
+    pub pmm_settle: String,
+    /// Where the endpoint listens. Loopback by default.
+    #[serde(default)]
+    pub serve: crate::serve::ServeConfig,
+    /// Half-spread at zero volatility, in hundredths of a bp.
+    pub base_half_spread_e2: u32,
+    /// Added half-spread per millibp of volatility, in hundredths of a bp.
+    #[serde(default)]
+    pub sigma_coefficient_e2: u32,
+    /// Ceiling on the half-spread.
+    pub max_half_spread_e2: u32,
+    /// Largest notional a single order may commit, in whole quote tokens. A decimal string
+    /// because TOML integers are `i64` and this is a `u128` once scaled.
+    pub max_notional_per_order: String,
+    /// Decimals of the quote token these markets are denominated in.
+    pub quote_decimals: u8,
+    /// How long a signed order stays fillable, and how long its inventory stays reserved.
+    pub ttl_secs: u64,
+    /// Floor on a single fill, in bps of the maker leg.
+    #[serde(default)]
+    pub min_fill_bps: u16,
+}
+
+impl RfqConfig {
+    /// Where the signing key lives.
+    ///
+    /// # Errors
+    ///
+    /// [`ConfigError`] when neither or both are set, when the variable name is empty, or when it
+    /// looks like somebody pasted the key itself where the variable name goes. The same three
+    /// checks `tx` makes, for the same reasons — and here the key is the more dangerous of the
+    /// two, so the section is required to name a source rather than being allowed to default to
+    /// none.
+    pub fn key_source(&self) -> Result<KeySource, ConfigError> {
+        let source = match (&self.private_key_env, &self.private_key_file) {
+            (Some(_), Some(_)) => {
+                return Err(invalid("rfq: set exactly one of private_key_env / private_key_file, not both"))
+            }
+            (None, None) => {
+                return Err(invalid(
+                    "rfq: no signing key; set private_key_env or private_key_file, or remove the \
+                     [rfq] section to run without the RFQ leg",
+                ))
+            }
+            (Some(v), None) => KeySource::Env(v.clone()),
+            (None, Some(p)) => KeySource::File(p.clone()),
+        };
+        if let KeySource::Env(name) = &source {
+            if name.trim().is_empty() {
+                return Err(invalid("rfq.private_key_env: must name an environment variable"));
+            }
+            if name.starts_with("0x") || name.len() >= 64 {
+                return Err(invalid(
+                    "rfq.private_key_env looks like a key rather than a variable name; \
+                     this field holds the NAME of an environment variable",
+                ));
+            }
+        }
+        Ok(source)
+    }
+
+    /// [`Self::max_notional_per_order`] in the quote token's own units.
+    ///
+    /// # Errors
+    /// [`ConfigError::Units`].
+    pub fn max_notional_units(&self) -> Result<u128, ConfigError> {
+        Ok(units::parse_fixed(&self.max_notional_per_order, self.quote_decimals)?)
+    }
+
+    /// The pricing parameters, as `quoting` wants them.
+    ///
+    /// # Errors
+    /// [`ConfigError::Units`] if the notional cap is not a decimal number.
+    pub fn params(&self) -> Result<crate::quoting::MakerParams, ConfigError> {
+        Ok(crate::quoting::MakerParams {
+            base_half_spread_e2: self.base_half_spread_e2,
+            sigma_coefficient_e2: self.sigma_coefficient_e2,
+            max_half_spread_e2: self.max_half_spread_e2,
+            max_notional_per_order: self.max_notional_units()?,
+            ttl_secs: self.ttl_secs,
+            min_fill_bps: self.min_fill_bps,
+        })
+    }
 }
 
 impl Config {

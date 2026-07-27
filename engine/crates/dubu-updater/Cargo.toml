@@ -13,6 +13,7 @@ dubu-core = { path = "../dubu-core" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 toml = { workspace = true }
+axum = { workspace = true }
 thiserror = { workspace = true }
 
 tokio = { workspace = true }
@@ -36,3 +37,7 @@ tracing-subscriber = { workspace = true }
 [[bin]]
 name = "dubu-updater"
 path = "src/main.rs"
+
+[dev-dependencies]
+# `oneshot`, so the RFQ endpoint is tested through the router rather than around it.
+tower = { version = "0.5", features = ["util"] }

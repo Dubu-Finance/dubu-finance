@@ -18,7 +18,12 @@ sha3 = { version = "0.11", default-features = false }
 # --- dubu-updater only -------------------------------------------------------
 # Kept in the workspace table so a future second bot cannot pick a different
 # alloy minor and end up with two incompatible `Address` types.
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "signal", "sync"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "signal", "sync", "net"] }
+
+# The RFQ maker endpoint. A hand-rolled HTTP parser would save a dependency and would be the wrong
+# place to save one: this endpoint answers with a signature that authorises a token transfer, so
+# its request parsing is security-relevant in a way the rest of this crate's I/O is not.
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
 tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "handshake", "rustls-tls-webpki-roots"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }

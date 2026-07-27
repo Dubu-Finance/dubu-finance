@@ -603,3 +603,31 @@ capacity_divergence_pct = 30
 binance = "BTCUSDT"
 okx     = "BTC-USDT"
 bybit   = "BTCUSDT"
+
+# ---------------------------------------------------------------------------
+# The RFQ maker endpoint.
+#
+# Absent means off. Present means this process signs orders that let PmmSettle pull tokens out of
+# the maker's balance, so the key is its own -- never tx's. See `maker`'s module docs for why the
+# two authorities are not comparable.
+#
+# `bind` is loopback on purpose. Put a TLS-terminating, rate-limited proxy in front of it before
+# anything outside this machine can reach it.
+# ---------------------------------------------------------------------------
+[rfq]
+private_key_env = "RFQ_PRIVATE_KEY"
+pmm_settle = "0x68CFa6E265AffD5D0DB2C49E4bb9DaEC5A920A9E"
+# 3 bp base, widening with volatility, capped at 20 bp. Tighter than the curve's standing quote
+# because an RFQ price is quoted after the size is known -- see `quoting`'s module docs.
+base_half_spread_e2 = 300
+sigma_coefficient_e2 = 10
+max_half_spread_e2 = 2000
+# $100k in one order. Denominated in money rather than tokens: "50" would mean 50 mWETH on one
+# pair and 50 mWBTC on another, a fifty-fold difference in the risk one order can take.
+max_notional_per_order = "100000"
+quote_decimals = 6
+ttl_secs = 30
+min_fill_bps = 1000
+
+[rfq.serve]
+bind = "127.0.0.1:8790"

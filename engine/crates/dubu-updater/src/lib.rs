@@ -126,7 +126,26 @@ pub mod markout;
 pub mod policy;
 pub mod quoting;
 pub mod risk;
+pub mod serve;
 pub mod skew;
 pub mod spread;
 pub mod tx;
 pub mod units;
+
+/// Seconds since the Unix epoch.
+///
+/// Lives here rather than in `main` because the quote cycle and the RFQ endpoint must agree about
+/// what "now" is: an order's expiry is set by one and swept by the other, and two clocks would
+/// mean a reservation released a little before or after the order it belongs to stops being
+/// fillable.
+///
+/// Zero on a clock before 1970, which is not a case worth propagating an error for — every caller
+/// would have to handle a variant that means the machine is fundamentally misconfigured, and a
+/// zero timestamp expires every order immediately, which is the safe direction.
+#[must_use]
+pub fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}

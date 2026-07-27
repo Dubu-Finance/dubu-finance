@@ -49,17 +49,22 @@ use tokio::sync::watch;
 use tracing::{error, info, warn};
 
 use dubu_updater::chain::heads::{self, HeadShared};
+use alloy_primitives::Address;
 use dubu_updater::chain::swaps::SwapWatch;
 use dubu_updater::chain::{ChainFacts, ChainHealth, ChainReader, ChainStatus, ChainView, Rpc};
 use dubu_updater::config::{Config, KeySource};
+use dubu_updater::now_unix;
 use dubu_updater::fair_value::{self, Reference, VenueQuote};
 use dubu_updater::feed::ws::MarketFeed;
 use dubu_updater::feed::{binance, bybit, coinbase, okx, FeedStatus, VenueFeeds, VenueId, VenueWatch};
 use dubu_updater::jump;
 use dubu_updater::ladder::{self, RowInputs};
+use dubu_updater::maker;
 use dubu_updater::markout::{self, Markout};
 use dubu_updater::policy::{self, CapacityDecision, Context, Decision};
+use dubu_updater::quoting;
 use dubu_updater::risk::{Halt, KillSwitch, Position};
+use dubu_updater::serve::{self, Shared as RfqShared};
 use dubu_updater::skew::{self, Inventory, Volatility};
 use dubu_updater::spread;
 use dubu_updater::tx::{Fees, Intent, Sender, Sent, Settled, Signer};
@@ -202,6 +207,9 @@ struct Runtime {
     swaps: SwapWatch,
     /// Who has been trading against us and how it went. Fed by [`scan_fills`].
     markout: Markout,
+    /// The state the RFQ endpoint quotes from, or `None` when the RFQ leg is off. Written once
+    /// per pair per cycle; read by whoever is asking for a quote at the time.
+    rfq: Option<Arc<RfqShared>>,
 }
 
 /// Why this cycle is running. Logged on every cycle, because "the fallback timer has been the
@@ -448,6 +456,7 @@ async fn run(args: &Args) -> Result<i32, Box<dyn std::error::Error>> {
 
     let health = ChainHealth::new(Instant::now(), cfg.chain.degraded_after_secs, cfg.chain.halt_after_secs);
     let cfg_pool = cfg.chain.pool;
+    let rfq_shared = start_rfq(&cfg)?;
     let mut rt = Runtime {
         cfg,
         facts,
@@ -465,6 +474,7 @@ async fn run(args: &Args) -> Result<i32, Box<dyn std::error::Error>> {
         health,
         swaps: SwapWatch::new(cfg_pool),
         markout: Markout::new(),
+        rfq: rfq_shared,
     };
 
     wait_for_feed(&rt).await;
@@ -820,6 +830,56 @@ async fn withdraw_pair(rt: &mut Runtime, pair_id: u16, why: &str) {
     }
 }
 
+/// Starts the RFQ maker endpoint, if one is configured.
+///
+/// `Ok(None)` is the ordinary case and means the leg is off: the aggregator routes AMM-only, which
+/// is a worse quote and a working system. Anything present but wrong is fatal here rather than
+/// degraded, because every failure mode of a misconfigured maker is *silent* from its own side —
+/// a wrong `pmm_settle` signs orders against a domain nothing verifies, and the operator sees a
+/// healthy process answering requests that no taker can ever fill.
+///
+/// The key is loaded before the listener binds so a bad key fails at startup rather than at the
+/// first request.
+fn start_rfq(cfg: &Config) -> Result<Option<Arc<RfqShared>>, Box<dyn std::error::Error>> {
+    let Some(rfq) = cfg.rfq.clone() else {
+        info!(target: "rfq", event = "disabled",
+              "no [rfq] section; the RFQ leg is off and routing is AMM-only");
+        return Ok(None);
+    };
+
+    let pmm_settle: Address = rfq.pmm_settle.parse()?;
+    let key = Arc::new(maker::MakerKey::load(&rfq.key_source()?, cfg.chain.chain_id, pmm_settle)?);
+    let shared = Arc::new(RfqShared::new());
+
+    // Both are logged, and both are worth checking against the chain before trusting a quote: the
+    // maker address is what `PmmSettle` must have an allowance from, and the separator is what a
+    // taker's own verification recomputes. A mismatch in either produces unfillable quotes and no
+    // error on this side.
+    info!(
+        target: "rfq", event = "enabled", maker = %key.address(), pmm_settle = %pmm_settle,
+        chain_id = cfg.chain.chain_id,
+        domain_separator = %format!("{:#x}", key.domain_separator()),
+        half_spread_e2 = rfq.base_half_spread_e2, ttl_secs = rfq.ttl_secs,
+        "RFQ maker enabled; verify the maker address holds the PmmSettle allowance and that the \
+         domain separator matches PmmSettle.DOMAIN_SEPARATOR()"
+    );
+
+    let params = rfq.params()?;
+    let serve_shared = Arc::clone(&shared);
+    let chain_id = cfg.chain.chain_id;
+    tokio::spawn(async move {
+        if let Err(e) = serve::run(&rfq.serve, serve_shared, key, params, chain_id, pmm_settle).await {
+            // Not fatal to the quote cycle. The pool keeps quoting its curve either way, and
+            // taking the ladder down because an HTTP listener died would turn a lost venue into
+            // no venue.
+            error!(target: "rfq", event = "serve_failed", error = %e,
+                   "THE RFQ ENDPOINT IS DOWN; the curve keeps quoting and routing falls back to AMM-only");
+        }
+    });
+
+    Ok(Some(shared))
+}
+
 /// Read the fills that landed since the last cycle, mark the ones that have matured, and log both.
 ///
 /// Runs after the quote decisions rather than before them, deliberately. Markout is a measurement
@@ -1132,6 +1192,31 @@ async fn run_cycle(
         // one already on chain, unless this cycle is also going to post a new epoch.
         let bid_cap = if snap.bid_capacity == 0 { capacity.bid } else { snap.bid_capacity };
         let ask_cap = if snap.ask_capacity == 0 { capacity.ask } else { snap.ask_capacity };
+
+        // Publish this market to the RFQ endpoint, or withdraw it.
+        //
+        // The epoch handed over is the one that will be in force, so RFQ subtracts the commitment
+        // the curve is about to honour rather than a stale one. With no fair value the market is
+        // retired outright: an RFQ order is a firm price for its whole TTL, so signing one against
+        // a reference the venues no longer agree on is worse than leaving a stale ladder up, which
+        // at least stops itself at `maxStaleSecs`.
+        if let Some(rfq) = &rt.rfq {
+            match fair {
+                Some(f) => rfq.publish(quoting::MarketState {
+                    pair_id: pair.pair_id,
+                    base: meta.base,
+                    quote: meta.quote,
+                    fair: f,
+                    price_scale_exp: meta.price_scale_exp,
+                    sigma_millibps,
+                    base_balance,
+                    quote_balance,
+                    epoch_ask_base: ask_cap,
+                    epoch_bid_base: bid_cap,
+                }),
+                None => rfq.retire(pair.pair_id),
+            }
+        }
 
         // --- the half-spread ---------------------------------------------------------------
         //
@@ -1503,9 +1588,3 @@ async fn wait_for_signal() {
     }
 }
 
-fn now_unix() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
