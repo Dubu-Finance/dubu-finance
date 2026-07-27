@@ -353,7 +353,21 @@ max_negative_bps = 10
 # back-solve once there is fill data. Set it to 0.0 to restore the old constant
 # spread exactly. Every row logs s0, sigma, vol_decibps, half_spread_bps and
 # `capped` so the next correction is a back-solve and not another guess.
-vol_coefficient = 0.5
+# RE-DERIVED for a 1 bp floor. s1 is not a taste: it is whatever makes the curve reach
+# the cap where the sweep says it must. `s0 + s1 * 50 = 30` gave 0.5 when s0 was 5;
+# with s0 = 1 it gives 0.58, which lowers the floor without moving the ceiling one
+# basis point.
+#
+#   sigma(300s)    s0=5,s1=0.50    s0=1,s1=0.58
+#          4.1bp        7.05bp          3.38bp
+#         10.0bp       10.00bp          6.80bp
+#         25.0bp       17.50bp         15.50bp
+#         50.0bp       30.00bp         30.00bp   <- unchanged, which is the point
+#
+# The note above says ETH's ordinary half-spread DOUBLES from 5 to 10 under this term.
+# With the floor at 1 it reaches 6.8 instead, so the honest cost accepted there is now
+# about a third of what it was.
+vol_coefficient = 0.58
 
 # THE CAP, and it is 30 bp because that is both the measured-positive point AND
 # UniV2's fee. The rule that produces is worth stating plainly: the pool never
@@ -534,7 +548,7 @@ base_decimals = 18
 quote_decimals = 6
 
 # 5 bp either side: a 10 bp round trip, matching the ladder measured in DEPLOYMENTS.md.
-half_spread_bps = 5
+half_spread_bps = 1
 
 # Concentration: the price decays at most this far across the WHOLE posted depth. An upper
 # bound, not a target — the solver narrows it whenever the fair-value ceiling on maxBid binds.
@@ -582,8 +596,8 @@ heartbeat_secs = 5
 #                threshold is loose and a quiet market does not churn gas.
 #
 # This inverts archi_v2 5.3's chase/retreat asymmetry on purpose; policy.rs argues why.
-adverse_drift_bps = 0.5
-favourable_drift_bps = 8
+adverse_drift_bps = 0.15
+favourable_drift_bps = 3
 
 # Refresh the capacity epoch once remaining capacity falls this far below the planned one.
 capacity_divergence_pct = 30
@@ -617,7 +631,10 @@ quote_decimals = 6
 
 # Wider than ETH: an 8-decimal base at a six-figure price is a coarser tick, and the pool holds
 # less of it in notional terms.
-half_spread_bps = 8
+# 2, not 1.6 -- the field is an integer. BTC keeps a wider floor than ETH for the same
+# reason its width is 40 against ETH's 25: it is the less liquid of the two references and
+# its own sigma carries it further anyway.
+half_spread_bps = 2
 width_bps = 40
 
 # See pairId 1. Same balanced target; the imbalance and the resulting skew are logged per row.
@@ -640,8 +657,8 @@ ask_capacity = "20"
 #
 # Cost: 2 pairs x 12 pushes a minute x 0.00000012 ETH = 0.0041 ETH a day.
 heartbeat_secs = 5
-adverse_drift_bps = 3
-favourable_drift_bps = 12
+adverse_drift_bps = 0.5
+favourable_drift_bps = 5
 capacity_divergence_pct = 30
 
 [pairs.venues]
@@ -664,8 +681,19 @@ private_key_env = "RFQ_PRIVATE_KEY"
 pmm_settle = "0x68CFa6E265AffD5D0DB2C49E4bb9DaEC5A920A9E"
 # 3 bp base, widening with volatility, capped at 20 bp. Tighter than the curve's standing quote
 # because an RFQ price is quoted after the size is known -- see `quoting`'s module docs.
-base_half_spread_e2 = 300
-sigma_coefficient_e2 = 10
+# 1 bp, matching the curve's new floor. Leaving it at 3 bp would have made the RFQ leg
+# quote WORSE than the curve it is supposed to beat on size -- the aggregator would have
+# routed around it and the leg would have looked broken rather than mispriced.
+#
+# The TTL premium is added on top, so what RFQ actually quotes is 1 bp + sigma + the cost
+# of the 5s option it writes. That is the design working: RFQ pays for its own optionality
+# rather than being handed a flat number that hides it.
+base_half_spread_e2 = 100
+# Matches the curve's re-derived s1 of 0.58: this field is hundredths of a bp per millibp
+# of sigma, so 0.58 bp per bp is 58 here... but the curve's sigma is over 300s and this one
+# is rescaled to the TTL, so the two are not the same multiplier. Kept at the curve's slope
+# so the two surfaces widen together in a volatile market.
+sigma_coefficient_e2 = 58
 max_half_spread_e2 = 2000
 # $100k in one order. Denominated in money rather than tokens: "50" would mean 50 mWETH on one
 # pair and 50 mWBTC on another, a fifty-fold difference in the risk one order can take.
