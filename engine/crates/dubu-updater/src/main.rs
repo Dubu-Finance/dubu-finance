@@ -42,7 +42,7 @@
 //! if it does not.
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use tokio::sync::watch;
@@ -51,6 +51,7 @@ use tracing::{error, info, warn};
 use dubu_updater::chain::heads::{self, HeadShared};
 use alloy_primitives::Address;
 use dubu_updater::chain::swaps::SwapWatch;
+use dubu_updater::chain::view::{self, SharedView as ViewSlot};
 use dubu_updater::chain::{ChainFacts, ChainHealth, ChainReader, ChainStatus, ChainView, Rpc, Selection};
 use dubu_updater::config::{Config, KeySource};
 use dubu_updater::now_unix;
@@ -178,9 +179,13 @@ struct Runtime {
     facts: ChainFacts,
     /// Ordinary RPC: transactions, nonce, receipts, startup metadata. Canonical.
     rpc: Rpc,
-    /// Flashblocks RPC: every state read, `pending` tag, ~200ms preconfirmed. Freshest.
-    flash: Rpc,
-    reader: ChainReader,
+    /// The chain state, published by the reader task rather than fetched here.
+    ///
+    /// `flash` and `reader` used to live on this struct and the cycle called them itself, which
+    /// is what pinned the cycle to the read's cadence. They now belong to
+    /// [`dubu_updater::chain::view::run`], and everything on this side reads whatever it last
+    /// published. See that module for why up to one interval of staleness costs nothing.
+    view: Arc<ViewSlot>,
     /// Every configured venue's feed state. One socket, one reconnect loop and one liveness
     /// state per venue, so one venue failing cannot take another down.
     feeds: Arc<VenueFeeds>,
@@ -200,7 +205,8 @@ struct Runtime {
     withdraw_fees: Fees,
     sender: Sender,
     kill: KillSwitch,
-    health: ChainHealth,
+    /// Shared with the reader task, which is where read successes and failures now come from.
+    health: Arc<Mutex<ChainHealth>>,
     /// Follows our own `Swap` logs. Read off the canonical RPC, not the flashblocks one: markout
     /// anchors to block timestamps, so a preconfirmed head buys it nothing, and a fill read out of
     /// a preconfirmation that later reorganises would be a phantom counterparty score.
@@ -485,14 +491,30 @@ async fn run(args: &Args) -> Result<i32, Box<dyn std::error::Error>> {
         max_priority_fee: cfg.jump.withdraw_priority_fee_wei()?,
     };
 
-    let health = ChainHealth::new(Instant::now(), cfg.chain.degraded_after_secs, cfg.chain.halt_after_secs);
+    let health = Arc::new(Mutex::new(ChainHealth::new(
+        Instant::now(),
+        cfg.chain.degraded_after_secs,
+        cfg.chain.halt_after_secs,
+    )));
+    let view = Arc::new(ViewSlot::new());
+
+    // The chain read gets its own clock. Until now it happened inside the cycle, which made the
+    // cycle run at whatever cadence the read was triggered at -- `newHeads`, one second -- and so
+    // made one second the ceiling on how often the pool could re-price. A 96ms round trip does not
+    // belong in a 200ms decision loop, so it moves out rather than in.
+    tokio::spawn(view::run(
+        Arc::new(reader),
+        Arc::new(flash),
+        Arc::clone(&view),
+        Arc::clone(&health),
+        view::Pacing::default(),
+    ));
     let cfg_pool = cfg.chain.pool;
     let mut rt = Runtime {
         cfg,
         facts,
         rpc,
-        flash,
-        reader,
+        view: Arc::clone(&view),
         feeds,
         watch: VenueWatch::new(),
         heads,
@@ -642,28 +664,20 @@ async fn quote_loop(
             );
         }
 
-        // --- the read ----------------------------------------------------------------------
-        match rt.reader.read(&rt.flash).await {
-            Ok(v) => {
-                rt.health.on_read(Instant::now(), v.block_number);
-                last_view = Some(v);
-            }
-            Err(e) => {
-                rt.health.on_failure(&e);
-                let level_is_rate_limit = e.is_rate_limit();
-                warn!(
-                    target: "chain", event = "read_failed", error = %e,
-                    rate_limit = level_is_rate_limit,
-                    consecutive_failures = rt.health.consecutive_failures(),
-                    status = rt.health.status(Instant::now()).label(),
-                    "chain read failed"
-                );
-            }
+        // --- the read, which already happened ---------------------------------------------
+        //
+        // Whatever the reader task last published. Up to one poll interval old, and see
+        // `chain::view` for why that costs nothing: every externally-driven change in here is a
+        // swap, and a swap only reduces what is exposed.
+        if let Some(v) = rt.view.latest() {
+            last_view = Some(v);
         }
 
         let now = Instant::now();
-        let status = rt.health.status(now);
-        let stall = rt.health.stall(now);
+        let (status, stall, best_block, last_error) = {
+            let h = rt.health.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            (h.status(now), h.stall(now), h.best_block(), h.last_error().unwrap_or("(none)").to_string())
+        };
         if let ChainStatus::Down { stale_secs } = status {
             let halt = Halt::Liveness {
                 reason: format!(
@@ -671,13 +685,13 @@ async fn quote_loop(
                      best block {}; heads: {}; last error: {}",
                     rt.cfg.chain.halt_after_secs,
                     stall.label(),
-                    rt.health.best_block(),
+                    best_block,
                     head.status.label(),
-                    rt.health.last_error().unwrap_or("(none)")
+                    last_error
                 ),
             };
             error!(target: "risk", event = "halt", switch = halt.label(), reason = %halt,
-                   stall = stall.label(), best_block = rt.health.best_block(),
+                   stall = stall.label(), best_block,
                    heads = head.status.label(),
                    "chain liveness is gone; halting and withdrawing quotes");
             let _ = rt.kill.halt(&halt, now_unix());
@@ -1110,6 +1124,12 @@ async fn run_cycle(
         read_ahead_of_head = head.last.map(|h| i64::try_from(view.block_number).unwrap_or(i64::MAX)
             - i64::try_from(h.number).unwrap_or(i64::MAX)),
         chain = status.label(), view_age_secs = view_age,
+        // The reader task's own counters. Worth having on the cycle line because the two now run
+        // on different clocks: a cycle count that no longer matches a read count is the whole
+        // point of the split, and `quiet_polls` is the signal a fill-frequency rule would key on
+        // once there is third-party flow to see.
+        reads = rt.view.polls(), read_failures = rt.view.failures(),
+        quiet_polls = rt.view.quiet_polls(),
         "cycle"
     );
 
@@ -1627,10 +1647,16 @@ async fn emit(rt: &mut Runtime, intent: Intent) {
             calldata_bytes = calldata.len(), would_be_hash = ?would_be_hash, would_be_nonce = ?would_be_nonce,
             "DRY RUN: would send this transaction"
         ),
-        Ok(Sent::Broadcast { hash, nonce }) => info!(
-            target: "tx", event = "sent", pair_id = intent.pair_id(), kind = intent.label(),
-            tx = %hash, nonce, "transaction broadcast"
-        ),
+        Ok(Sent::Broadcast { hash, nonce }) => {
+            // The one adaptive signal the reader takes, and it is one we generate: this
+            // transaction is about to change the state the reader publishes, ~440ms from now.
+            // Looking again then settles it sooner and unblocks the in-flight gate sooner.
+            rt.view.nudge();
+            info!(
+                target: "tx", event = "sent", pair_id = intent.pair_id(), kind = intent.label(),
+                tx = %hash, nonce, "transaction broadcast"
+            );
+        }
         Err(e) => error!(
             target: "tx", event = "send_failed", pair_id = intent.pair_id(), kind = intent.label(),
             error = %e, "could not send"

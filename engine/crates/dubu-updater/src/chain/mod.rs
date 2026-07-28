@@ -101,6 +101,7 @@
 
 pub mod heads;
 pub mod swaps;
+pub mod view;
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
