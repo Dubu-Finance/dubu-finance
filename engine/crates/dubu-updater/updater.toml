@@ -713,7 +713,19 @@ quote_decimals = 6
 # reorganised, and a taker who fills against one wants the order still valid if their transaction
 # is re-included a block later. Buying that costs about 0.2bp of premium over a 3s TTL, which is
 # a better trade than discovering the alternative in production.
-ttl_secs = 5
+# 2 seconds. The TTL is an option the maker writes, priced by quoting::ttl_premium_e2 and growing
+# with sqrt(TTL), so shorter is cheaper -- 5s cost 0.58bp of spread at today's sigma, 2s costs 0.37.
+#
+# The floor is the taker's round trip, measured rather than guessed:
+#   quote round trip   ~78ms   (edge)
+#   sign and submit    ~50ms
+#   inclusion         440ms median, 508ms max   (six transactions)
+#   ----------------------------------
+#                    ~640ms worst observed
+# 2s leaves 3.1x margin. 1s would leave 1.6x, which one slow sequencer moment turns into an order
+# that expires in flight -- and an expired order costs the taker gas for a revert, which is worse
+# than never quoting.
+ttl_secs = 2
 min_fill_bps = 1000
 
 [rfq.serve]

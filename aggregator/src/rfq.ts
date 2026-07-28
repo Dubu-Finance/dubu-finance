@@ -52,18 +52,27 @@ import type { Config } from './config.js';
 /**
  * A quote must still be valid this long after we return it.
  *
- * Three seconds. The number it is sized against is *inclusion*, not confirmation: a transaction on
- * GIWA is visible in a preconfirmation in as little as 5ms, and an RFQ order only has to be
- * unexpired at the block that includes the fill. A confirmed receipt takes about a second, but
- * nothing here waits for one.
+ * One second, sized against the whole path a quote has to survive, measured rather than guessed:
  *
- * It was 20s, which was picked for comfort rather than from a measurement, and comfort turned out
- * to be expensive: the maker's TTL is an option it writes, priced by `quoting::ttl_premium_e2` and
- * growing with sqrt(TTL), so every second of headroom demanded here forces a second of TTL and
- * therefore a wider quote. A headroom larger than the chain needs is spread the taker pays for and
- * nobody receives.
+ * ```text
+ *   quote round trip to the taker   ~78ms   (edge, measured)
+ *   sign and submit                 ~50ms
+ *   inclusion in a preconfirmation  440ms median, 508ms max over six transactions
+ *   ----------------------------------------
+ *                                  ~640ms worst observed
+ * ```
+ *
+ * The target is *inclusion*, not confirmation: a fill executes against preconfirmed state, so an
+ * order only has to be unexpired at the block that includes it. A confirmed receipt takes about a
+ * second and nothing here waits for one — an earlier 3s was sized against that receipt, which
+ * measured bookkeeping instead of the chain.
+ *
+ * Headroom is not free. The maker's TTL is an option it writes, priced by
+ * `quoting::ttl_premium_e2` and growing with sqrt(TTL), so every second demanded here forces a
+ * second of TTL and therefore a wider quote. This pairs with a 2s TTL, leaving the taker a full
+ * second of slack over a 640ms worst case.
  */
-export const MIN_EXPIRY_HEADROOM_SECS = 3;
+export const MIN_EXPIRY_HEADROOM_SECS = 1;
 
 /**
  * How far past the best AMM quote an RFQ quote may claim to be, in bps, before it is refused.
