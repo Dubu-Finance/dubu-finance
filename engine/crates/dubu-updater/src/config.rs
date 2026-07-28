@@ -167,7 +167,7 @@ impl<'de> Deserialize<'de> for EndpointUrl {
 /// An unset or empty variable is an error rather than an empty expansion: a URL with a blank key
 /// segment produces a 401 at the first request, which is a much worse place to discover a
 /// missing `.env` than startup.
-fn expand_env(field: &str, template: &str) -> Result<String, ConfigError> {
+pub(crate) fn expand_env(field: &str, template: &str) -> Result<String, ConfigError> {
     let mut out = String::with_capacity(template.len());
     let mut rest = template;
     while let Some(start) = rest.find("${") {

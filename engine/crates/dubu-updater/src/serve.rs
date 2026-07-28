@@ -373,10 +373,16 @@ pub async fn run(
     chain_id: u64,
     pmm_settle: Address,
 ) -> std::io::Result<()> {
-    let addr: SocketAddr = cfg.bind.parse().map_err(|e| {
+    // `${VAR}` is expanded here so a platform that hands out its port in the environment can be
+    // written as `0.0.0.0:${PORT}`. Render does exactly that, and without this the config would
+    // have to hard-code a port the platform did not choose -- or, worse, keep the loopback default
+    // and deploy a maker that starts cleanly, logs nothing wrong, and is reachable by nobody.
+    let bind = crate::config::expand_env("rfq.serve.bind", &cfg.bind)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string()))?;
+    let addr: SocketAddr = bind.parse().map_err(|e| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            format!("bind `{}`: {e}", cfg.bind),
+            format!("bind `{bind}`: {e}"),
         )
     })?;
 
