@@ -203,6 +203,8 @@ fn main() {
 
 /// Everything resolved at startup, so the cycle never has to ask again.
 struct Runtime {
+    /// Whether the clock has been compared against the chain yet. See `check_clock_skew`.
+    clock_checked: bool,
     /// The sealed block timestamp the per-block work last ran at.
     ///
     /// The cycle runs at the quote cadence now, several times per block, but some of what it does
@@ -597,6 +599,7 @@ async fn run(args: &Args) -> Result<i32, Box<dyn std::error::Error>> {
     ));
     let cfg_pool = cfg.chain.pool;
     let mut rt = Runtime {
+        clock_checked: false,
         last_block_work: 0,
         last_push: BTreeMap::new(),
         cfg,
@@ -668,6 +671,43 @@ async fn wait_for_feed(rt: &Runtime) {
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
+}
+
+/// Compare this machine's clock to the chain's, and say so loudly if they disagree.
+///
+/// The RFQ expiry is a contract between three clocks that nothing synchronises: the maker stamps
+/// `expiry` from *here*, the aggregator refuses anything with less than a second left using
+/// *its* clock, and the settler enforces it against `block.timestamp`. The budget between them is
+/// `ttl_secs` minus the aggregator's headroom minus a block -- with a 2s TTL that is zero, and any
+/// skew at all is spent before the order exists.
+///
+/// It happened: this machine ran two seconds slow, so every signed order arrived already expired
+/// and the aggregator reported `rejected: expired` -- which is true, and says nothing about a
+/// clock. The maker looked healthy, the tunnel answered, the price was right, and the RFQ leg
+/// simply never filled. Two seconds of NTP drift, invisible from every log we had.
+fn check_clock_skew(rt: &Runtime, snap: &heads::HeadSnapshot) {
+    let Some(head) = snap.last else {
+        return;
+    };
+    let local = now_unix();
+    let skew =
+        i64::try_from(local).unwrap_or(i64::MAX) - i64::try_from(head.timestamp).unwrap_or(0);
+
+    // A sealed head is a second or so old by construction, so the honest expectation is `local`
+    // slightly AHEAD of it. Behind, or far ahead, is the machine's clock being wrong.
+    if (-1..=3).contains(&skew) {
+        info!(target: "startup", event = "clock", local, chain = head.timestamp, skew_secs = skew,
+              "clock agrees with the chain");
+        return;
+    }
+    warn!(
+        target: "startup", event = "clock_skew", local, chain = head.timestamp, skew_secs = skew,
+        rfq_ttl_secs = rt.cfg.rfq.as_ref().map(|r| r.ttl_secs),
+        "THIS MACHINE'S CLOCK DISAGREES WITH THE CHAIN. A signed RFQ order carries an expiry \
+         stamped from here and validated elsewhere, so a skew of a second or more is spent before \
+         the order exists and every quote is refused as expired. Enable automatic time \
+         synchronisation on this host"
+    );
 }
 
 /// Give the subscription a moment to establish before the first cycle, so the opening cycle is
@@ -1274,6 +1314,15 @@ async fn run_cycle(
     // header and a much better one than a projection: the machine's skew against the sequencer is
     // seconds at worst, where the projection is twelve out by construction.
     let chain_now = head.last.map_or_else(now_unix, |h| h.timestamp);
+
+    // Once, on the first cycle that has a real sealed head to compare against. Deliberately not at
+    // startup: `wait_for_first_head` is not fatal on timeout, so the check ran there with no head at
+    // all and returned silently -- on the very run where the subscription was down and the clock
+    // mattered most.
+    if !rt.clock_checked && head.last.is_some() {
+        rt.clock_checked = true;
+        check_clock_skew(rt, head);
+    }
 
     // True once per sealed block. See `Runtime::last_block_work`.
     let block_work = chain_now > rt.last_block_work;

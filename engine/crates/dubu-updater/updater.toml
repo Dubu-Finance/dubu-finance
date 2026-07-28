@@ -26,7 +26,23 @@
 # this at all — it answers 405 to a websocket upgrade — which is why the loop used to be a timer.
 # Pointing this at an https:// URL is refused at startup: that endpoint answers
 # "notifications not supported" and the loop would silently run on its fallback forever.
-ws_url = "wss://giwa-sepolia.nodit.io/${NODIT_API_KEY}"
+# NOT ${NODIT_API_KEY}. That key carries the whole read pool's share plus whatever the write path
+# falls back to, and it is the one that has actually hit its limit -- when it does, the websocket
+# gets `1008 policy violation: API usage quota has been exceeded` and closes before acknowledging
+# the subscription.
+#
+# It also needs a key nothing else touches. `newHeads` pushes about once a second, which is ~86k
+# billable events a day on top of whatever else that key carries -- pointing it at a key that was
+# already in the read pool exhausted that one too, within minutes. KEY_7 is therefore removed from
+# `read_rpc_urls` below and belongs to the subscription alone.
+#
+# That failure is quiet and expensive. The bot keeps quoting, because the fallback timer is exactly
+# the mechanism for a dead subscription -- but `chain_now` falls back to this machine's clock, and
+# every quote age, markout stamp and RFQ expiry is then measured against a clock nothing checks.
+# Observed: 231 consecutive cycles with heads down and no other symptom.
+#
+# The websocket still has no fallback list of its own, which is the remaining gap here.
+ws_url = "wss://giwa-sepolia.nodit.io/${NODIT_API_KEY_7}"
 
 # TRANSACTIONS AND ANYTHING CANONICAL: nonce, receipts, startup metadata. Defaults to Nodit now
 # that it exists — 20 rapid eth_blockNumber calls returned 200 every time, where the public
@@ -103,13 +119,13 @@ flashblocks_rpc_url = "https://sepolia-rpc-flashblocks.giwa.io"
 # reading a nonce from the flashblocks `pending` tag, arriving by a different road.
 #
 # Templates, never literals. The values live in a gitignored `.env`.
+# KEY_7 is deliberately absent: it belongs to the `newHeads` subscription alone. See `ws_url`.
 read_rpc_urls = [
   "https://giwa-sepolia.nodit.io/${NODIT_API_KEY_2}",
   "https://giwa-sepolia.nodit.io/${NODIT_API_KEY_3}",
   "https://giwa-sepolia.nodit.io/${NODIT_API_KEY_4}",
   "https://giwa-sepolia.nodit.io/${NODIT_API_KEY_5}",
   "https://giwa-sepolia.nodit.io/${NODIT_API_KEY_6}",
-  "https://giwa-sepolia.nodit.io/${NODIT_API_KEY_7}",
   # Flashblocks-aware, kept as a last fallback rather than the primary. See the note on `rpc_url`.
   "https://sepolia-rpc-flashblocks.giwa.io",
 ]
