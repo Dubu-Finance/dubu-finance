@@ -50,10 +50,11 @@
 pub mod binance;
 pub mod bybit;
 pub mod coinbase;
+pub mod hyperliquid;
 pub mod okx;
 pub mod ws;
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -71,11 +72,19 @@ pub enum VenueId {
     Bybit,
     /// Coinbase Exchange, `ticker`.
     Coinbase,
+    /// Hyperliquid `l2Book`, including HIP-3 builder books. The only venue here carrying equities.
+    Hyperliquid,
 }
 
 impl VenueId {
     /// Every venue this crate can speak to, in a stable order.
-    pub const ALL: [Self; 4] = [Self::Binance, Self::Okx, Self::Bybit, Self::Coinbase];
+    pub const ALL: [Self; 5] = [
+        Self::Binance,
+        Self::Okx,
+        Self::Bybit,
+        Self::Coinbase,
+        Self::Hyperliquid,
+    ];
 
     /// Short stable string for structured logs and config keys.
     #[must_use]
@@ -85,6 +94,7 @@ impl VenueId {
             Self::Okx => "okx",
             Self::Bybit => "bybit",
             Self::Coinbase => "coinbase",
+            Self::Hyperliquid => "hyperliquid",
         }
     }
 
@@ -96,6 +106,7 @@ impl VenueId {
             Self::Okx => "wss://ws.okx.com:8443/ws/v5/public",
             Self::Bybit => "wss://stream.bybit.com/v5/public/spot",
             Self::Coinbase => "wss://ws-feed.exchange.coinbase.com",
+            Self::Hyperliquid => "wss://api.hyperliquid.xyz/ws",
         }
     }
 }
@@ -412,16 +423,33 @@ impl FeedShared {
 /// Every configured venue's feed state, read together.
 pub struct VenueFeeds {
     feeds: BTreeMap<VenueId, std::sync::Arc<FeedShared>>,
+    /// Which canonical symbols each venue was actually subscribed to.
+    ///
+    /// Without this, [`Self::snapshots`] asks every venue about every symbol and a venue that was
+    /// never asked answers [`VenueStatus::NoData`] -- indistinguishable from one that was asked and
+    /// has not printed. `VenueWatch` then reports it as a venue LOST. Adding the equity pairs made
+    /// that concrete: Binance, OKX and Bybit list no shares, so a boot logged twelve "VENUE LOST"
+    /// warnings for venues that had never carried those symbols, which is exactly how a real venue
+    /// outage stops being noticed.
+    carries: BTreeMap<VenueId, BTreeSet<String>>,
 }
 
 impl VenueFeeds {
-    /// Build from the venues that at least one pair names.
+    /// Build from each venue and the canonical symbols it is subscribed to.
+    ///
+    /// The coverage is required rather than optional: a venue with no symbols carries nothing and
+    /// is absent from every cross-section, which is a legitimate state and must not be confused
+    /// with "not configured, so let everything through".
     #[must_use]
-    pub fn new(venues: &[VenueId], stale_after: Duration) -> Self {
+    pub fn new(coverage: &[(VenueId, Vec<String>)], stale_after: Duration) -> Self {
         Self {
-            feeds: venues
+            carries: coverage
                 .iter()
-                .map(|&v| (v, std::sync::Arc::new(FeedShared::new(v, stale_after))))
+                .map(|(v, syms)| (*v, syms.iter().cloned().collect()))
+                .collect(),
+            feeds: coverage
+                .iter()
+                .map(|&(v, _)| (v, std::sync::Arc::new(FeedShared::new(v, stale_after))))
                 .collect(),
         }
     }
@@ -458,6 +486,7 @@ impl VenueFeeds {
     pub fn snapshots(&self, symbol: &str, now: Instant) -> Vec<(VenueId, FeedSnapshot)> {
         self.feeds
             .iter()
+            .filter(|(v, _)| self.carries.get(v).is_some_and(|c| c.contains(symbol)))
             .map(|(&v, f)| (v, f.snapshot(symbol, now)))
             .collect()
     }
@@ -674,7 +703,10 @@ mod tests {
     fn venues_are_independent() {
         // The property the whole design rests on: one venue dying must not touch another.
         let feeds = VenueFeeds::new(
-            &[VenueId::Binance, VenueId::Okx],
+            &[
+                (VenueId::Binance, vec!["ETHUSDT".to_string()]),
+                (VenueId::Okx, vec!["ETHUSDT".to_string()]),
+            ],
             Duration::from_millis(5_000),
         );
         let now = Instant::now();
@@ -700,7 +732,10 @@ mod tests {
     fn losing_a_venue_is_an_event_and_a_steady_state_is_not() {
         let mut w = VenueWatch::new();
         let feeds = VenueFeeds::new(
-            &[VenueId::Binance, VenueId::Okx],
+            &[
+                (VenueId::Binance, vec!["ETHUSDT".to_string()]),
+                (VenueId::Okx, vec!["ETHUSDT".to_string()]),
+            ],
             Duration::from_millis(5_000),
         );
         let now = Instant::now();
@@ -740,11 +775,51 @@ mod tests {
         assert!(ev[0].recovered());
     }
 
+    /// A venue that does not carry a symbol is absent from that cross-section, not reported as
+    /// having lost it.
+    ///
+    /// Binance lists no shares. Before the coverage map, asking it about `AAPL` returned `NoData`
+    /// -- identical to a venue that was asked and has not printed -- and every boot logged three
+    /// "VENUE LOST" warnings per equity pair. Twelve false alarms is how a real outage stops being
+    /// read.
+    #[test]
+    fn a_venue_is_not_asked_about_a_symbol_it_does_not_carry() {
+        let now = Instant::now();
+        let feeds = VenueFeeds::new(
+            &[
+                (VenueId::Binance, vec!["ETHUSDT".to_string()]),
+                (VenueId::Hyperliquid, vec!["AAPL".to_string()]),
+            ],
+            Duration::from_millis(5_000),
+        );
+
+        let equity = feeds.snapshots("AAPL", now);
+        assert_eq!(
+            equity.iter().map(|(v, _)| *v).collect::<Vec<_>>(),
+            vec![VenueId::Hyperliquid],
+            "binance lists no shares and must not appear in an equity cross-section"
+        );
+        assert!(
+            VenueWatch::new().diff("AAPL", &equity).len() <= 1,
+            "at most the one venue that carries it may report a transition"
+        );
+
+        let crypto = feeds.snapshots("ETHUSDT", now);
+        assert_eq!(
+            crypto.iter().map(|(v, _)| *v).collect::<Vec<_>>(),
+            vec![VenueId::Binance],
+            "and the reverse: hyperliquid is not in the ETH cross-section here"
+        );
+    }
+
     #[test]
     fn a_venue_that_never_connects_announces_itself_once() {
         // The absence this closes: a venue configured, never delivering, and never mentioned.
         let mut w = VenueWatch::new();
-        let feeds = VenueFeeds::new(&[VenueId::Coinbase], Duration::from_millis(5_000));
+        let feeds = VenueFeeds::new(
+            &[(VenueId::Coinbase, vec!["ETHUSDT".to_string()])],
+            Duration::from_millis(5_000),
+        );
         let now = Instant::now();
         let ev = w.diff("ETHUSDT", &feeds.snapshots("ETHUSDT", now));
         assert_eq!(ev.len(), 1);
@@ -757,7 +832,10 @@ mod tests {
     #[test]
     fn an_ageing_stale_venue_does_not_re_announce_every_cycle() {
         let mut w = VenueWatch::new();
-        let feeds = VenueFeeds::new(&[VenueId::Bybit], Duration::from_millis(1_000));
+        let feeds = VenueFeeds::new(
+            &[(VenueId::Bybit, vec!["ETHUSDT".to_string()])],
+            Duration::from_millis(1_000),
+        );
         let t0 = Instant::now();
         let f = feeds.venue(VenueId::Bybit).unwrap();
         f.on_connected(true);

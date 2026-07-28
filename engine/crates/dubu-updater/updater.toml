@@ -929,18 +929,168 @@ bybit   = "SOLUSDT"
 
 
 # ---------------------------------------------------------------------------
-# EQUITIES -- LISTED ON CHAIN, NOT YET QUOTED
+# EQUITIES -- pairs 6-9, quoted from ONE venue
 #
-# Pairs 6-9 (mAAPL, mTSLA, mSKHY, mSPCX) exist on the pool and their hedge routes are configured
-# below, but they are absent from this file and therefore not quoted. That is deliberate and the
-# config validator is what made it explicit: a pair with no venues can never reach `min_venues`, so
-# it refused to start rather than run a market that would be silent forever.
+# These four run at a quorum of one, and that is the only thing about them worth reading carefully.
+# Everywhere else in this file a price has to survive a cross-venue median before the pool will
+# stand behind it; here there is nothing to survive.
 #
-# What is missing is a FEED, not a hedge. `hedge::hyperliquid` reads mids for the hedge leg; the
-# reference the ladder is built from comes from `feed/`, and no adapter there carries equities --
-# Binance, OKX and Bybit list none of them. Until `feed/hyperliquid.rs` exists these markets have no
-# price, and a pool that invented one would be worse than a pool with no market.
+# It is not laziness. Measured 2026-07-29, four HIP-3 builders quote AAPL and five quote TSLA --
+# but every builder except `xyz` carries ZERO open interest, and their prints sit 16% (AAPL) and
+# 30% (TSLA) away from it. Those are stale oracle marks, not trades. Adding one as a second venue
+# would make the quorum PASS while dragging the median toward a dead book, which is strictly worse
+# than a quorum of one: it fails silently instead of loudly. SKHY and SPCX have no second builder
+# at any open interest.
+#
+# THE SPREAD BELOW IS NOT A VOLATILITY NUMBER. Sampled over 10s during regular hours, these are
+# CALMER than the crypto pairs -- converted to the same 300s horizon the skew section measures ETH
+# at: AAPL 3.2 bps, SPCX 4.1, TSLA 10.9 against ETH's 10. On vol alone they would quote tighter
+# than SOL. They quote at 8 bps because of three things vol does not capture:
+#
+#   1. Quorum of one. No second opinion, so a single venue's bad print IS the reference.
+#   2. 16:00 ET. The underlying stops printing and the perp keeps trading; overnight and weekend
+#      gaps arrive as a jump the pool cannot have seen coming. The jump detector is armed at a
+#      15 bp floor for exactly that, which is double what the crypto pairs use.
+#   3. Funding basis. These are perps against spot tokens, and the basis is NOT corrected --
+#      see `feed/hyperliquid.rs`. The reference is a few bp off the underlying by construction.
+#
+# Sizing is bounded by the SHARED quote token, not by each pair's own inventory. The pool holds
+# ~$10M of each equity but only ~$12M of mUSDC across all nine pairs, and the five crypto pairs
+# already claim ~$10M of bid capacity against it. $1M a side here keeps the capacity limit the
+# binding constraint rather than the reserve -- capacity degrades a quote, an exhausted reserve
+# reverts the swap.
 # ---------------------------------------------------------------------------
+
+[[pairs]]
+pair_id = 6
+symbol = "AAPL"
+
+# Read back from the chain: mAAPL is 8 decimals, mUSDC 6. All four equities share this shape.
+base_decimals = 8
+quote_decimals = 6
+
+target_base_share_pct = 50
+
+capture = "500"
+
+# ~$1M a side at 339. See the shared-quote note above.
+bid_capacity = "2900"
+ask_capacity = "2900"
+
+capacity_divergence_pct = 30
+
+# One venue, a closing bell, and an uncorrected basis -- not volatility. See the header.
+half_spread_bps = 8
+width_bps = 60
+jump_floor_bps = 15
+max_push_interval_ms = 330
+adverse_drift_bps = 0.8
+favourable_drift_bps = 8
+heartbeat_secs = 5
+
+# The builder prefix is part of the venue's name for this market, not decoration: `flx:AAPL` is a
+# different market that happens to share a ticker. See `feed/hyperliquid.rs`.
+min_venues = 1
+
+[pairs.venues]
+hyperliquid = "xyz:AAPL"
+
+
+[[pairs]]
+pair_id = 7
+symbol = "TSLA"
+
+base_decimals = 8
+quote_decimals = 6
+
+target_base_share_pct = 50
+
+capture = "500"
+
+# ~$1M a side at 307.
+bid_capacity = "3200"
+ask_capacity = "3200"
+
+capacity_divergence_pct = 30
+
+# The most volatile of the four on the sample, and the widest builder disagreement (30%). Same
+# spread as the others: the disagreement is between books we do not use, and the vol difference is
+# inside the noise of an 11-sample estimate.
+half_spread_bps = 8
+width_bps = 60
+jump_floor_bps = 15
+max_push_interval_ms = 330
+adverse_drift_bps = 0.8
+favourable_drift_bps = 8
+heartbeat_secs = 5
+
+min_venues = 1
+
+[pairs.venues]
+hyperliquid = "xyz:TSLA"
+
+
+[[pairs]]
+pair_id = 8
+symbol = "SKHY"
+
+base_decimals = 8
+quote_decimals = 6
+
+target_base_share_pct = 50
+
+capture = "1000"
+
+# ~$1M a side at 131.
+bid_capacity = "7600"
+ask_capacity = "7600"
+
+capacity_divergence_pct = 30
+
+half_spread_bps = 8
+width_bps = 60
+jump_floor_bps = 15
+max_push_interval_ms = 330
+adverse_drift_bps = 0.8
+favourable_drift_bps = 8
+heartbeat_secs = 5
+
+min_venues = 1
+
+[pairs.venues]
+hyperliquid = "xyz:SKHY"
+
+
+[[pairs]]
+pair_id = 9
+symbol = "SPCX"
+
+base_decimals = 8
+quote_decimals = 6
+
+target_base_share_pct = 50
+
+capture = "1000"
+
+# ~$1M a side at 115.
+bid_capacity = "8600"
+ask_capacity = "8600"
+
+capacity_divergence_pct = 30
+
+half_spread_bps = 8
+width_bps = 60
+jump_floor_bps = 15
+max_push_interval_ms = 330
+adverse_drift_bps = 0.8
+favourable_drift_bps = 8
+heartbeat_secs = 5
+
+min_venues = 1
+
+[pairs.venues]
+hyperliquid = "xyz:SPCX"
+
 
 [rfq]
 private_key_env = "RFQ_PRIVATE_KEY"

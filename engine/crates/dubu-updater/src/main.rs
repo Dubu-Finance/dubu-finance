@@ -59,7 +59,7 @@ use dubu_updater::config::{Config, KeySource};
 use dubu_updater::fair_value::{self, Reference, VenueQuote};
 use dubu_updater::feed::ws::MarketFeed;
 use dubu_updater::feed::{
-    binance, bybit, coinbase, okx, FeedStatus, VenueFeeds, VenueId, VenueWatch,
+    binance, bybit, coinbase, hyperliquid, okx, FeedStatus, VenueFeeds, VenueId, VenueWatch,
 };
 use dubu_updater::hedge;
 use dubu_updater::jump;
@@ -468,8 +468,21 @@ async fn run(args: &Args) -> Result<i32, Box<dyn std::error::Error>> {
     // One task per venue a pair actually names. A venue is enabled by being used, not by a
     // separate switch, so there is no way to configure a venue that connects and quotes nothing.
     let venues = cfg.venues();
+    // Paired with the symbols each venue actually carries, so a venue that was never asked about a
+    // symbol is absent from that cross-section rather than reported as having lost it.
+    let coverage: Vec<(VenueId, Vec<String>)> = venues
+        .iter()
+        .map(|&v| {
+            let syms = cfg
+                .venue_symbols(v)
+                .into_iter()
+                .map(|(_, canonical)| canonical)
+                .collect();
+            (v, syms)
+        })
+        .collect();
     let feeds = Arc::new(VenueFeeds::new(
-        &venues,
+        &coverage,
         Duration::from_millis(cfg.feed.stale_after_ms),
     ));
     let mut feed_tasks = Vec::new();
@@ -480,6 +493,7 @@ async fn run(args: &Args) -> Result<i32, Box<dyn std::error::Error>> {
             VenueId::Okx => Box::new(okx::Client::new(&symbols)),
             VenueId::Bybit => Box::new(bybit::Client::new(&symbols)),
             VenueId::Coinbase => Box::new(coinbase::Client::new(&symbols)),
+            VenueId::Hyperliquid => Box::new(hyperliquid::Client::new(&symbols)),
         };
         let Some(shared) = feeds.venue(*venue) else {
             continue;
@@ -690,27 +704,33 @@ async fn wait_for_feed(rt: &Runtime) {
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
         let now = Instant::now();
-        let worst = rt
+        // Each pair against ITS OWN quorum, not against the global one. The equity pairs run at a
+        // quorum of one because a second honest source does not exist (see `PairConfig::min_venues`),
+        // and measuring them against `feed.min_venues` would leave this probe permanently unsatisfied
+        // -- every boot would burn the full deadline and log "not ready" while the pool was fine.
+        let short = rt
             .cfg
             .pairs
             .iter()
-            .map(|p| {
-                rt.feeds
+            .filter_map(|p| {
+                let live = rt
+                    .feeds
                     .snapshots(&p.symbol, now)
                     .iter()
                     .filter(|(_, s)| s.status.is_live())
-                    .count()
+                    .count();
+                let need = usize::from(p.min_venues.unwrap_or(rt.cfg.feed.min_venues));
+                (live < need).then_some((p.symbol.as_str(), live, need))
             })
-            .min()
-            .unwrap_or(0);
-        if worst >= usize::from(rt.cfg.feed.min_venues) {
-            info!(target: "feed", event = "ready", venues_live = worst,
-                  min_venues = rt.cfg.feed.min_venues, "every configured symbol has quorum");
+            .next();
+        let Some((symbol, live, need)) = short else {
+            info!(target: "feed", event = "ready", pairs = rt.cfg.pairs.len(),
+                  "every configured symbol has quorum");
             return;
-        }
+        };
         if Instant::now() >= deadline {
-            warn!(target: "feed", event = "not_ready", venues_live = worst,
-                  min_venues = rt.cfg.feed.min_venues,
+            warn!(target: "feed", event = "not_ready", symbol = %symbol,
+                  venues_live = live, min_venues = need,
                   "starting the loop without quorum on every symbol; pushes will be gated until it arrives");
             return;
         }
@@ -996,6 +1016,7 @@ async fn jump_scan(rt: &mut Runtime) {
 
     for i in 0..rt.cfg.pairs.len() {
         let (pair_id, symbol) = (rt.cfg.pairs[i].pair_id, rt.cfg.pairs[i].symbol.clone());
+        let quorum = rt.cfg.pairs[i].min_venues;
         let snaps = rt.feeds.snapshots(&symbol, now);
         let mut quotes: Vec<VenueQuote> = Vec::new();
         for (venue, s) in &snaps {
@@ -1007,7 +1028,8 @@ async fn jump_scan(rt: &mut Runtime) {
         // No reference means no observation. The detector's own anchor then ages, and a gap past
         // `vol_max_sample_ms` trips it as `feed_gap` on recovery — which is the right answer,
         // because the pool spent the outage armed behind a fixed ladder.
-        let Ok(reference) = fair_value::combine(&quotes, &rt.cfg.feed.mad_params()) else {
+        let Ok(reference) = fair_value::combine(&quotes, &rt.cfg.feed.mad_params_with(quorum))
+        else {
             continue;
         };
 
@@ -1812,7 +1834,7 @@ async fn run_cycle(
             }
         }
 
-        let reference = fair_value::combine(&quotes, &rt.cfg.feed.mad_params());
+        let reference = fair_value::combine(&quotes, &rt.cfg.feed.mad_params_with(pair.min_venues));
         let feed_status = match &reference {
             Ok(_) => FeedStatus::Live,
             Err(e) => e.status(),

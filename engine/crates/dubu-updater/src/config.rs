@@ -977,6 +977,9 @@ pub struct VenueUrls {
     /// Coinbase Exchange feed endpoint.
     #[serde(default)]
     pub coinbase: Option<String>,
+    /// Override for Hyperliquid's websocket. See [`VenueId::default_ws_url`].
+    #[serde(default)]
+    pub hyperliquid: Option<String>,
 }
 
 impl VenueUrls {
@@ -988,6 +991,7 @@ impl VenueUrls {
             VenueId::Okx => &self.okx,
             VenueId::Bybit => &self.bybit,
             VenueId::Coinbase => &self.coinbase,
+            VenueId::Hyperliquid => &self.hyperliquid,
         };
         over.as_deref().unwrap_or_else(|| venue.default_ws_url())
     }
@@ -1085,8 +1089,18 @@ impl FeedConfig {
     /// The MAD filter's knobs, converted out of the config's decimal-bps form.
     #[must_use]
     pub fn mad_params(&self) -> MadParams {
+        self.mad_params_with(None)
+    }
+
+    /// The same, with a pair's [`PairConfig::min_venues`] override applied.
+    ///
+    /// Only the quorum is per-pair. The MAD multiplier and the dispersion ceiling are not: those
+    /// describe how much venues may disagree before the disagreement is the signal, and that is a
+    /// property of the filter rather than of the market.
+    #[must_use]
+    pub fn mad_params_with(&self, over: Option<u8>) -> MadParams {
         MadParams {
-            min_venues: self.min_venues,
+            min_venues: over.unwrap_or(self.min_venues),
             k_tenths: (self.mad_k * 10.0).round().max(0.0) as u32,
             floor_decibps: decibps(self.mad_floor_bps),
             max_dispersion_decibps: decibps(self.max_dispersion_bps),
@@ -1790,6 +1804,13 @@ pub struct PairVenues {
     /// Coinbase product id, e.g. `ETH-USDT`.
     #[serde(default)]
     pub coinbase: Option<String>,
+    /// This pair on Hyperliquid, carrying the HIP-3 builder: `xyz:AAPL`.
+    ///
+    /// The prefix is not decoration. Builders attach their own oracles and disagree -- `xyz:TSLA`
+    /// 307.31 against `flx:TSLA` 395.50, measured in the same second -- so naming the book is
+    /// naming a fair value.
+    #[serde(default)]
+    pub hyperliquid: Option<String>,
 }
 
 impl PairVenues {
@@ -1801,6 +1822,7 @@ impl PairVenues {
             VenueId::Okx => self.okx.as_deref(),
             VenueId::Bybit => self.bybit.as_deref(),
             VenueId::Coinbase => self.coinbase.as_deref(),
+            VenueId::Hyperliquid => self.hyperliquid.as_deref(),
         }
     }
 
@@ -1840,7 +1862,23 @@ pub struct PairConfig {
     /// Canonical symbol of the **real** asset this pair's mock base token tracks. See the struct
     /// docs — this is not a market in the mock token.
     pub symbol: String,
-    /// Which symbol each venue quotes this pair under. At least `feed.min_venues` of them.
+    /// Venues that must agree before this pair has a reference, overriding [`FeedConfig::min_venues`].
+    ///
+    /// Set this only where a second independent source does not exist, and know what it costs. The
+    /// cross-venue median is what catches a single venue publishing a wrong price with full
+    /// confidence; at a quorum of one there is nothing to catch it, and the pool quotes whatever
+    /// that venue says.
+    ///
+    /// The equity pairs are the case. Measured on 2026-07-29, four HIP-3 builders quote AAPL and
+    /// five quote TSLA, but every builder other than `xyz` carries ZERO open interest -- their
+    /// prints are stale oracle marks, not trades, and they sit 16% (AAPL) and 30% (TSLA) away.
+    /// Adding one as a second venue would satisfy the quorum with a dead book and drag the median
+    /// toward it, which is worse than a quorum of one because it LOOKS met. SKHY and SPCX have no
+    /// second builder at all.
+    #[serde(default)]
+    pub min_venues: Option<u8>,
+
+    /// Which symbol each venue quotes this pair under. At least as many as the quorum needs.
     pub venues: PairVenues,
     /// Decimals of the base token. Verified against the deployed ERC-20 at startup.
     pub base_decimals: u8,
@@ -1966,9 +2004,15 @@ impl PairConfig {
         // rather than discovering it as a permanent `no_quorum` at run time is the difference
         // between a startup error and a bot that looks healthy and quotes nothing.
         let venues = self.venues.count();
+        let min_venues = self.min_venues.unwrap_or(min_venues);
+        if min_venues == 0 {
+            return Err(invalid(format!(
+                "pairs[{id}].min_venues: 0 would mean a reference with no venue behind it"
+            )));
+        }
         if venues < usize::from(min_venues) {
             return Err(invalid(format!(
-                "pairs[{id}].venues names {venues} venue(s) but feed.min_venues is {min_venues}; \
+                "pairs[{id}].venues names {venues} venue(s) but the quorum is {min_venues}; \
                  this pair could never reach quorum and would never quote"
             )));
         }
