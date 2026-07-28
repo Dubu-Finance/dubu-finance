@@ -29,6 +29,7 @@
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use alloy_primitives::Address;
 use axum::extract::State;
@@ -74,6 +75,19 @@ pub struct Shared {
 
 #[derive(Debug, Default)]
 struct Inner {
+    /// The chain's clock, as `(sealed head timestamp, when we received it)`.
+    ///
+    /// Expiry cannot be stamped from this host's wall clock. It is a promise read by two other
+    /// machines -- the aggregator refuses anything with under a second left using *its* clock, and
+    /// the settler enforces it against `block.timestamp` -- and nothing synchronises the three.
+    /// Measured here: this host ran two seconds slow, so every signed order arrived already expired
+    /// and the RFQ leg simply never filled.
+    ///
+    /// The `Instant` is what makes this work. A monotonic clock measures *elapsed* time correctly
+    /// however wrong the wall clock's absolute offset is, so `head_secs + elapsed` is chain time to
+    /// within the head's own delivery latency -- tens of milliseconds -- and is immune to the skew
+    /// entirely.
+    chain_clock: Option<(u64, Instant)>,
     markets: BTreeMap<u16, MarketState>,
     book: Book,
     /// Set once the cycle has published anything at all. Before that every request is refused —
@@ -87,6 +101,25 @@ impl Shared {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Replaces the state for one market. Called by the cycle, once per pair per cycle.
+    ///
+    /// Publishing per pair rather than as one batch: a pair whose venues have gone quiet should
+    /// stop being quotable without taking the others with it, and [`Self::retire`] is how that
+    /// happens.
+    /// Record the chain's clock from a sealed head. See [`Inner::chain_clock`].
+    pub fn publish_clock(&self, head_secs: u64, at: Instant) {
+        if let Ok(mut g) = self.inner.lock() {
+            g.chain_clock = Some((head_secs, at));
+        }
+    }
+
+    /// Chain time now, or `None` before any head has arrived.
+    #[must_use]
+    pub fn chain_now(&self) -> Option<u64> {
+        let (secs, at) = self.inner.lock().ok()?.chain_clock?;
+        Some(secs.saturating_add(Instant::now().saturating_duration_since(at).as_secs()))
     }
 
     /// Replaces the state for one market. Called by the cycle, once per pair per cycle.
@@ -240,7 +273,10 @@ async fn quote(
         )
     })?;
 
-    let now_secs = crate::now_unix();
+    // Chain time, never this host's wall clock. See `Inner::chain_clock` -- a signed expiry is
+    // read by machines whose clocks we do not control, and a skewed one here is invisible until
+    // every quote comes back refused as expired.
+    let now_secs = ctx.shared.chain_now().unwrap_or_else(crate::now_unix);
 
     let (quote, nonce) = {
         let mut g = ctx.shared.inner.lock().map_err(|_| {
@@ -415,6 +451,28 @@ pub async fn run(
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+    /// Expiry must come from the chain, not from this host.
+    ///
+    /// The regression: this machine ran two seconds slow, the maker stamped expiry from its own
+    /// wall clock, and the aggregator -- refusing anything with under a second left, using a clock
+    /// that was right -- rejected every order as expired. Nothing looked broken. The maker was
+    /// healthy, the tunnel answered in 92ms, the price was correct, and the leg never filled.
+    #[test]
+    fn chain_now_counts_from_the_head_and_ignores_the_host_clock() {
+        let s = Shared::new();
+        assert_eq!(s.chain_now(), None, "no head yet, so no chain clock");
+
+        // A head that arrived a moment ago carrying chain second 1_000.
+        s.publish_clock(1_000, Instant::now());
+        assert_eq!(s.chain_now(), Some(1_000));
+
+        // The same head, two seconds of monotonic time later. The host's wall clock is not
+        // consulted at any point, so its offset -- whatever it is -- cannot enter this.
+        s.publish_clock(1_000, Instant::now() - Duration::from_secs(2));
+        assert_eq!(s.chain_now(), Some(1_002));
+    }
+
     use super::*;
     use crate::tx::Signer;
     use alloy_primitives::address;

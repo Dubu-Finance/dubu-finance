@@ -1315,6 +1315,19 @@ async fn run_cycle(
     // seconds at worst, where the projection is twelve out by construction.
     let chain_now = head.last.map_or_else(now_unix, |h| h.timestamp);
 
+    // Hand the RFQ maker the chain's clock. It stamps every signed expiry from this rather than
+    // from the host's wall clock -- see `serve::Inner::chain_clock` for why that distinction is the
+    // difference between the leg working and every order arriving expired.
+    if let (Some(rfq), Some(h)) = (&rt.rfq, head.last) {
+        // Back-dated by the head's own age, so `chain_now` counts from when the head actually
+        // arrived rather than from this cycle. Both ends are monotonic, so the host's wall clock
+        // never enters the arithmetic.
+        let received = Instant::now()
+            .checked_sub(Duration::from_millis(head.age_ms.unwrap_or(0)))
+            .unwrap_or_else(Instant::now);
+        rfq.publish_clock(h.timestamp, received);
+    }
+
     // Once, on the first cycle that has a real sealed head to compare against. Deliberately not at
     // startup: `wait_for_first_head` is not fatal on timeout, so the check ran there with no head at
     // all and returned silently -- on the very run where the subscription was down and the clock
