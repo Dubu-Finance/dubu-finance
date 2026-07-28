@@ -685,6 +685,62 @@ contract SimulationTest is Test {
         console2.log("  is what that sentence costs when the number is set by how much volume you want.");
     }
 
+    /// @notice The three levers that could pay for a narrower quote, swept **together**.
+    ///
+    /// @dev Each of these has been argued about separately and the separate answers do not compose,
+    ///     which is why they are in one table. `s1` is the volatility coefficient, and lowering it
+    ///     is the only way to actually quote near the 1 bp floor in a live market — at the measured
+    ///     sigma the term contributes 6.5 of the 7.5 bp posted. The standing objection has been
+    ///     that `s1` is jump protection and must not be touched. That objection was measured when
+    ///     `s0` was 5 bp, the epoch was $2M and the width 25 bp, and **every one of those has since
+    ///     changed**, so it is re-measured here rather than re-quoted.
+    ///
+    ///     Capacity is the lever the arithmetic says should dominate: loss is
+    ///     `(jump - absorption) x exposed depth`, absorption moves by a few bp across any
+    ///     realistic spread, and depth is set outright by configuration.
+    ///
+    ///     Width is included because it is the one that looks like a defence and is not. Against a
+    ///     100 bp gap every rung of a 25 bp ladder is still profitable to the taker, so the ladder
+    ///     is swept whole either way and the width only decides the average price paid — it buys
+    ///     nothing back and costs honest size on every ordinary trade.
+    function test_sweep_theThreeLeversTogether() public {
+        uint256[3] memory s1s = [uint256(58), 30, 0];
+        uint96[3] memory caps = [uint96(1_000e18), uint96(250e18), uint96(50e18)];
+        uint256[2] memory widths = [uint256(25), 8];
+
+        _sweepHeader("s1 x CAPACITY x WIDTH", "s1 / epoch / width");
+        for (uint256 a; a < s1s.length; ++a) {
+            for (uint256 b; b < caps.length; ++b) {
+                for (uint256 c; c < widths.length; ++c) {
+                    FlowModel.Params memory p = _jump();
+                    p.horizonSecs = 900;
+                    p.jumpAtSecs = 450;
+                    p.s1E2 = s1s[a];
+                    p.halfSpreadBps = 1;
+                    p.bidCapacity = caps[b];
+                    p.askCapacity = caps[b];
+                    p.widthBps = widths[c];
+                    FlowModel.Result memory res = _run(p);
+                    _sweepRow(
+                        string.concat(
+                            "s1=", FlowModel.u2s(s1s[a]),
+                            " cap=", FlowModel.u2s(uint256(caps[b]) / 1e18),
+                            " w=", FlowModel.u2s(widths[c])
+                        ),
+                        string.concat("$", FlowModel.thousands(((uint256(caps[b]) * REF_MID) / SCALE) / 1e6)),
+                        res,
+                        p
+                    );
+                }
+            }
+        }
+        console2.log("  s0 is 1 bp on every row, so the posted half-spread is 1 + s1 * sigma and the s1 column");
+        console2.log("  is the whole difference between quoting near the floor and quoting near the old 7.5.");
+        console2.log("  Read the capacity column first: if it dominates, the spread is not what was protecting");
+        console2.log("  us and the tightening is affordable. If s1 dominates instead, it is not, and the");
+        console2.log("  standing objection survives its own re-measurement.");
+    }
+
     /// @notice **The sub-second deliverable.** How long a wrong quote stays up, swept ACROSS the
     ///         one-second boundary the old model could not see past.
     ///

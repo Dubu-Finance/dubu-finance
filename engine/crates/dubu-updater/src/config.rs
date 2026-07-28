@@ -1651,6 +1651,14 @@ pub struct PairConfig {
     /// this far across the whole posted depth. It is an *upper* bound — the inverse solver
     /// narrows it further whenever the price bounds bind.
     pub width_bps: u16,
+    /// How large a reference move `jump` refuses to absorb, in bps.
+    ///
+    /// Defaults to [`Self::half_spread_bps`], which is what it was derived from until `s0` stopped
+    /// being the posted spread. Set it explicitly: the posted half-spread is `s0 + s1 * sigma`, so
+    /// a low `s0` no longer implies a low absorption, and a floor below the reference's own tick
+    /// noise makes the detector fire on nothing. See `jump::Bounds::new`.
+    #[serde(default)]
+    pub jump_floor_bps: Option<u16>,
     /// **Target inventory, as a share of this pair's book, in percent.**
     ///
     /// Configuration rather than a constant, and a *share* rather than an amount so that it stays

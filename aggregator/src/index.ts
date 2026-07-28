@@ -48,6 +48,22 @@ export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
 
+    // The CORS preflight. A browser sending `POST` with `content-type: application/json` asks
+    // first, and until this existed the ask got a 404 — so every request from a page failed with
+    // an opaque "Failed to fetch" while curl worked perfectly. Returning the allow-origin header
+    // on the *response* is not enough on its own; the preflight has to be answered too.
+    if (request.method === "OPTIONS") {
+      return new Response(null, {
+        status: 204,
+        headers: {
+          "access-control-allow-origin": "*",
+          "access-control-allow-methods": "GET, POST, OPTIONS",
+          "access-control-allow-headers": "content-type",
+          "access-control-max-age": "86400",
+        },
+      });
+    }
+
     if (request.method === 'GET' && url.pathname === '/health') {
       return json({ ok: true, chainId: loadConfig(env).chainId });
     }

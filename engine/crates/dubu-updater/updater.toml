@@ -556,6 +556,14 @@ half_spread_bps = 1
 # ceiling allows only `half_spread` of lift, so `W <= 2 * 5bp * 1000/20 = 500 bp`.
 width_bps = 25
 
+# The jump detector's floor, stated separately from s0 now that s0 is 1 bp.
+#
+# 5 is the value the detector was validated at, back when half_spread_bps WAS 5 and the floor was
+# derived from it. Lowering s0 silently took this to 1 bp, which is below the tick noise of a
+# four-venue combined reference: measured, four trips in seven minutes with no jump anywhere, each
+# holding capacity at zero for the 30s cool-off. 29% of the run withdrawn for nothing.
+jump_floor_bps = 5
+
 # TARGET INVENTORY, as a share of this pair's book — configuration, not a constant, and a share
 # rather than an amount so it stays meaningful as the pool grows or shrinks. The book is this
 # pair's mWETH valued at the reference plus its share of the shared mUSDC; see skew::Inventory on
@@ -636,6 +644,9 @@ quote_decimals = 6
 # its own sigma carries it further anyway.
 half_spread_bps = 2
 width_bps = 40
+
+# Same as pair 1. BTC's reference is noisier, so its floor stays the wider of the two.
+jump_floor_bps = 8
 
 # See pairId 1. Same balanced target; the imbalance and the resulting skew are logged per row.
 target_base_share_pct = 50

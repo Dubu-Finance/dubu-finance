@@ -188,12 +188,36 @@ impl Bounds {
     /// Derive the bounds from one pair's configured spread and ladder width.
     #[must_use]
     pub const fn from_pair(half_spread_bps: u16, width_bps: u16) -> Self {
+        Self::new(half_spread_bps, half_spread_bps, width_bps)
+    }
+
+    /// The same bounds with the floor stated separately from the spread.
+    ///
+    /// The floor used to be `half_spread_bps` and that was right while that field *was* the
+    /// posted spread. It is not any more: `spread::compute` posts `s0 + s1 * sigma`, and when `s0`
+    /// dropped from 5 bp to 1 the floor followed it down to a level below the ordinary tick noise
+    /// of a four-venue combined reference. The detector then tripped on nothing — measured, four
+    /// trips in seven minutes, each holding capacity at zero for the 30s cool-off, which is 29% of
+    /// the run spent withdrawn with no jump anywhere.
+    ///
+    /// So the two numbers are separated, because they now answer different questions. `s0` is what
+    /// the pool charges in a dead market. This is how large a move it refuses to absorb, and it
+    /// belongs to the detector.
+    #[must_use]
+    pub const fn new(floor_bps: u16, half_spread_bps: u16, width_bps: u16) -> Self {
         // `* 100` converts bps to hundredths of a bp; `* 50` is `width / 2` in the same step.
-        let floor = (half_spread_bps as u32) * 100;
+        let floor = (floor_bps as u32) * 100;
         // A zero floor would let feed noise trip the detector on every tick. The config validator
         // already refuses `half_spread_bps = 0`, so this is a belt on top of braces.
         let floor = if floor == 0 { 100 } else { floor };
-        let ceiling = floor + (width_bps as u32) * 50;
+        // The ceiling stays the absorption limit -- `half_spread + width / 2` -- because that is a
+        // property of the ladder, not of the detector. A move the ladder can absorb is not a jump
+        // no matter how the floor is set, so the ceiling is computed from the posted spread and
+        // width as it always was, and only the floor was pulled out.
+        let ceiling = (half_spread_bps as u32) * 100 + (width_bps as u32) * 50;
+        // A floor above the ceiling would make the clamp degenerate silently into always-floor.
+        // Raising the ceiling to meet it keeps `threshold` monotone in sigma.
+        let ceiling = if ceiling < floor { floor } else { ceiling };
         Self { floor_bps_e2: floor, ceiling_bps_e2: ceiling }
     }
 
@@ -674,6 +698,42 @@ impl Book {
 
 #[cfg(test)]
 mod tests {
+    /// The regression that motivated splitting the floor out of the spread.
+    ///
+    /// Lowering `s0` from 5 bp to 1 used to drag the detector's floor down with it, and a 1 bp
+    /// floor is under the tick noise of a four-venue combined reference: a 3.24 bp move over a
+    /// 201ms sample -- an ordinary one, taken verbatim from a trip record in the run that exposed
+    /// this -- read as a jump and cost a 30s cool-off. With the floor stated on its own it does
+    /// not, and a real jump still does.
+    #[test]
+    fn ordinary_reference_noise_is_not_a_jump_at_a_one_bp_spread() {
+        let coupled = Bounds::from_pair(1, 25);
+        let (t, bound) = coupled.threshold(600, 3);
+        assert_eq!((t, bound), (100, Bound::Floor), "the old floor was s0 itself");
+        assert!(324 > t, "so 3.24bp of noise tripped it");
+
+        let split = Bounds::new(5, 1, 25);
+        let (t, bound) = split.threshold(600, 3);
+        assert_eq!((t, bound), (500, Bound::Floor));
+        assert!(324 < t, "the same sample is now inside the floor");
+
+        // The ceiling is still the absorption limit, computed from the posted spread and width and
+        // untouched by the floor.
+        assert_eq!(split.ceiling_bps_e2, coupled.ceiling_bps_e2);
+        // And a move that gaps past the ladder is still a jump.
+        assert!(10_000 > split.threshold(600, 3).0);
+    }
+
+    /// A floor set above the absorption limit must not invert the clamp.
+    #[test]
+    fn a_floor_above_the_ceiling_does_not_invert_the_clamp() {
+        let b = Bounds::new(90, 1, 25);
+        assert!(b.ceiling_bps_e2 >= b.floor_bps_e2);
+        let (lo, _) = b.threshold(600, 0);
+        let (hi, _) = b.threshold(600, 100_000);
+        assert!(hi >= lo, "threshold stayed monotone in sigma");
+    }
+
     use super::*;
     use crate::skew::VolConfig;
 

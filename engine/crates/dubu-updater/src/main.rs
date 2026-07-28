@@ -468,7 +468,16 @@ async fn run(args: &Args) -> Result<i32, Box<dyn std::error::Error>> {
     let jump_bounds: Vec<(u16, jump::Bounds)> = cfg
         .pairs
         .iter()
-        .map(|p| (p.pair_id, jump::Bounds::from_pair(p.half_spread_bps, p.width_bps)))
+        .map(|p| {
+            (
+                p.pair_id,
+                jump::Bounds::new(
+                    p.jump_floor_bps.unwrap_or(p.half_spread_bps),
+                    p.half_spread_bps,
+                    p.width_bps,
+                ),
+            )
+        })
         .collect();
     let jump_book = jump::Book::new(
         &jump_bounds,
