@@ -47,6 +47,7 @@
 use std::time::{Duration, Instant};
 
 pub mod binance;
+pub mod hyperliquid;
 
 /// Which way the hedge has to go on the venue.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
