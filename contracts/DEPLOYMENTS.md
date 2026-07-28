@@ -13,6 +13,9 @@ the source is in this repo at the commit that deployed them.
 | mUSDC (6 dec) | [`0xd28596C6750D87C53EA146134AfAB53de86C5155`](https://sepolia-explorer.giwa.io/address/0xd28596C6750D87C53EA146134AfAB53de86C5155) |
 | mWETH (18 dec) | [`0x81e46C6379498beBEB5DCcD47ab2DdFaf967d445`](https://sepolia-explorer.giwa.io/address/0x81e46C6379498beBEB5DCcD47ab2DdFaf967d445) |
 | mWBTC (8 dec) | [`0x3548991B5EF2D7805EFa95bEa6CeDeAee3869875`](https://sepolia-explorer.giwa.io/address/0x3548991B5EF2D7805EFa95bEa6CeDeAee3869875) |
+| mBNB (18 dec) | [`0x54fbDB9F5bf1c345F0230773C66607DF3f7b99AC`](https://sepolia-explorer.giwa.io/address/0x54fbDB9F5bf1c345F0230773C66607DF3f7b99AC) |
+| mXRP (6 dec) | [`0x4Cbc341D56232805B258ed5a33C7b80dbF1A9d01`](https://sepolia-explorer.giwa.io/address/0x4Cbc341D56232805B258ed5a33C7b80dbF1A9d01) |
+| mSOL (9 dec) | [`0x1F96E44136D765802005c5083a51830841dca9b3`](https://sepolia-explorer.giwa.io/address/0x1F96E44136D765802005c5083a51830841dca9b3) |
 | UniswapV2Factory | [`0x751cd28542301ac7158a0417C9B8475aae22eD59`](https://sepolia-explorer.giwa.io/address/0x751cd28542301ac7158a0417C9B8475aae22eD59) |
 | UniswapV2Router02 | [`0x98E2aa881cEFe66E394C8261d1D1BdE25D4BffA6`](https://sepolia-explorer.giwa.io/address/0x98E2aa881cEFe66E394C8261d1D1BdE25D4BffA6) |
 | **PropPool** | [`0xBbE55E29BbC6d71EcAb1ac011c9Ac5206aB2Fe74`](https://sepolia-explorer.giwa.io/address/0xBbE55E29BbC6d71EcAb1ac011c9Ac5206aB2Fe74) |
@@ -128,3 +131,23 @@ make deploy     # ~13 tx, resumable — addresses already in .env are reused
 make demo       # ~203 tx, idempotent, restores both venues between sizes
 make demo-dry   # same table, sends nothing, needs no key
 ```
+
+### Markets added after the original deployment
+
+`script/AddMarkets.s.sol` added BNB, XRP and SOL against the live pool on 2026-07-28, taking
+`pairCount` from 2 to 5. It is a separate script from `Deploy.s.sol` on purpose: `Deploy` re-derives
+every market from its own run, so raising `MARKET_COUNT` and re-running it against a live pool would
+call `addPair` on the existing two and revert with `PairExists` -- after having already deployed the
+new tokens, leaving orphans.
+
+| pair | token | decimals | priceScaleExp | hedge |
+|---|---|---|---|---|
+| 3 | mBNB | 18 | 24 | BNBUSDT |
+| 4 | mXRP | 6 | 15 | XRPUSDT |
+| 5 | mSOL | 9 | 16 | SOLUSDT |
+
+The three exponents differ because the tokens carry each chain's own decimals rather than a uniform
+18. That is deliberate: identical decimals never exercise `PropCurve`'s alignment path at all.
+
+⚠️ The quote leg was not topped up. All five markets draw on the same mUSDC reserve, so the pool now
+splits one balance five ways -- fund it before raising capacity.

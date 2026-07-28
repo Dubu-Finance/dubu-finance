@@ -800,6 +800,134 @@ bybit   = "BTCUSDT"
 # `bind` is loopback on purpose. Put a TLS-terminating, rate-limited proxy in front of it before
 # anything outside this machine can reach it.
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# BNB / XRP / SOL, added 2026-07-28 against the live pool.
+#
+# `price_scale_exp` is NOT chosen here -- it is derived on chain by `addPair` and read back at
+# startup from `snapshot`. Each is different (24 / 15 / 16) because the tokens carry each chain's
+# own decimals rather than a uniform 18, which is deliberate: identical decimals never exercise
+# `PropCurve`'s alignment path at all.
+#
+# `half_spread_bps` scales with how twitchy the reference is, not with the price. XRP moves more
+# than BNB in relative terms, so it starts wider. These are starting points, not derivations --
+# the same caveat that applies to pair 1 and 2 applies here: nothing has measured the adverse
+# selection they are supposed to pay for.
+# ---------------------------------------------------------------------------
+
+[[pairs]]
+pair_id = 3
+symbol = "BNBUSDT"
+
+# Decimals as the token was actually deployed, not a uniform 18. `price_scale_exp` is read back
+# from the chain rather than set here, and it differs per pair precisely because these do.
+base_decimals = 18
+quote_decimals = 6
+
+# 50:50 is the WORKING inventory target -- what the pool needs on hand to fill either side --
+# and it is not the same thing as the risk target, which is zero. The hedge is what separates
+# them: hold the tokens, carry no net exposure. See `skew::Inventory`.
+target_base_share_pct = 50
+
+capture = "20"
+
+# ~$2M a side, matching the notional the first two markets were sized at.
+bid_capacity = "2200"
+ask_capacity = "2200"
+
+capacity_divergence_pct = 30
+
+half_spread_bps = 2
+width_bps = 25
+jump_floor_bps = 5
+max_push_interval_ms = 330
+adverse_drift_bps = 0.3
+favourable_drift_bps = 4
+heartbeat_secs = 5
+
+# Every venue's own spelling. Naming a venue here is what enables it; OKX hyphenates where the
+# other two do not, and getting that wrong drops the pair below its quorum rather than erroring.
+[pairs.venues]
+binance = "BNBUSDT"
+okx     = "BNB-USDT"
+bybit   = "BNBUSDT"
+
+
+[[pairs]]
+pair_id = 4
+symbol = "XRPUSDT"
+
+# Decimals as the token was actually deployed, not a uniform 18. `price_scale_exp` is read back
+# from the chain rather than set here, and it differs per pair precisely because these do.
+base_decimals = 6
+quote_decimals = 6
+
+# 50:50 is the WORKING inventory target -- what the pool needs on hand to fill either side --
+# and it is not the same thing as the risk target, which is zero. The hedge is what separates
+# them: hold the tokens, carry no net exposure. See `skew::Inventory`.
+target_base_share_pct = 50
+
+capture = "20"
+
+# ~$2M a side, matching the notional the first two markets were sized at.
+bid_capacity = "1000000"
+ask_capacity = "1000000"
+
+capacity_divergence_pct = 30
+
+half_spread_bps = 3
+width_bps = 40
+jump_floor_bps = 8
+max_push_interval_ms = 330
+adverse_drift_bps = 0.5
+favourable_drift_bps = 5
+heartbeat_secs = 5
+
+# Every venue's own spelling. Naming a venue here is what enables it; OKX hyphenates where the
+# other two do not, and getting that wrong drops the pair below its quorum rather than erroring.
+[pairs.venues]
+binance = "XRPUSDT"
+okx     = "XRP-USDT"
+bybit   = "XRPUSDT"
+
+
+[[pairs]]
+pair_id = 5
+symbol = "SOLUSDT"
+
+# Decimals as the token was actually deployed, not a uniform 18. `price_scale_exp` is read back
+# from the chain rather than set here, and it differs per pair precisely because these do.
+base_decimals = 9
+quote_decimals = 6
+
+# 50:50 is the WORKING inventory target -- what the pool needs on hand to fill either side --
+# and it is not the same thing as the risk target, which is zero. The hedge is what separates
+# them: hold the tokens, carry no net exposure. See `skew::Inventory`.
+target_base_share_pct = 50
+
+capture = "20"
+
+# ~$2M a side, matching the notional the first two markets were sized at.
+bid_capacity = "10000"
+ask_capacity = "10000"
+
+capacity_divergence_pct = 30
+
+half_spread_bps = 3
+width_bps = 35
+jump_floor_bps = 7
+max_push_interval_ms = 330
+adverse_drift_bps = 0.4
+favourable_drift_bps = 5
+heartbeat_secs = 5
+
+# Every venue's own spelling. Naming a venue here is what enables it; OKX hyphenates where the
+# other two do not, and getting that wrong drops the pair below its quorum rather than erroring.
+[pairs.venues]
+binance = "SOLUSDT"
+okx     = "SOL-USDT"
+bybit   = "SOLUSDT"
+
+
 [rfq]
 private_key_env = "RFQ_PRIVATE_KEY"
 pmm_settle = "0x68CFa6E265AffD5D0DB2C49E4bb9DaEC5A920A9E"
@@ -900,6 +1028,30 @@ min_qty_base = "10000000000000000"
 # 25 ETH. A RISK CHOICE, not a derivation: it bounds what a burst can build up before the derived
 # interval elapses. The interval is what makes the hedge cheap; this is what stops it being slow.
 max_drift_base = "25000000000000000000"
+cooloff_ms = 2000
+
+[[hedge.pairs]]
+pair_id = 3
+symbol = "BNBUSDT"
+qty_decimals = 2
+min_qty_base = "10000000000000000"
+max_drift_base = "50000000000000000000"
+cooloff_ms = 2000
+
+[[hedge.pairs]]
+pair_id = 4
+symbol = "XRPUSDT"
+qty_decimals = 1
+min_qty_base = "1000000"
+max_drift_base = "20000000000"
+cooloff_ms = 2000
+
+[[hedge.pairs]]
+pair_id = 5
+symbol = "SOLUSDT"
+qty_decimals = 2
+min_qty_base = "10000000"
+max_drift_base = "250000000000"
 cooloff_ms = 2000
 
 [[hedge.pairs]]
