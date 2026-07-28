@@ -703,10 +703,33 @@ impl Sender {
         // Sized under the measured 296ms best-case inclusion so a fast landing is still seen on
         // the first poll after it happens.
         const MIN_AGE: Duration = Duration::from_millis(250);
+
+        // Only transactions the chain has already accounted for.
+        //
+        // A receipt used to be how the in-flight gate learned a send had landed, so every pending
+        // transaction was asked about on every cycle until one appeared -- and most of those asks
+        // returned null, because they were made before the transaction could be there. Measured at
+        // the quote cadence that was 8.19 requests a second, nearly twice the send rate itself and
+        // the single largest consumer on the write path.
+        //
+        // The gate reads `landed_nonce` now (see `observe_landed`), which comes free with a read the
+        // reader was making anyway. So a receipt is no longer needed to decide whether to keep
+        // sending -- only to decide whether what landed *succeeded*, and that question is worth
+        // asking exactly once, after the nonce says there is an answer to get.
+        //
+        // What this keeps: a revert still surfaces. `updateQuote` passing every off-chain check and
+        // then reverting means dubu-core has diverged from the contract, which must never pass
+        // silently, and it is why this is a narrowed filter rather than a deleted call.
+        //
+        // What this gives up: a transaction that lands but whose nonce we have not observed yet is
+        // not classified this cycle. It is classified on the next one, and the timeout below is
+        // unchanged, so nothing is left pending forever.
+        let landed = self.landed_nonce;
         let entries: Vec<(u16, Pending)> = self
             .pending
             .iter()
             .flat_map(|(k, v)| v.iter().map(move |p| (*k, *p)))
+            .filter(|(_, p)| p.nonce < landed)
             .filter(|(_, p)| now.duration_since(p.submitted_at) >= MIN_AGE)
             .collect();
 
@@ -733,29 +756,58 @@ impl Sender {
                     ));
                     self.forget(pair_id, p.hash);
                 }
-                // Either no receipt yet, or the lookup failed. Both mean "still pending", and
-                // both are subject to the timeout below.
-                _ => {
-                    let waited = now.saturating_duration_since(p.submitted_at);
-                    if waited >= self.pending_timeout {
-                        settled.push((
-                            pair_id,
-                            p,
-                            Settled::TimedOut {
-                                waited_secs: waited.as_secs(),
-                            },
-                        ));
-                        // Everything behind a timed-out transaction is dropped with it, not just
-                        // the one that expired. If nonce `k` never lands there is a gap, and every
-                        // nonce after it is unexecutable however healthy its own transaction looks
-                        // — tracking those would be tracking transactions that cannot settle.
-                        self.pending.remove(&pair_id);
-                        // The abandoned nonce may or may not have been consumed. Re-reading is
-                        // the only way to find out, and guessing produces a stuck queue.
-                        self.resync_nonce();
-                    }
-                }
+                // Either no receipt yet, or the lookup failed. Both mean "ask again next cycle";
+                // the timeout sweep below is what eventually gives up, and it runs over every
+                // pending transaction rather than only the ones reached here.
+                _ => {}
             }
+        }
+
+        settled.extend(self.sweep_timeouts(now));
+        settled
+    }
+
+    /// Give up on transactions that have outlived [`Self::pending_timeout`].
+    ///
+    /// Separate from the receipt loop, and not an accident of layout. That loop deliberately skips
+    /// anything `landed_nonce` has not passed, because asking about a transaction the chain has not
+    /// accounted for was 8.19 null answers a second. But a genuinely stuck transaction is
+    /// *precisely* one the nonce never passes, so a timeout living inside that loop would have made
+    /// the one case it exists for the one case it can never reach.
+    ///
+    /// Pure: no RPC, so the behaviour is testable without a node.
+    fn sweep_timeouts(&mut self, now: Instant) -> Vec<(u16, Pending, Settled)> {
+        let mut settled = Vec::new();
+        let stuck: Vec<(u16, Pending)> = self
+            .pending
+            .iter()
+            .flat_map(|(k, v)| v.iter().map(move |p| (*k, *p)))
+            .filter(|(_, p)| now.saturating_duration_since(p.submitted_at) >= self.pending_timeout)
+            .collect();
+        for (pair_id, p) in stuck {
+            // The receipt loop may already have settled and forgotten it this pass.
+            if !self
+                .pending
+                .get(&pair_id)
+                .is_some_and(|v| v.iter().any(|q| q.hash == p.hash))
+            {
+                continue;
+            }
+            let waited = now.saturating_duration_since(p.submitted_at);
+            settled.push((
+                pair_id,
+                p,
+                Settled::TimedOut {
+                    waited_secs: waited.as_secs(),
+                },
+            ));
+            // Everything behind a timed-out transaction is dropped with it, not just the one that
+            // expired. If nonce `k` never lands there is a gap, and every nonce after it is
+            // unexecutable however healthy its own transaction looks.
+            self.pending.remove(&pair_id);
+            // The abandoned nonce may or may not have been consumed. Re-reading is the only way to
+            // find out, and guessing produces a stuck queue.
+            self.resync_nonce();
         }
         settled
     }
@@ -763,6 +815,49 @@ impl Sender {
 
 #[cfg(test)]
 mod tests {
+    /// A transaction the nonce never passes must still time out.
+    ///
+    /// The receipt loop only looks at transactions below `landed_nonce`, which is the whole point --
+    /// asking about a transaction before the chain has accounted for it was 8.19 requests a second
+    /// of null answers. But a genuinely stuck transaction is *precisely* one the nonce never
+    /// passes, so leaving the timeout inside that loop made the one case it exists for the one case
+    /// it could never reach: the queue would have blocked forever behind it.
+    #[test]
+    fn a_stuck_transaction_times_out_even_though_the_nonce_never_passes_it() {
+        let mut s = Sender::new(
+            None,
+            91_342,
+            Address::ZERO,
+            &tx_cfg(true),
+            50_000_000,
+            5_000_000,
+        );
+        s.pending_timeout = Duration::from_millis(1);
+        s.pending.insert(
+            7,
+            vec![Pending {
+                hash: B256::repeat_byte(9),
+                kind: "updateQuote",
+                nonce: 500,
+                submitted_at: Instant::now() - Duration::from_secs(30),
+            }],
+        );
+        // Nonce 500 has NOT landed, so the receipt loop skips it entirely.
+        s.observe_landed(400);
+        assert!(
+            s.at_capacity(7) || s.in_flight(7) > 0,
+            "it is still counted in flight"
+        );
+
+        let out = s.sweep_timeouts(Instant::now());
+        assert!(
+            out.iter()
+                .any(|(_, _, st)| matches!(st, Settled::TimedOut { .. })),
+            "the sweep must reach it: {out:?}"
+        );
+        assert_eq!(s.in_flight(7), 0, "and the queue must be cleared behind it");
+    }
+
     /// The gate must reopen on the chain's nonce, not on a receipt arriving.
     ///
     /// This is the regression that cost 14.7% of quote cycles: a transaction landed in ~570ms, the

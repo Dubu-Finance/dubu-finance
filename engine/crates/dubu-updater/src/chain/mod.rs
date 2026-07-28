@@ -262,14 +262,27 @@ impl RpcError {
     /// the same intent twice on the guess that the first one did not count.
     #[must_use]
     pub const fn is_endpoint_fault(&self) -> bool {
-        matches!(
-            self,
+        match self {
             Self::Transport { .. }
-                | Self::Http { .. }
-                | Self::RateLimited { .. }
-                | Self::BackingOff { .. }
-                | Self::BudgetExhausted { .. }
-        )
+            | Self::Http { .. }
+            | Self::RateLimited { .. }
+            | Self::BackingOff { .. }
+            | Self::BudgetExhausted { .. } => true,
+            // A node error usually means the node understood the request and refused it, so
+            // another node would refuse it identically and moving on is pointless. These codes are
+            // the exception: they say the endpoint refused to serve *this caller*, which is a
+            // property of the key, not of the request. A different key answers it fine.
+            //
+            // This is not theoretical. `403 API usage quota has been exceeded` arrives as a
+            // JSON-RPC error object, so it was classified as a node error, and the pool gave up on
+            // the first endpoint while six working keys sat behind it -- the bot could not start.
+            //
+            // Safe on the transmit path, where a retry would otherwise risk a second broadcast:
+            // these are all refusals issued *before* the request was processed, so nothing was
+            // submitted and there is nothing to double.
+            Self::Node { code, .. } => matches!(code, 401 | 403 | 429 | -32005),
+            Self::Decode { .. } => false,
+        }
     }
 
     /// Whether this is the rate limit rather than some other failure. Drives the health state
@@ -1701,6 +1714,47 @@ mod tests {
             Duration::from_millis(1_000)
         );
         assert_eq!(l.rate_limit_events, 6);
+    }
+
+    /// A quota refusal must move the pool to the next key, not end the call.
+    ///
+    /// This is the regression that stopped the bot starting at all: `403 API usage quota has been
+    /// exceeded` arrives as a JSON-RPC error object, so it read as "the node refused this request"
+    /// -- the one class the pool deliberately does not retry, because another node would refuse it
+    /// identically. For a quota that reasoning is exactly inverted: the refusal is about the key,
+    /// and six working keys were sitting behind the one that hit its limit.
+    #[test]
+    fn a_quota_refusal_is_the_endpoints_fault_not_the_requests() {
+        let quota = RpcError::Node {
+            endpoint: "rpc",
+            code: 403,
+            message: "API usage quota has been exceeded".into(),
+        };
+        assert!(quota.is_endpoint_fault(), "must fail over to the next key");
+
+        for code in [401, 429, -32005] {
+            let e = RpcError::Node {
+                endpoint: "rpc",
+                code,
+                message: "refused".into(),
+            };
+            assert!(
+                e.is_endpoint_fault(),
+                "code {code} refuses the caller, not the request"
+            );
+        }
+
+        // And the ordinary case is unchanged: a malformed request is malformed everywhere, and
+        // retrying it on the transmit path would be a second broadcast of the same intent.
+        let bad = RpcError::Node {
+            endpoint: "rpc",
+            code: -32000,
+            message: "nonce too low".into(),
+        };
+        assert!(
+            !bad.is_endpoint_fault(),
+            "every node answers this identically"
+        );
     }
 
     #[test]

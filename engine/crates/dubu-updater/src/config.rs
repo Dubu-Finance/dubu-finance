@@ -563,6 +563,19 @@ pub struct ChainConfig {
     /// independence from one of them being down.
     #[serde(default)]
     pub read_rpc_urls: Vec<EndpointUrl>,
+    /// Additional endpoints for the **write** path: nonce, submit, receipt.
+    ///
+    /// [`Self::rpc_url`] is tried first and these are the fallbacks. They exist because a quota is
+    /// a property of a key, not of a node: the read pool already rotates over several keys, so a
+    /// single-key write path was the one place left where one exhausted key stopped the bot
+    /// sending anything at all. Measured, that is exactly what happened -- 1,448 consecutive
+    /// `403 API usage quota has been exceeded` while the reader carried on fine.
+    ///
+    /// Selected with [`Selection::Pin`], not `Rotate`: consecutive calls on this path have to
+    /// reach the same node's view of our nonce, so it stays on one endpoint and moves only when
+    /// that endpoint is genuinely failing.
+    #[serde(default)]
+    pub write_rpc_urls: Vec<EndpointUrl>,
     /// EIP-155 chain id. 91342 for GIWA Sepolia.
     pub chain_id: u64,
     /// `PropPool` address.

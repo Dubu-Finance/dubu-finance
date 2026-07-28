@@ -308,7 +308,13 @@ async fn run(args: &Args) -> Result<i32, Box<dyn std::error::Error>> {
     // endpoints are configured. Nonce, submit and receipt must reach one node's view of the
     // pending set; reading a nonce from a node that has not seen the previous transaction leaves
     // a gap that nothing fills.
-    let rpc = Rpc::new("rpc", &cfg.chain.rpc_url, &cfg.chain)?;
+    // The write path gets a pool too. A quota belongs to a key, not to a node, and this was the
+    // one path still running on a single key -- when it was exhausted the bot could not send at
+    // all while the reader, rotating over six, never noticed. `Pin` rather than `Rotate` because
+    // consecutive calls here must see the same node's view of our nonce.
+    let mut write_urls = vec![cfg.chain.rpc_url.clone()];
+    write_urls.extend(cfg.chain.write_rpc_urls.iter().cloned());
+    let rpc = Rpc::pooled("rpc", &write_urls, Selection::Pin, &cfg.chain)?;
 
     // Reads rotate. A read is a question about one block and any node can answer it, so the pool's
     // budget is the sum of its keys rather than the smallest of them.

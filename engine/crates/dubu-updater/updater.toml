@@ -31,7 +31,40 @@ ws_url = "wss://giwa-sepolia.nodit.io/${NODIT_API_KEY}"
 # TRANSACTIONS AND ANYTHING CANONICAL: nonce, receipts, startup metadata. Defaults to Nodit now
 # that it exists — 20 rapid eth_blockNumber calls returned 200 every time, where the public
 # endpoint gave us HTTP 429 during a 203-transaction broadcast.
-rpc_url = "https://giwa-sepolia.nodit.io/${NODIT_API_KEY}"
+# The write path's primary, and deliberately the keyless public endpoint.
+#
+# Measured: this path burns 12.38 req/s -- 4.07 sends, 7.31 receipt lookups, 1 eth_getLogs -- which
+# is 1.07M requests a day, and `Selection::Pin` puts all of it on ONE key while the seven read keys
+# carry 0.87/s each. That is what exhausted the quota and stopped the bot sending: a 14x imbalance
+# nobody chose.
+#
+# The public endpoint has no key and therefore no quota, and nothing on this path needs a keyed
+# one: `eth_sendRawTransaction` only has to reach the sequencer, and the in-flight gate no longer
+# waits on receipts -- it reads our confirmed nonce out of the chain view, which comes from the
+# rotating read pool. The keyed endpoints stay behind this as fallbacks.
+rpc_url = "https://sepolia-rpc.giwa.io"
+
+# Fallbacks for the write path, tried in order after `rpc_url`.
+#
+# A quota belongs to a KEY, not to a node. The read pool has rotated over six keys for a while, so
+# this was the one path left running on one -- and when that key hit its limit the bot stopped
+# sending entirely: 1,448 consecutive `403 API usage quota has been exceeded` while the reader
+# carried on without noticing. Raising the cycle to 5/s and adding the 330ms cadence is what got it
+# there, so the fix belongs with those changes.
+#
+# The public endpoint is first because it has no key and therefore no quota; `eth_sendRawTransaction`
+# only needs to reach the sequencer, which it does. The keyed endpoints sit behind it as depth.
+#
+# Selected with Pin, not Rotate: consecutive calls here must see the same node's view of our nonce.
+write_rpc_urls = [
+  "https://giwa-sepolia.nodit.io/${NODIT_API_KEY}",
+  "https://giwa-sepolia.nodit.io/${NODIT_API_KEY_2}",
+  "https://giwa-sepolia.nodit.io/${NODIT_API_KEY_3}",
+  "https://giwa-sepolia.nodit.io/${NODIT_API_KEY_4}",
+  "https://giwa-sepolia.nodit.io/${NODIT_API_KEY_5}",
+  "https://giwa-sepolia.nodit.io/${NODIT_API_KEY_6}",
+  "https://giwa-sepolia.nodit.io/${NODIT_API_KEY_7}",
+]
 
 # THE FRESHEST READ, and still worth a separate endpoint. Read-only, and only under the
 # `pending` tag: that is where the ~200ms preconfirmed state lives, which is FRESHER than the 1s
