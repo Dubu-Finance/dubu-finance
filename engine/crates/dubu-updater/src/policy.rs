@@ -110,6 +110,20 @@ pub enum Trigger {
     /// quoting the *pre-jump* price with a full epoch behind it — which is the exact fill the
     /// withdrawal was for.
     LadderStaleWithoutCapacity,
+    /// Nothing has been pushed for `max_push_interval_ms`, measured on our own clock.
+    ///
+    /// Separate from [`Self::Heartbeat`], and the separation is forced by the chain: the heartbeat
+    /// compares `quote_age_secs`, which comes from the pool's `updatedAt` field, a uint32 of
+    /// **seconds**. Sub-second staleness is not observable there at all. This measures from our own
+    /// last send instead, which is an `Instant`, so it can express a cadence shorter than a block.
+    ///
+    /// It exists to hold the posted quote's age near the interval the spread is priced for. The
+    /// drift triggers only fire when the reference has already moved; this fires when it has not,
+    /// which is the case that leaves an old quote sitting there looking fresh.
+    Cadence {
+        /// Milliseconds since the last send for this pair.
+        since_ms: u64,
+    },
     /// The market moved against the posted quote.
     AdverseDrift {
         /// How far, in deci-bps (tenths of a bps) of the posted executable top.
@@ -146,6 +160,7 @@ impl Trigger {
             Self::LadderStaleWithoutCapacity => "ladder_stale_without_capacity",
             Self::AdverseDrift { .. } => "adverse_drift",
             Self::Heartbeat { .. } => "heartbeat",
+            Self::Cadence { .. } => "cadence",
             Self::FavourableDrift { .. } => "favourable_drift",
         }
     }
@@ -420,6 +435,12 @@ pub struct Context<'a> {
     pub jump_cooloff_remaining_ms: u64,
     /// Configured heartbeat.
     pub heartbeat_secs: u64,
+    /// Push at least this often, in milliseconds, measured from our own last send. `None` disables
+    /// the cadence trigger and leaves the chain-derived heartbeat as the only time-based one.
+    pub max_push_interval_ms: Option<u64>,
+    /// Milliseconds since this pair's last send. `None` when nothing has been sent yet, which the
+    /// other triggers already cover.
+    pub since_last_push_ms: Option<u64>,
     /// Tight threshold, for a move against us, in deci-bps (tenths of a bps). Built from
     /// [`crate::config::PairConfig::adverse_drift_decibps`], which is where the fractional-bps
     /// config value gets fixed to this precision.
@@ -549,6 +570,17 @@ pub fn evaluate_quote(ctx: &Context<'_>) -> Result<Decision, CurveError> {
         return Ok(finish(Decision::Send(t), ctx, &planned));
     }
 
+    // 3b. Cadence — the heartbeat the chain's second-resolution `updatedAt` cannot express.
+    //
+    // After the drift triggers, not before: a cycle where the reference actually moved should be
+    // reported as the move it was. This only fires when nothing else had anything to say.
+    if let (Some(limit_ms), Some(since_ms)) = (ctx.max_push_interval_ms, ctx.since_last_push_ms) {
+        if since_ms >= limit_ms {
+            let t = Trigger::Cadence { since_ms };
+            return Ok(finish(Decision::Send(t), ctx, &planned));
+        }
+    }
+
     // 4. Favourable drift — the loose threshold.
     if d.favourable_bps >= u128::from(ctx.favourable_drift_bps) {
         if let Some(side) = d.favourable_side {
@@ -671,6 +703,64 @@ pub fn evaluate_capacity(ctx: &Context<'_>) -> CapacityDecision {
 
 #[cfg(test)]
 mod tests {
+    /// The cadence must be able to express an interval the chain cannot.
+    ///
+    /// `quote_age_secs` comes from `updatedAt`, a uint32 of seconds, so a quote 330ms old and one
+    /// 0ms old are the same number there. That is the whole reason this trigger measures locally.
+    ///
+    /// Note the planned ladder differs from the stored one. It has to: the cadence is deliberately
+    /// NOT exempt from the unchanged-row guard the way the heartbeat is. The heartbeat exists to
+    /// refresh `updatedAt` and re-posting identical bytes is its whole job; the cadence exists to
+    /// get a NEW price out sooner, and firing it on an unchanged row would write the same numbers
+    /// three times a second for nothing.
+    #[test]
+    fn cadence_fires_below_the_second_the_heartbeat_cannot_see() {
+        let l = ladder(900, 1_000, 1_100, 1_200);
+        let s = snap(l, 1_000, 0, 100);
+        let mut c = ctx(&s, Some(ladder(901, 1_001, 1_101, 1_201)));
+        c.heartbeat_secs = 5;
+        c.block_timestamp = 100; // age 0s: the heartbeat has nothing to say
+                                 // Raised past the 9 bps this planned row implies, so the drift triggers stay quiet and the
+                                 // cadence is the only thing that could fire. That is the case being tested: a fresh price
+                                 // worth posting, that no drift threshold considers urgent.
+        c.adverse_drift_bps = 1_000;
+        c.favourable_drift_bps = 1_000;
+        c.max_push_interval_ms = Some(330);
+
+        c.since_last_push_ms = Some(200);
+        assert!(
+            matches!(
+                evaluate_quote(&c),
+                Ok(Decision::Hold(_)) | Ok(Decision::Send(Trigger::AdverseDrift { .. }))
+            ),
+            "inside the cadence, this trigger must not fire"
+        );
+
+        c.since_last_push_ms = Some(400);
+        match evaluate_quote(&c) {
+            Ok(Decision::Send(Trigger::Cadence { since_ms })) => assert_eq!(since_ms, 400),
+            other => panic!("expected a cadence send past the interval, got {other:?}"),
+        }
+    }
+
+    /// Unset means the pair keeps only the second-resolution heartbeat it always had.
+    #[test]
+    fn cadence_is_off_when_unconfigured() {
+        let l = ladder(900, 1_000, 1_100, 1_200);
+        let s = snap(l, 1_000, 0, 100);
+        let mut c = ctx(&s, Some(l));
+        c.block_timestamp = 100;
+        c.max_push_interval_ms = None;
+        c.since_last_push_ms = Some(999_999);
+        assert!(
+            !matches!(
+                evaluate_quote(&c),
+                Ok(Decision::Send(Trigger::Cadence { .. }))
+            ),
+            "an unconfigured cadence must never fire"
+        );
+    }
+
     use super::*;
 
     fn snap(l: Ladder, capacity: u128, used: u128, updated_at: u64) -> Snap {
@@ -704,6 +794,8 @@ mod tests {
     /// A healthy context: nothing gated, quote fresh, row identical to what is stored.
     fn ctx<'a>(s: &'a Snap, planned: Option<Ladder>) -> Context<'a> {
         Context {
+            max_push_interval_ms: None,
+            since_last_push_ms: None,
             block_timestamp: s.updated_at + 10,
             snap: s,
             planned,

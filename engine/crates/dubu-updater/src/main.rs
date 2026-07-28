@@ -211,6 +211,11 @@ struct Runtime {
     /// same block -- one as wasted `eth_getLogs` calls, the other as duplicate reference samples
     /// carrying an identical timestamp.
     last_block_work: u64,
+    /// When each pair was last sent, on our own clock.
+    ///
+    /// The chain cannot answer this below a second -- `updatedAt` is a uint32 of seconds -- so the
+    /// cadence trigger measures from here instead. See `policy::Trigger::Cadence`.
+    last_push: BTreeMap<u16, Instant>,
     cfg: Config,
     facts: ChainFacts,
     /// Ordinary RPC: transactions, nonce, receipts, startup metadata. Canonical.
@@ -587,6 +592,7 @@ async fn run(args: &Args) -> Result<i32, Box<dyn std::error::Error>> {
     let cfg_pool = cfg.chain.pool;
     let mut rt = Runtime {
         last_block_work: 0,
+        last_push: BTreeMap::new(),
         cfg,
         facts,
         rpc,
@@ -1678,6 +1684,12 @@ block_work,
                 .detector(pair.pair_id)
                 .map_or(0, |d| d.cooloff_remaining_ms(now)),
             heartbeat_secs: pair.heartbeat_secs,
+            max_push_interval_ms: pair.max_push_interval_ms,
+            since_last_push_ms: rt.last_push.get(&pair.pair_id).map(|t| {
+                now.saturating_duration_since(*t)
+                    .as_millis()
+                    .min(u128::from(u64::MAX)) as u64
+            }),
             adverse_drift_bps: pair.adverse_drift_decibps(),
             favourable_drift_bps: pair.favourable_drift_decibps(),
             capacity_divergence_pct: pair.capacity_divergence_pct,
@@ -1887,6 +1899,12 @@ async fn emit(rt: &mut Runtime, intent: Intent) {
             "DRY RUN: would send this transaction"
         ),
         Ok(Sent::Broadcast { hash, nonce }) => {
+            // Stamped on broadcast, not on confirmation. The cadence this drives is about how
+            // often a fresh price leaves here; waiting for the receipt would make the interval
+            // include the inclusion latency twice and turn a 330ms cadence into ~770ms.
+            if matches!(intent, Intent::UpdateQuote { .. }) {
+                rt.last_push.insert(intent.pair_id(), Instant::now());
+            }
             // The one adaptive signal the reader takes, and it is one we generate: this
             // transaction is about to change the state the reader publishes, ~440ms from now.
             // Looking again then settles it sooner and unblocks the in-flight gate sooner.

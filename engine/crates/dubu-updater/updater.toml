@@ -219,6 +219,15 @@ max_priority_fee_per_gas_gwei = "0.005"
 # stored.
 pending_timeout_secs = 10
 
+# The cadence (330ms) is shorter than inclusion (~440ms measured), so a send is still in the air
+# when the next one is due and the pipeline has to be at least two deep to hold the cadence at all.
+# Three leaves one slot for the tail of the inclusion distribution, which is what actually binds --
+# 15% of sends land in 2.0-2.75s, and with a depth of two those alone stall the cadence.
+#
+# Depth is not risk here: updateQuote is an idempotent overwrite, so a send that never lands needs
+# no retry and the one behind it supersedes it entirely.
+max_in_flight = 3
+
 [skew]
 # ---------------------------------------------------------------------------
 # INVENTORY SKEW — Avellaneda-Stoikov, linear term only.
@@ -377,7 +386,18 @@ max_negative_bps = 10
 # The note above says ETH's ordinary half-spread DOUBLES from 5 to 10 under this term.
 # With the floor at 1 it reaches 6.8 instead, so the honest cost accepted there is now
 # about a third of what it was.
-vol_coefficient = 0.58
+# Halved from 0.58 on 2026-07-28 to see how tight the pool can quote.
+#
+# What this spends is a margin nobody has measured. The posted half-spread was 4.0 bp against a
+# staleness-window drift of 0.29 bp -- a 13.5-sigma buffer in pure diffusion terms, which is absurd
+# for diffusion and is really a buffer against jumps and adverse selection. Neither has ever been
+# measured here: third-party flow is zero and markout is empty. The three-lever sweep found s1's
+# effect on P&L small and sign-flipping with width, which is the only evidence either way, and it
+# says the margin buys little.
+#
+# So this is not slack that was found. It is an unmeasured safety margin being spent deliberately,
+# and it is the first thing to put back if markout ever shows toxicity.
+vol_coefficient = 0.29
 
 # THE CAP, and it is 30 bp because that is both the measured-positive point AND
 # UniV2's fee. The rule that produces is worth stating plainly: the pool never
@@ -574,6 +594,16 @@ width_bps = 25
 # holding capacity at zero for the 30s cool-off. 29% of the run withdrawn for nothing.
 jump_floor_bps = 5
 
+# Push at least this often, measured on our own clock.
+#
+# 330ms is one flashblock, measured at 327ms median on GIWA. The chain-derived heartbeat cannot
+# express this: it compares `updatedAt`, a uint32 of SECONDS, so sub-second staleness is invisible
+# there. See `policy::Trigger::Cadence`.
+#
+# Inclusion runs ~440ms, longer than the cadence, so sends pipeline -- max_in_flight has to be
+# above 1 for this to hold, and the tail of the inclusion distribution is what will bind.
+max_push_interval_ms = 330
+
 # TARGET INVENTORY, as a share of this pair's book — configuration, not a constant, and a share
 # rather than an amount so it stays meaningful as the pool grows or shrinks. The book is this
 # pair's mWETH valued at the reference plus its share of the shared mUSDC; see skew::Inventory on
@@ -658,6 +688,9 @@ width_bps = 40
 # Same as pair 1. BTC's reference is noisier, so its floor stays the wider of the two.
 jump_floor_bps = 8
 
+# Same as pair 1.
+max_push_interval_ms = 330
+
 # See pairId 1. Same balanced target; the imbalance and the resulting skew are logged per row.
 target_base_share_pct = 50
 
@@ -714,7 +747,7 @@ base_half_spread_e2 = 100
 # of sigma, so 0.58 bp per bp is 58 here... but the curve's sigma is over 300s and this one
 # is rescaled to the TTL, so the two are not the same multiplier. Kept at the curve's slope
 # so the two surfaces widen together in a volatile market.
-sigma_coefficient_e2 = 58
+sigma_coefficient_e2 = 29
 max_half_spread_e2 = 2000
 # $100k in one order. Denominated in money rather than tokens: "50" would mean 50 mWETH on one
 # pair and 50 mWBTC on another, a fifty-fold difference in the risk one order can take.

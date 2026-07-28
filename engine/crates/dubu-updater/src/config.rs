@@ -1741,6 +1741,14 @@ pub struct PairConfig {
     /// noise makes the detector fire on nothing. See `jump::Bounds::new`.
     #[serde(default)]
     pub jump_floor_bps: Option<u16>,
+    /// Push at least this often, in milliseconds, measured from our own last send.
+    ///
+    /// The chain-derived heartbeat cannot go below a second: it compares `quote_age_secs`, and the
+    /// pool stores `updatedAt` as a uint32 of seconds. This is measured locally, so it can hold the
+    /// posted quote near the interval the spread is actually priced for. Unset leaves only the
+    /// second-resolution heartbeat. See `policy::Trigger::Cadence`.
+    #[serde(default)]
+    pub max_push_interval_ms: Option<u64>,
     /// **Target inventory, as a share of this pair's book, in percent.**
     ///
     /// Configuration rather than a constant, and a *share* rather than an amount so that it stays
