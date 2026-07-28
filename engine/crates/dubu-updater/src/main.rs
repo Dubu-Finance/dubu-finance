@@ -1194,6 +1194,12 @@ fn start_rfq(cfg: &Config) -> Result<RfqLeg, Box<dyn std::error::Error>> {
 
 /// The venue client, the per-pair bands, and the mapping between pool units and venue units.
 struct HedgeLeg {
+    /// Net position on the venue per pair, in the pool's base units and signed: negative is short.
+    ///
+    /// Tracked here rather than polled, because it has to include orders that are in flight. A
+    /// hedge that has been sent has already committed the exposure, and skew that only counts
+    /// settled fills double-counts the inventory for as long as the venue takes to answer.
+    positions: BTreeMap<u16, i128>,
     venue: hedge::binance::Venue,
     bands: BTreeMap<u16, hedge::Bands>,
     symbols: BTreeMap<u16, String>,
@@ -1275,6 +1281,7 @@ fn start_hedge(cfg: &Config, sigma_millibps_per_sqrt_sec: u64) -> Option<HedgeLe
         "hedge leg configured; the crossing interval is derived from fee and sigma, not chosen"
     );
     Some(HedgeLeg {
+        positions: BTreeMap::new(),
         venue,
         bands,
         symbols,
@@ -1327,10 +1334,28 @@ async fn run_hedge(rt: &mut Runtime) {
             continue;
         }
 
+        // Committed before the round trip, not after. The exposure is taken the moment the order
+        // leaves; waiting for the reply is what let one fill be hedged twice.
+        let committed = i128::try_from(order.qty).unwrap_or(i128::MAX);
+        let signed = match order.side {
+            hedge::Side::Sell => -committed,
+            hedge::Side::Buy => committed,
+        };
+        *leg.positions.entry(order.pair_id).or_insert(0) += signed;
+
         match leg.venue.market(&symbol, order.side, qty).await {
             Ok(fill) => {
                 // Settled on what filled, not on what was asked for. See `hedge::Bands::settle`.
+                // Correct the commitment to what actually filled. A partial fill leaves the
+                // difference un-hedged, and the position must say so or the skew believes an
+                // exposure was neutralised that is still open.
                 let filled_base = (fill.executed_qty * scale) as u128;
+                let actual = i128::try_from(filled_base).unwrap_or(i128::MAX);
+                let corrected = match order.side {
+                    hedge::Side::Sell => -actual,
+                    hedge::Side::Buy => actual,
+                };
+                *leg.positions.entry(order.pair_id).or_insert(0) += corrected - signed;
                 if let Some(b) = leg.bands.get_mut(&order.pair_id) {
                     b.settle(Instant::now(), order.side, filled_base);
                 }
@@ -1342,11 +1367,17 @@ async fn run_hedge(rt: &mut Runtime) {
                     "inventory neutralised on the venue"
                 );
             }
-            Err(e) => error!(
+            Err(e) => {
+                // Nothing reached the venue, so the commitment has to come back off. Leaving it
+                // would report an exposure that was never taken and skew against a hedge that does
+                // not exist.
+                *leg.positions.entry(order.pair_id).or_insert(0) -= signed;
+                error!(
                 target: "hedge", event = "cross_failed", pair_id = order.pair_id, symbol = %symbol,
                 side = order.side.as_str(), qty, error = %e,
                 "the drift stays outstanding and will be retried"
-            ),
+                );
+            }
         }
     }
 }
@@ -1888,6 +1919,23 @@ async fn run_cycle(
                 // `skew::Inventory`; it is the same assumption archi_v2 5.4's missing cross-asset
                 // clamp already makes.
                 quote_share: quote_balance / rt.cfg.pairs.len().max(1) as u128,
+                // The hedge, valued at the same reference and signed. Zero when there is no hedge
+                // leg, which is exactly the behaviour this had before one existed.
+                hedge_value: rt
+                    .hedge
+                    .as_ref()
+                    .and_then(|h| h.positions.get(&pair.pair_id).copied())
+                    .map(|base| {
+                        let magnitude = dubu_updater::risk::value(
+                            base.unsigned_abs(),
+                            f,
+                            meta.price_scale_exp,
+                        )
+                        .unwrap_or(0);
+                        let v = i128::try_from(magnitude).unwrap_or(i128::MAX);
+                        if base < 0 { -v } else { v }
+                    })
+                    .unwrap_or(0),
                 target_ppm: pair.target_base_share_ppm(),
             };
             let floor_cap = skew::min_price_cap_bps(f, meta.min_price, half_spread);
