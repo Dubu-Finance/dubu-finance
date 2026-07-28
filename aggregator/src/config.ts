@@ -53,7 +53,17 @@ export interface Config {
 
 export const CHAIN_ID = 91342;
 export const MULTICALL3: Address = '0xcA11bde05977b3631167028862bE2a173976CA11';
-export const DEFAULT_RPC = 'https://sepolia-rpc.giwa.io';
+// The flashblocks-aware endpoint, and the `pending` tag that goes with it.
+//
+// Reading `latest` on a plain node meant a DuBu quote did not exist for a taker until its block
+// sealed -- up to a second after the maker had already replaced it. The pool re-quotes every ~415ms,
+// so most of what it publishes was invisible here, and the price this aggregator returned was
+// systematically the previous one.
+//
+// Preconfirmed state is not final, which is the honest cost: a quote read here can be reordered
+// before sealing. That is what `minAmountOut` is for, and it is a far smaller error than quoting a
+// price the maker has already moved off.
+export const DEFAULT_RPC = 'https://sepolia-rpc-flashblocks.giwa.io';
 
 const MUSDC: Address = getAddress('0xd28596C6750D87C53EA146134AfAB53de86C5155');
 const MWETH: Address = getAddress('0x81e46C6379498beBEB5DCcD47ab2DdFaf967d445');

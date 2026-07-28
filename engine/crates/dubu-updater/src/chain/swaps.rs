@@ -151,6 +151,26 @@ pub struct SwapWatch {
     undecodable: u64,
 }
 
+/// Where a log query ends.
+///
+/// `Pending` is the flashblocks tag: it returns logs from preconfirmed transactions, which land
+/// ~200ms after submission where a sealed block is a second away. It is only ever used on the path
+/// that does not advance the cursor -- see [`SwapWatch::poll`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BlockBound {
+    Number(u64),
+    Pending,
+}
+
+impl BlockBound {
+    fn tag(self) -> serde_json::Value {
+        match self {
+            Self::Number(n) => serde_json::Value::String(format!("0x{n:x}")),
+            Self::Pending => serde_json::Value::String("pending".into()),
+        }
+    }
+}
+
 impl SwapWatch {
     /// A watcher over `pool`, positioned nowhere until its first poll.
     pub fn new(pool: Address) -> Self {
@@ -213,13 +233,30 @@ impl SwapWatch {
         let mut out = Polled::default();
         while from <= head {
             let to = head.min(from + MAX_RANGE_BLOCKS - 1);
-            let logs = self.fetch(rpc, from, to).await?;
+            let logs = self.fetch(rpc, from, BlockBound::Number(to)).await?;
             self.absorb(&logs, &mut out);
             // Only now: the range is in hand, so re-reading it is unnecessary. A `?` above leaves
             // the cursor where it was and the next poll repeats this range.
             self.cursor = Some(to);
             from = to + 1;
         }
+
+        // Preconfirmed fills, on a path that deliberately does NOT move the cursor.
+        //
+        // A fill is the only thing that tells us an informed counterparty just traded against us,
+        // and until this existed it arrived once per sealed block -- while quotes went out every
+        // 415ms. Two or three more quotes at essentially the same price left before the fill was
+        // even visible, which is two or three more bites for whoever knew something we did not.
+        //
+        // The cursor stays on sealed blocks because a preconfirmed block's contents are not final:
+        // advancing past one means never re-reading it if it changes, which would turn a fast path
+        // into a source of permanently missed fills. So this reads ahead of the cursor and lets the
+        // sealed pass cover the same range again. The duplicate that produces is exactly what
+        // `seen` is for, and it is counted rather than hidden.
+        let preconf = self
+            .fetch(rpc, head.saturating_add(1), BlockBound::Pending)
+            .await?;
+        self.absorb(&preconf, &mut out);
         self.resolve_timestamps(rpc, &mut out).await?;
         out.fills.sort_by_key(|f| (f.block_number, f.log_index));
         Ok(out)
@@ -292,11 +329,11 @@ impl SwapWatch {
         &self,
         rpc: &Rpc,
         from: u64,
-        to: u64,
+        to: BlockBound,
     ) -> Result<Vec<serde_json::Value>, RpcError> {
         let filter = json!({
             "fromBlock": format!("0x{from:x}"),
-            "toBlock": format!("0x{to:x}"),
+            "toBlock": to.tag(),
             "address": self.pool.to_string(),
             "topics": [format!("{:#x}", Swap::SIGNATURE_HASH)],
         });

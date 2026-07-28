@@ -1812,9 +1812,15 @@ block_work,
         emit(rt, intent).await;
     }
 
-    if block_work {
-        scan_fills(rt, head).await;
-    }
+    // Every cycle, not once per sealed block.
+    //
+    // It was gated with the other per-block work because `eth_getLogs` over sealed ranges finds
+    // nothing four cycles out of five. But a fill is not per-block information -- it is the only
+    // signal that an informed counterparty just traded against us, and at a 415ms re-quote interval
+    // waiting a full second for it meant two or three more quotes went out at the same price before
+    // we knew. `SwapWatch::poll` now also reads the `pending` tag, so the extra frequency has
+    // preconfirmed fills to find rather than re-reading blocks it has already seen.
+    scan_fills(rt, head).await;
 
     // The killswitches. Skipped entirely when any pair has no fair value: marking inventory
     // against a price we do not have would be an invention, and an invented NAV is worse than

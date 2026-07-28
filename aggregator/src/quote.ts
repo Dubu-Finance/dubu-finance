@@ -99,6 +99,10 @@ export async function quoteAmms(
     abi: MULTICALL3_ABI,
     functionName: 'aggregate3',
     args: [calls],
+    // Preconfirmed state. viem defaults to `latest`, which is a SEALED block -- and the pool
+    // re-quotes every ~415ms, so `latest` served the previous quote for most of every second. See
+    // DEFAULT_RPC.
+    blockTag: 'pending',
   })) as readonly { success: boolean; returnData: `0x${string}` }[];
 
   let best: AmmQuote | null = null;
@@ -231,6 +235,9 @@ export async function makerCanDeliver(
       abi: MULTICALL3_ABI,
       functionName: 'aggregate3',
       args: [calls],
+      // Same reason as the quote path: a sealed read cannot see a transfer or an approval the maker
+      // made in the last second, so a maker that CAN deliver gets refused as if it could not.
+      blockTag: 'pending',
     })) as readonly { success: boolean; returnData: `0x${string}` }[];
 
     const balance = decodeUint(results[0], 'balanceOf');
