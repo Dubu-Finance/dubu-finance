@@ -110,19 +110,35 @@ impl Fill {
     /// zero would hide exactly the observation this module exists to make.
     pub fn markout_e2(&self, ref_later: u128) -> Option<i128> {
         let scale = 10i128.checked_pow(u32::from(self.price_scale_exp))?;
-        let base = i128::try_from(if self.is_bid { self.amount_in } else { self.amount_out }).ok()?;
-        let quote = i128::try_from(if self.is_bid { self.amount_out } else { self.amount_in }).ok()?;
+        let base = i128::try_from(if self.is_bid {
+            self.amount_in
+        } else {
+            self.amount_out
+        })
+        .ok()?;
+        let quote = i128::try_from(if self.is_bid {
+            self.amount_out
+        } else {
+            self.amount_in
+        })
+        .ok()?;
         let later = i128::try_from(ref_later).ok()?;
 
         // What the base leg is worth at the later reference, in quote units.
         let base_value = base.checked_mul(later)?.checked_div(scale)?;
         // Bid: the pool paid `quote` and holds base now worth `base_value`.
         // Ask: the pool gave up base now worth `base_value` and holds `quote`.
-        let pnl = if self.is_bid { base_value.checked_sub(quote)? } else { quote.checked_sub(base_value)? };
+        let pnl = if self.is_bid {
+            base_value.checked_sub(quote)?
+        } else {
+            quote.checked_sub(base_value)?
+        };
 
         // Notional is the base leg at the fill-time reference, so a markout is a fraction of what
         // was actually traded rather than of whichever leg happened to be larger.
-        let notional = base.checked_mul(i128::try_from(self.ref_at_fill).ok()?)?.checked_div(scale)?;
+        let notional = base
+            .checked_mul(i128::try_from(self.ref_at_fill).ok()?)?
+            .checked_div(scale)?;
         if notional == 0 {
             return None;
         }
@@ -158,7 +174,10 @@ impl Score {
             return None;
         }
         let notional = i128::try_from(self.notional).ok()?;
-        self.pnl.get(horizon_index)?.checked_mul(1_000_000)?.checked_div(notional)
+        self.pnl
+            .get(horizon_index)?
+            .checked_mul(1_000_000)?
+            .checked_div(notional)
     }
 
     /// True when there is enough here to act on.
@@ -279,7 +298,12 @@ impl Markout {
 
     fn fold(&mut self, fill: &Fill, marks: &[Option<i128>; HORIZONS_SECS.len()]) {
         let scale = 10i128.saturating_pow(u32::from(fill.price_scale_exp));
-        let base = i128::try_from(if fill.is_bid { fill.amount_in } else { fill.amount_out }).unwrap_or(0);
+        let base = i128::try_from(if fill.is_bid {
+            fill.amount_in
+        } else {
+            fill.amount_out
+        })
+        .unwrap_or(0);
         let notional = base
             .saturating_mul(i128::try_from(fill.ref_at_fill).unwrap_or(0))
             .checked_div(scale)
@@ -396,7 +420,7 @@ mod tests {
         f.is_bid = false;
         f.amount_in = 2_000_000_000; // quote in
         f.amount_out = 1_000_000_000_000_000_000; // base out
-        // The pool sold base and the market rose: it sold too cheaply.
+                                                  // The pool sold base and the market rose: it sold too cheaply.
         assert_eq!(f.markout_e2(MID * 101 / 100), Some(-10_000));
     }
 
@@ -435,7 +459,15 @@ mod tests {
         for t in [100u64, 200] {
             m.observe_reference(1, t, MID);
             for h in HORIZONS_SECS {
-                m.observe_reference(1, t + h, if t == 100 { MID * 101 / 100 } else { MID * 99 / 100 });
+                m.observe_reference(
+                    1,
+                    t + h,
+                    if t == 100 {
+                        MID * 101 / 100
+                    } else {
+                        MID * 99 / 100
+                    },
+                );
             }
         }
         // A small winner and a hundred-times-larger loser.
@@ -463,7 +495,10 @@ mod tests {
         m.settle(200);
 
         let s = m.score_of(&who(1)).expect("scored");
-        assert!(!s.is_actionable(5, 0), "a single fill must not earn a punitive spread");
+        assert!(
+            !s.is_actionable(5, 0),
+            "a single fill must not earn a punitive spread"
+        );
         assert!(s.is_actionable(1, 0));
     }
 }

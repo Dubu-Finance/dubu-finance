@@ -505,7 +505,11 @@ pub fn evaluate_quote(ctx: &Context<'_>) -> Result<Decision, CurveError> {
     //    stored ladder: the pool will reject every fill against it until something is pushed.
     let unusable = ctx.snap.never_quoted() || ctx.snap.ladder().validate(ctx.min_price).is_err();
     if unusable {
-        return Ok(finish(Decision::Send(Trigger::NoUsableQuote), ctx, &planned));
+        return Ok(finish(
+            Decision::Send(Trigger::NoUsableQuote),
+            ctx,
+            &planned,
+        ));
     }
 
     // 1b. Standing aside with a stale ladder. Deliberately **not** gated on `jump_withdrawn`:
@@ -514,7 +518,11 @@ pub fn evaluate_quote(ctx: &Context<'_>) -> Result<Decision, CurveError> {
     //     be restored in one step without a block of pre-jump prices in between. `finish` still
     //     holds `Unchanged` when the row has not actually moved, so a quiet cool-off is silent.
     if ctx.withdrawn_on_chain() && planned != ctx.snap.ladder() {
-        return Ok(finish(Decision::Send(Trigger::LadderStaleWithoutCapacity), ctx, &planned));
+        return Ok(finish(
+            Decision::Send(Trigger::LadderStaleWithoutCapacity),
+            ctx,
+            &planned,
+        ));
     }
 
     let d = drift(ctx.snap, &planned)?;
@@ -523,21 +531,32 @@ pub fn evaluate_quote(ctx: &Context<'_>) -> Result<Decision, CurveError> {
     //    heartbeat: a quote that is wrong now is more urgent than a quote that expires later.
     if d.adverse_bps >= u128::from(ctx.adverse_drift_bps) {
         if let Some(side) = d.adverse_side {
-            let t = Trigger::AdverseDrift { bps: d.adverse_bps, side, threshold_bps: ctx.adverse_drift_bps };
+            let t = Trigger::AdverseDrift {
+                bps: d.adverse_bps,
+                side,
+                threshold_bps: ctx.adverse_drift_bps,
+            };
             return Ok(finish(Decision::Send(t), ctx, &planned));
         }
     }
 
     // 3. Heartbeat.
     if age >= limit {
-        let t = Trigger::Heartbeat { age_secs: age, limit_secs: limit };
+        let t = Trigger::Heartbeat {
+            age_secs: age,
+            limit_secs: limit,
+        };
         return Ok(finish(Decision::Send(t), ctx, &planned));
     }
 
     // 4. Favourable drift — the loose threshold.
     if d.favourable_bps >= u128::from(ctx.favourable_drift_bps) {
         if let Some(side) = d.favourable_side {
-            let t = Trigger::FavourableDrift { bps: d.favourable_bps, side, threshold_bps: ctx.favourable_drift_bps };
+            let t = Trigger::FavourableDrift {
+                bps: d.favourable_bps,
+                side,
+                threshold_bps: ctx.favourable_drift_bps,
+            };
             return Ok(finish(Decision::Send(t), ctx, &planned));
         }
     }
@@ -555,7 +574,9 @@ pub fn evaluate_quote(ctx: &Context<'_>) -> Result<Decision, CurveError> {
 /// refreshing `updatedAt` *is* the change it wants; every other trigger sending an identical
 /// row would spend gas to store the bytes that are already there.
 fn finish(decision: Decision, ctx: &Context<'_>, planned: &Ladder) -> Decision {
-    let Decision::Send(t) = decision else { return decision };
+    let Decision::Send(t) = decision else {
+        return decision;
+    };
     if *planned == ctx.snap.ladder() && !t.justifies_identical_row() {
         return Decision::Hold(Hold::Unchanged);
     }
@@ -595,8 +616,18 @@ pub fn evaluate_capacity(ctx: &Context<'_>) -> CapacityDecision {
     }
 
     let sides = [
-        (Side::Bid, ctx.snap.bid_capacity, ctx.snap.bid_used(), ctx.capacity.bid),
-        (Side::Ask, ctx.snap.ask_capacity, ctx.snap.ask_used(), ctx.capacity.ask),
+        (
+            Side::Bid,
+            ctx.snap.bid_capacity,
+            ctx.snap.bid_used(),
+            ctx.capacity.bid,
+        ),
+        (
+            Side::Ask,
+            ctx.snap.ask_capacity,
+            ctx.snap.ask_used(),
+            ctx.capacity.ask,
+        ),
     ];
 
     // 1. A side with no epoch at all quotes zero however good the ladder is.
@@ -631,7 +662,11 @@ pub fn evaluate_capacity(ctx: &Context<'_>) -> CapacityDecision {
         }
     }
 
-    CapacityDecision::Hold(Hold::NoTrigger { adverse_bps: 0, favourable_bps: 0, age_secs: 0 })
+    CapacityDecision::Hold(Hold::NoTrigger {
+        adverse_bps: 0,
+        favourable_bps: 0,
+        age_secs: 0,
+    })
 }
 
 #[cfg(test)]
@@ -658,7 +693,12 @@ mod tests {
     }
 
     fn ladder(min_bid: u128, max_bid: u128, min_ask: u128, max_ask: u128) -> Ladder {
-        Ladder { min_bid, max_bid, min_ask, max_ask }
+        Ladder {
+            min_bid,
+            max_bid,
+            min_ask,
+            max_ask,
+        }
     }
 
     /// A healthy context: nothing gated, quote fresh, row identical to what is stored.
@@ -703,16 +743,26 @@ mod tests {
         // Planned: same maxBid, zero width. The taker would get 1000 — an 11% better price than
         // the pool is currently offering. `maxBid` is identical, so comparing it sees nothing.
         let planned = ladder(1_000, 1_000, 1_100, 1_300);
-        assert_eq!(planned.max_bid, s.max_bid, "the naive comparison is blind here by construction");
+        assert_eq!(
+            planned.max_bid, s.max_bid,
+            "the naive comparison is blind here by construction"
+        );
 
         let d = drift(&s, &planned).unwrap();
         assert_eq!(d.favourable_bps, 11_111);
         assert_eq!(d.favourable_side, Some(Side::Bid));
 
-        let c = Context { adverse_drift_bps: 20, favourable_drift_bps: 80, ..ctx(&s, Some(planned)) };
+        let c = Context {
+            adverse_drift_bps: 20,
+            favourable_drift_bps: 80,
+            ..ctx(&s, Some(planned))
+        };
         assert!(matches!(
             evaluate_quote(&c).unwrap(),
-            Decision::Send(Trigger::FavourableDrift { side: Side::Bid, .. })
+            Decision::Send(Trigger::FavourableDrift {
+                side: Side::Bid,
+                ..
+            })
         ));
     }
 
@@ -723,7 +773,10 @@ mod tests {
         let s = snap(ladder(800, 1_000, 1_100, 1_300), 100, 50, 1_000);
         let planned = ladder(850, 950, 1_150, 1_250);
         assert_eq!(executable_top_bid(850, 950, 100, 50), Ok(900));
-        assert_eq!(executable_top_ask(1_150, 1_250, 100, 50), executable_top_ask(1_100, 1_300, 100, 50));
+        assert_eq!(
+            executable_top_ask(1_150, 1_250, 100, 50),
+            executable_top_ask(1_100, 1_300, 100, 50)
+        );
 
         // `maxBid` moved 500 bps, so the naive comparison fires; the executable top did not
         // move at all, so this one holds.
@@ -731,7 +784,11 @@ mod tests {
         let c = ctx(&s, Some(planned));
         assert!(matches!(
             evaluate_quote(&c).unwrap(),
-            Decision::Hold(Hold::NoTrigger { adverse_bps: 0, favourable_bps: 0, .. })
+            Decision::Hold(Hold::NoTrigger {
+                adverse_bps: 0,
+                favourable_bps: 0,
+                ..
+            })
         ));
     }
 
@@ -742,14 +799,22 @@ mod tests {
         // Market fell: our posted bid is now too high, and our posted ask is conservative.
         let down = ladder(800, 900, 1_000, 1_100);
         let d = drift(&s, &down).unwrap();
-        assert_eq!(d.adverse_side, Some(Side::Bid), "a lower planned bid means we are overpaying");
+        assert_eq!(
+            d.adverse_side,
+            Some(Side::Bid),
+            "a lower planned bid means we are overpaying"
+        );
         assert_eq!(d.adverse_bps, 10_000);
         assert_eq!(d.favourable_side, Some(Side::Ask));
 
         // Market rose: our posted ask is now too low, our bid is conservative.
         let up = ladder(1_000, 1_100, 1_200, 1_300);
         let d = drift(&s, &up).unwrap();
-        assert_eq!(d.adverse_side, Some(Side::Ask), "a higher planned ask means we are underselling");
+        assert_eq!(
+            d.adverse_side,
+            Some(Side::Ask),
+            "a higher planned ask means we are underselling"
+        );
         assert_eq!(d.favourable_side, Some(Side::Bid));
     }
 
@@ -775,7 +840,10 @@ mod tests {
     fn a_never_quoted_pair_is_pushed_immediately() {
         let s = snap(ladder(0, 0, 0, 0), 100, 0, 0);
         let c = ctx(&s, Some(ladder(900, 1_000, 1_100, 1_200)));
-        assert_eq!(evaluate_quote(&c).unwrap(), Decision::Send(Trigger::NoUsableQuote));
+        assert_eq!(
+            evaluate_quote(&c).unwrap(),
+            Decision::Send(Trigger::NoUsableQuote)
+        );
     }
 
     #[test]
@@ -783,26 +851,51 @@ mod tests {
         // The manager can raise `minPrice` after a ladder is stored. Until something is pushed
         // the pool rejects every fill, and nothing else in this module would notice.
         let s = snap(ladder(900, 1_000, 1_100, 1_200), 100, 0, 1_000);
-        let c = Context { min_price: 950, ..ctx(&s, Some(ladder(960, 1_000, 1_100, 1_200))) };
-        assert_eq!(evaluate_quote(&c).unwrap(), Decision::Send(Trigger::NoUsableQuote));
+        let c = Context {
+            min_price: 950,
+            ..ctx(&s, Some(ladder(960, 1_000, 1_100, 1_200)))
+        };
+        assert_eq!(
+            evaluate_quote(&c).unwrap(),
+            Decision::Send(Trigger::NoUsableQuote)
+        );
     }
 
     #[test]
     fn adverse_drift_fires_at_the_threshold_and_not_below_it() {
-        let s = snap(ladder(1_000_000, 1_000_000, 2_000_000, 2_000_000), 100, 0, 1_000);
+        let s = snap(
+            ladder(1_000_000, 1_000_000, 2_000_000, 2_000_000),
+            100,
+            0,
+            1_000,
+        );
         let c = |bid: u128| ctx(&s, Some(ladder(bid, bid, 2_000_000, 2_000_000)));
 
         // 1 bp under: below the 2 bp threshold, and the ask side did not move. Hold.
         let just_under = 1_000_000 - 100;
-        assert_eq!(drift(&s, &ladder(just_under, just_under, 2_000_000, 2_000_000)).unwrap().adverse_bps, 10);
+        assert_eq!(
+            drift(&s, &ladder(just_under, just_under, 2_000_000, 2_000_000))
+                .unwrap()
+                .adverse_bps,
+            10
+        );
         assert!(!evaluate_quote(&c(just_under)).unwrap().sends());
 
         // Exactly 2 bp: fires.
         let at = 1_000_000 - 200;
-        assert_eq!(drift(&s, &ladder(at, at, 2_000_000, 2_000_000)).unwrap().adverse_bps, 20);
+        assert_eq!(
+            drift(&s, &ladder(at, at, 2_000_000, 2_000_000))
+                .unwrap()
+                .adverse_bps,
+            20
+        );
         assert!(matches!(
             evaluate_quote(&c(at)).unwrap(),
-            Decision::Send(Trigger::AdverseDrift { bps: 20, side: Side::Bid, threshold_bps: 20 })
+            Decision::Send(Trigger::AdverseDrift {
+                bps: 20,
+                side: Side::Bid,
+                threshold_bps: 20
+            })
         ));
     }
 
@@ -810,51 +903,89 @@ mod tests {
     fn a_sub_one_bp_threshold_fires_where_a_whole_bp_threshold_would_not() {
         // The whole point of deci-bps resolution: 0.5 bp (5 deci-bps) and 1 bp (10 deci-bps) must
         // be distinguishable, which integer-bps measurement could never do.
-        let s = snap(ladder(1_000_000, 1_000_000, 2_000_000, 2_000_000), 100, 0, 1_000);
+        let s = snap(
+            ladder(1_000_000, 1_000_000, 2_000_000, 2_000_000),
+            100,
+            0,
+            1_000,
+        );
         let moved = 1_000_000 - 50; // 0.5 bp move.
         let planned = ladder(moved, moved, 2_000_000, 2_000_000);
         assert_eq!(drift(&s, &planned).unwrap().adverse_bps, 5);
 
-        let loose = Context { adverse_drift_bps: 10, ..ctx(&s, Some(planned)) };
-        assert!(!evaluate_quote(&loose).unwrap().sends(), "5 deci-bps must not clear a 10 deci-bps threshold");
+        let loose = Context {
+            adverse_drift_bps: 10,
+            ..ctx(&s, Some(planned))
+        };
+        assert!(
+            !evaluate_quote(&loose).unwrap().sends(),
+            "5 deci-bps must not clear a 10 deci-bps threshold"
+        );
 
-        let tight = Context { adverse_drift_bps: 5, ..ctx(&s, Some(planned)) };
+        let tight = Context {
+            adverse_drift_bps: 5,
+            ..ctx(&s, Some(planned))
+        };
         assert!(matches!(
             evaluate_quote(&tight).unwrap(),
-            Decision::Send(Trigger::AdverseDrift { bps: 5, threshold_bps: 5, .. })
+            Decision::Send(Trigger::AdverseDrift {
+                bps: 5,
+                threshold_bps: 5,
+                ..
+            })
         ));
     }
 
     #[test]
     fn favourable_drift_needs_the_looser_threshold() {
-        let s = snap(ladder(1_000_000, 1_000_000, 2_000_000, 2_000_000), 100, 0, 1_000);
+        let s = snap(
+            ladder(1_000_000, 1_000_000, 2_000_000, 2_000_000),
+            100,
+            0,
+            1_000,
+        );
         // Bid 5 bp better than posted: favourable, under the 8 bp threshold, and the ask is
         // unchanged so nothing is adverse. Hold — this is the case that saves the gas.
         let better = 1_000_000 + 500;
         let c = ctx(&s, Some(ladder(better, better, 2_000_000, 2_000_000)));
         let d = drift(&s, c.planned.as_ref().unwrap()).unwrap();
         assert_eq!((d.adverse_bps, d.favourable_bps), (0, 50));
-        assert!(matches!(evaluate_quote(&c).unwrap(), Decision::Hold(Hold::NoTrigger { .. })));
+        assert!(matches!(
+            evaluate_quote(&c).unwrap(),
+            Decision::Hold(Hold::NoTrigger { .. })
+        ));
 
         // 8 bp: fires.
         let better = 1_000_000 + 800;
         let c = ctx(&s, Some(ladder(better, better, 2_000_000, 2_000_000)));
         assert!(matches!(
             evaluate_quote(&c).unwrap(),
-            Decision::Send(Trigger::FavourableDrift { bps: 80, threshold_bps: 80, .. })
+            Decision::Send(Trigger::FavourableDrift {
+                bps: 80,
+                threshold_bps: 80,
+                ..
+            })
         ));
     }
 
     #[test]
     fn adverse_drift_outranks_the_heartbeat() {
         // Both are due. The reported reason must be the one that costs money.
-        let s = snap(ladder(1_000_000, 1_000_000, 2_000_000, 2_000_000), 100, 0, 1_000);
+        let s = snap(
+            ladder(1_000_000, 1_000_000, 2_000_000, 2_000_000),
+            100,
+            0,
+            1_000,
+        );
         let moved = 1_000_000 - 1_000;
         let c = Context {
             block_timestamp: 1_000 + 3_000,
             ..ctx(&s, Some(ladder(moved, moved, 2_000_000, 2_000_000)))
         };
-        assert!(matches!(evaluate_quote(&c).unwrap(), Decision::Send(Trigger::AdverseDrift { .. })));
+        assert!(matches!(
+            evaluate_quote(&c).unwrap(),
+            Decision::Send(Trigger::AdverseDrift { .. })
+        ));
     }
 
     #[test]
@@ -866,9 +997,15 @@ mod tests {
         assert_eq!(c.heartbeat_limit(), 2_400);
 
         // A config looser than the chain window is clamped to it, not honoured.
-        let c = Context { heartbeat_secs: 999_999, ..ctx(&s, Some(l)) };
+        let c = Context {
+            heartbeat_secs: 999_999,
+            ..ctx(&s, Some(l))
+        };
         assert_eq!(c.heartbeat_limit(), 2_880);
-        assert!(c.heartbeat_limit() < u64::from(s.max_stale_secs), "the quote must never expire between pushes");
+        assert!(
+            c.heartbeat_limit() < u64::from(s.max_stale_secs),
+            "the quote must never expire between pushes"
+        );
     }
 
     #[test]
@@ -877,14 +1014,26 @@ mod tests {
         let s = snap(l, 100, 0, 1_000);
 
         // One second short of the heartbeat, identical row: hold.
-        let c = Context { block_timestamp: 1_000 + 2_399, ..ctx(&s, Some(l)) };
-        assert!(matches!(evaluate_quote(&c).unwrap(), Decision::Hold(Hold::NoTrigger { .. })));
+        let c = Context {
+            block_timestamp: 1_000 + 2_399,
+            ..ctx(&s, Some(l))
+        };
+        assert!(matches!(
+            evaluate_quote(&c).unwrap(),
+            Decision::Hold(Hold::NoTrigger { .. })
+        ));
 
         // At the heartbeat, identical row: send anyway. Refreshing `updatedAt` is the point.
-        let c = Context { block_timestamp: 1_000 + 2_400, ..ctx(&s, Some(l)) };
+        let c = Context {
+            block_timestamp: 1_000 + 2_400,
+            ..ctx(&s, Some(l))
+        };
         assert_eq!(
             evaluate_quote(&c).unwrap(),
-            Decision::Send(Trigger::Heartbeat { age_secs: 2_400, limit_secs: 2_400 })
+            Decision::Send(Trigger::Heartbeat {
+                age_secs: 2_400,
+                limit_secs: 2_400
+            })
         );
     }
 
@@ -910,34 +1059,83 @@ mod tests {
         let base = ctx(&s, Some(l));
 
         let cases: Vec<(Context<'_>, Hold)> = vec![
-            (Context { halted: true, ..base }, Hold::Halted),
-            (Context { chain: ChainStatus::Down { stale_secs: 600 }, ..base }, Hold::ChainDown),
             (
-                Context { feed: FeedStatus::NoQuorum { have: 1, need: 2 }, ..base },
+                Context {
+                    halted: true,
+                    ..base
+                },
+                Hold::Halted,
+            ),
+            (
+                Context {
+                    chain: ChainStatus::Down { stale_secs: 600 },
+                    ..base
+                },
+                Hold::ChainDown,
+            ),
+            (
+                Context {
+                    feed: FeedStatus::NoQuorum { have: 1, need: 2 },
+                    ..base
+                },
                 Hold::FeedNotLive(FeedStatus::NoQuorum { have: 1, need: 2 }),
             ),
             (
-                Context { feed: FeedStatus::Dispersed { dispersion_bps: 600, limit_bps: 250, venues: 3 }, ..base },
-                Hold::FeedNotLive(FeedStatus::Dispersed { dispersion_bps: 600, limit_bps: 250, venues: 3 }),
+                Context {
+                    feed: FeedStatus::Dispersed {
+                        dispersion_bps: 600,
+                        limit_bps: 250,
+                        venues: 3,
+                    },
+                    ..base
+                },
+                Hold::FeedNotLive(FeedStatus::Dispersed {
+                    dispersion_bps: 600,
+                    limit_bps: 250,
+                    venues: 3,
+                }),
             ),
             (
-                Context { view_age_secs: 21, ..base },
-                Hold::ChainViewStale { age_secs: 21, limit_secs: 20 },
+                Context {
+                    view_age_secs: 21,
+                    ..base
+                },
+                Hold::ChainViewStale {
+                    age_secs: 21,
+                    limit_secs: 20,
+                },
             ),
-            (Context { in_flight: true, ..base }, Hold::PushInFlight),
+            (
+                Context {
+                    in_flight: true,
+                    ..base
+                },
+                Hold::PushInFlight,
+            ),
         ];
         for (c, expected) in cases {
-            assert_eq!(evaluate_quote(&c).unwrap(), Decision::Hold(expected), "gate {expected:?} did not abort");
+            assert_eq!(
+                evaluate_quote(&c).unwrap(),
+                Decision::Hold(expected),
+                "gate {expected:?} did not abort"
+            );
         }
 
         // Paused needs its own snapshot.
         let mut paused = s;
         paused.flags = 1;
         let c = ctx(&paused, Some(l));
-        assert_eq!(evaluate_quote(&c).unwrap(), Decision::Hold(Hold::PoolPaused));
+        assert_eq!(
+            evaluate_quote(&c).unwrap(),
+            Decision::Hold(Hold::PoolPaused)
+        );
 
         // Precedence: halted outranks everything, including a down chain.
-        let c = Context { halted: true, chain: ChainStatus::Down { stale_secs: 600 }, ..base };
+        let c = Context {
+            halted: true,
+            chain: ChainStatus::Down { stale_secs: 600 },
+            ..base
+        };
         assert_eq!(evaluate_quote(&c).unwrap(), Decision::Hold(Hold::Halted));
     }
 
@@ -946,7 +1144,10 @@ mod tests {
         // Degraded widens the spread upstream; it must not stop the loop, or a transient RPC
         // wobble becomes a quoting outage which is the worse failure.
         let s = snap(ladder(0, 0, 0, 0), 100, 0, 0);
-        let c = Context { chain: ChainStatus::Degraded { stale_secs: 40 }, ..ctx(&s, Some(ladder(900, 1_000, 1_100, 1_200))) };
+        let c = Context {
+            chain: ChainStatus::Degraded { stale_secs: 40 },
+            ..ctx(&s, Some(ladder(900, 1_000, 1_100, 1_200)))
+        };
         assert!(evaluate_quote(&c).unwrap().sends());
     }
 
@@ -963,8 +1164,14 @@ mod tests {
         // wrong: a price nothing corroborates is how the first fill gets picked off.
         let s = snap(ladder(0, 0, 0, 0), 100, 0, 0);
         let no_quorum = FeedStatus::NoQuorum { have: 1, need: 2 };
-        let c = Context { feed: no_quorum, ..ctx(&s, Some(ladder(900, 1_000, 1_100, 1_200))) };
-        assert_eq!(evaluate_quote(&c).unwrap(), Decision::Hold(Hold::FeedNotLive(no_quorum)));
+        let c = Context {
+            feed: no_quorum,
+            ..ctx(&s, Some(ladder(900, 1_000, 1_100, 1_200)))
+        };
+        assert_eq!(
+            evaluate_quote(&c).unwrap(),
+            Decision::Hold(Hold::FeedNotLive(no_quorum))
+        );
     }
 
     #[test]
@@ -973,10 +1180,23 @@ mod tests {
         // of two camps 60 bp apart is quoting a number no venue is showing.
         let l = ladder(900, 1_000, 1_100, 1_200);
         let s = snap(l, 100, 0, 1_000);
-        let dispersed = FeedStatus::Dispersed { dispersion_bps: 600, limit_bps: 250, venues: 4 };
-        let c = Context { feed: dispersed, ..ctx(&s, Some(ladder(800, 900, 1_000, 1_100))) };
-        assert_eq!(evaluate_quote(&c).unwrap(), Decision::Hold(Hold::FeedNotLive(dispersed)));
-        assert_eq!(evaluate_capacity(&c), CapacityDecision::Hold(Hold::FeedNotLive(dispersed)));
+        let dispersed = FeedStatus::Dispersed {
+            dispersion_bps: 600,
+            limit_bps: 250,
+            venues: 4,
+        };
+        let c = Context {
+            feed: dispersed,
+            ..ctx(&s, Some(ladder(800, 900, 1_000, 1_100)))
+        };
+        assert_eq!(
+            evaluate_quote(&c).unwrap(),
+            Decision::Hold(Hold::FeedNotLive(dispersed))
+        );
+        assert_eq!(
+            evaluate_capacity(&c),
+            CapacityDecision::Hold(Hold::FeedNotLive(dispersed))
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -987,7 +1207,10 @@ mod tests {
     fn a_full_epoch_does_not_get_refreshed() {
         let l = ladder(900, 1_000, 1_100, 1_200);
         let s = snap(l, 1_000, 0, 1_000);
-        assert!(matches!(evaluate_capacity(&ctx(&s, Some(l))), CapacityDecision::Hold(Hold::NoTrigger { .. })));
+        assert!(matches!(
+            evaluate_capacity(&ctx(&s, Some(l))),
+            CapacityDecision::Hold(Hold::NoTrigger { .. })
+        ));
     }
 
     #[test]
@@ -1006,7 +1229,10 @@ mod tests {
         ));
         // 29% consumed: hold. Refreshing here would hand the epoch's risk budget back for free.
         let s = snap(l, 1_000, 290, 1_000);
-        assert!(matches!(evaluate_capacity(&ctx(&s, Some(l))), CapacityDecision::Hold(Hold::NoTrigger { .. })));
+        assert!(matches!(
+            evaluate_capacity(&ctx(&s, Some(l))),
+            CapacityDecision::Hold(Hold::NoTrigger { .. })
+        ));
     }
 
     #[test]
@@ -1018,7 +1244,12 @@ mod tests {
         let l = ladder(900, 1_000, 1_100, 1_200);
         let s = snap(l, 1_000, 0, 1_000);
         let mut c = ctx(&s, Some(l));
-        c.capacity = CapacityPlan { bid: 1_000, ask: 500, bid_cut_by_inventory: false, ask_cut_by_inventory: true };
+        c.capacity = CapacityPlan {
+            bid: 1_000,
+            ask: 500,
+            bid_cut_by_inventory: false,
+            ask_cut_by_inventory: true,
+        };
         assert!(matches!(
             evaluate_capacity(&c),
             CapacityDecision::Send(CapacityTrigger::Diverged {
@@ -1031,8 +1262,16 @@ mod tests {
 
         // Inside the threshold in that direction: hold, so a dust-sized inventory change does
         // not churn the epoch.
-        c.capacity = CapacityPlan { bid: 1_000, ask: 800, bid_cut_by_inventory: false, ask_cut_by_inventory: true };
-        assert!(matches!(evaluate_capacity(&c), CapacityDecision::Hold(Hold::NoTrigger { .. })));
+        c.capacity = CapacityPlan {
+            bid: 1_000,
+            ask: 800,
+            bid_cut_by_inventory: false,
+            ask_cut_by_inventory: true,
+        };
+        assert!(matches!(
+            evaluate_capacity(&c),
+            CapacityDecision::Hold(Hold::NoTrigger { .. })
+        ));
     }
 
     #[test]
@@ -1043,8 +1282,16 @@ mod tests {
         let mut s = snap(l, 1_000, 0, 1_000);
         s.ask_capacity = 0;
         let mut c = ctx(&s, Some(l));
-        c.capacity = CapacityPlan { bid: 1_000, ask: 1_000, bid_cut_by_inventory: false, ask_cut_by_inventory: false };
-        assert_eq!(evaluate_capacity(&c), CapacityDecision::Send(CapacityTrigger::NoEpoch { side: Side::Ask }));
+        c.capacity = CapacityPlan {
+            bid: 1_000,
+            ask: 1_000,
+            bid_cut_by_inventory: false,
+            ask_cut_by_inventory: false,
+        };
+        assert_eq!(
+            evaluate_capacity(&c),
+            CapacityDecision::Send(CapacityTrigger::NoEpoch { side: Side::Ask })
+        );
     }
 
     #[test]
@@ -1056,7 +1303,10 @@ mod tests {
         s.cap_gen = 14;
         s.used_gen = 13;
         assert_eq!(s.ask_used(), 0);
-        assert!(matches!(evaluate_capacity(&ctx(&s, Some(l))), CapacityDecision::Hold(Hold::NoTrigger { .. })));
+        assert!(matches!(
+            evaluate_capacity(&ctx(&s, Some(l))),
+            CapacityDecision::Hold(Hold::NoTrigger { .. })
+        ));
 
         // With the generations matching, the same counters do trigger.
         s.used_gen = 14;
@@ -1074,9 +1324,20 @@ mod tests {
         let mut s = snap(l, 1_000, 0, 1_000);
         s.bid_capacity = 0;
         let no_quorum = FeedStatus::NoQuorum { have: 0, need: 2 };
-        let mut c = Context { feed: no_quorum, ..ctx(&s, Some(l)) };
-        c.capacity = CapacityPlan { bid: 1_000, ask: 1_000, bid_cut_by_inventory: false, ask_cut_by_inventory: false };
-        assert_eq!(evaluate_capacity(&c), CapacityDecision::Hold(Hold::FeedNotLive(no_quorum)));
+        let mut c = Context {
+            feed: no_quorum,
+            ..ctx(&s, Some(l))
+        };
+        c.capacity = CapacityPlan {
+            bid: 1_000,
+            ask: 1_000,
+            bid_cut_by_inventory: false,
+            ask_cut_by_inventory: false,
+        };
+        assert_eq!(
+            evaluate_capacity(&c),
+            CapacityDecision::Hold(Hold::FeedNotLive(no_quorum))
+        );
     }
 
     #[test]
@@ -1084,8 +1345,16 @@ mod tests {
         let l = ladder(900, 1_000, 1_100, 1_200);
         let mut s = snap(l, 1_000, 0, 1_000);
         s.bid_capacity = 0;
-        let mut c = Context { halted: true, ..ctx(&s, Some(l)) };
-        c.capacity = CapacityPlan { bid: 1_000, ask: 1_000, bid_cut_by_inventory: false, ask_cut_by_inventory: false };
+        let mut c = Context {
+            halted: true,
+            ..ctx(&s, Some(l))
+        };
+        c.capacity = CapacityPlan {
+            bid: 1_000,
+            ask: 1_000,
+            bid_cut_by_inventory: false,
+            ask_cut_by_inventory: false,
+        };
         assert_eq!(evaluate_capacity(&c), CapacityDecision::Hold(Hold::Halted));
     }
 
@@ -1120,7 +1389,9 @@ mod tests {
         };
         assert_eq!(
             evaluate_capacity(&c),
-            CapacityDecision::Hold(Hold::JumpWithdrawn { cooloff_remaining_ms: 21_000 }),
+            CapacityDecision::Hold(Hold::JumpWithdrawn {
+                cooloff_remaining_ms: 21_000
+            }),
             "capacity must stay at zero for the whole cool-off"
         );
         assert_eq!(
@@ -1132,12 +1403,21 @@ mod tests {
         // A quiet cool-off is silent: the trigger needs the row to have actually moved, so this
         // does not become one transaction per second for thirty seconds in a market that has
         // stopped moving.
-        let quiet = Context { planned: Some(l), ..c };
-        assert!(!evaluate_quote(&quiet).unwrap().sends(), "an unchanged row must not be re-posted");
+        let quiet = Context {
+            planned: Some(l),
+            ..c
+        };
+        assert!(
+            !evaluate_quote(&quiet).unwrap().sends(),
+            "an unchanged row must not be re-posted"
+        );
 
         // Once the cool-off ends, the epoch comes back — in one transaction, against a ladder that
         // is already current.
-        let resumed = Context { jump_withdrawn: false, ..c };
+        let resumed = Context {
+            jump_withdrawn: false,
+            ..c
+        };
         assert_eq!(
             evaluate_capacity(&resumed),
             CapacityDecision::Send(CapacityTrigger::NoEpoch { side: Side::Bid })
@@ -1154,7 +1434,11 @@ mod tests {
         s.bid_capacity = 0;
         s.ask_capacity = 0;
         let moved = ladder(900_000, 900_000, 1_900_000, 1_900_000); // 1000 bp away
-        assert_eq!(drift(&s, &moved).unwrap(), Drift::default(), "drift genuinely cannot see it");
+        assert_eq!(
+            drift(&s, &moved).unwrap(),
+            Drift::default(),
+            "drift genuinely cannot see it"
+        );
         assert!(matches!(
             evaluate_quote(&ctx(&s, Some(moved))).unwrap(),
             Decision::Send(Trigger::LadderStaleWithoutCapacity)
@@ -1168,7 +1452,11 @@ mod tests {
         let l = ladder(900, 1_000, 1_100, 1_200);
         let mut s = snap(l, 1_000, 0, 1_000);
         s.bid_capacity = 0;
-        let c = Context { halted: true, jump_withdrawn: true, ..ctx(&s, Some(l)) };
+        let c = Context {
+            halted: true,
+            jump_withdrawn: true,
+            ..ctx(&s, Some(l))
+        };
         assert_eq!(evaluate_capacity(&c), CapacityDecision::Hold(Hold::Halted));
     }
 
@@ -1179,7 +1467,12 @@ mod tests {
         let l = ladder(900, 1_000, 1_100, 1_200);
         let s = snap(l, 1_000, 0, 1_000);
         let mut c = ctx(&s, Some(l));
-        c.capacity = CapacityPlan { bid: 0, ask: 0, bid_cut_by_inventory: true, ask_cut_by_inventory: true };
+        c.capacity = CapacityPlan {
+            bid: 0,
+            ask: 0,
+            bid_cut_by_inventory: true,
+            ask_cut_by_inventory: true,
+        };
         assert_eq!(evaluate_capacity(&c), CapacityDecision::Hold(Hold::NoRow));
     }
 }

@@ -180,10 +180,9 @@ pub fn compute(
     params: &SpreadParams,
 ) -> Spread {
     // s1 * sigma, in deci-bps: (s1_e2 / 100) * (sigma_millibps / 1000) * 10.
-    let vol_decibps = u32::try_from(
-        u64::from(params.vol_coefficient_e2).saturating_mul(sigma_millibps) / 10_000,
-    )
-    .unwrap_or(u32::MAX);
+    let vol_decibps =
+        u32::try_from(u64::from(params.vol_coefficient_e2).saturating_mul(sigma_millibps) / 10_000)
+            .unwrap_or(u32::MAX);
     // Round the term UP to whole bps. `dubu-core` takes whole bps, and every other rounding in
     // this crate goes away from the taker; a half-spread rounded down is the one direction that
     // gives an edge away.
@@ -194,8 +193,11 @@ pub fn compute(
     // `.max(s0_bps)`: a cap below the configured spread must never *narrow* it. `s0` is the
     // operator's floor, not a suggestion — the volatility term simply contributes nothing there.
     // `config` refuses that combination at startup, so this is the second belt.
-    let (vol_scaled_bps, capped) =
-        if wanted > cap { (cap.max(s0_bps), true) } else { (wanted, false) };
+    let (vol_scaled_bps, capped) = if wanted > cap {
+        (cap.max(s0_bps), true)
+    } else {
+        (wanted, false)
+    };
 
     let half_spread_bps = vol_scaled_bps
         .saturating_add(degraded_extra_bps)
@@ -219,7 +221,10 @@ mod tests {
 
     /// The derived configuration: s1 = 0.5, cap 30 bp.
     fn params() -> SpreadParams {
-        SpreadParams { vol_coefficient_e2: 50, max_half_spread_bps: 30 }
+        SpreadParams {
+            vol_coefficient_e2: 50,
+            max_half_spread_bps: 30,
+        }
     }
 
     /// sigma in whole bps -> the milli-bps the estimator reports.
@@ -238,7 +243,11 @@ mod tests {
         assert_eq!(eth(5), 30, "the measured-positive point in the sweep");
 
         let btc = |m: u64| compute(8, sigma(3 * m), 0, &params()).half_spread_bps;
-        assert_eq!(btc(1), 10, "8 + 0.5*3 = 9.5, rounded up away from the taker");
+        assert_eq!(
+            btc(1),
+            10,
+            "8 + 0.5*3 = 9.5, rounded up away from the taker"
+        );
         assert_eq!(btc(2), 11);
         assert_eq!(btc(5), 16, "8 + 0.5*15 = 15.5, rounded up");
 
@@ -301,11 +310,24 @@ mod tests {
     fn a_cap_below_the_configured_spread_never_narrows_it() {
         // `s0` is the operator's floor, not a suggestion. `config::validate` refuses this
         // combination at startup; this is the behaviour if it ever gets past.
-        let tight = SpreadParams { vol_coefficient_e2: 50, max_half_spread_bps: 3 };
+        let tight = SpreadParams {
+            vol_coefficient_e2: 50,
+            max_half_spread_bps: 3,
+        };
         let s = compute(5, sigma(10), 0, &tight);
-        assert_eq!(s.half_spread_bps, 5, "the cap floors at s0, it never cuts below it");
-        assert_eq!(s.vol_bps(), 0, "and the volatility term contributes nothing there");
-        assert!(s.capped, "but the cap did bind, and the log line must say so");
+        assert_eq!(
+            s.half_spread_bps, 5,
+            "the cap floors at s0, it never cuts below it"
+        );
+        assert_eq!(
+            s.vol_bps(),
+            0,
+            "and the volatility term contributes nothing there"
+        );
+        assert!(
+            s.capped,
+            "but the cap did bind, and the log line must say so"
+        );
     }
 
     #[test]
@@ -334,7 +356,10 @@ mod tests {
                     .validate(1_000_000_000_000_000)
                     .expect("every reachable half-spread must still pass the chain's validator");
                 // The spread really is what was asked for, and it really does widen with sigma.
-                assert_eq!(row.bid_target, row.mid * (10_000 - u128::from(s.half_spread_bps)) / 10_000);
+                assert_eq!(
+                    row.bid_target,
+                    row.mid * (10_000 - u128::from(s.half_spread_bps)) / 10_000
+                );
             }
         }
 
@@ -365,6 +390,9 @@ mod tests {
         let fair = 1_010_000_000_000_000u128;
         let narrow = crate::skew::min_price_cap_bps(fair, min_price, 5);
         let wide = crate::skew::min_price_cap_bps(fair, min_price, 30);
-        assert!(wide < narrow, "a wider spread must leave less headroom, got {wide} vs {narrow}");
+        assert!(
+            wide < narrow,
+            "a wider spread must leave less headroom, got {wide} vs {narrow}"
+        );
     }
 }

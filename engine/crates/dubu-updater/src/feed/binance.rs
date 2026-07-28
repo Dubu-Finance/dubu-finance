@@ -70,7 +70,10 @@ impl Client {
     #[must_use]
     pub fn new(symbols: &[(String, String)]) -> Self {
         Self {
-            symbols: symbols.iter().map(|(v, c)| (v.to_uppercase(), c.clone())).collect(),
+            symbols: symbols
+                .iter()
+                .map(|(v, c)| (v.to_uppercase(), c.clone()))
+                .collect(),
         }
     }
 }
@@ -81,9 +84,16 @@ impl MarketFeed for Client {
     }
 
     fn url(&self, base: &str) -> String {
-        let streams: Vec<String> =
-            self.symbols.keys().map(|s| format!("{}@bookTicker", s.to_lowercase())).collect();
-        format!("{}?streams={}", base.trim_end_matches('/'), streams.join("/"))
+        let streams: Vec<String> = self
+            .symbols
+            .keys()
+            .map(|s| format!("{}@bookTicker", s.to_lowercase()))
+            .collect();
+        format!(
+            "{}?streams={}",
+            base.trim_end_matches('/'),
+            streams.join("/")
+        )
     }
 
     fn subscribe_frames(&self) -> Vec<String> {
@@ -99,7 +109,9 @@ impl MarketFeed for Client {
                 Err(_) => return Ok(None),
             },
         };
-        let Some(symbol) = self.symbols.get(&data.s.to_uppercase()) else { return Ok(None) };
+        let Some(symbol) = self.symbols.get(&data.s.to_uppercase()) else {
+            return Ok(None);
+        };
 
         let f = |field: &str, v: &str| -> Result<u128, String> {
             units::parse_fixed(v, FEED_SCALE).map_err(|e| format!("{field}: {e}"))
@@ -111,7 +123,11 @@ impl MarketFeed for Client {
             ask: f("a", &data.a)?,
             ask_qty: f("A", &data.ask_qty)?,
         };
-        Ok(Some(Update { symbol: symbol.clone(), tick, reset: false }))
+        Ok(Some(Update {
+            symbol: symbol.clone(),
+            tick,
+            reset: false,
+        }))
     }
 }
 
@@ -120,7 +136,10 @@ mod tests {
     use super::*;
 
     fn client() -> Client {
-        Client::new(&[("ETHUSDT".into(), "ETHUSDT".into()), ("BTCUSDT".into(), "BTCUSDT".into())])
+        Client::new(&[
+            ("ETHUSDT".into(), "ETHUSDT".into()),
+            ("BTCUSDT".into(), "BTCUSDT".into()),
+        ])
     }
 
     #[test]
@@ -128,7 +147,10 @@ mod tests {
         // Captured off the live endpoint.
         let text = r#"{"stream":"ethusdt@bookTicker","data":{"u":400900217,"s":"ETHUSDT",
             "b":"1943.82000000","B":"24.25800000","a":"1943.83000000","A":"13.78110000"}}"#;
-        let u = client().parse(text).unwrap().expect("frame carries a book update");
+        let u = client()
+            .parse(text)
+            .unwrap()
+            .expect("frame carries a book update");
         assert_eq!(u.symbol, "ETHUSDT");
         assert!(!u.reset);
         assert_eq!(u.tick.update_id, 400_900_217);
@@ -149,7 +171,10 @@ mod tests {
 
     #[test]
     fn subscribe_acknowledgements_are_ignored_not_errors() {
-        assert!(client().parse(r#"{"result":null,"id":1}"#).unwrap().is_none());
+        assert!(client()
+            .parse(r#"{"result":null,"id":1}"#)
+            .unwrap()
+            .is_none());
         assert!(client().parse("not json at all").unwrap().is_none());
     }
 
@@ -164,13 +189,19 @@ mod tests {
         // The failure this prevents: `bid = 0` sailing through into a fair value.
         let text = r#"{"u":1,"s":"ETHUSDT","b":"1.9e3","B":"1","a":"2000","A":"1"}"#;
         let err = client().parse(text).unwrap_err();
-        assert!(err.starts_with("b:"), "error must name the offending field, got `{err}`");
+        assert!(
+            err.starts_with("b:"),
+            "error must name the offending field, got `{err}`"
+        );
     }
 
     #[test]
     fn the_subscription_is_in_the_url() {
         let url = client().url("wss://stream.binance.com:9443/stream");
-        assert_eq!(url, "wss://stream.binance.com:9443/stream?streams=btcusdt@bookTicker/ethusdt@bookTicker");
+        assert_eq!(
+            url,
+            "wss://stream.binance.com:9443/stream?streams=btcusdt@bookTicker/ethusdt@bookTicker"
+        );
         assert!(client().subscribe_frames().is_empty());
     }
 }

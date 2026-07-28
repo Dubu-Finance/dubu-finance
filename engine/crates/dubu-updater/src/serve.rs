@@ -56,7 +56,9 @@ fn default_bind() -> String {
 
 impl Default for ServeConfig {
     fn default() -> Self {
-        Self { bind: default_bind() }
+        Self {
+            bind: default_bind(),
+        }
     }
 }
 
@@ -112,7 +114,10 @@ impl Shared {
     /// which is the same double-commitment the book exists to prevent, in the other direction.
     #[must_use]
     pub fn reserved(&self, pair_id: u16, sells_base: bool) -> u128 {
-        self.inner.lock().map(|g| g.book.reserved(pair_id, sells_base)).unwrap_or(0)
+        self.inner
+            .lock()
+            .map(|g| g.book.reserved(pair_id, sells_base))
+            .unwrap_or(0)
     }
 
     /// Outstanding orders across every market.
@@ -227,19 +232,24 @@ async fn quote(
         ));
     }
 
-    let taker_amount: u128 = req
-        .taker_amount
-        .parse()
-        .map_err(|_| bad(StatusCode::BAD_REQUEST, "bad-amount", "takerAmount must be a decimal integer".into()))?;
+    let taker_amount: u128 = req.taker_amount.parse().map_err(|_| {
+        bad(
+            StatusCode::BAD_REQUEST,
+            "bad-amount",
+            "takerAmount must be a decimal integer".into(),
+        )
+    })?;
 
     let now_secs = crate::now_unix();
 
     let (quote, nonce) = {
-        let mut g = ctx
-            .shared
-            .inner
-            .lock()
-            .map_err(|_| bad(StatusCode::INTERNAL_SERVER_ERROR, "poisoned", "shared state is poisoned".into()))?;
+        let mut g = ctx.shared.inner.lock().map_err(|_| {
+            bad(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "poisoned",
+                "shared state is poisoned".into(),
+            )
+        })?;
 
         if !g.seeded {
             return Err(bad(
@@ -272,13 +282,23 @@ async fn quote(
         let nonce = g.book.next_nonce();
         let q = g
             .book
-            .quote(&ctx.params, &market, taker_buys_base, taker_amount, now_secs)
+            .quote(
+                &ctx.params,
+                &market,
+                taker_buys_base,
+                taker_amount,
+                now_secs,
+            )
             .map_err(refusal)?;
         (q, nonce)
     };
 
     let signed = ctx.key.sign(&quote, nonce).map_err(|e| {
-        bad(StatusCode::INTERNAL_SERVER_ERROR, "sign-failed", e.to_string())
+        bad(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "sign-failed",
+            e.to_string(),
+        )
     })?;
 
     info!(
@@ -311,7 +331,11 @@ async fn quote(
 
 fn refusal(r: Refusal) -> (StatusCode, Json<ErrorResponse>) {
     let (code, name, detail) = match r {
-        Refusal::UnknownPair => (StatusCode::NOT_FOUND, "no-market", "not a market this maker quotes"),
+        Refusal::UnknownPair => (
+            StatusCode::NOT_FOUND,
+            "no-market",
+            "not a market this maker quotes",
+        ),
         Refusal::SizeOutOfRange => (
             StatusCode::BAD_REQUEST,
             "size-out-of-range",
@@ -322,7 +346,11 @@ fn refusal(r: Refusal) -> (StatusCode, Json<ErrorResponse>) {
             "insufficient-inventory",
             "the inventory left after the curve's epoch and outstanding orders will not cover it",
         ),
-        Refusal::Undefined => (StatusCode::INTERNAL_SERVER_ERROR, "undefined", "the pricing arithmetic overflowed"),
+        Refusal::Undefined => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "undefined",
+            "the pricing arithmetic overflowed",
+        ),
     };
     bad(code, name, detail.into())
 }
@@ -345,10 +373,12 @@ pub async fn run(
     chain_id: u64,
     pmm_settle: Address,
 ) -> std::io::Result<()> {
-    let addr: SocketAddr = cfg
-        .bind
-        .parse()
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("bind `{}`: {e}", cfg.bind)))?;
+    let addr: SocketAddr = cfg.bind.parse().map_err(|e| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("bind `{}`: {e}", cfg.bind),
+        )
+    })?;
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
     if !addr.ip().is_loopback() {
@@ -364,7 +394,17 @@ pub async fn run(
         "RFQ maker endpoint up"
     );
 
-    axum::serve(listener, router(Ctx { shared, key, params, chain_id, pmm_settle })).await
+    axum::serve(
+        listener,
+        router(Ctx {
+            shared,
+            key,
+            params,
+            chain_id,
+            pmm_settle,
+        }),
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -414,7 +454,11 @@ mod tests {
     fn app(shared: Arc<Shared>) -> Router {
         router(Ctx {
             shared,
-            key: Arc::new(MakerKey::new(Signer::from_hex(KEY).expect("key"), CHAIN_ID, PMM_SETTLE)),
+            key: Arc::new(MakerKey::new(
+                Signer::from_hex(KEY).expect("key"),
+                CHAIN_ID,
+                PMM_SETTLE,
+            )),
             params: params(),
             chain_id: CHAIN_ID,
             pmm_settle: PMM_SETTLE,
@@ -427,7 +471,10 @@ mod tests {
         s
     }
 
-    async fn post_quote(shared: Arc<Shared>, body: serde_json::Value) -> (StatusCode, serde_json::Value) {
+    async fn post_quote(
+        shared: Arc<Shared>,
+        body: serde_json::Value,
+    ) -> (StatusCode, serde_json::Value) {
         let res = app(shared)
             .oneshot(
                 Request::builder()
@@ -440,8 +487,13 @@ mod tests {
             .await
             .expect("response");
         let status = res.status();
-        let bytes = axum::body::to_bytes(res.into_body(), 1 << 20).await.expect("body");
-        (status, serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null))
+        let bytes = axum::body::to_bytes(res.into_body(), 1 << 20)
+            .await
+            .expect("body");
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null),
+        )
     }
 
     fn buy_request(taker_amount: &str) -> serde_json::Value {
@@ -458,11 +510,25 @@ mod tests {
     async fn a_well_formed_request_gets_a_signed_order() {
         let (status, body) = post_quote(seeded(), buy_request("2000000000")).await;
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(body["order"]["takerAmount"], "2000000000", "the taker leg is honoured exactly");
+        assert_eq!(
+            body["order"]["takerAmount"], "2000000000",
+            "the taker leg is honoured exactly"
+        );
         assert_eq!(body["order"]["takerAsset"], QUOTE.to_string());
         assert_eq!(body["order"]["makerAsset"], BASE.to_string());
-        assert_eq!(body["signature"].as_str().expect("signature").len(), 132, "65 bytes as 0x-hex");
-        assert!(body["order"]["makerAmount"].as_str().expect("amount").parse::<u128>().expect("u128") > 0);
+        assert_eq!(
+            body["signature"].as_str().expect("signature").len(),
+            132,
+            "65 bytes as 0x-hex"
+        );
+        assert!(
+            body["order"]["makerAmount"]
+                .as_str()
+                .expect("amount")
+                .parse::<u128>()
+                .expect("u128")
+                > 0
+        );
     }
 
     /// The amounts are decimal strings, not JSON numbers. A `u128` past 2^53 loses precision as a
@@ -481,11 +547,17 @@ mod tests {
     async fn a_request_for_another_domain_is_refused() {
         let mut wrong_chain = buy_request("2000000000");
         wrong_chain["chainId"] = serde_json::json!(1);
-        assert_eq!(post_quote(seeded(), wrong_chain).await.0, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            post_quote(seeded(), wrong_chain).await.0,
+            StatusCode::BAD_REQUEST
+        );
 
         let mut wrong_contract = buy_request("2000000000");
         wrong_contract["verifyingContract"] = serde_json::json!(BASE.to_string());
-        assert_eq!(post_quote(seeded(), wrong_contract).await.0, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            post_quote(seeded(), wrong_contract).await.0,
+            StatusCode::BAD_REQUEST
+        );
     }
 
     /// Quoting from an empty snapshot is quoting from zero.
@@ -501,7 +573,12 @@ mod tests {
     #[tokio::test]
     async fn a_retired_market_stops_being_quotable() {
         let shared = seeded();
-        assert_eq!(post_quote(shared.clone(), buy_request("2000000000")).await.0, StatusCode::OK);
+        assert_eq!(
+            post_quote(shared.clone(), buy_request("2000000000"))
+                .await
+                .0,
+            StatusCode::OK
+        );
         shared.retire(1);
         let (status, body) = post_quote(shared, buy_request("2000000000")).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
@@ -538,18 +615,28 @@ mod tests {
         let shared = seeded();
         assert_eq!(shared.reserved(1, true), 0);
         post_quote(shared.clone(), buy_request("2000000000")).await;
-        assert!(shared.reserved(1, true) > 0, "the base leg must be visible as reserved");
+        assert!(
+            shared.reserved(1, true) > 0,
+            "the base leg must be visible as reserved"
+        );
         assert_eq!(shared.open_orders(), 1);
     }
 
     #[tokio::test]
     async fn health_reports_the_domain_the_maker_signs_for() {
         let res = app(seeded())
-            .oneshot(Request::builder().uri("/health").body(Body::empty()).expect("request"))
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
             .await
             .expect("response");
         assert_eq!(res.status(), StatusCode::OK);
-        let bytes = axum::body::to_bytes(res.into_body(), 1 << 20).await.expect("body");
+        let bytes = axum::body::to_bytes(res.into_body(), 1 << 20)
+            .await
+            .expect("body");
         let body: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
         assert_eq!(
             body["domainSeparator"],

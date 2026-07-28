@@ -156,11 +156,19 @@ mod tests {
 
     /// What a taker hands over for a one-base-token trade, in the direction's own units.
     const fn taker_leg(taker_buys_base: bool) -> u128 {
-        if taker_buys_base { ONE_ETH_IN_USDC } else { ONE_ETH }
+        if taker_buys_base {
+            ONE_ETH_IN_USDC
+        } else {
+            ONE_ETH
+        }
     }
 
     fn key() -> MakerKey {
-        MakerKey::new(Signer::from_hex(KEY).expect("valid key"), CHAIN_ID, PMM_SETTLE)
+        MakerKey::new(
+            Signer::from_hex(KEY).expect("valid key"),
+            CHAIN_ID,
+            PMM_SETTLE,
+        )
     }
 
     fn params() -> MakerParams {
@@ -193,7 +201,13 @@ mod tests {
     fn signed(taker_buys_base: bool) -> SignedOrder {
         let mut book = Book::new();
         let q = book
-            .quote(&params(), &state(), taker_buys_base, taker_leg(taker_buys_base), 1_000)
+            .quote(
+                &params(),
+                &state(),
+                taker_buys_base,
+                taker_leg(taker_buys_base),
+                1_000,
+            )
             .expect("quotable");
         key().sign(&q, book.next_nonce()).expect("signable")
     }
@@ -217,7 +231,11 @@ mod tests {
     fn the_signature_is_65_bytes_with_a_recovery_id_the_evm_accepts() {
         let s = signed(true);
         assert_eq!(s.signature.len(), 65);
-        assert!(s.signature[64] == 27 || s.signature[64] == 28, "v = {}", s.signature[64]);
+        assert!(
+            s.signature[64] == 27 || s.signature[64] == 28,
+            "v = {}",
+            s.signature[64]
+        );
     }
 
     /// `MalleableSignature` is rejected on chain. k256 normalises to low-S, and this asserts that
@@ -227,10 +245,14 @@ mod tests {
         let s = signed(true);
         // secp256k1 n/2.
         const HALF_N: [u8; 32] = [
-            0x7f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-            0x5d, 0x57, 0x6e, 0x73, 0x57, 0xa4, 0x50, 0x1d, 0xdf, 0xe9, 0x2f, 0x46, 0x68, 0x1b, 0x20, 0xa0,
+            0x7f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+            0xff, 0xff, 0x5d, 0x57, 0x6e, 0x73, 0x57, 0xa4, 0x50, 0x1d, 0xdf, 0xe9, 0x2f, 0x46,
+            0x68, 0x1b, 0x20, 0xa0,
         ];
-        assert!(s.signature[32..64] <= HALF_N[..], "s must be in the lower half of the curve order");
+        assert!(
+            s.signature[32..64] <= HALF_N[..],
+            "s must be in the lower half of the curve order"
+        );
     }
 
     /// The whole point: what the taker recovers has to be the maker the order names.
@@ -246,7 +268,10 @@ mod tests {
     fn both_directions_recover_to_the_same_maker() {
         for buys in [true, false] {
             let s = signed(buys);
-            assert_eq!(recover(&s.digest, &s.signature).expect("recoverable"), key().address());
+            assert_eq!(
+                recover(&s.digest, &s.signature).expect("recoverable"),
+                key().address()
+            );
         }
     }
 
@@ -255,12 +280,17 @@ mod tests {
     #[test]
     fn every_field_changes_the_digest() {
         let mut book = Book::new();
-        let q = book.quote(&params(), &state(), true, ONE_ETH_IN_USDC, 1_000).expect("quotable");
+        let q = book
+            .quote(&params(), &state(), true, ONE_ETH_IN_USDC, 1_000)
+            .expect("quotable");
         let base = key().sign(&q, 0).expect("signable");
 
         let mut bigger = q;
         bigger.maker_amount += 1;
-        assert_ne!(key().sign(&bigger, 0).expect("signable").digest, base.digest);
+        assert_ne!(
+            key().sign(&bigger, 0).expect("signable").digest,
+            base.digest
+        );
 
         let mut later = q;
         later.expiry += 1;
@@ -268,9 +298,16 @@ mod tests {
 
         let mut fussier = q;
         fussier.min_fill_bps += 1;
-        assert_ne!(key().sign(&fussier, 0).expect("signable").digest, base.digest);
+        assert_ne!(
+            key().sign(&fussier, 0).expect("signable").digest,
+            base.digest
+        );
 
-        assert_ne!(key().sign(&q, 1).expect("signable").digest, base.digest, "the nonce is in the digest");
+        assert_ne!(
+            key().sign(&q, 1).expect("signable").digest,
+            base.digest,
+            "the nonce is in the digest"
+        );
     }
 
     /// The nonce is the cancellation handle, so two orders from one book must not share one.
@@ -278,9 +315,13 @@ mod tests {
     fn consecutive_quotes_get_distinct_digests() {
         let mut book = Book::new();
         let k = key();
-        let a = book.quote(&params(), &state(), true, ONE_ETH_IN_USDC, 1_000).expect("quotable");
+        let a = book
+            .quote(&params(), &state(), true, ONE_ETH_IN_USDC, 1_000)
+            .expect("quotable");
         let sa = k.sign(&a, book.next_nonce()).expect("signable");
-        let b = book.quote(&params(), &state(), true, ONE_ETH_IN_USDC, 1_000).expect("quotable");
+        let b = book
+            .quote(&params(), &state(), true, ONE_ETH_IN_USDC, 1_000)
+            .expect("quotable");
         let sb = k.sign(&b, book.next_nonce()).expect("signable");
         assert_ne!(sa.digest, sb.digest);
         assert_ne!(sa.order.nonce, sb.order.nonce);
@@ -291,7 +332,14 @@ mod tests {
     #[test]
     fn decay_is_off() {
         let s = signed(true);
-        assert_eq!((s.order.decay_start, s.order.decay_per_sec, s.order.decay_cap), (0, 0, 0));
+        assert_eq!(
+            (
+                s.order.decay_start,
+                s.order.decay_per_sec,
+                s.order.decay_cap
+            ),
+            (0, 0, 0)
+        );
     }
 
     /// A different settlement contract is a different domain, so the same order signs differently.
@@ -304,7 +352,9 @@ mod tests {
             address!("00000000000000000000000000000000000000BD"),
         );
         let mut book = Book::new();
-        let q = book.quote(&params(), &state(), true, ONE_ETH_IN_USDC, 1_000).expect("quotable");
+        let q = book
+            .quote(&params(), &state(), true, ONE_ETH_IN_USDC, 1_000)
+            .expect("quotable");
         assert_ne!(
             other.sign(&q, 0).expect("signable").digest,
             key().sign(&q, 0).expect("signable").digest
@@ -315,7 +365,9 @@ mod tests {
     fn a_different_chain_yields_a_different_digest() {
         let other = MakerKey::new(Signer::from_hex(KEY).expect("valid key"), 1, PMM_SETTLE);
         let mut book = Book::new();
-        let q = book.quote(&params(), &state(), true, ONE_ETH_IN_USDC, 1_000).expect("quotable");
+        let q = book
+            .quote(&params(), &state(), true, ONE_ETH_IN_USDC, 1_000)
+            .expect("quotable");
         assert_ne!(
             other.sign(&q, 0).expect("signable").digest,
             key().sign(&q, 0).expect("signable").digest

@@ -137,9 +137,13 @@ impl MakerParams {
     #[must_use]
     pub fn half_spread_e2(&self, sigma_millibps: u64) -> u32 {
         let scaled = u64::from(self.base_half_spread_e2)
-            .saturating_add(u64::from(self.sigma_coefficient_e2).saturating_mul(sigma_millibps) / 1_000)
+            .saturating_add(
+                u64::from(self.sigma_coefficient_e2).saturating_mul(sigma_millibps) / 1_000,
+            )
             .saturating_add(self.ttl_premium_e2(sigma_millibps));
-        u32::try_from(scaled).unwrap_or(u32::MAX).min(self.max_half_spread_e2)
+        u32::try_from(scaled)
+            .unwrap_or(u32::MAX)
+            .min(self.max_half_spread_e2)
     }
 
     /// What the TTL costs, in hundredths of a bp.
@@ -326,7 +330,9 @@ impl Book {
         }
 
         let half = params.half_spread_e2(state.sigma_millibps);
-        let scale = 10u128.checked_pow(u32::from(state.price_scale_exp)).ok_or(Refusal::Undefined)?;
+        let scale = 10u128
+            .checked_pow(u32::from(state.price_scale_exp))
+            .ok_or(Refusal::Undefined)?;
         // The maker's side of the spread, always against itself. Selling base is priced up from
         // fair, buying base is priced down from it. The sign is not configurable.
         let num = u128::from(BPS_E2) * 100;
@@ -339,7 +345,11 @@ impl Book {
         // inputs were nonsense when they were merely too big. Bounding the taker's leg by what the
         // notional cap permits keeps the multiply inside `u128` and gives the honest refusal.
         let (maker_amount, base_amount) = if taker_buys_base {
-            let price = state.fair.checked_mul(num + u128::from(half)).ok_or(Refusal::Undefined)? / num;
+            let price = state
+                .fair
+                .checked_mul(num + u128::from(half))
+                .ok_or(Refusal::Undefined)?
+                / num;
             if price == 0 {
                 return Err(Refusal::Undefined);
             }
@@ -361,7 +371,11 @@ impl Book {
             if taker_amount > ceiling {
                 return Err(Refusal::SizeOutOfRange);
             }
-            let price = state.fair.checked_mul(num - u128::from(half)).ok_or(Refusal::Undefined)? / num;
+            let price = state
+                .fair
+                .checked_mul(num - u128::from(half))
+                .ok_or(Refusal::Undefined)?
+                / num;
             let quote = taker_amount.checked_mul(price).ok_or(Refusal::Undefined)? / scale;
             if quote > params.max_notional_per_order {
                 return Err(Refusal::SizeOutOfRange);
@@ -389,8 +403,16 @@ impl Book {
 
         Ok(Quote {
             pair_id: state.pair_id,
-            maker_asset: if taker_buys_base { state.base } else { state.quote },
-            taker_asset: if taker_buys_base { state.quote } else { state.base },
+            maker_asset: if taker_buys_base {
+                state.base
+            } else {
+                state.quote
+            },
+            taker_asset: if taker_buys_base {
+                state.quote
+            } else {
+                state.base
+            },
             maker_amount,
             taker_amount,
             maker_sells_base: taker_buys_base,
@@ -413,13 +435,23 @@ impl Book {
             // Buying base spends quote, so what bounds the base leg is the quote on hand converted
             // at fair. An approximation by exactly the spread, and in the safe direction: valuing
             // the base at the mid rather than at the bid understates what the quote will buy.
-            let scale = 10u128.checked_pow(u32::from(state.price_scale_exp)).ok_or(Refusal::Undefined)?;
+            let scale = 10u128
+                .checked_pow(u32::from(state.price_scale_exp))
+                .ok_or(Refusal::Undefined)?;
             if state.fair == 0 {
                 return Err(Refusal::Undefined);
             }
-            state.quote_balance.checked_mul(scale).ok_or(Refusal::Undefined)? / state.fair
+            state
+                .quote_balance
+                .checked_mul(scale)
+                .ok_or(Refusal::Undefined)?
+                / state.fair
         };
-        let epoch = if sells_base { state.epoch_ask_base } else { state.epoch_bid_base };
+        let epoch = if sells_base {
+            state.epoch_ask_base
+        } else {
+            state.epoch_bid_base
+        };
         Ok(held
             .saturating_sub(epoch)
             .saturating_sub(self.reserved(state.pair_id, sells_base)))
@@ -472,7 +504,9 @@ mod tests {
     fn the_taker_leg_comes_back_exactly_as_it_went_in() {
         let mut book = Book::new();
         for (buys, amount) in [(true, ONE_ETH_IN_USDC + 7), (false, ONE_ETH + 7)] {
-            let q = book.quote(&params(), &state(), buys, amount, 1_000).expect("quotable");
+            let q = book
+                .quote(&params(), &state(), buys, amount, 1_000)
+                .expect("quotable");
             assert_eq!(q.taker_amount, amount, "taker_buys_base = {buys}");
         }
     }
@@ -483,12 +517,22 @@ mod tests {
         let scale = 10u128.pow(24);
 
         // Buying base: the base delivered is less than the taker's quote would buy at mid.
-        let buy = book.quote(&params(), &state(), true, ONE_ETH_IN_USDC, 1_000).expect("quotable");
-        assert!(buy.maker_amount < ONE_ETH_IN_USDC * scale / state().fair, "buying must cost above mid");
+        let buy = book
+            .quote(&params(), &state(), true, ONE_ETH_IN_USDC, 1_000)
+            .expect("quotable");
+        assert!(
+            buy.maker_amount < ONE_ETH_IN_USDC * scale / state().fair,
+            "buying must cost above mid"
+        );
 
         // Selling base: the quote paid is less than the base is worth at mid.
-        let sell = book.quote(&params(), &state(), false, ONE_ETH, 1_000).expect("quotable");
-        assert!(sell.maker_amount < ONE_ETH * state().fair / scale, "selling must pay below mid");
+        let sell = book
+            .quote(&params(), &state(), false, ONE_ETH, 1_000)
+            .expect("quotable");
+        assert!(
+            sell.maker_amount < ONE_ETH * state().fair / scale,
+            "selling must pay below mid"
+        );
     }
 
     /// The property that makes two venues from one maker safe. Whatever the spreads, going in one
@@ -497,9 +541,16 @@ mod tests {
     fn a_round_trip_through_both_sides_always_loses() {
         let mut book = Book::new();
         // Buy some base for a known amount of quote, then sell exactly that base back.
-        let buy = book.quote(&params(), &state(), true, ONE_ETH_IN_USDC, 1_000).expect("quotable");
-        let sell = book.quote(&params(), &state(), false, buy.maker_amount, 1_000).expect("quotable");
-        assert!(sell.maker_amount < ONE_ETH_IN_USDC, "the round trip must not be free money");
+        let buy = book
+            .quote(&params(), &state(), true, ONE_ETH_IN_USDC, 1_000)
+            .expect("quotable");
+        let sell = book
+            .quote(&params(), &state(), false, buy.maker_amount, 1_000)
+            .expect("quotable");
+        assert!(
+            sell.maker_amount < ONE_ETH_IN_USDC,
+            "the round trip must not be free money"
+        );
     }
 
     /// The term that makes the TTL self-pricing: a longer quote is automatically a wider one, so
@@ -507,9 +558,20 @@ mod tests {
     #[test]
     fn a_longer_ttl_costs_more_spread() {
         let sigma = 2_000; // millibps over the 300s horizon
-        let short = MakerParams { ttl_secs: 3, ..params() }.half_spread_e2(sigma);
-        let long = MakerParams { ttl_secs: 30, ..params() }.half_spread_e2(sigma);
-        assert!(long > short, "30s must cost more than 3s: {long} vs {short}");
+        let short = MakerParams {
+            ttl_secs: 3,
+            ..params()
+        }
+        .half_spread_e2(sigma);
+        let long = MakerParams {
+            ttl_secs: 30,
+            ..params()
+        }
+        .half_spread_e2(sigma);
+        assert!(
+            long > short,
+            "30s must cost more than 3s: {long} vs {short}"
+        );
     }
 
     /// Square-root-of-time, not linear. Ten times the window is about three times the premium —
@@ -517,25 +579,54 @@ mod tests {
     #[test]
     fn the_ttl_premium_scales_with_the_square_root_of_time() {
         let sigma = 10_000;
-        let p1 = MakerParams { ttl_secs: 3, ..params() }.ttl_premium_e2(sigma);
-        let p10 = MakerParams { ttl_secs: 30, ..params() }.ttl_premium_e2(sigma);
+        let p1 = MakerParams {
+            ttl_secs: 3,
+            ..params()
+        }
+        .ttl_premium_e2(sigma);
+        let p10 = MakerParams {
+            ttl_secs: 30,
+            ..params()
+        }
+        .ttl_premium_e2(sigma);
         assert!(p1 > 0 && p10 > 0);
         let ratio = (p10 * 100) / p1;
-        assert!((280..=380).contains(&ratio), "expected ~sqrt(10) = 3.16x, got {}x", ratio as f64 / 100.0);
+        assert!(
+            (280..=380).contains(&ratio),
+            "expected ~sqrt(10) = 3.16x, got {}x",
+            ratio as f64 / 100.0
+        );
     }
 
     /// Opting out has to be typed, not defaulted into.
     #[test]
     fn the_premium_is_only_zero_when_switched_off() {
-        assert_eq!(MakerParams { sigma_horizon_secs: 0, ..params() }.ttl_premium_e2(10_000), 0);
-        assert_eq!(MakerParams { ttl_secs: 0, ..params() }.ttl_premium_e2(10_000), 0);
+        assert_eq!(
+            MakerParams {
+                sigma_horizon_secs: 0,
+                ..params()
+            }
+            .ttl_premium_e2(10_000),
+            0
+        );
+        assert_eq!(
+            MakerParams {
+                ttl_secs: 0,
+                ..params()
+            }
+            .ttl_premium_e2(10_000),
+            0
+        );
         assert!(params().ttl_premium_e2(10_000) > 0);
     }
 
     #[test]
     fn volatility_widens_the_spread_up_to_the_cap() {
         assert!(params().half_spread_e2(50_000) > params().half_spread_e2(0));
-        assert_eq!(params().half_spread_e2(u64::MAX), params().max_half_spread_e2);
+        assert_eq!(
+            params().half_spread_e2(u64::MAX),
+            params().max_half_spread_e2
+        );
     }
 
     /// The cap is a notional however the size was expressed, so both directions refuse the same
@@ -551,7 +642,10 @@ mod tests {
             book.quote(&params(), &state(), false, 101 * ONE_ETH, 1_000),
             Err(Refusal::SizeOutOfRange)
         );
-        assert_eq!(book.quote(&params(), &state(), true, 0, 1_000), Err(Refusal::SizeOutOfRange));
+        assert_eq!(
+            book.quote(&params(), &state(), true, 0, 1_000),
+            Err(Refusal::SizeOutOfRange)
+        );
     }
 
     /// The point of denominating the cap in money: the same cap on a pair priced fifty times
@@ -563,10 +657,20 @@ mod tests {
         pricey.fair *= 50; // a $100k base token instead of a $2k one
         pricey.base_balance = 1_000 * ONE_ETH;
 
-        let cheap = book.quote(&params(), &state(), true, 100 * ONE_ETH_IN_USDC, 1_000).expect("quotable");
-        let dear = book.quote(&params(), &pricey, true, 100 * ONE_ETH_IN_USDC, 1_000).expect("quotable");
-        assert_eq!(cheap.taker_amount, dear.taker_amount, "the same money either way");
-        assert!(dear.base_amount * 40 < cheap.base_amount, "and far less of the dearer token");
+        let cheap = book
+            .quote(&params(), &state(), true, 100 * ONE_ETH_IN_USDC, 1_000)
+            .expect("quotable");
+        let dear = book
+            .quote(&params(), &pricey, true, 100 * ONE_ETH_IN_USDC, 1_000)
+            .expect("quotable");
+        assert_eq!(
+            cheap.taker_amount, dear.taker_amount,
+            "the same money either way"
+        );
+        assert!(
+            dear.base_amount * 40 < cheap.base_amount,
+            "and far less of the dearer token"
+        );
     }
 
     /// The whole point of the book: two quotes for the same inventory must not both be honoured.
@@ -576,13 +680,19 @@ mod tests {
         let mut s = state();
         s.base_balance = 10 * ONE_ETH;
 
-        book.quote(&params(), &s, true, 6 * ONE_ETH_IN_USDC, 1_000).expect("first fits");
-        assert!(book.reserved(1, true) > 5 * ONE_ETH, "roughly six base reserved");
+        book.quote(&params(), &s, true, 6 * ONE_ETH_IN_USDC, 1_000)
+            .expect("first fits");
+        assert!(
+            book.reserved(1, true) > 5 * ONE_ETH,
+            "roughly six base reserved"
+        );
         assert_eq!(
             book.quote(&params(), &s, true, 6 * ONE_ETH_IN_USDC, 1_000),
             Err(Refusal::InsufficientInventory)
         );
-        assert!(book.quote(&params(), &s, true, 3 * ONE_ETH_IN_USDC, 1_000).is_ok());
+        assert!(book
+            .quote(&params(), &s, true, 3 * ONE_ETH_IN_USDC, 1_000)
+            .is_ok());
     }
 
     #[test]
@@ -590,15 +700,22 @@ mod tests {
         let mut book = Book::new();
         let mut s = state();
         s.base_balance = 10 * ONE_ETH;
-        book.quote(&params(), &s, false, 10 * ONE_ETH, 1_000).expect("fits");
+        book.quote(&params(), &s, false, 10 * ONE_ETH, 1_000)
+            .expect("fits");
         assert_eq!(book.open_len(), 1);
 
         book.expire(1_000 + params().ttl_secs - 1);
-        assert_eq!(book.reserved(1, false), 10 * ONE_ETH, "still live one second before expiry");
+        assert_eq!(
+            book.reserved(1, false),
+            10 * ONE_ETH,
+            "still live one second before expiry"
+        );
 
         book.expire(1_000 + params().ttl_secs + 1);
         assert_eq!(book.reserved(1, false), 0);
-        assert!(book.quote(&params(), &s, false, 10 * ONE_ETH, 2_000).is_ok());
+        assert!(book
+            .quote(&params(), &s, false, 10 * ONE_ETH, 2_000)
+            .is_ok());
     }
 
     /// The two sides draw on different assets, so a sell reservation must not block a buy.
@@ -607,7 +724,8 @@ mod tests {
         let mut book = Book::new();
         let mut s = state();
         s.base_balance = 10 * ONE_ETH;
-        book.quote(&params(), &s, true, 10 * ONE_ETH_IN_USDC, 1_000).expect("fits");
+        book.quote(&params(), &s, true, 10 * ONE_ETH_IN_USDC, 1_000)
+            .expect("fits");
         assert_eq!(book.reserved(1, false), 0);
         assert!(book.quote(&params(), &s, false, ONE_ETH, 1_000).is_ok());
     }
@@ -623,7 +741,9 @@ mod tests {
             book.quote(&params(), &s, true, 5 * ONE_ETH_IN_USDC, 1_000),
             Err(Refusal::InsufficientInventory)
         );
-        assert!(book.quote(&params(), &s, true, ONE_ETH_IN_USDC / 2, 1_000).is_ok());
+        assert!(book
+            .quote(&params(), &s, true, ONE_ETH_IN_USDC / 2, 1_000)
+            .is_ok());
     }
 
     /// Buying base spends quote, so an empty quote balance must stop the bid even with base to spare.
@@ -632,21 +752,27 @@ mod tests {
         let mut book = Book::new();
         let mut s = state();
         s.quote_balance = 0;
-        assert_eq!(book.quote(&params(), &s, false, ONE_ETH, 1_000), Err(Refusal::InsufficientInventory));
+        assert_eq!(
+            book.quote(&params(), &s, false, ONE_ETH, 1_000),
+            Err(Refusal::InsufficientInventory)
+        );
     }
 
     #[test]
     fn nonces_do_not_repeat_within_a_run() {
         let mut book = Book::new();
         let first = book.next_nonce();
-        book.quote(&params(), &state(), false, ONE_ETH, 1_000).expect("quotable");
+        book.quote(&params(), &state(), false, ONE_ETH, 1_000)
+            .expect("quotable");
         assert_ne!(book.next_nonce(), first);
     }
 
     #[test]
     fn the_expiry_is_the_ttl_from_now_and_the_order_says_so() {
         let mut book = Book::new();
-        let q = book.quote(&params(), &state(), false, ONE_ETH, 1_000).expect("quotable");
+        let q = book
+            .quote(&params(), &state(), false, ONE_ETH, 1_000)
+            .expect("quotable");
         assert_eq!(q.expiry, 1_000 + params().ttl_secs);
         assert_eq!(q.min_fill_bps, params().min_fill_bps);
     }
@@ -659,13 +785,23 @@ mod tests {
         let mut book = Book::new();
         let s = state();
 
-        let buy = book.quote(&params(), &s, true, ONE_ETH_IN_USDC, 1_000).expect("quotable");
-        assert_eq!(buy.maker_asset, s.base, "the taker buying base means the maker delivers base");
+        let buy = book
+            .quote(&params(), &s, true, ONE_ETH_IN_USDC, 1_000)
+            .expect("quotable");
+        assert_eq!(
+            buy.maker_asset, s.base,
+            "the taker buying base means the maker delivers base"
+        );
         assert_eq!(buy.taker_asset, s.quote);
         assert_eq!(buy.taker_amount, ONE_ETH_IN_USDC);
-        assert_eq!(buy.base_amount, buy.maker_amount, "the reserved leg is the base one");
+        assert_eq!(
+            buy.base_amount, buy.maker_amount,
+            "the reserved leg is the base one"
+        );
 
-        let sell = book.quote(&params(), &s, false, ONE_ETH, 1_000).expect("quotable");
+        let sell = book
+            .quote(&params(), &s, false, ONE_ETH, 1_000)
+            .expect("quotable");
         assert_eq!(sell.maker_asset, s.quote);
         assert_eq!(sell.taker_asset, s.base);
         assert_eq!(sell.taker_amount, ONE_ETH);

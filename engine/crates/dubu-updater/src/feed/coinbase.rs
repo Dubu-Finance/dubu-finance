@@ -69,7 +69,9 @@ impl Client {
     /// Build from `(venue product, canonical symbol)` pairs.
     #[must_use]
     pub fn new(symbols: &[(String, String)]) -> Self {
-        Self { symbols: symbols.iter().cloned().collect() }
+        Self {
+            symbols: symbols.iter().cloned().collect(),
+        }
     }
 }
 
@@ -91,11 +93,15 @@ impl MarketFeed for Client {
         if text.starts_with(r#"{"type":"error""#) {
             return Err(format!("subscription rejected: {text}"));
         }
-        let Ok(t) = serde_json::from_str::<Ticker>(text) else { return Ok(None) };
+        let Ok(t) = serde_json::from_str::<Ticker>(text) else {
+            return Ok(None);
+        };
         if t.kind != "ticker" {
             return Ok(None);
         }
-        let Some(symbol) = self.symbols.get(&t.product_id) else { return Ok(None) };
+        let Some(symbol) = self.symbols.get(&t.product_id) else {
+            return Ok(None);
+        };
 
         let f = |field: &str, v: &str| -> Result<u128, String> {
             units::parse_fixed(v, FEED_SCALE).map_err(|e| format!("{field}: {e}"))
@@ -107,7 +113,11 @@ impl MarketFeed for Client {
             ask: f("best_ask", &t.best_ask)?,
             ask_qty: f("best_ask_size", &t.best_ask_size)?,
         };
-        Ok(Some(Update { symbol: symbol.clone(), tick, reset: false }))
+        Ok(Some(Update {
+            symbol: symbol.clone(),
+            tick,
+            reset: false,
+        }))
     }
 }
 
@@ -116,7 +126,10 @@ mod tests {
     use super::*;
 
     fn client() -> Client {
-        Client::new(&[("ETH-USDT".into(), "ETHUSDT".into()), ("BTC-USD".into(), "BTCUSDT".into())])
+        Client::new(&[
+            ("ETH-USDT".into(), "ETHUSDT".into()),
+            ("BTC-USD".into(), "BTCUSDT".into()),
+        ])
     }
 
     /// Captured verbatim off `wss://ws-feed.exchange.coinbase.com`.
@@ -124,7 +137,10 @@ mod tests {
 
     #[test]
     fn parses_a_real_ticker_frame() {
-        let u = client().parse(LIVE).unwrap().expect("frame carries a book update");
+        let u = client()
+            .parse(LIVE)
+            .unwrap()
+            .expect("frame carries a book update");
         assert_eq!(u.symbol, "ETHUSDT");
         assert!(!u.reset);
         assert_eq!(u.tick.update_id, 26_459_104_740);
@@ -168,6 +184,7 @@ mod tests {
         assert_eq!(frames.len(), 1);
         assert!(frames[0].contains(r#""ETH-USDT""#));
         assert!(frames[0].contains(r#""BTC-USD""#));
-        serde_json::from_str::<serde_json::Value>(&frames[0]).expect("subscribe frame must be JSON");
+        serde_json::from_str::<serde_json::Value>(&frames[0])
+            .expect("subscribe frame must be JSON");
     }
 }

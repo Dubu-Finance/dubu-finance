@@ -264,7 +264,10 @@ impl RpcError {
     pub const fn is_endpoint_fault(&self) -> bool {
         matches!(
             self,
-            Self::Transport { .. } | Self::Http { .. } | Self::RateLimited { .. } | Self::BackingOff { .. }
+            Self::Transport { .. }
+                | Self::Http { .. }
+                | Self::RateLimited { .. }
+                | Self::BackingOff { .. }
                 | Self::BudgetExhausted { .. }
         )
     }
@@ -273,12 +276,18 @@ impl RpcError {
     /// machine's `reason` field and nothing else — both kinds count as a failed poll.
     #[must_use]
     pub const fn is_rate_limit(&self) -> bool {
-        matches!(self, Self::RateLimited { .. } | Self::BackingOff { .. } | Self::BudgetExhausted { .. })
+        matches!(
+            self,
+            Self::RateLimited { .. } | Self::BackingOff { .. } | Self::BudgetExhausted { .. }
+        )
     }
 }
 
 fn decode_err(what: &'static str, detail: impl std::fmt::Display) -> RpcError {
-    RpcError::Decode { what, detail: detail.to_string() }
+    RpcError::Decode {
+        what,
+        detail: detail.to_string(),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -330,7 +339,9 @@ impl Limiter {
     }
 
     fn refill(&mut self, now: Instant) {
-        let elapsed = now.saturating_duration_since(self.last_refill).as_secs_f64();
+        let elapsed = now
+            .saturating_duration_since(self.last_refill)
+            .as_secs_f64();
         if elapsed > 0.0 {
             self.tokens = (self.tokens + elapsed * self.refill_per_sec).min(self.burst);
             self.last_refill = now;
@@ -340,8 +351,12 @@ impl Limiter {
     fn try_take(&mut self, endpoint: &'static str, now: Instant) -> Result<(), RpcError> {
         if let Some(until) = self.penalty_until {
             if now < until {
-                let remaining_ms = u64::try_from(until.duration_since(now).as_millis()).unwrap_or(u64::MAX);
-                return Err(RpcError::BackingOff { endpoint, remaining_ms });
+                let remaining_ms =
+                    u64::try_from(until.duration_since(now).as_millis()).unwrap_or(u64::MAX);
+                return Err(RpcError::BackingOff {
+                    endpoint,
+                    remaining_ms,
+                });
             }
             self.penalty_until = None;
         }
@@ -457,7 +472,10 @@ impl Rpc {
             .timeout(Duration::from_millis(cfg.request_timeout_ms))
             .user_agent(concat!("dubu-updater/", env!("CARGO_PKG_VERSION")))
             .build()
-            .map_err(|source| RpcError::Transport { endpoint: name, source })?;
+            .map_err(|source| RpcError::Transport {
+                endpoint: name,
+                source,
+            })?;
         let now = Instant::now();
         Ok(Self {
             name,
@@ -501,11 +519,16 @@ impl Rpc {
     /// How many times any endpoint in this pool has rate-limited us.
     #[must_use]
     pub fn rate_limit_events(&self) -> u64 {
-        self.endpoints.iter().map(|e| Self::lock_of(e).rate_limit_events).sum()
+        self.endpoints
+            .iter()
+            .map(|e| Self::lock_of(e).rate_limit_events)
+            .sum()
     }
 
     fn lock_of(e: &Endpoint) -> std::sync::MutexGuard<'_, Limiter> {
-        e.limiter.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+        e.limiter
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// One JSON-RPC call.
@@ -513,7 +536,11 @@ impl Rpc {
     /// # Errors
     /// [`RpcError`]. Note that [`RpcError::BackingOff`] and [`RpcError::BudgetExhausted`] are
     /// returned *without opening a socket*, which is the point.
-    pub async fn call(&self, method: &str, params: serde_json::Value) -> Result<serde_json::Value, RpcError> {
+    pub async fn call(
+        &self,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value, RpcError> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let body = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
 
@@ -521,7 +548,9 @@ impl Rpc {
         let start = match self.selection {
             // Advance the cursor once per call, so consecutive reads land on different keys and
             // the pool's budget is the sum of its keys rather than the smallest of them.
-            Selection::Rotate => usize::try_from(self.cursor.fetch_add(1, Ordering::Relaxed)).unwrap_or(0) % n,
+            Selection::Rotate => {
+                usize::try_from(self.cursor.fetch_add(1, Ordering::Relaxed)).unwrap_or(0) % n
+            }
             Selection::Pin => 0,
         };
 
@@ -559,7 +588,11 @@ impl Rpc {
     }
 
     /// One attempt against one endpoint.
-    async fn call_one(&self, endpoint: &Endpoint, body: &serde_json::Value) -> Result<serde_json::Value, RpcError> {
+    async fn call_one(
+        &self,
+        endpoint: &Endpoint,
+        body: &serde_json::Value,
+    ) -> Result<serde_json::Value, RpcError> {
         // One of exactly two `expose()` call sites in the crate; the other is the websocket
         // connect in `heads`. Everything else — logs, errors, Debug output — sees the redaction.
         let resp = self
@@ -568,14 +601,21 @@ impl Rpc {
             .json(body)
             .send()
             .await
-            .map_err(|source| RpcError::Transport { endpoint: self.name, source })?;
+            .map_err(|source| RpcError::Transport {
+                endpoint: self.name,
+                source,
+            })?;
 
         let status = resp.status();
-        let text = resp.text().await.map_err(|source| RpcError::Transport { endpoint: self.name, source })?;
+        let text = resp.text().await.map_err(|source| RpcError::Transport {
+            endpoint: self.name,
+            source,
+        })?;
 
         // The observed shape is a 429 with an "over rate limit" body, but some gateways answer
         // 200 with the same text, so the body is checked either way.
-        let looks_rate_limited = status.as_u16() == 429 || text.to_ascii_lowercase().contains("over rate limit");
+        let looks_rate_limited =
+            status.as_u16() == 429 || text.to_ascii_lowercase().contains("over rate limit");
         if looks_rate_limited {
             let backoff = {
                 let mut g = Self::lock_of(endpoint);
@@ -594,12 +634,20 @@ impl Rpc {
             });
         }
 
-        let v: serde_json::Value = serde_json::from_str(&text).map_err(|e| decode_err("json-rpc envelope", e))?;
+        let v: serde_json::Value =
+            serde_json::from_str(&text).map_err(|e| decode_err("json-rpc envelope", e))?;
         if let Some(err) = v.get("error") {
             return Err(RpcError::Node {
                 endpoint: self.name,
-                code: err.get("code").and_then(serde_json::Value::as_i64).unwrap_or(0),
-                message: err.get("message").and_then(serde_json::Value::as_str).unwrap_or("(none)").to_string(),
+                code: err
+                    .get("code")
+                    .and_then(serde_json::Value::as_i64)
+                    .unwrap_or(0),
+                message: err
+                    .get("message")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("(none)")
+                    .to_string(),
             });
         }
         Self::lock_of(endpoint).on_success();
@@ -613,7 +661,9 @@ impl Rpc {
     pub async fn eth_call(&self, to: Address, data: &[u8], tag: &str) -> Result<Vec<u8>, RpcError> {
         let params = json!([{ "to": to.to_string(), "data": hex0x(data) }, tag]);
         let result = self.call("eth_call", params).await?;
-        let s = result.as_str().ok_or_else(|| decode_err("eth_call result", "not a string"))?;
+        let s = result
+            .as_str()
+            .ok_or_else(|| decode_err("eth_call result", "not a string"))?;
         unhex(s).ok_or_else(|| decode_err("eth_call result", "not hex"))
     }
 
@@ -623,7 +673,9 @@ impl Rpc {
     /// [`RpcError`].
     pub async fn quantity(&self, method: &str, params: serde_json::Value) -> Result<u64, RpcError> {
         let r = self.call(method, params).await?;
-        let s = r.as_str().ok_or_else(|| decode_err("quantity", "not a string"))?;
+        let s = r
+            .as_str()
+            .ok_or_else(|| decode_err("quantity", "not a string"))?;
         u64::from_str_radix(s.trim_start_matches("0x"), 16).map_err(|e| decode_err("quantity", e))
     }
 }
@@ -646,7 +698,9 @@ pub fn unhex(s: &str) -> Option<Vec<u8>> {
     if t.len() % 2 != 0 {
         return None;
     }
-    (0..t.len() / 2).map(|i| u8::from_str_radix(&t[i * 2..i * 2 + 2], 16).ok()).collect()
+    (0..t.len() / 2)
+        .map(|i| u8::from_str_radix(&t[i * 2..i * 2 + 2], 16).ok())
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -809,7 +863,9 @@ impl ChainHealth {
         if read_ref <= progress_ref {
             Stall::Reads
         } else {
-            Stall::Progress { at_block: self.best_block }
+            Stall::Progress {
+                at_block: self.best_block,
+            }
         }
     }
 
@@ -915,7 +971,12 @@ impl Snap {
     /// The stored four prices.
     #[must_use]
     pub const fn ladder(&self) -> Ladder {
-        Ladder { min_bid: self.min_bid, max_bid: self.max_bid, min_ask: self.min_ask, max_ask: self.max_ask }
+        Ladder {
+            min_bid: self.min_bid,
+            max_bid: self.max_bid,
+            min_ask: self.min_ask,
+            max_ask: self.max_ask,
+        }
     }
 
     /// Age of the stored quote against a block timestamp, saturating at zero for a clock skew.
@@ -1049,7 +1110,12 @@ impl ChainReader {
     /// helpers, then one `snapshot` per pair, then one `balanceOf` per token. Order is the
     /// decode contract.
     #[must_use]
-    pub fn new(pool: Address, multicall: Address, pair_ids: Vec<u16>, tokens: Vec<Address>) -> Self {
+    pub fn new(
+        pool: Address,
+        multicall: Address,
+        pair_ids: Vec<u16>,
+        tokens: Vec<Address>,
+    ) -> Self {
         Self::build(pool, multicall, pair_ids, tokens, None)
     }
 
@@ -1118,7 +1184,14 @@ impl ChainReader {
             }
         }
         let calldata = abi::aggregate3Call { calls }.abi_encode().into();
-        Self { pool, multicall, pair_ids, tokens, maker, calldata }
+        Self {
+            pool,
+            multicall,
+            pair_ids,
+            tokens,
+            maker,
+            calldata,
+        }
     }
 
     /// The pool this reader reads.
@@ -1144,14 +1217,21 @@ impl ChainReader {
     /// crate-wide.
     #[allow(clippy::indexing_slicing)]
     pub async fn read(&self, rpc: &Rpc) -> Result<ChainView, RpcError> {
-        let raw = rpc.eth_call(self.multicall, &self.calldata, "pending").await?;
-        let extra = if self.maker.is_some() { 2 * self.tokens.len() } else { 0 };
+        let raw = rpc
+            .eth_call(self.multicall, &self.calldata, "pending")
+            .await?;
+        let extra = if self.maker.is_some() {
+            2 * self.tokens.len()
+        } else {
+            0
+        };
         let results = decode_batch(&raw, 2 + self.pair_ids.len() + self.tokens.len() + extra)?;
 
         let block_number = abi::getBlockNumberCall::abi_decode_returns(&results[0].returnData)
             .map_err(|e| decode_err("getBlockNumber", e))?;
-        let block_timestamp = abi::getCurrentBlockTimestampCall::abi_decode_returns(&results[1].returnData)
-            .map_err(|e| decode_err("getCurrentBlockTimestamp", e))?;
+        let block_timestamp =
+            abi::getCurrentBlockTimestampCall::abi_decode_returns(&results[1].returnData)
+                .map_err(|e| decode_err("getCurrentBlockTimestamp", e))?;
 
         let mut snaps = BTreeMap::new();
         for (i, &id) in self.pair_ids.iter().enumerate() {
@@ -1165,7 +1245,10 @@ impl ChainReader {
         for (i, &t) in self.tokens.iter().enumerate() {
             let v = abi::balanceOfCall::abi_decode_returns(&results[base + i].returnData)
                 .map_err(|e| decode_err("balanceOf", e))?;
-            balances.insert(t, u128::try_from(v).map_err(|_| decode_err("balanceOf", "exceeds u128"))?);
+            balances.insert(
+                t,
+                u128::try_from(v).map_err(|_| decode_err("balanceOf", "exceeds u128"))?,
+            );
         }
 
         // What the RFQ maker could pay out, per token: the lesser of what it holds and what it has
@@ -1177,11 +1260,15 @@ impl ChainReader {
             for (i, &t) in self.tokens.iter().enumerate() {
                 let bal = abi::balanceOfCall::abi_decode_returns(&results[base + 2 * i].returnData)
                     .map_err(|e| decode_err("maker balanceOf", e))?;
-                let allow = abi::allowanceCall::abi_decode_returns(&results[base + 2 * i + 1].returnData)
-                    .map_err(|e| decode_err("maker allowance", e))?;
+                let allow =
+                    abi::allowanceCall::abi_decode_returns(&results[base + 2 * i + 1].returnData)
+                        .map_err(|e| decode_err("maker allowance", e))?;
                 let d = bal.min(allow);
-                maker_deliverable
-                    .insert(t, u128::try_from(d).map_err(|_| decode_err("maker deliverable", "exceeds u128"))?);
+                maker_deliverable.insert(
+                    t,
+                    u128::try_from(d)
+                        .map_err(|_| decode_err("maker deliverable", "exceeds u128"))?,
+                );
             }
         }
 
@@ -1203,12 +1290,19 @@ impl ChainReader {
 /// zero-filled snapshot is the kind of silent wrong answer that ends up quoted, so the length
 /// and the success flags are both checked rather than assumed.
 fn decode_batch(raw: &[u8], expected: usize) -> Result<Vec<abi::Call3Result>, RpcError> {
-    let results = abi::aggregate3Call::abi_decode_returns(raw).map_err(|e| decode_err("aggregate3 results", e))?;
+    let results = abi::aggregate3Call::abi_decode_returns(raw)
+        .map_err(|e| decode_err("aggregate3 results", e))?;
     if results.len() != expected {
-        return Err(decode_err("aggregate3 results", format!("expected {expected} entries, got {}", results.len())));
+        return Err(decode_err(
+            "aggregate3 results",
+            format!("expected {expected} entries, got {}", results.len()),
+        ));
     }
     if let Some(i) = results.iter().position(|r| !r.success) {
-        return Err(decode_err("aggregate3 results", format!("sub-call {i} reverted")));
+        return Err(decode_err(
+            "aggregate3 results",
+            format!("sub-call {i} reverted"),
+        ));
     }
     Ok(results)
 }
@@ -1259,35 +1353,58 @@ pub async fn verify_against_chain(
 ) -> Result<ChainFacts, RpcError> {
     // Round one: pairCount, updater, and every pairConfig.
     let mut calls = vec![
-        abi::Call3 { target: pool, allowFailure: false, callData: abi::pairCountCall {}.abi_encode().into() },
-        abi::Call3 { target: pool, allowFailure: false, callData: abi::updaterCall {}.abi_encode().into() },
+        abi::Call3 {
+            target: pool,
+            allowFailure: false,
+            callData: abi::pairCountCall {}.abi_encode().into(),
+        },
+        abi::Call3 {
+            target: pool,
+            allowFailure: false,
+            callData: abi::updaterCall {}.abi_encode().into(),
+        },
     ];
     for p in &cfg.pairs {
         calls.push(abi::Call3 {
             target: pool,
             allowFailure: false,
-            callData: abi::pairConfigCall { pairId: p.pair_id }.abi_encode().into(),
+            callData: abi::pairConfigCall { pairId: p.pair_id }
+                .abi_encode()
+                .into(),
         });
     }
-    let raw = rpc.eth_call(multicall, &abi::aggregate3Call { calls }.abi_encode(), "latest").await?;
+    let raw = rpc
+        .eth_call(
+            multicall,
+            &abi::aggregate3Call { calls }.abi_encode(),
+            "latest",
+        )
+        .await?;
     let res = decode_batch(&raw, 2 + cfg.pairs.len())?;
 
-    let pair_count =
-        abi::pairCountCall::abi_decode_returns(&res[0].returnData).map_err(|e| decode_err("pairCount", e))?;
-    let updater = abi::updaterCall::abi_decode_returns(&res[1].returnData).map_err(|e| decode_err("updater", e))?;
+    let pair_count = abi::pairCountCall::abi_decode_returns(&res[0].returnData)
+        .map_err(|e| decode_err("pairCount", e))?;
+    let updater = abi::updaterCall::abi_decode_returns(&res[1].returnData)
+        .map_err(|e| decode_err("updater", e))?;
 
     let mut configs = BTreeMap::new();
     for (i, p) in cfg.pairs.iter().enumerate() {
         if p.pair_id > pair_count {
             return Err(decode_err(
                 "pair id",
-                format!("config lists pair_id {} but the pool has {pair_count} pairs", p.pair_id),
+                format!(
+                    "config lists pair_id {} but the pool has {pair_count} pairs",
+                    p.pair_id
+                ),
             ));
         }
         let c = abi::pairConfigCall::abi_decode_returns(&res[2 + i].returnData)
             .map_err(|e| decode_err("PairConfig", e))?;
         if !c.exists {
-            return Err(decode_err("pair id", format!("pair {} does not exist on chain", p.pair_id)));
+            return Err(decode_err(
+                "pair id",
+                format!("pair {} does not exist on chain", p.pair_id),
+            ));
         }
         configs.insert(p.pair_id, c);
     }
@@ -1303,13 +1420,24 @@ pub async fn verify_against_chain(
     }
     let calls: Vec<_> = tokens
         .iter()
-        .map(|&t| abi::Call3 { target: t, allowFailure: false, callData: abi::decimalsCall {}.abi_encode().into() })
+        .map(|&t| abi::Call3 {
+            target: t,
+            allowFailure: false,
+            callData: abi::decimalsCall {}.abi_encode().into(),
+        })
         .collect();
-    let raw = rpc.eth_call(multicall, &abi::aggregate3Call { calls }.abi_encode(), "latest").await?;
+    let raw = rpc
+        .eth_call(
+            multicall,
+            &abi::aggregate3Call { calls }.abi_encode(),
+            "latest",
+        )
+        .await?;
     let res = decode_batch(&raw, tokens.len())?;
     let mut decimals = BTreeMap::new();
     for (i, &t) in tokens.iter().enumerate() {
-        let d = abi::decimalsCall::abi_decode_returns(&res[i].returnData).map_err(|e| decode_err("decimals", e))?;
+        let d = abi::decimalsCall::abi_decode_returns(&res[i].returnData)
+            .map_err(|e| decode_err("decimals", e))?;
         decimals.insert(t, d);
     }
 
@@ -1341,12 +1469,10 @@ pub async fn verify_against_chain(
         }
         match nav_token {
             None => nav_token = Some(c.quote),
-            Some(q) if q != c.quote => {
-                return Err(decode_err(
-                    "quote token",
-                    "configured pairs do not share a quote token, so a single NAV is not well defined",
-                ))
-            }
+            Some(q) if q != c.quote => return Err(decode_err(
+                "quote token",
+                "configured pairs do not share a quote token, so a single NAV is not well defined",
+            )),
             Some(_) => {}
         }
         pairs.insert(
@@ -1370,11 +1496,20 @@ pub async fn verify_against_chain(
     if nav_decimals != cfg.risk.nav_decimals {
         return Err(decode_err(
             "risk.nav_decimals",
-            format!("config says {} but the quote token reports {nav_decimals}", cfg.risk.nav_decimals),
+            format!(
+                "config says {} but the quote token reports {nav_decimals}",
+                cfg.risk.nav_decimals
+            ),
         ));
     }
 
-    Ok(ChainFacts { pairs, updater, tokens, nav_token, nav_decimals })
+    Ok(ChainFacts {
+        pairs,
+        updater,
+        tokens,
+        nav_token,
+        nav_decimals,
+    })
 }
 
 #[cfg(test)]
@@ -1405,7 +1540,11 @@ mod tests {
         // Exactly the live pool's shape: capGen 14, usedGen 13, and a large raw ask counter
         // that the pool itself ignores.
         let stale = snap(14, 13, 0, 499_438_326_634_891_408_781);
-        assert_eq!(stale.ask_used(), 0, "a superseded epoch's usage must read as zero");
+        assert_eq!(
+            stale.ask_used(),
+            0,
+            "a superseded epoch's usage must read as zero"
+        );
         assert_eq!(stale.bid_used(), 0);
 
         let current = snap(14, 14, 0, 499_438_326_634_891_408_781);
@@ -1445,20 +1584,33 @@ mod tests {
         let mut l = Limiter::new(1.0, 2.0, t0);
         assert!(l.try_take("rpc", t0).is_ok());
         assert!(l.try_take("rpc", t0).is_ok());
-        assert!(matches!(l.try_take("rpc", t0), Err(RpcError::BudgetExhausted { .. })));
+        assert!(matches!(
+            l.try_take("rpc", t0),
+            Err(RpcError::BudgetExhausted { .. })
+        ));
         // One second later, one token.
         let t1 = t0 + Duration::from_secs(1);
         assert!(l.try_take("rpc", t1).is_ok());
-        assert!(matches!(l.try_take("rpc", t1), Err(RpcError::BudgetExhausted { .. })));
+        assert!(matches!(
+            l.try_take("rpc", t1),
+            Err(RpcError::BudgetExhausted { .. })
+        ));
     }
 
     #[test]
     fn a_429_opens_no_further_sockets_until_the_penalty_expires() {
         let t0 = Instant::now();
         let mut l = Limiter::new(100.0, 100.0, t0);
-        let b = l.on_rate_limited(t0, Duration::from_millis(1_000), Duration::from_millis(60_000));
+        let b = l.on_rate_limited(
+            t0,
+            Duration::from_millis(1_000),
+            Duration::from_millis(60_000),
+        );
         assert_eq!(b, Duration::from_millis(1_000));
-        assert!(matches!(l.try_take("rpc", t0), Err(RpcError::BackingOff { .. })));
+        assert!(matches!(
+            l.try_take("rpc", t0),
+            Err(RpcError::BackingOff { .. })
+        ));
         assert!(matches!(
             l.try_take("rpc", t0 + Duration::from_millis(999)),
             Err(RpcError::BackingOff { .. })
@@ -1472,14 +1624,33 @@ mod tests {
         let mut l = Limiter::new(100.0, 100.0, t0);
         let init = Duration::from_millis(1_000);
         let max = Duration::from_millis(8_000);
-        assert_eq!(l.on_rate_limited(t0, init, max), Duration::from_millis(1_000));
-        assert_eq!(l.on_rate_limited(t0, init, max), Duration::from_millis(2_000));
-        assert_eq!(l.on_rate_limited(t0, init, max), Duration::from_millis(4_000));
-        assert_eq!(l.on_rate_limited(t0, init, max), Duration::from_millis(8_000));
-        assert_eq!(l.on_rate_limited(t0, init, max), Duration::from_millis(8_000), "must cap");
+        assert_eq!(
+            l.on_rate_limited(t0, init, max),
+            Duration::from_millis(1_000)
+        );
+        assert_eq!(
+            l.on_rate_limited(t0, init, max),
+            Duration::from_millis(2_000)
+        );
+        assert_eq!(
+            l.on_rate_limited(t0, init, max),
+            Duration::from_millis(4_000)
+        );
+        assert_eq!(
+            l.on_rate_limited(t0, init, max),
+            Duration::from_millis(8_000)
+        );
+        assert_eq!(
+            l.on_rate_limited(t0, init, max),
+            Duration::from_millis(8_000),
+            "must cap"
+        );
         // A success resets the ladder, so an isolated 429 an hour later is cheap again.
         l.on_success();
-        assert_eq!(l.on_rate_limited(t0, init, max), Duration::from_millis(1_000));
+        assert_eq!(
+            l.on_rate_limited(t0, init, max),
+            Duration::from_millis(1_000)
+        );
         assert_eq!(l.rate_limit_events, 6);
     }
 
@@ -1491,13 +1662,25 @@ mod tests {
         h.on_read(t0, 1_000);
 
         assert_eq!(h.status(t0 + Duration::from_secs(29)), ChainStatus::Healthy);
-        assert_eq!(h.status(t0 + Duration::from_secs(30)), ChainStatus::Degraded { stale_secs: 30 });
-        assert_eq!(h.status(t0 + Duration::from_secs(299)), ChainStatus::Degraded { stale_secs: 299 });
-        assert_eq!(h.status(t0 + Duration::from_secs(300)), ChainStatus::Down { stale_secs: 300 });
+        assert_eq!(
+            h.status(t0 + Duration::from_secs(30)),
+            ChainStatus::Degraded { stale_secs: 30 }
+        );
+        assert_eq!(
+            h.status(t0 + Duration::from_secs(299)),
+            ChainStatus::Degraded { stale_secs: 299 }
+        );
+        assert_eq!(
+            h.status(t0 + Duration::from_secs(300)),
+            ChainStatus::Down { stale_secs: 300 }
+        );
 
         // A read at a new block at any point returns to healthy.
         h.on_read(t0 + Duration::from_secs(300), 1_001);
-        assert_eq!(h.status(t0 + Duration::from_secs(301)), ChainStatus::Healthy);
+        assert_eq!(
+            h.status(t0 + Duration::from_secs(301)),
+            ChainStatus::Healthy
+        );
     }
 
     #[test]
@@ -1505,7 +1688,10 @@ mod tests {
         // Otherwise a bot that never reaches the node would sit `Healthy` forever.
         let t0 = Instant::now();
         let h = ChainHealth::new(t0, 30, 300);
-        assert_eq!(h.status(t0 + Duration::from_secs(300)), ChainStatus::Down { stale_secs: 300 });
+        assert_eq!(
+            h.status(t0 + Duration::from_secs(300)),
+            ChainStatus::Down { stale_secs: 300 }
+        );
     }
 
     #[test]
@@ -1523,7 +1709,11 @@ mod tests {
             h.on_read(t0 + Duration::from_secs(s), 5_000);
         }
         let now = t0 + Duration::from_secs(310);
-        assert_eq!(h.consecutive_failures(), 0, "nothing failed; that is the point");
+        assert_eq!(
+            h.consecutive_failures(),
+            0,
+            "nothing failed; that is the point"
+        );
         assert_eq!(h.status(now), ChainStatus::Down { stale_secs: 310 });
         assert_eq!(h.stall(now), Stall::Progress { at_block: 5_000 });
 
@@ -1555,11 +1745,21 @@ mod tests {
         let mut h = ChainHealth::new(t0, 30, 300);
         h.on_read(t0, 5_000);
         h.on_read(t0 + Duration::from_secs(1), 4_998);
-        assert_eq!(h.best_block(), 5_000, "a lagging replica must not rewind the high-water mark");
+        assert_eq!(
+            h.best_block(),
+            5_000,
+            "a lagging replica must not rewind the high-water mark"
+        );
         // Staleness runs from the QUIETER signal, which is progress at t0 rather than the read
         // at t0+1s — so a stream of reads that never advance cannot mask a stalled chain.
-        assert_eq!(h.status(t0 + Duration::from_secs(40)), ChainStatus::Degraded { stale_secs: 40 });
-        assert_eq!(h.stall(t0 + Duration::from_secs(40)), Stall::Progress { at_block: 5_000 });
+        assert_eq!(
+            h.status(t0 + Duration::from_secs(40)),
+            ChainStatus::Degraded { stale_secs: 40 }
+        );
+        assert_eq!(
+            h.stall(t0 + Duration::from_secs(40)),
+            Stall::Progress { at_block: 5_000 }
+        );
     }
 
     #[test]
@@ -1576,16 +1776,34 @@ mod tests {
     fn the_read_encodes_one_call_per_thing_it_needs() {
         let pool = Address::repeat_byte(0xaa);
         let mc = Address::repeat_byte(0xbb);
-        let p = ChainReader::new(pool, mc, vec![1, 2], vec![Address::repeat_byte(1), Address::repeat_byte(2)]);
+        let p = ChainReader::new(
+            pool,
+            mc,
+            vec![1, 2],
+            vec![Address::repeat_byte(1), Address::repeat_byte(2)],
+        );
         // Decoding our own calldata proves the layout the read's decoder assumes.
         let decoded = abi::aggregate3Call::abi_decode(&p.calldata).unwrap();
         assert_eq!(decoded.calls.len(), 6, "2 helpers + 2 pairs + 2 tokens");
         assert_eq!(decoded.calls[0].target, mc);
         assert_eq!(decoded.calls[2].target, pool);
         assert_eq!(decoded.calls[4].target, Address::repeat_byte(1));
-        assert!(decoded.calls.iter().all(|c| !c.allowFailure), "a reverting sub-call must fail the batch");
+        assert!(
+            decoded.calls.iter().all(|c| !c.allowFailure),
+            "a reverting sub-call must fail the batch"
+        );
         // And the pair ids landed in the right slots.
-        assert_eq!(abi::snapshotCall::abi_decode(&decoded.calls[2].callData).unwrap().pairId, 1);
-        assert_eq!(abi::snapshotCall::abi_decode(&decoded.calls[3].callData).unwrap().pairId, 2);
+        assert_eq!(
+            abi::snapshotCall::abi_decode(&decoded.calls[2].callData)
+                .unwrap()
+                .pairId,
+            1
+        );
+        assert_eq!(
+            abi::snapshotCall::abi_decode(&decoded.calls[3].callData)
+                .unwrap()
+                .pairId,
+            2
+        );
     }
 }

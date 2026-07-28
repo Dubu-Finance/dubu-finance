@@ -79,21 +79,30 @@ pub fn parse_fixed(s: &str, scale: u8) -> Result<u128, UnitsError> {
         return Err(UnitsError::Malformed(s.to_string()));
     }
     if frac_part.len() > usize::from(scale) {
-        return Err(UnitsError::TooPrecise { value: s.to_string(), scale });
+        return Err(UnitsError::TooPrecise {
+            value: s.to_string(),
+            scale,
+        });
     }
 
     let unit = pow10(scale).ok_or_else(|| UnitsError::Overflow(s.to_string()))?;
     let whole: u128 = if int_part.is_empty() {
         0
     } else {
-        int_part.parse().map_err(|_| UnitsError::Overflow(s.to_string()))?
+        int_part
+            .parse()
+            .map_err(|_| UnitsError::Overflow(s.to_string()))?
     };
     // Right-pad the fraction to the full scale: `.5` at scale 8 is 50_000_000, not 5.
-    let pad = pow10(scale - frac_part.len() as u8).ok_or_else(|| UnitsError::Overflow(s.to_string()))?;
+    let pad =
+        pow10(scale - frac_part.len() as u8).ok_or_else(|| UnitsError::Overflow(s.to_string()))?;
     let frac: u128 = if frac_part.is_empty() {
         0
     } else {
-        frac_part.parse::<u128>().map_err(|_| UnitsError::Overflow(s.to_string()))? * pad
+        frac_part
+            .parse::<u128>()
+            .map_err(|_| UnitsError::Overflow(s.to_string()))?
+            * pad
     };
 
     whole
@@ -108,11 +117,18 @@ pub fn parse_fixed(s: &str, scale: u8) -> Result<u128, UnitsError> {
 /// reader this came off the feed at scale 8, where `1943.82` does not.
 #[must_use]
 pub fn format_fixed(v: u128, scale: u8) -> String {
-    let Some(unit) = pow10(scale) else { return v.to_string() };
+    let Some(unit) = pow10(scale) else {
+        return v.to_string();
+    };
     if unit == 1 {
         return v.to_string();
     }
-    format!("{}.{:0width$}", v / unit, v % unit, width = usize::from(scale))
+    format!(
+        "{}.{:0width$}",
+        v / unit,
+        v % unit,
+        width = usize::from(scale)
+    )
 }
 
 /// The decimal shift between a human price and the pool's `uint56` price for one pair.
@@ -175,10 +191,16 @@ mod tests {
 
     #[test]
     fn parses_what_binance_actually_sends() {
-        assert_eq!(parse_fixed("1943.82000000", FEED_SCALE), Ok(194_382_000_000));
+        assert_eq!(
+            parse_fixed("1943.82000000", FEED_SCALE),
+            Ok(194_382_000_000)
+        );
         assert_eq!(parse_fixed("24.25800000", FEED_SCALE), Ok(2_425_800_000));
         assert_eq!(parse_fixed("0.00000001", FEED_SCALE), Ok(1));
-        assert_eq!(parse_fixed("118000.00000000", FEED_SCALE), Ok(11_800_000_000_000));
+        assert_eq!(
+            parse_fixed("118000.00000000", FEED_SCALE),
+            Ok(11_800_000_000_000)
+        );
     }
 
     #[test]
@@ -196,13 +218,18 @@ mod tests {
         // The failure this prevents: a 9-decimal capacity silently becoming 0 at 8 decimals.
         assert_eq!(
             parse_fixed("0.000000001", 8),
-            Err(UnitsError::TooPrecise { value: "0.000000001".into(), scale: 8 })
+            Err(UnitsError::TooPrecise {
+                value: "0.000000001".into(),
+                scale: 8
+            })
         );
     }
 
     #[test]
     fn junk_is_rejected_rather_than_coerced() {
-        for bad in ["", " ", "-1", "+1", "1e9", "1_000", "1,000", "abc", "1.2.3", ".", "1.2a"] {
+        for bad in [
+            "", " ", "-1", "+1", "1e9", "1_000", "1,000", "abc", "1.2.3", ".", "1.2a",
+        ] {
             assert!(parse_fixed(bad, 8).is_err(), "`{bad}` was accepted");
         }
     }

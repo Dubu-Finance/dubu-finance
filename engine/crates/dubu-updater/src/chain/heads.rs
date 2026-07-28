@@ -214,7 +214,9 @@ impl HeadShared {
             (Link::Down, _, _) => HeadStatus::Down,
             (Link::Up, None, _) => HeadStatus::NoData,
             (Link::Up, Some(_), Some(d)) if d <= self.stale_after => HeadStatus::Live,
-            (Link::Up, _, _) => HeadStatus::Stale { age_ms: age_ms.unwrap_or(u64::MAX) },
+            (Link::Up, _, _) => HeadStatus::Stale {
+                age_ms: age_ms.unwrap_or(u64::MAX),
+            },
         };
         HeadSnapshot {
             status,
@@ -229,7 +231,9 @@ impl HeadShared {
     /// guard is correct: taking the process down would turn a cosmetic panic into a quoting
     /// outage, and every consumer re-derives staleness from the timestamp anyway.
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
-        self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 }
 
@@ -270,16 +274,26 @@ fn quantity(v: Option<&serde_json::Value>) -> Option<u64> {
 /// `-32601 "notifications not supported"` back, which is a configuration mistake rather than an
 /// outage and deserves to be logged as one.
 fn parse_subscribe_ack(text: &str, id: u64) -> Result<Option<String>, String> {
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(text) else { return Ok(None) };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(text) else {
+        return Ok(None);
+    };
     if v.get("id").and_then(serde_json::Value::as_u64) != Some(id) {
         return Ok(None);
     }
     if let Some(err) = v.get("error") {
-        let code = err.get("code").and_then(serde_json::Value::as_i64).unwrap_or(0);
-        let msg = err.get("message").and_then(serde_json::Value::as_str).unwrap_or("(none)");
+        let code = err
+            .get("code")
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or(0);
+        let msg = err
+            .get("message")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("(none)");
         return Err(format!("node refused eth_subscribe: {code}: {msg}"));
     }
-    Ok(v.get("result").and_then(serde_json::Value::as_str).map(ToString::to_string))
+    Ok(v.get("result")
+        .and_then(serde_json::Value::as_str)
+        .map(ToString::to_string))
 }
 
 /// Parse a `eth_subscription` notification into a head.
@@ -288,15 +302,25 @@ fn parse_subscribe_ack(text: &str, id: u64) -> Result<Option<String>, String> {
 /// acknowledgements, and — the reason the id is checked rather than assumed — notifications from
 /// some other subscription, which would otherwise be counted as head liveness.
 fn parse_head_notification(text: &str, subscription: &str) -> Result<Option<Head>, String> {
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(text) else { return Ok(None) };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(text) else {
+        return Ok(None);
+    };
     if v.get("method").and_then(serde_json::Value::as_str) != Some("eth_subscription") {
         return Ok(None);
     }
-    let Some(params) = v.get("params") else { return Ok(None) };
-    if params.get("subscription").and_then(serde_json::Value::as_str) != Some(subscription) {
+    let Some(params) = v.get("params") else {
+        return Ok(None);
+    };
+    if params
+        .get("subscription")
+        .and_then(serde_json::Value::as_str)
+        != Some(subscription)
+    {
         return Ok(None);
     }
-    let Some(result) = params.get("result") else { return Ok(None) };
+    let Some(result) = params.get("result") else {
+        return Ok(None);
+    };
     let number = quantity(result.get("number")).ok_or("head has no usable `number`")?;
     let timestamp = quantity(result.get("timestamp")).ok_or("head has no usable `timestamp`")?;
     Ok(Some(Head { number, timestamp }))
@@ -359,7 +383,8 @@ pub async fn run(
                           "connected but could not send eth_subscribe");
                     shared.on_disconnected();
                 } else {
-                    match await_subscription(&mut socket, sub_id, read_timeout, &mut shutdown).await {
+                    match await_subscription(&mut socket, sub_id, read_timeout, &mut shutdown).await
+                    {
                         Sub::Shutdown => {
                             let _ = socket.close(None).await;
                             shared.on_disconnected();
@@ -382,8 +407,15 @@ pub async fn run(
                             first = false;
                             delay = Duration::from_millis(cfg.ws_reconnect_initial_ms);
 
-                            read_heads(&mut socket, &subscription, &shared, &wake, read_timeout, &mut shutdown)
-                                .await;
+                            read_heads(
+                                &mut socket,
+                                &subscription,
+                                &shared,
+                                &wake,
+                                read_timeout,
+                                &mut shutdown,
+                            )
+                            .await;
 
                             if *shutdown.borrow() {
                                 let _ = socket.close(None).await;
@@ -423,9 +455,8 @@ enum Sub {
     Shutdown,
 }
 
-type Socket = tokio_tungstenite::WebSocketStream<
-    tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
->;
+type Socket =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
 /// Read frames until the subscribe acknowledgement arrives, times out, or errors.
 async fn await_subscription(
@@ -446,8 +477,12 @@ async fn await_subscription(
             r = tokio::time::timeout(remaining, socket.next()) => r,
         };
         let msg = match next {
-            Err(_) => return Sub::Failed("no eth_subscribe reply inside the watchdog window".into()),
-            Ok(None) => return Sub::Failed("socket closed before the subscription was acknowledged".into()),
+            Err(_) => {
+                return Sub::Failed("no eth_subscribe reply inside the watchdog window".into())
+            }
+            Ok(None) => {
+                return Sub::Failed("socket closed before the subscription was acknowledged".into())
+            }
             Ok(Some(Err(e))) => return Sub::Failed(format!("websocket read failed: {e}")),
             Ok(Some(Ok(m))) => m,
         };
@@ -554,7 +589,9 @@ mod tests {
 
     #[test]
     fn parses_a_real_new_heads_notification() {
-        let head = parse_head_notification(REAL_HEAD, SUB).unwrap().expect("carries a head");
+        let head = parse_head_notification(REAL_HEAD, SUB)
+            .unwrap()
+            .expect("carries a head");
         assert_eq!(head.number, 0x1e4_f5e4);
         assert_eq!(head.timestamp, 0x686e_5cc0);
     }
@@ -570,7 +607,9 @@ mod tests {
         assert_eq!(payload(&as_text), Some(REAL_HEAD));
         assert_eq!(payload(&as_binary), Some(REAL_HEAD));
         for m in [&as_text, &as_binary] {
-            let head = parse_head_notification(payload(m).unwrap(), SUB).unwrap().unwrap();
+            let head = parse_head_notification(payload(m).unwrap(), SUB)
+                .unwrap()
+                .unwrap();
             assert_eq!(head.number, 0x1e4_f5e4);
         }
         // Control frames carry no payload and must not be mistaken for one.
@@ -583,13 +622,21 @@ mod tests {
     fn a_notification_for_another_subscription_is_not_our_liveness() {
         // The failure this prevents: some other subscription's traffic resetting the head
         // watchdog, so a dead `newHeads` looks alive.
-        assert!(parse_head_notification(REAL_HEAD, "0xsomethingelse").unwrap().is_none());
+        assert!(parse_head_notification(REAL_HEAD, "0xsomethingelse")
+            .unwrap()
+            .is_none());
     }
 
     #[test]
     fn acknowledgements_and_noise_are_ignored_rather_than_errors() {
-        assert!(parse_head_notification(r#"{"jsonrpc":"2.0","id":1,"result":"0xdead"}"#, SUB).unwrap().is_none());
-        assert!(parse_head_notification("not json at all", SUB).unwrap().is_none());
+        assert!(
+            parse_head_notification(r#"{"jsonrpc":"2.0","id":1,"result":"0xdead"}"#, SUB)
+                .unwrap()
+                .is_none()
+        );
+        assert!(parse_head_notification("not json at all", SUB)
+            .unwrap()
+            .is_none());
     }
 
     #[test]
@@ -598,7 +645,10 @@ mod tests {
         // signal `ChainHealth` reads to decide the chain has stopped.
         let text = REAL_HEAD.replace(r#""number":"0x1e4f5e4","#, "");
         let err = parse_head_notification(&text, SUB).unwrap_err();
-        assert!(err.contains("number"), "error must name the missing field, got `{err}`");
+        assert!(
+            err.contains("number"),
+            "error must name the missing field, got `{err}`"
+        );
     }
 
     #[test]
@@ -626,14 +676,23 @@ mod tests {
         let s = shared();
         let t0 = Instant::now();
         s.on_subscribed(true);
-        s.record(Head { number: 100, timestamp: 1 }, t0);
+        s.record(
+            Head {
+                number: 100,
+                timestamp: 1,
+            },
+            t0,
+        );
         assert_eq!(s.snapshot(t0).status, HeadStatus::Live);
 
         let inside = t0 + Duration::from_millis(10_000);
         assert_eq!(s.snapshot(inside).status, HeadStatus::Live);
 
         let outside = t0 + Duration::from_millis(10_001);
-        assert_eq!(s.snapshot(outside).status, HeadStatus::Stale { age_ms: 10_001 });
+        assert_eq!(
+            s.snapshot(outside).status,
+            HeadStatus::Stale { age_ms: 10_001 }
+        );
         assert!(!s.snapshot(outside).status.is_live());
         // ... and the last head is still readable for the diagnostic log line.
         assert_eq!(s.snapshot(outside).last.map(|h| h.number), Some(100));
@@ -646,17 +705,50 @@ mod tests {
         let s = shared();
         let t0 = Instant::now();
         s.on_subscribed(true);
-        assert!(s.record(Head { number: 100, timestamp: 1 }, t0));
+        assert!(s.record(
+            Head {
+                number: 100,
+                timestamp: 1
+            },
+            t0
+        ));
 
         let later = t0 + Duration::from_millis(9_000);
-        assert!(!s.record(Head { number: 100, timestamp: 1 }, later), "a duplicate is not liveness");
-        assert!(!s.record(Head { number: 99, timestamp: 1 }, later), "a reorg backwards is not liveness");
+        assert!(
+            !s.record(
+                Head {
+                    number: 100,
+                    timestamp: 1
+                },
+                later
+            ),
+            "a duplicate is not liveness"
+        );
+        assert!(
+            !s.record(
+                Head {
+                    number: 99,
+                    timestamp: 1
+                },
+                later
+            ),
+            "a reorg backwards is not liveness"
+        );
 
         // The clock still runs from the ORIGINAL arrival, so the watchdog still trips on time.
-        assert_eq!(s.snapshot(t0 + Duration::from_millis(10_001)).status, HeadStatus::Stale { age_ms: 10_001 });
+        assert_eq!(
+            s.snapshot(t0 + Duration::from_millis(10_001)).status,
+            HeadStatus::Stale { age_ms: 10_001 }
+        );
 
         // A genuinely newer head does reset it.
-        assert!(s.record(Head { number: 101, timestamp: 2 }, later));
+        assert!(s.record(
+            Head {
+                number: 101,
+                timestamp: 2
+            },
+            later
+        ));
         assert_eq!(s.snapshot(later).status, HeadStatus::Live);
     }
 
@@ -665,20 +757,36 @@ mod tests {
         let s = shared();
         let t0 = Instant::now();
         s.on_subscribed(true);
-        s.record(Head { number: 100, timestamp: 1 }, t0);
+        s.record(
+            Head {
+                number: 100,
+                timestamp: 1,
+            },
+            t0,
+        );
 
         s.on_disconnected();
         assert_eq!(s.snapshot(t0).status, HeadStatus::Down);
 
         s.on_subscribed(false);
         let snap = s.snapshot(t0);
-        assert_eq!(snap.status, HeadStatus::NoData, "a pre-outage head must not survive a reconnect");
+        assert_eq!(
+            snap.status,
+            HeadStatus::NoData,
+            "a pre-outage head must not survive a reconnect"
+        );
         assert_eq!(snap.reconnects, 1);
         assert_eq!(snap.subscriptions, 2);
 
         // An endpoint whose head numbering is behind the pre-outage one must still be accepted,
         // since the sequence state was cleared with the head.
-        assert!(s.record(Head { number: 7, timestamp: 3 }, t0));
+        assert!(s.record(
+            Head {
+                number: 7,
+                timestamp: 3
+            },
+            t0
+        ));
         assert_eq!(s.snapshot(t0).status, HeadStatus::Live);
     }
 
@@ -688,6 +796,9 @@ mod tests {
         s.on_subscribed(true);
         let snap = s.snapshot(Instant::now());
         assert_eq!(snap.status, HeadStatus::NoData);
-        assert!(!snap.status.is_live(), "an acknowledged subscription that delivers nothing is not live");
+        assert!(
+            !snap.status.is_live(),
+            "an acknowledged subscription that delivers nothing is not live"
+        );
     }
 }

@@ -218,7 +218,10 @@ impl Bounds {
         // A floor above the ceiling would make the clamp degenerate silently into always-floor.
         // Raising the ceiling to meet it keeps `threshold` monotone in sigma.
         let ceiling = if ceiling < floor { floor } else { ceiling };
-        Self { floor_bps_e2: floor, ceiling_bps_e2: ceiling }
+        Self {
+            floor_bps_e2: floor,
+            ceiling_bps_e2: ceiling,
+        }
     }
 
     /// The threshold for one observation: the sigma arm, clamped between the two bounds.
@@ -479,7 +482,11 @@ impl Detector {
             // A hole in the reference. Not a return, and not safe to assume nothing happened.
             self.anchor = Some((price, now));
             let edge = self.trip(now, Reason::FeedGap);
-            return self.report(Measured { tripped: Some(Reason::FeedGap), edge, ..base });
+            return self.report(Measured {
+                tripped: Some(Reason::FeedGap),
+                edge,
+                ..base
+            });
         }
 
         let (threshold, bound) = self.bounds.threshold(self.params.sigma_k_e2, sigma_bps_e2);
@@ -488,11 +495,20 @@ impl Detector {
         let moved = mul_div_floor(price.abs_diff(prev), BPS_E2, prev).unwrap_or(BPS_E2);
         let move_bps_e2 = u32::try_from(moved).unwrap_or(u32::MAX);
         self.anchor = Some((price, now));
-        let base = Measured { move_bps_e2, threshold_bps_e2: threshold, bound, ..base };
+        let base = Measured {
+            move_bps_e2,
+            threshold_bps_e2: threshold,
+            bound,
+            ..base
+        };
 
         if move_bps_e2 >= threshold {
             let edge = self.trip(now, Reason::Move);
-            self.report(Measured { tripped: Some(Reason::Move), edge, ..base })
+            self.report(Measured {
+                tripped: Some(Reason::Move),
+                edge,
+                ..base
+            })
         } else {
             let resumed = self.maybe_resume(now);
             self.report(Measured { resumed, ..base })
@@ -531,13 +547,17 @@ impl Detector {
 
     /// The three conditions, in the order they are cheapest to reject.
     fn settled(&self, now: Instant) -> bool {
-        let Some(t) = self.tripped_at else { return true };
+        let Some(t) = self.tripped_at else {
+            return true;
+        };
         // 1. The minimum, measured from the most recent trip.
         if now.saturating_duration_since(t) < self.params.cooloff {
             return false;
         }
         // 3. A dead feed must never satisfy the settle test by having nothing to contradict it.
-        let Some(&(_, last_t)) = self.window.back() else { return false };
+        let Some(&(_, last_t)) = self.window.back() else {
+            return false;
+        };
         if now.saturating_duration_since(last_t) > self.params.max_sample {
             return false;
         }
@@ -619,7 +639,10 @@ impl Book {
     #[must_use]
     pub fn new(pairs: &[(u16, Bounds)], params: Params, scope: Scope, enabled: bool) -> Self {
         Self {
-            detectors: pairs.iter().map(|&(id, b)| (id, Detector::new(params, b))).collect(),
+            detectors: pairs
+                .iter()
+                .map(|&(id, b)| (id, Detector::new(params, b)))
+                .collect(),
             scope,
             enabled,
         }
@@ -647,13 +670,20 @@ impl Book {
     /// disabled book, so a caller can use it as a gate without a second check.
     #[must_use]
     pub fn withdrawn(&self, pair_id: u16) -> bool {
-        self.enabled && self.detectors.get(&pair_id).is_some_and(Detector::withdrawn)
+        self.enabled
+            && self
+                .detectors
+                .get(&pair_id)
+                .is_some_and(Detector::withdrawn)
     }
 
     /// Every pair currently withdrawn, in id order.
     pub fn withdrawn_pairs(&self) -> impl Iterator<Item = u16> + '_ {
         let enabled = self.enabled;
-        self.detectors.iter().filter(move |(_, d)| enabled && d.withdrawn()).map(|(id, _)| *id)
+        self.detectors
+            .iter()
+            .filter(move |(_, d)| enabled && d.withdrawn())
+            .map(|(id, _)| *id)
     }
 
     /// Fold one pair's reference observation in.
@@ -709,7 +739,11 @@ mod tests {
     fn ordinary_reference_noise_is_not_a_jump_at_a_one_bp_spread() {
         let coupled = Bounds::from_pair(1, 25);
         let (t, bound) = coupled.threshold(600, 3);
-        assert_eq!((t, bound), (100, Bound::Floor), "the old floor was s0 itself");
+        assert_eq!(
+            (t, bound),
+            (100, Bound::Floor),
+            "the old floor was s0 itself"
+        );
         assert!(324 > t, "so 3.24bp of noise tripped it");
 
         let split = Bounds::new(5, 1, 25);
@@ -738,7 +772,12 @@ mod tests {
     use crate::skew::VolConfig;
 
     fn vol_cfg() -> VolConfig {
-        VolConfig { tau_ms: 60_000, horizon_secs: 300, min_sample_ms: 100, max_sample_ms: 10_000 }
+        VolConfig {
+            tau_ms: 60_000,
+            horizon_secs: 300,
+            min_sample_ms: 100,
+            max_sample_ms: 10_000,
+        }
     }
 
     fn params() -> Params {
@@ -773,7 +812,11 @@ mod tests {
 
     impl Path {
         fn new(bounds: Bounds) -> Self {
-            Self { vol: Volatility::new(vol_cfg()), det: Detector::new(params(), bounds), t: Instant::now() }
+            Self {
+                vol: Volatility::new(vol_cfg()),
+                det: Detector::new(params(), bounds),
+                t: Instant::now(),
+            }
         }
 
         /// One second passes and the reference is `price`.
@@ -802,8 +845,20 @@ mod tests {
     fn the_bounds_are_the_pairs_own_spread_and_its_absorption_limit() {
         // The whole reason a single global `sigma_k` works across two instruments: neither bound
         // is a number picked here, both come from the pair's configuration.
-        assert_eq!(eth(), Bounds { floor_bps_e2: 500, ceiling_bps_e2: 1_750 }); // 5 bp .. 17.5 bp
-        assert_eq!(btc(), Bounds { floor_bps_e2: 800, ceiling_bps_e2: 2_800 }); // 8 bp .. 28 bp
+        assert_eq!(
+            eth(),
+            Bounds {
+                floor_bps_e2: 500,
+                ceiling_bps_e2: 1_750
+            }
+        ); // 5 bp .. 17.5 bp
+        assert_eq!(
+            btc(),
+            Bounds {
+                floor_bps_e2: 800,
+                ceiling_bps_e2: 2_800
+            }
+        ); // 8 bp .. 28 bp
     }
 
     #[test]
@@ -833,9 +888,16 @@ mod tests {
         // A deterministic 1 bp/s sawtooth, 600 samples, plus a slow drift so it is not a pure
         // oscillation the EWMA could special-case.
         for i in 0..600u128 {
-            let price = if i % 2 == 0 { BASE + i / 4 * bp } else { BASE + i / 4 * bp + bp };
+            let price = if i % 2 == 0 {
+                BASE + i / 4 * bp
+            } else {
+                BASE + i / 4 * bp + bp
+            };
             let obs = p.step(price);
-            assert!(obs.tripped.is_none(), "1 bp/s diffusion tripped at i={i}: {obs:?}");
+            assert!(
+                obs.tripped.is_none(),
+                "1 bp/s diffusion tripped at i={i}: {obs:?}"
+            );
             assert_eq!(obs.state, State::Quoting);
         }
         assert_eq!(p.det.trips(), 0);
@@ -881,7 +943,11 @@ mod tests {
         assert_eq!(obs.tripped, Some(Reason::Move));
         assert!(obs.edge, "the first trip owes a withdrawal transaction");
         assert_eq!(obs.move_bps_e2, 10_000);
-        assert_eq!(obs.bound, Bound::Floor, "in a calm market the floor is what fires");
+        assert_eq!(
+            obs.bound,
+            Bound::Floor,
+            "in a calm market the floor is what fires"
+        );
         assert_eq!(obs.state, State::Withdrawn);
         assert_eq!(p.det.trips(), 1);
 
@@ -893,7 +959,10 @@ mod tests {
         }
         // ... and comes back once the trailing window is entirely post-jump and quiet.
         let obs = p.step(jumped);
-        assert!(obs.resumed, "must resume after the cool-off on a settled reference");
+        assert!(
+            obs.resumed,
+            "must resume after the cool-off on a settled reference"
+        );
         assert_eq!(obs.state, State::Quoting);
         assert_eq!(p.det.trips(), 1, "resuming is not a second trip");
     }
@@ -913,7 +982,10 @@ mod tests {
 
         // Sigma is now enormous, and the raw sigma arm is far above the absorption limit.
         let sigma_now = p.vol.sigma_bps_e2_over_ms(1_000);
-        assert!(sigma_now > 1_000, "one 100 bp return must move sigma(1s) past 10 bp, got {sigma_now}");
+        assert!(
+            sigma_now > 1_000,
+            "one 100 bp return must move sigma(1s) past 10 bp, got {sigma_now}"
+        );
         assert_eq!(eth().threshold(600, sigma_now).1, Bound::Absorption);
 
         // Ten quiet seconds — not enough to resume, and sigma decays only slowly.
@@ -925,10 +997,17 @@ mod tests {
         let leg2 = leg1 + leg1 / 200;
         let o2 = p.step(leg2);
         assert_eq!(o2.move_bps_e2, 5_000);
-        assert_eq!(o2.bound, Bound::Absorption, "the ceiling, not sigma, is what set the threshold");
+        assert_eq!(
+            o2.bound,
+            Bound::Absorption,
+            "the ceiling, not sigma, is what set the threshold"
+        );
         assert!(o2.threshold_bps_e2 <= 1_750);
         assert_eq!(o2.tripped, Some(Reason::Move), "the second leg MUST trip");
-        assert!(!o2.edge, "already withdrawn, so no second transaction is owed");
+        assert!(
+            !o2.edge,
+            "already withdrawn, so no second transaction is owed"
+        );
     }
 
     #[test]
@@ -949,9 +1028,15 @@ mod tests {
         // The first leg's cool-off would have expired 10s from here. It must not.
         for i in 0..29u64 {
             let obs = p.step(leg2);
-            assert!(obs.state.withdrawn(), "resumed {i}s after the SECOND leg, cool-off is 30s");
+            assert!(
+                obs.state.withdrawn(),
+                "resumed {i}s after the SECOND leg, cool-off is 30s"
+            );
         }
-        assert!(p.step(leg2).resumed, "and it does come back once the second leg has settled");
+        assert!(
+            p.step(leg2).resumed,
+            "and it does come back once the second leg has settled"
+        );
     }
 
     #[test]
@@ -969,8 +1054,14 @@ mod tests {
         for i in 0..40u64 {
             price += price * 4 / 10_000;
             let obs = p.step(price);
-            assert!(obs.tripped.is_none(), "a 4 bp step must not trip the move test (i={i})");
-            assert!(obs.state.withdrawn(), "but the range test must hold the withdrawal open (i={i})");
+            assert!(
+                obs.tripped.is_none(),
+                "a 4 bp step must not trip the move test (i={i})"
+            );
+            assert!(
+                obs.state.withdrawn(),
+                "but the range test must hold the withdrawal open (i={i})"
+            );
             assert!(obs.range_bps_e2 > obs.threshold_bps_e2);
         }
         // It resumes only once the walking stops.
@@ -992,7 +1083,10 @@ mod tests {
         let obs = p.det.observe(BASE, p.t, &p.vol);
         assert_eq!(obs.tripped, Some(Reason::FeedGap));
         assert!(obs.edge);
-        assert!(obs.state.withdrawn(), "the price is unchanged, and that is not the point");
+        assert!(
+            obs.state.withdrawn(),
+            "the price is unchanged, and that is not the point"
+        );
     }
 
     #[test]
@@ -1006,7 +1100,9 @@ mod tests {
         assert!(obs.tripped.is_none(), "a 10 ms separation is not a return");
         // The anchor is still the pre-gap price, so the next real observation measures the whole
         // move rather than losing it.
-        let obs = p.det.observe(BASE * 2, t + Duration::from_millis(1_000), &p.vol);
+        let obs = p
+            .det
+            .observe(BASE * 2, t + Duration::from_millis(1_000), &p.vol);
         assert_eq!(obs.tripped, Some(Reason::Move));
     }
 
@@ -1036,13 +1132,18 @@ mod tests {
 
         // pairId 2 jumps; pairId 1 has seen nothing at all.
         book.observe(2, BASE, now, &vol);
-        let o = book.observe(2, BASE + BASE / 100, now + Duration::from_secs(1), &vol).unwrap();
+        let o = book
+            .observe(2, BASE + BASE / 100, now + Duration::from_secs(1), &vol)
+            .unwrap();
         assert_eq!(o.tripped, Some(Reason::Move));
 
         let newly = book.contagion(2, now + Duration::from_secs(1));
         assert_eq!(newly, vec![1], "the other pair owes a withdrawal");
         assert!(book.withdrawn(1) && book.withdrawn(2));
-        assert_eq!(book.detector(1).and_then(Detector::last_reason), Some(Reason::Contagion));
+        assert_eq!(
+            book.detector(1).and_then(Detector::last_reason),
+            Some(Reason::Contagion)
+        );
 
         // Re-propagating does not owe a second transaction for a pair already at zero capacity.
         assert!(book.contagion(2, now + Duration::from_secs(2)).is_empty());
@@ -1066,7 +1167,9 @@ mod tests {
         let now = Instant::now();
         let vol = Volatility::new(vol_cfg());
         assert!(book.observe(1, BASE, now, &vol).is_none());
-        assert!(book.observe(1, BASE * 2, now + Duration::from_secs(1), &vol).is_none());
+        assert!(book
+            .observe(1, BASE * 2, now + Duration::from_secs(1), &vol)
+            .is_none());
         assert!(!book.withdrawn(1));
         assert_eq!(book.withdrawn_pairs().count(), 0);
     }

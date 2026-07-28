@@ -48,20 +48,24 @@ use std::time::{Duration, Instant};
 use tokio::sync::watch;
 use tracing::{error, info, warn};
 
-use dubu_updater::chain::heads::{self, HeadShared};
 use alloy_primitives::Address;
+use dubu_updater::chain::heads::{self, HeadShared};
 use dubu_updater::chain::swaps::SwapWatch;
 use dubu_updater::chain::view::{self, SharedView as ViewSlot};
-use dubu_updater::chain::{ChainFacts, ChainHealth, ChainReader, ChainStatus, ChainView, Rpc, Selection};
+use dubu_updater::chain::{
+    ChainFacts, ChainHealth, ChainReader, ChainStatus, ChainView, Rpc, Selection,
+};
 use dubu_updater::config::{Config, KeySource};
-use dubu_updater::now_unix;
 use dubu_updater::fair_value::{self, Reference, VenueQuote};
 use dubu_updater::feed::ws::MarketFeed;
-use dubu_updater::feed::{binance, bybit, coinbase, okx, FeedStatus, VenueFeeds, VenueId, VenueWatch};
+use dubu_updater::feed::{
+    binance, bybit, coinbase, okx, FeedStatus, VenueFeeds, VenueId, VenueWatch,
+};
 use dubu_updater::jump;
 use dubu_updater::ladder::{self, RowInputs};
 use dubu_updater::maker;
 use dubu_updater::markout::{self, Markout};
+use dubu_updater::now_unix;
 use dubu_updater::policy::{self, CapacityDecision, Context, Decision};
 use dubu_updater::quoting;
 use dubu_updater::risk::{Halt, KillSwitch, Position};
@@ -70,6 +74,19 @@ use dubu_updater::skew::{self, Inventory, Volatility};
 use dubu_updater::spread;
 use dubu_updater::tx::{Fees, Intent, Sender, Sent, Settled, Signer};
 use dubu_updater::units::{self, FEED_SCALE};
+
+/// Emit a trace at `info` on a sampled cycle and at `debug` on the rest.
+///
+/// The cycle runs at 5-6Hz since it got its own clock, and these lines are per-pair, so leaving
+/// them all at `info` turned a readable 13 lines a second into 63 -- five million a day, in which
+/// the lines reporting an actual send are outnumbered by the ones reporting that nothing happened.
+/// Sampling on `block_work` keeps exactly the resolution the log had before the clock changed, one
+/// full trace per sealed block, and `RUST_LOG=debug` still shows every tick.
+macro_rules! trace_at {
+    ($loud:expr, $($arg:tt)*) => {
+        if $loud { tracing::info!($($arg)*) } else { tracing::debug!($($arg)*) }
+    };
+}
 
 /// Exit code when the bot stops because a killswitch latched or the chain went away.
 const EXIT_HALTED: i32 = 2;
@@ -85,7 +102,12 @@ struct Args {
 }
 
 fn parse_args() -> Result<Args, String> {
-    let mut a = Args { config: "updater.toml".into(), once: false, force_dry_run: false, cycles: None };
+    let mut a = Args {
+        config: "updater.toml".into(),
+        once: false,
+        force_dry_run: false,
+        cycles: None,
+    };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
         match arg.as_str() {
@@ -93,7 +115,10 @@ fn parse_args() -> Result<Args, String> {
             "--once" => a.once = true,
             "--cycles" => {
                 let v = it.next().ok_or("--cycles needs a count")?;
-                a.cycles = Some(v.parse::<u64>().map_err(|_| format!("--cycles: `{v}` is not a number"))?);
+                a.cycles = Some(
+                    v.parse::<u64>()
+                        .map_err(|_| format!("--cycles: `{v}` is not a number"))?,
+                );
             }
             // A command-line override that can only ever make the bot safer. There is
             // deliberately no `--transmit` counterpart: broadcasting is a config decision, made
@@ -156,7 +181,10 @@ fn main() {
               "loaded variables from .env (values are never logged)");
     }
 
-    let runtime = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
         Ok(r) => r,
         Err(e) => {
             eprintln!("dubu-updater: cannot start the async runtime: {e}");
@@ -175,6 +203,14 @@ fn main() {
 
 /// Everything resolved at startup, so the cycle never has to ask again.
 struct Runtime {
+    /// The sealed block timestamp the per-block work last ran at.
+    ///
+    /// The cycle runs at the quote cadence now, several times per block, but some of what it does
+    /// is keyed to a block rather than to a quote: reading Swap logs, and stamping a reference for
+    /// markout to compare fills against. Both would repeat themselves for every cycle inside the
+    /// same block -- one as wasted `eth_getLogs` calls, the other as duplicate reference samples
+    /// carrying an identical timestamp.
+    last_block_work: u64,
     cfg: Config,
     facts: ChainFacts,
     /// Ordinary RPC: transactions, nonce, receipts, startup metadata. Canonical.
@@ -232,6 +268,10 @@ enum Wake {
     Head(u64),
     /// The fallback timer. Normal only while heads are absent.
     Fallback,
+    /// The quote clock. The normal case now: the cycle paces itself rather than waiting for a
+    /// head, because the posted spread has to cover the reference's drift over the re-quote
+    /// interval and a one-second interval was setting the spread.
+    Tick,
 }
 
 impl Wake {
@@ -240,6 +280,7 @@ impl Wake {
             Self::Startup => "startup",
             Self::Head(_) => "head",
             Self::Fallback => "fallback_timer",
+            Self::Tick => "quote_tick",
         }
     }
 
@@ -276,7 +317,9 @@ async fn run(args: &Args) -> Result<i32, Box<dyn std::error::Error>> {
     );
 
     // Every check that needs the chain, before the loop is allowed to compute anything.
-    let facts = dubu_updater::chain::verify_against_chain(&rpc, cfg.chain.pool, cfg.chain.multicall3, &cfg).await?;
+    let facts =
+        dubu_updater::chain::verify_against_chain(&rpc, cfg.chain.pool, cfg.chain.multicall3, &cfg)
+            .await?;
 
     // A missing key is fatal only when something is actually going to be broadcast. A dry run
     // has to work with no key material present at all — that is most of what makes it safe to
@@ -311,9 +354,9 @@ async fn run(args: &Args) -> Result<i32, Box<dyn std::error::Error>> {
             Some(a) if a == facts.updater => {}
             Some(a) => {
                 return Err(format!(
-                    "transmit_allowed is set but the loaded key is {a}, and the pool's updater is {}",
-                    facts.updater
-                )
+                "transmit_allowed is set but the loaded key is {a}, and the pool's updater is {}",
+                facts.updater
+            )
                 .into())
             }
             None => return Err("transmit_allowed is set but no key is loaded".into()),
@@ -401,7 +444,10 @@ async fn run(args: &Args) -> Result<i32, Box<dyn std::error::Error>> {
     // One task per venue a pair actually names. A venue is enabled by being used, not by a
     // separate switch, so there is no way to configure a venue that connects and quotes nothing.
     let venues = cfg.venues();
-    let feeds = Arc::new(VenueFeeds::new(&venues, Duration::from_millis(cfg.feed.stale_after_ms)));
+    let feeds = Arc::new(VenueFeeds::new(
+        &venues,
+        Duration::from_millis(cfg.feed.stale_after_ms),
+    ));
     let mut feed_tasks = Vec::new();
     for venue in &venues {
         let symbols = cfg.venue_symbols(*venue);
@@ -411,7 +457,9 @@ async fn run(args: &Args) -> Result<i32, Box<dyn std::error::Error>> {
             VenueId::Bybit => Box::new(bybit::Client::new(&symbols)),
             VenueId::Coinbase => Box::new(coinbase::Client::new(&symbols)),
         };
-        let Some(shared) = feeds.venue(*venue) else { continue };
+        let Some(shared) = feeds.venue(*venue) else {
+            continue;
+        };
         info!(
             target: "startup", event = "venue", venue = %venue,
             url = %cfg.feed.urls.get(*venue),
@@ -442,7 +490,10 @@ async fn run(args: &Args) -> Result<i32, Box<dyn std::error::Error>> {
 
     // Started before the reader, because the reader's call list depends on whether there is a
     // maker to read a deliverable for.
-    let RfqLeg { shared: rfq_shared, maker: rfq_maker } = start_rfq(&cfg)?;
+    let RfqLeg {
+        shared: rfq_shared,
+        maker: rfq_maker,
+    } = start_rfq(&cfg)?;
 
     // With the RFQ leg on, the batch also carries what the maker can deliver — its balance and its
     // allowance to `PmmSettle`, per token. Folded in here rather than fetched separately so both
@@ -457,10 +508,18 @@ async fn run(args: &Args) -> Result<i32, Box<dyn std::error::Error>> {
             rfq_maker,
             r.pmm_settle.parse()?,
         ),
-        _ => ChainReader::new(cfg.chain.pool, cfg.chain.multicall3, pair_ids, facts.tokens.clone()),
+        _ => ChainReader::new(
+            cfg.chain.pool,
+            cfg.chain.multicall3,
+            pair_ids,
+            facts.tokens.clone(),
+        ),
     };
-    let vol: BTreeMap<u16, Volatility> =
-        cfg.pairs.iter().map(|p| (p.pair_id, Volatility::new(cfg.skew.vol_config()))).collect();
+    let vol: BTreeMap<u16, Volatility> = cfg
+        .pairs
+        .iter()
+        .map(|p| (p.pair_id, Volatility::new(cfg.skew.vol_config())))
+        .collect();
 
     // Both trip bounds come from the pair's OWN configuration — the floor is its half-spread and
     // the ceiling is `half_spread + width/2`, its absorption limit — which is what lets one global
@@ -520,6 +579,7 @@ async fn run(args: &Args) -> Result<i32, Box<dyn std::error::Error>> {
     ));
     let cfg_pool = cfg.chain.pool;
     let mut rt = Runtime {
+        last_block_work: 0,
         cfg,
         facts,
         rpc,
@@ -567,7 +627,13 @@ async fn wait_for_feed(rt: &Runtime) {
             .cfg
             .pairs
             .iter()
-            .map(|p| rt.feeds.snapshots(&p.symbol, now).iter().filter(|(_, s)| s.status.is_live()).count())
+            .map(|p| {
+                rt.feeds
+                    .snapshots(&p.symbol, now)
+                    .iter()
+                    .filter(|(_, s)| s.status.is_live())
+                    .count()
+            })
             .min()
             .unwrap_or(0);
         if worst >= usize::from(rt.cfg.feed.min_venues) {
@@ -621,6 +687,8 @@ async fn quote_loop(
 ) -> i32 {
     let mut last_view: Option<ChainView> = None;
     let fallback = Duration::from_millis(rt.cfg.chain.fallback_poll_interval_ms);
+    // The cycle's own clock. Heads still wake it -- they just no longer pace it.
+    let quote_every = Duration::from_millis(rt.cfg.chain.quote_interval_ms);
     let jump_scan_every = rt.cfg.jump.scan_interval();
     let mut halted = false;
     let mut wake = Wake::Startup;
@@ -684,8 +752,16 @@ async fn quote_loop(
 
         let now = Instant::now();
         let (status, stall, best_block, last_error) = {
-            let h = rt.health.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            (h.status(now), h.stall(now), h.best_block(), h.last_error().unwrap_or("(none)").to_string())
+            let h = rt
+                .health
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            (
+                h.status(now),
+                h.stall(now),
+                h.best_block(),
+                h.last_error().unwrap_or("(none)").to_string(),
+            )
         };
         if let ChainStatus::Down { stale_secs } = status {
             let halt = Halt::Liveness {
@@ -709,7 +785,7 @@ async fn quote_loop(
 
         if !halted {
             if let Some(view) = &last_view {
-                halted = run_cycle(rt, view, status, wake, &head).await;
+                halted = run_cycle(rt, view, status, wake, &head, cycles).await;
             }
         }
 
@@ -738,11 +814,20 @@ async fn quote_loop(
         // in-memory feed snapshots, and costs zero RPC unless something actually trips. It does
         // NOT count as a wake: after scanning it goes straight back to waiting, so a scan never
         // consumes a chain read or a cycle.
-        let deadline = cycle_start + fallback;
+        // Whichever comes first: the quote clock, or the fallback that bounds how long a cycle
+        // can go without one when heads are down. With the quote clock at 200ms the fallback never
+        // wins, and that is the point -- it stays as the bound it always was rather than as the
+        // thing that decides the cadence.
+        let tick_at = cycle_start + quote_every;
+        let deadline = tick_at.min(cycle_start + fallback);
         wake = 'wait: loop {
             let now = Instant::now();
             if now >= deadline {
-                break Wake::Fallback;
+                break if deadline == tick_at {
+                    Wake::Tick
+                } else {
+                    Wake::Fallback
+                };
             }
             let next_scan = (now + jump_scan_every).min(deadline);
             tokio::select! {
@@ -813,13 +898,23 @@ async fn jump_scan(rt: &mut Runtime) {
         // No reference means no observation. The detector's own anchor then ages, and a gap past
         // `vol_max_sample_ms` trips it as `feed_gap` on recovery — which is the right answer,
         // because the pool spent the outage armed behind a fixed ladder.
-        let Ok(reference) = fair_value::combine(&quotes, &rt.cfg.feed.mad_params()) else { continue };
+        let Ok(reference) = fair_value::combine(&quotes, &rt.cfg.feed.mad_params()) else {
+            continue;
+        };
 
-        let Some(vol) = rt.vol.get(&pair_id) else { continue };
-        let Some(obs) = rt.jump.observe(pair_id, reference.micro, now, vol) else { continue };
+        let Some(vol) = rt.vol.get(&pair_id) else {
+            continue;
+        };
+        let Some(obs) = rt.jump.observe(pair_id, reference.micro, now, vol) else {
+            continue;
+        };
 
         if let Some(reason) = obs.tripped {
-            let level = if obs.edge { "JUMP" } else { "jump (already withdrawn)" };
+            let level = if obs.edge {
+                "JUMP"
+            } else {
+                "jump (already withdrawn)"
+            };
             warn!(
                 target: "jump", event = "trip", pair_id, symbol = %symbol,
                 reason = reason.label(), edge = obs.edge,
@@ -875,10 +970,22 @@ async fn withdraw_pair(rt: &mut Runtime, pair_id: u16, why: &str) {
     if let Some(rfq) = &rt.rfq {
         rfq.retire(pair_id);
     }
-    let intent = Intent::RefreshCapacity { pair_id, bid: 0, ask: 0 };
+    let intent = Intent::RefreshCapacity {
+        pair_id,
+        bid: 0,
+        ask: 0,
+    };
     let started = Instant::now();
-    match rt.sender.send_with_fees(&rt.rpc, intent, Some(rt.withdraw_fees)).await {
-        Ok(Sent::DryRun { calldata, would_be_nonce, .. }) => info!(
+    match rt
+        .sender
+        .send_with_fees(&rt.rpc, intent, Some(rt.withdraw_fees))
+        .await
+    {
+        Ok(Sent::DryRun {
+            calldata,
+            would_be_nonce,
+            ..
+        }) => info!(
             target: "tx", event = "withdraw_dry_run", pair_id, why,
             calldata = %dubu_updater::chain::hex0x(&calldata),
             would_be_nonce = ?would_be_nonce,
@@ -923,11 +1030,18 @@ fn start_rfq(cfg: &Config) -> Result<RfqLeg, Box<dyn std::error::Error>> {
     let Some(rfq) = cfg.rfq.clone() else {
         info!(target: "rfq", event = "disabled",
               "no [rfq] section; the RFQ leg is off and routing is AMM-only");
-        return Ok(RfqLeg { shared: None, maker: Address::ZERO });
+        return Ok(RfqLeg {
+            shared: None,
+            maker: Address::ZERO,
+        });
     };
 
     let pmm_settle: Address = rfq.pmm_settle.parse()?;
-    let key = Arc::new(maker::MakerKey::load(&rfq.key_source()?, cfg.chain.chain_id, pmm_settle)?);
+    let key = Arc::new(maker::MakerKey::load(
+        &rfq.key_source()?,
+        cfg.chain.chain_id,
+        pmm_settle,
+    )?);
     let maker_address = key.address();
     let shared = Arc::new(RfqShared::new());
 
@@ -952,7 +1066,9 @@ fn start_rfq(cfg: &Config) -> Result<RfqLeg, Box<dyn std::error::Error>> {
     let serve_shared = Arc::clone(&shared);
     let chain_id = cfg.chain.chain_id;
     tokio::spawn(async move {
-        if let Err(e) = serve::run(&rfq.serve, serve_shared, key, params, chain_id, pmm_settle).await {
+        if let Err(e) =
+            serve::run(&rfq.serve, serve_shared, key, params, chain_id, pmm_settle).await
+        {
             // Not fatal to the quote cycle. The pool keeps quoting its curve either way, and
             // taking the ladder down because an HTTP listener died would turn a lost venue into
             // no venue.
@@ -961,7 +1077,10 @@ fn start_rfq(cfg: &Config) -> Result<RfqLeg, Box<dyn std::error::Error>> {
         }
     });
 
-    Ok(RfqLeg { shared: Some(shared), maker: maker_address })
+    Ok(RfqLeg {
+        shared: Some(shared),
+        maker: maker_address,
+    })
 }
 
 /// Read the fills that landed since the last cycle, mark the ones that have matured, and log both.
@@ -1018,13 +1137,24 @@ async fn scan_fills(rt: &mut Runtime, head: &heads::HeadSnapshot) {
         // true statement about the fill. Both are honest scales for "how big was this trade" —
         // what would not be is reaching for the nearest reference regardless of how far away it
         // is, which is the one thing `reference_at`'s tolerance exists to prevent.
-        let base = if log.is_bid { log.amount_in } else { log.amount_out };
-        let quote = if log.is_bid { log.amount_out } else { log.amount_in };
+        let base = if log.is_bid {
+            log.amount_in
+        } else {
+            log.amount_out
+        };
+        let quote = if log.is_bid {
+            log.amount_out
+        } else {
+            log.amount_in
+        };
         let ref_at_fill = match rt.markout.reference_at(log.pair_id, log.at_secs) {
             Some(r) => r,
             None => {
                 let scale = 10u128.pow(u32::from(meta.price_scale_exp));
-                match quote.checked_mul(scale).and_then(|n| n.checked_div(base.max(1))) {
+                match quote
+                    .checked_mul(scale)
+                    .and_then(|n| n.checked_div(base.max(1)))
+                {
                     Some(p) if p > 0 => p,
                     _ => continue,
                 }
@@ -1084,6 +1214,7 @@ async fn run_cycle(
     status: ChainStatus,
     wake: Wake,
     head: &heads::HeadSnapshot,
+    cycles: u64,
 ) -> bool {
     // Settle anything outstanding first, so `in_flight` is current when the gates run.
     for (pair_id, pending, settled) in rt.sender.poll_pending(&rt.rpc).await {
@@ -1120,27 +1251,42 @@ async fn run_cycle(
     // seconds at worst, where the projection is twelve out by construction.
     let chain_now = head.last.map_or_else(now_unix, |h| h.timestamp);
 
+    // True once per sealed block. See `Runtime::last_block_work`.
+    let block_work = chain_now > rt.last_block_work;
+    if block_work {
+        rt.last_block_work = chain_now;
+    }
+
     // One line per cycle saying what woke it and how far the read got ahead of the head. The
     // delta is the flashblocks endpoint earning its place: `pending` there is typically at or
     // ahead of the confirmed head that triggered the read, which is the freshness the split
     // exists for. A persistently negative delta would mean the read source has fallen behind
     // the head source and the endpoints want revisiting.
-    info!(
-        target: "loop", event = "cycle", woke_on = wake.label(), head = ?wake.head_number(),
-        heads_status = head.status.label(), head_age_ms = ?head.age_ms,
-        head_reconnects = head.reconnects,
-        read_block = view.block_number, block_timestamp = view.block_timestamp,
-        read_ahead_of_head = head.last.map(|h| i64::try_from(view.block_number).unwrap_or(i64::MAX)
-            - i64::try_from(h.number).unwrap_or(i64::MAX)),
-        chain = status.label(), view_age_secs = view_age,
-        // The reader task's own counters. Worth having on the cycle line because the two now run
-        // on different clocks: a cycle count that no longer matches a read count is the whole
-        // point of the split, and `quiet_polls` is the signal a fill-frequency rule would key on
-        // once there is third-party flow to see.
-        reads = rt.view.polls(), read_failures = rt.view.failures(),
-        quiet_polls = rt.view.quiet_polls(),
-        "cycle"
-    );
+    // Once a second rather than once a cycle. The cycle runs at 5Hz now and this line carries no
+    // per-cycle information -- it reports the state of the read, the head and the health, none of
+    // which move faster than a block. Emitting it every tick would bury the lines that do mean
+    // something in five times their own volume.
+    if block_work {
+        info!(
+            // Cycles since start. The line is emitted once per sealed block, so the difference
+        // between two of them IS the cycle rate -- which is the number the quote clock exists to
+        // raise and therefore the one that has to be visible rather than assumed.
+        target: "loop", event = "cycle", cycles, woke_on = wake.label(), head = ?wake.head_number(),
+            heads_status = head.status.label(), head_age_ms = ?head.age_ms,
+            head_reconnects = head.reconnects,
+            read_block = view.block_number, block_timestamp = view.block_timestamp,
+            read_ahead_of_head = head.last.map(|h| i64::try_from(view.block_number).unwrap_or(i64::MAX)
+                - i64::try_from(h.number).unwrap_or(i64::MAX)),
+            chain = status.label(), view_age_secs = view_age,
+            // The reader task's own counters. Worth having on the cycle line because the two now run
+            // on different clocks: a cycle count that no longer matches a read count is the whole
+            // point of the split, and `quiet_polls` is the signal a fill-frequency rule would key on
+            // once there is third-party flow to see.
+            reads = rt.view.polls(), read_failures = rt.view.failures(),
+            quiet_polls = rt.view.quiet_polls(),
+            "cycle"
+        );
+    }
 
     let degraded_extra = if matches!(status, ChainStatus::Degraded { .. }) {
         rt.cfg.chain.degraded_extra_half_spread_bps
@@ -1163,11 +1309,19 @@ async fn run_cycle(
 
     for i in 0..rt.cfg.pairs.len() {
         let pair = rt.cfg.pairs[i].clone();
-        let Some(meta) = rt.facts.pairs.get(&pair.pair_id).copied() else { continue };
-        let Some(snap) = view.snaps.get(&pair.pair_id).copied() else { continue };
+        let Some(meta) = rt.facts.pairs.get(&pair.pair_id).copied() else {
+            continue;
+        };
+        let Some(snap) = view.snaps.get(&pair.pair_id).copied() else {
+            continue;
+        };
 
         let now = Instant::now();
-        let shift = units::price_shift(meta.price_scale_exp, meta.base_decimals, meta.quote_decimals);
+        let shift = units::price_shift(
+            meta.price_scale_exp,
+            meta.base_decimals,
+            meta.quote_decimals,
+        );
 
         // Re-assert a withdrawal the chain does not show. The fast lane sends once, on the edge;
         // if that transaction was rejected, dropped, or sent while the RPC was unavailable, the
@@ -1222,11 +1376,21 @@ async fn run_cycle(
             Err(e) => e.status(),
         };
 
-        let Some(vol) = rt.vol.get_mut(&pair.pair_id) else { continue };
+        let Some(vol) = rt.vol.get_mut(&pair.pair_id) else {
+            continue;
+        };
         let fair = match &reference {
             Ok(r) => {
                 vol.observe(r.micro, now);
-                log_reference(&pair.symbol, pair.pair_id, r, &snaps, shift, vol);
+                log_reference(
+                    &pair.symbol,
+                    pair.pair_id,
+                    r,
+                    &snaps,
+                    shift,
+                    vol,
+                    block_work,
+                );
                 units::to_pool_price(r.micro, shift)
             }
             // No branch on the error side: markout's reference history must contain only prices
@@ -1253,8 +1417,10 @@ async fn run_cycle(
         // Stamped with the block timestamp, not the wall clock, because the fills these marks are
         // compared against carry block timestamps too. Mixing the two clocks would put a systematic
         // offset between a fill and its own reference.
-        if let Some(f) = fair {
-            rt.markout.observe_reference(pair.pair_id, chain_now, f);
+        if block_work {
+            if let Some(f) = fair {
+                rt.markout.observe_reference(pair.pair_id, chain_now, f);
+            }
         }
 
         let base_balance = view.balances.get(&meta.base).copied().unwrap_or(0);
@@ -1290,8 +1456,16 @@ async fn run_cycle(
 
         // The row is solved against the capacity that will be in force when it executes: the
         // one already on chain, unless this cycle is also going to post a new epoch.
-        let bid_cap = if snap.bid_capacity == 0 { capacity.bid } else { snap.bid_capacity };
-        let ask_cap = if snap.ask_capacity == 0 { capacity.ask } else { snap.ask_capacity };
+        let bid_cap = if snap.bid_capacity == 0 {
+            capacity.bid
+        } else {
+            snap.bid_capacity
+        };
+        let ask_cap = if snap.ask_capacity == 0 {
+            capacity.ask
+        } else {
+            snap.ask_capacity
+        };
 
         // Publish this market to the RFQ endpoint, or withdraw it.
         //
@@ -1315,15 +1489,27 @@ async fn run_cycle(
                     price_scale_exp: meta.price_scale_exp,
                     sigma_millibps,
                     base_balance: view.maker_deliverable.get(&meta.base).copied().unwrap_or(0),
-                    quote_balance: view.maker_deliverable.get(&meta.quote).copied().unwrap_or(0),
+                    quote_balance: view
+                        .maker_deliverable
+                        .get(&meta.quote)
+                        .copied()
+                        .unwrap_or(0),
                     // Subtract the curve's epoch only if it comes out of the same account. The
                     // maker and the pool are normally different addresses holding different
                     // tokens, and taking the pool's commitment off the maker's balance is
                     // comparing two balance sheets that never meet — it made a maker holding 500
                     // mWETH of allowance refuse a one-mWETH order because the *pool* had promised
                     // 1000.
-                    epoch_ask_base: if rt.rfq_shares_pool_inventory { ask_cap } else { 0 },
-                    epoch_bid_base: if rt.rfq_shares_pool_inventory { bid_cap } else { 0 },
+                    epoch_ask_base: if rt.rfq_shares_pool_inventory {
+                        ask_cap
+                    } else {
+                        0
+                    },
+                    epoch_bid_base: if rt.rfq_shares_pool_inventory {
+                        bid_cap
+                    } else {
+                        0
+                    },
                 }),
                 None => rfq.retire(pair.pair_id),
             }
@@ -1346,23 +1532,25 @@ async fn run_cycle(
         // Every row, every cycle. Without these five fields, back-solving `s1` from history later
         // is guesswork — `vol_decibps` next to `capped` is what says whether the model or the
         // ceiling has been doing the deciding.
-        info!(
-            target: "spread", event = "half_spread", pair_id = pair.pair_id, symbol = %pair.symbol,
-            s0_bps = spread.s0_bps,
-            sigma_millibps = spread.sigma_millibps,
-            sigma_horizon_secs = rt.cfg.skew.vol_horizon_secs,
-            vol_samples,
-            s1 = rt.cfg.spread.vol_coefficient,
-            vol_decibps = spread.vol_decibps,
-            vol_bps = spread.vol_bps(),
-            vol_scaled_bps = spread.vol_scaled_bps,
-            capped = spread.capped,
-            cap_bps = rt.cfg.spread.max_half_spread_bps,
-            degraded_extra_bps = spread.degraded_extra_bps,
-            half_spread_bps = spread.half_spread_bps,
-            absorption_bps = u32::from(spread.half_spread_bps) + u32::from(pair.width_bps) / 2,
-            "volatility-scaled half-spread"
-        );
+        trace_at!(
+        block_work,
+
+                    target: "spread", event = "half_spread", pair_id = pair.pair_id, symbol = %pair.symbol,
+                    s0_bps = spread.s0_bps,
+                    sigma_millibps = spread.sigma_millibps,
+                    sigma_horizon_secs = rt.cfg.skew.vol_horizon_secs,
+                    vol_samples,
+                    s1 = rt.cfg.spread.vol_coefficient,
+                    vol_decibps = spread.vol_decibps,
+                    vol_bps = spread.vol_bps(),
+                    vol_scaled_bps = spread.vol_scaled_bps,
+                    capped = spread.capped,
+                    cap_bps = rt.cfg.spread.max_half_spread_bps,
+                    degraded_extra_bps = spread.degraded_extra_bps,
+                    half_spread_bps = spread.half_spread_bps,
+                    absorption_bps = u32::from(spread.half_spread_bps) + u32::from(pair.width_bps) / 2,
+                    "volatility-scaled half-spread"
+                );
 
         // --- the inventory skew ------------------------------------------------------------
         //
@@ -1373,7 +1561,8 @@ async fn run_cycle(
         // unvalidated.
         let skew = fair.map(|f| {
             let inventory = Inventory {
-                base_value: dubu_updater::risk::value(base_balance, f, meta.price_scale_exp).unwrap_or(0),
+                base_value: dubu_updater::risk::value(base_balance, f, meta.price_scale_exp)
+                    .unwrap_or(0),
                 // The shared quote token split evenly across pairs. Named as a simplification in
                 // `skew::Inventory`; it is the same assumption archi_v2 5.4's missing cross-asset
                 // clamp already makes.
@@ -1381,12 +1570,20 @@ async fn run_cycle(
                 target_ppm: pair.target_base_share_ppm(),
             };
             let floor_cap = skew::min_price_cap_bps(f, meta.min_price, half_spread);
-            let s = skew::compute(&inventory, sigma_sq, sigma_millibps, &rt.cfg.skew.params(), floor_cap);
+            let s = skew::compute(
+                &inventory,
+                sigma_sq,
+                sigma_millibps,
+                &rt.cfg.skew.params(),
+                floor_cap,
+            );
 
             // Every row, every cycle. This is the input to tuning gamma later, and without it
             // gamma is guesswork: `raw_decibps` next to `applied_bps` is what says whether the
             // model or the clamp has been doing the deciding.
-            info!(
+            trace_at!(
+block_work,
+
                 target: "skew", event = "skew", pair_id = pair.pair_id, symbol = %pair.symbol,
                 imbalance_ppm = s.imbalance_ppm,
                 target_ppm = inventory.target_ppm,
@@ -1428,23 +1625,27 @@ async fn run_cycle(
         });
 
         if let Some(r) = &row {
-            let h = |p: u128| units::from_pool_price(p, shift).map(|v| units::format_fixed(v, FEED_SCALE));
-            info!(
-                target: "ladder", event = "row", pair_id = pair.pair_id, symbol = %pair.symbol,
-                min_bid = %r.ladder.min_bid, max_bid = %r.ladder.max_bid,
-                min_ask = %r.ladder.min_ask, max_ask = %r.ladder.max_ask,
-                human_max_bid = ?h(r.ladder.max_bid), human_min_ask = ?h(r.ladder.min_ask),
-                bid_target = %r.bid_target, ask_target = %r.ask_target,
-                realised_bid = %r.realised_bid, realised_ask = %r.realised_ask,
-                bid_width = %r.bid.width, ask_width = %r.ask.width,
-                bid_binding = ?r.bid.binding, ask_binding = ?r.ask.binding,
-                ask_repaired = r.ask_repaired,
-                bid_capture_cost = %r.bid_capture_cost, ask_capture_cost = %r.ask_capture_cost,
-                skew_bps = skew.map_or(0, |s| s.applied_bps),
-                fair = %r.fair, mid = %r.mid,
-                word = %r.word.to_hex().unwrap_or_default(),
-                "ladder computed and validated"
-            );
+            let h = |p: u128| {
+                units::from_pool_price(p, shift).map(|v| units::format_fixed(v, FEED_SCALE))
+            };
+            trace_at!(
+            block_work,
+
+                            target: "ladder", event = "row", pair_id = pair.pair_id, symbol = %pair.symbol,
+                            min_bid = %r.ladder.min_bid, max_bid = %r.ladder.max_bid,
+                            min_ask = %r.ladder.min_ask, max_ask = %r.ladder.max_ask,
+                            human_max_bid = ?h(r.ladder.max_bid), human_min_ask = ?h(r.ladder.min_ask),
+                            bid_target = %r.bid_target, ask_target = %r.ask_target,
+                            realised_bid = %r.realised_bid, realised_ask = %r.realised_ask,
+                            bid_width = %r.bid.width, ask_width = %r.ask.width,
+                            bid_binding = ?r.bid.binding, ask_binding = ?r.ask.binding,
+                            ask_repaired = r.ask_repaired,
+                            bid_capture_cost = %r.bid_capture_cost, ask_capture_cost = %r.ask_capture_cost,
+                            skew_bps = skew.map_or(0, |s| s.applied_bps),
+                            fair = %r.fair, mid = %r.mid,
+                            word = %r.word.to_hex().unwrap_or_default(),
+                            "ladder computed and validated"
+                        );
         }
 
         let ctx = Context {
@@ -1477,22 +1678,24 @@ async fn run_cycle(
         });
         let capacity_decision = policy::evaluate_capacity(&ctx);
 
-        info!(
-            target: "policy", event = "decision", pair_id = pair.pair_id, symbol = %pair.symbol,
-            quote = quote_decision.label(), quote_detail = ?quote_decision,
-            capacity = capacity_decision.label(), capacity_detail = ?capacity_decision,
-            quote_age_secs = snap.quote_age_secs(chain_now),
-            heartbeat_limit_secs = ctx.heartbeat_limit(),
-            bid_used = %snap.bid_used(), ask_used = %snap.ask_used(),
-            bid_capacity = %snap.bid_capacity, ask_capacity = %snap.ask_capacity,
-            block = view.block_number, block_timestamp = view.block_timestamp,
-            view_age_secs = view_age, feed = feed_status.label(), chain = status.label(),
-            venues_live = quotes.len(), venues_configured = snaps.len(),
-            half_spread_bps = half_spread,
-            jump_state = rt.jump.detector(pair.pair_id).map_or("disabled", |d| d.state().label()),
-            jump_trips = rt.jump.detector(pair.pair_id).map_or(0, jump::Detector::trips),
-            "decision"
-        );
+        trace_at!(
+        block_work,
+
+                    target: "policy", event = "decision", pair_id = pair.pair_id, symbol = %pair.symbol,
+                    quote = quote_decision.label(), quote_detail = ?quote_decision,
+                    capacity = capacity_decision.label(), capacity_detail = ?capacity_decision,
+                    quote_age_secs = snap.quote_age_secs(chain_now),
+                    heartbeat_limit_secs = ctx.heartbeat_limit(),
+                    bid_used = %snap.bid_used(), ask_used = %snap.ask_used(),
+                    bid_capacity = %snap.bid_capacity, ask_capacity = %snap.ask_capacity,
+                    block = view.block_number, block_timestamp = view.block_timestamp,
+                    view_age_secs = view_age, feed = feed_status.label(), chain = status.label(),
+                    venues_live = quotes.len(), venues_configured = snaps.len(),
+                    half_spread_bps = half_spread,
+                    jump_state = rt.jump.detector(pair.pair_id).map_or("disabled", |d| d.state().label()),
+                    jump_trips = rt.jump.detector(pair.pair_id).map_or(0, jump::Detector::trips),
+                    "decision"
+                );
 
         // What goes out when both fired, and in what order.
         //
@@ -1520,7 +1723,10 @@ async fn run_cycle(
         // `ladder::build` already solves against the *planned* capacity when the on-chain one is
         // zero, so the row is coherent against the epoch that is about to follow it.
         let quote_intent = || match row.as_ref().map(ladder::QuoteRow::packed) {
-            Some(Ok(word)) => Some(Intent::UpdateQuote { pair_id: pair.pair_id, word }),
+            Some(Ok(word)) => Some(Intent::UpdateQuote {
+                pair_id: pair.pair_id,
+                word,
+            }),
             Some(Err(e)) => {
                 error!(target: "ladder", event = "pack_failed", pair_id = pair.pair_id,
                        error = %e, "a validated row would not pack; dropped");
@@ -1576,7 +1782,9 @@ async fn run_cycle(
         emit(rt, intent).await;
     }
 
-    scan_fills(rt, head).await;
+    if block_work {
+        scan_fills(rt, head).await;
+    }
 
     // The killswitches. Skipped entirely when any pair has no fair value: marking inventory
     // against a price we do not have would be an invention, and an invented NAV is worse than
@@ -1585,19 +1793,23 @@ async fn run_cycle(
         let quote_balance = view.balances.get(&rt.facts.nav_token).copied().unwrap_or(0);
         match rt.kill.observe(quote_balance, &positions, now_unix()) {
             Ok((obs, halt)) => {
-                info!(
-                    target: "risk", event = "mark",
-                    nav = %obs.nav, revaluation = %obs.revaluation, trade_pnl = %obs.trade_pnl,
-                    drawdown = %obs.drawdown, cumulative_trade_loss = %obs.cumulative_trade_loss,
-                    seeded = obs.seeded, "NAV marked"
-                );
+                trace_at!(
+                block_work,
+
+                                    target: "risk", event = "mark",
+                                    nav = %obs.nav, revaluation = %obs.revaluation, trade_pnl = %obs.trade_pnl,
+                                    drawdown = %obs.drawdown, cumulative_trade_loss = %obs.cumulative_trade_loss,
+                                    seeded = obs.seeded, "NAV marked"
+                                );
                 if let Some(h) = halt {
                     error!(target: "risk", event = "halt", switch = h.label(), reason = %h,
                            "KILLSWITCH TRIPPED; withdrawing quotes and exiting");
                     return true;
                 }
             }
-            Err(e) => warn!(target: "risk", event = "mark_failed", error = %e, "could not mark NAV"),
+            Err(e) => {
+                warn!(target: "risk", event = "mark_failed", error = %e, "could not mark NAV")
+            }
         }
     } else {
         info!(target: "risk", event = "mark_skipped", have = positions.len(), want = rt.cfg.pairs.len(),
@@ -1620,8 +1832,10 @@ fn log_reference(
     snaps: &[(VenueId, dubu_updater::feed::FeedSnapshot)],
     shift: i32,
     vol: &Volatility,
+    loud: bool,
 ) {
-    info!(
+    trace_at!(
+        loud,
         target: "feed", event = "reference", pair_id, symbol = %symbol,
         micro = %units::format_fixed(r.micro, FEED_SCALE),
         median = %units::format_fixed(r.median, FEED_SCALE),
@@ -1650,7 +1864,11 @@ fn log_reference(
 
 async fn emit(rt: &mut Runtime, intent: Intent) {
     match rt.sender.send(&rt.rpc, intent).await {
-        Ok(Sent::DryRun { calldata, would_be_hash, would_be_nonce }) => info!(
+        Ok(Sent::DryRun {
+            calldata,
+            would_be_hash,
+            would_be_nonce,
+        }) => info!(
             target: "tx", event = "dry_run", pair_id = intent.pair_id(), kind = intent.label(),
             to = %rt.cfg.chain.pool, calldata = %dubu_updater::chain::hex0x(&calldata),
             calldata_bytes = calldata.len(), would_be_hash = ?would_be_hash, would_be_nonce = ?would_be_nonce,
@@ -1679,7 +1897,11 @@ async fn emit(rt: &mut Runtime, intent: Intent) {
 /// broken, and an error here must not stop the remaining pairs from being withdrawn.
 async fn withdraw_quotes(cfg: &Config, rpc: &Rpc, sender: &mut Sender) {
     for p in &cfg.pairs {
-        let intent = Intent::RefreshCapacity { pair_id: p.pair_id, bid: 0, ask: 0 };
+        let intent = Intent::RefreshCapacity {
+            pair_id: p.pair_id,
+            bid: 0,
+            ask: 0,
+        };
         match sender.send(rpc, intent).await {
             Ok(Sent::DryRun { calldata, .. }) => info!(
                 target: "tx", event = "withdraw_dry_run", pair_id = p.pair_id,
@@ -1720,4 +1942,3 @@ async fn wait_for_signal() {
         let _ = tokio::signal::ctrl_c().await;
     }
 }
-

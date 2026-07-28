@@ -73,7 +73,9 @@ impl Client {
     /// Build from `(venue symbol, canonical symbol)` pairs.
     #[must_use]
     pub fn new(symbols: &[(String, String)]) -> Self {
-        Self { symbols: symbols.iter().cloned().collect() }
+        Self {
+            symbols: symbols.iter().cloned().collect(),
+        }
     }
 }
 
@@ -88,11 +90,17 @@ impl MarketFeed for Client {
             .keys()
             .map(|s| format!(r#"{{"channel":"bbo-tbt","instId":"{s}"}}"#))
             .collect();
-        vec![format!(r#"{{"op":"subscribe","args":[{}]}}"#, args.join(","))]
+        vec![format!(
+            r#"{{"op":"subscribe","args":[{}]}}"#,
+            args.join(",")
+        )]
     }
 
     fn keepalive(&self) -> Option<(std::time::Duration, String)> {
-        Some((std::time::Duration::from_secs(KEEPALIVE_SECS), "ping".to_string()))
+        Some((
+            std::time::Duration::from_secs(KEEPALIVE_SECS),
+            "ping".to_string(),
+        ))
     }
 
     fn parse(&mut self, text: &str) -> Result<Option<Update>, String> {
@@ -103,11 +111,20 @@ impl MarketFeed for Client {
             return Ok(None);
         }
         if let Some(rest) = text.strip_prefix(r#"{"event":"error""#) {
-            return Err(format!("subscription rejected: {}", rest.trim_end_matches('}')));
+            return Err(format!(
+                "subscription rejected: {}",
+                rest.trim_end_matches('}')
+            ));
         }
-        let Ok(frame) = serde_json::from_str::<Frame>(text) else { return Ok(None) };
-        let Some(symbol) = self.symbols.get(&frame.arg.inst_id) else { return Ok(None) };
-        let Some(bbo) = frame.data.first() else { return Ok(None) };
+        let Ok(frame) = serde_json::from_str::<Frame>(text) else {
+            return Ok(None);
+        };
+        let Some(symbol) = self.symbols.get(&frame.arg.inst_id) else {
+            return Ok(None);
+        };
+        let Some(bbo) = frame.data.first() else {
+            return Ok(None);
+        };
 
         let (Some(bid), Some(ask)) = (bbo.bids.first(), bbo.asks.first()) else {
             // A book with a side missing is not a top of book. Dropping it is right: the
@@ -130,7 +147,11 @@ impl MarketFeed for Client {
             ask: f("asks[0][0]", &ask[0])?,
             ask_qty: f("asks[0][1]", &ask[1])?,
         };
-        Ok(Some(Update { symbol: symbol.clone(), tick, reset: false }))
+        Ok(Some(Update {
+            symbol: symbol.clone(),
+            tick,
+            reset: false,
+        }))
     }
 }
 
@@ -139,7 +160,10 @@ mod tests {
     use super::*;
 
     fn client() -> Client {
-        Client::new(&[("ETH-USDT".into(), "ETHUSDT".into()), ("BTC-USDT".into(), "BTCUSDT".into())])
+        Client::new(&[
+            ("ETH-USDT".into(), "ETHUSDT".into()),
+            ("BTC-USDT".into(), "BTCUSDT".into()),
+        ])
     }
 
     /// Captured verbatim off `wss://ws.okx.com:8443/ws/v5/public`.
@@ -147,7 +171,10 @@ mod tests {
 
     #[test]
     fn parses_a_real_bbo_frame() {
-        let u = client().parse(LIVE).unwrap().expect("frame carries a book update");
+        let u = client()
+            .parse(LIVE)
+            .unwrap()
+            .expect("frame carries a book update");
         assert_eq!(u.symbol, "ETHUSDT");
         assert!(!u.reset);
         assert_eq!(u.tick.update_id, 72_498_651_540);
@@ -175,8 +202,13 @@ mod tests {
             .unwrap()
             .is_none());
         // A rejected subscription must not look like a quiet venue.
-        let err = c.parse(r#"{"event":"error","code":"60012","msg":"Invalid request"}"#).unwrap_err();
-        assert!(err.contains("60012"), "the error must carry the venue's code: {err}");
+        let err = c
+            .parse(r#"{"event":"error","code":"60012","msg":"Invalid request"}"#)
+            .unwrap_err();
+        assert!(
+            err.contains("60012"),
+            "the error must carry the venue's code: {err}"
+        );
     }
 
     #[test]
@@ -198,6 +230,7 @@ mod tests {
         assert!(frames[0].contains(r#"{"channel":"bbo-tbt","instId":"ETH-USDT"}"#));
         assert!(frames[0].contains(r#"{"channel":"bbo-tbt","instId":"BTC-USDT"}"#));
         // It has to be valid JSON, since a malformed frame is answered with a close.
-        serde_json::from_str::<serde_json::Value>(&frames[0]).expect("subscribe frame must be JSON");
+        serde_json::from_str::<serde_json::Value>(&frames[0])
+            .expect("subscribe frame must be JSON");
     }
 }

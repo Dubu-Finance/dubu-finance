@@ -164,7 +164,12 @@ impl Volatility {
     /// A fresh estimator with no history.
     #[must_use]
     pub const fn new(cfg: VolConfig) -> Self {
-        Self { cfg, var_per_sec: 0, last: None, samples: 0 }
+        Self {
+            cfg,
+            var_per_sec: 0,
+            last: None,
+            samples: 0,
+        }
     }
 
     /// How many returns have been folded in. Below a few `tau`s the estimate is still warming up,
@@ -190,7 +195,8 @@ impl Volatility {
             self.last = Some((price, now));
             return;
         };
-        let dt_ms = u64::try_from(now.saturating_duration_since(t0).as_millis()).unwrap_or(u64::MAX);
+        let dt_ms =
+            u64::try_from(now.saturating_duration_since(t0).as_millis()).unwrap_or(u64::MAX);
         if dt_ms < self.cfg.min_sample_ms {
             // Too close together to divide by. Keep the old anchor so the next sample spans a
             // sensible interval rather than starting over.
@@ -232,7 +238,10 @@ impl Volatility {
     pub const fn sigma_sq_bps_e6(&self) -> u128 {
         // sigma_rel^2 over the horizon is `var_per_sec * horizon` in (1/REL)^2 units. In bps^2
         // that is `* REL^2 / 10^8`, i.e. `* 10^-8`; scaled by 10^6 it is `/ 100`.
-        (self.var_per_sec.saturating_mul(self.cfg.horizon_secs as u128)) / 100
+        (self
+            .var_per_sec
+            .saturating_mul(self.cfg.horizon_secs as u128))
+            / 100
     }
 
     /// `sigma` over the configured horizon, in thousandths of a basis point.
@@ -421,13 +430,17 @@ pub fn min_price_cap_bps(fair: u128, min_price: u128, half_spread_bps: u16) -> u
     if fair == 0 {
         return 0;
     }
-    let Some(mid_min) = mul_div_ceil(min_price, BPS, BPS - hs) else { return 0 };
+    let Some(mid_min) = mul_div_ceil(min_price, BPS, BPS - hs) else {
+        return 0;
+    };
     let mid_min = mid_min.saturating_add(1);
     if fair <= mid_min {
         return 0;
     }
     // skew <= BPS - ceil(mid_min * BPS / fair)
-    let Some(needed) = mul_div_ceil(mid_min, BPS, fair) else { return 0 };
+    let Some(needed) = mul_div_ceil(mid_min, BPS, fair) else {
+        return 0;
+    };
     let cap = BPS.saturating_sub(needed);
     u16::try_from(cap.min(MAX_BPS)).unwrap_or(0)
 }
@@ -471,12 +484,14 @@ pub fn compute(
 
     // skew_decibps = 10 * gamma * q * sigma^2 / 10_000, in two steps so no intermediate is
     // larger than it has to be. `step` is `gamma * sigma^2 * 1_000`.
-    let step = mul_div_floor(sigma_sq_bps_e6, u128::from(params.gamma_e2), 100_000).unwrap_or(u128::MAX);
+    let step =
+        mul_div_floor(sigma_sq_bps_e6, u128::from(params.gamma_e2), 100_000).unwrap_or(u128::MAX);
     let magnitude = mul_div_floor(step, u128::from(q.unsigned_abs()), 1_000_000_000_000)
         .unwrap_or(u128::from(u32::MAX));
     let magnitude = i64::try_from(magnitude).unwrap_or(i64::from(i32::MAX));
     let raw_decibps_i64 = if q < 0 { -magnitude } else { magnitude };
-    let raw_decibps = i32::try_from(raw_decibps_i64).unwrap_or(if q < 0 { i32::MIN } else { i32::MAX });
+    let raw_decibps =
+        i32::try_from(raw_decibps_i64).unwrap_or(if q < 0 { i32::MIN } else { i32::MAX });
 
     // Round half away from zero, so a 0.5 bp skew becomes 1 bp rather than 0. `dubu-core` takes
     // whole bps; sub-bp resolution would mean a second implementation of the skew here, which is
@@ -520,11 +535,20 @@ mod tests {
     use std::time::Duration;
 
     fn vol_cfg() -> VolConfig {
-        VolConfig { tau_ms: 60_000, horizon_secs: 300, min_sample_ms: 100, max_sample_ms: 10_000 }
+        VolConfig {
+            tau_ms: 60_000,
+            horizon_secs: 300,
+            min_sample_ms: 100,
+            max_sample_ms: 10_000,
+        }
     }
 
     fn params() -> SkewParams {
-        SkewParams { gamma_e2: 10_000, max_positive_bps: 30, max_negative_bps: 10 }
+        SkewParams {
+            gamma_e2: 10_000,
+            max_positive_bps: 30,
+            max_negative_bps: 10,
+        }
     }
 
     /// A pool holding `base_pct` of its book in base, against a 50% target.
@@ -550,9 +574,21 @@ mod tests {
         }
         assert_eq!(v.sigma_sq_bps_e6(), 0);
         assert_eq!(v.sigma_millibps(), 0);
-        let s = compute(&inv(90), v.sigma_sq_bps_e6(), v.sigma_millibps(), &params(), 9_999);
-        assert_eq!(s.applied_bps, 0, "no volatility means no risk to skew against");
-        assert_ne!(s.imbalance_ppm, 0, "... and it is not because the imbalance is zero");
+        let s = compute(
+            &inv(90),
+            v.sigma_sq_bps_e6(),
+            v.sigma_millibps(),
+            &params(),
+            9_999,
+        );
+        assert_eq!(
+            s.applied_bps, 0,
+            "no volatility means no risk to skew against"
+        );
+        assert_ne!(
+            s.imbalance_ppm, 0,
+            "... and it is not because the imbalance is zero"
+        );
     }
 
     #[test]
@@ -590,8 +626,14 @@ mod tests {
             t += Duration::from_millis(1_000);
         }
         let one_sec = v.sigma_bps_e2_over_ms(1_000);
-        assert!((90..=110).contains(&one_sec), "expected ~100 hundredths of a bp, got {one_sec}");
-        assert!((16_000..=19_000).contains(&v.sigma_millibps()), "sigma(300s) should be ~17.3 bp");
+        assert!(
+            (90..=110).contains(&one_sec),
+            "expected ~100 hundredths of a bp, got {one_sec}"
+        );
+        assert!(
+            (16_000..=19_000).contains(&v.sigma_millibps()),
+            "sigma(300s) should be ~17.3 bp"
+        );
 
         // Square-root-of-time between the two sampling rates the loop actually uses: a 200ms
         // fast-lane scan and a 1s cycle scan differ by exactly sqrt(5) = 2.236. That is what makes
@@ -608,7 +650,10 @@ mod tests {
         // which is what makes this one estimator rather than two that happen to be near each other.
         // `isqrt(sigma_sq_bps_e6)` is milli-bps, so `/10` puts it in hundredths of a bp.
         let from_horizon = isqrt(v.sigma_sq_bps_e6() / 300) / 10;
-        assert!(from_horizon.abs_diff(u128::from(one_sec)) <= 2, "{from_horizon} vs {one_sec}");
+        assert!(
+            from_horizon.abs_diff(u128::from(one_sec)) <= 2,
+            "{from_horizon} vs {one_sec}"
+        );
     }
 
     #[test]
@@ -621,18 +666,31 @@ mod tests {
     #[test]
     fn the_horizon_scales_as_the_square_root_of_time() {
         let feed = |horizon| {
-            let mut v = Volatility::new(VolConfig { horizon_secs: horizon, ..vol_cfg() });
+            let mut v = Volatility::new(VolConfig {
+                horizon_secs: horizon,
+                ..vol_cfg()
+            });
             let mut t = Instant::now();
             let base = 100_000_000_000u128;
             for i in 0..1_000 {
-                v.observe(if i % 2 == 0 { base } else { base + base / 1_000 }, t);
+                v.observe(
+                    if i % 2 == 0 {
+                        base
+                    } else {
+                        base + base / 1_000
+                    },
+                    t,
+                );
                 t += Duration::from_millis(1_000);
             }
             v.sigma_millibps()
         };
         // 4x the horizon is 2x the sigma, within integer rounding.
         let (a, b) = (feed(300), feed(1_200));
-        assert!(b > 19 * a / 10 && b < 21 * a / 10, "sqrt-of-time broke: {a} -> {b}");
+        assert!(
+            b > 19 * a / 10 && b < 21 * a / 10,
+            "sqrt-of-time broke: {a} -> {b}"
+        );
     }
 
     #[test]
@@ -673,7 +731,11 @@ mod tests {
         v.observe(100_000_000_000, t);
         v.reset();
         v.observe(200_000_000_000, t + Duration::from_secs(1));
-        assert_eq!(v.samples(), 0, "the first post-reset observation is an anchor, not a return");
+        assert_eq!(
+            v.samples(),
+            0,
+            "the first post-reset observation is an anchor, not a return"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -686,9 +748,18 @@ mod tests {
         let sig = 900 * 1_000_000;
         let long = compute(&inv(70), sig, 30_000, &params(), 9_999);
         let short = compute(&inv(30), sig, 30_000, &params(), 9_999);
-        assert!(long.imbalance_ppm > 0 && long.applied_bps > 0, "long must push the book DOWN");
-        assert!(short.imbalance_ppm < 0 && short.applied_bps < 0, "short must push the book UP");
-        assert_eq!(long.applied_bps, -short.applied_bps, "the model itself is symmetric");
+        assert!(
+            long.imbalance_ppm > 0 && long.applied_bps > 0,
+            "long must push the book DOWN"
+        );
+        assert!(
+            short.imbalance_ppm < 0 && short.applied_bps < 0,
+            "short must push the book UP"
+        );
+        assert_eq!(
+            long.applied_bps, -short.applied_bps,
+            "the model itself is symmetric"
+        );
 
         // At target, no skew at all.
         let flat = compute(&inv(50), sig, 30_000, &params(), 9_999);
@@ -701,9 +772,16 @@ mod tests {
     fn the_documented_worked_example_comes_out_where_the_docs_say() {
         // 20% away from target, sigma 10 bps (the live ETHUSDT measurement), gamma 1000 -> 2 bp.
         // This is the number the module docs quote to justify gamma's range, so it is pinned.
-        let i = Inventory { base_value: 700_000, quote_share: 300_000, target_ppm: 500_000 };
+        let i = Inventory {
+            base_value: 700_000,
+            quote_share: 300_000,
+            target_ppm: 500_000,
+        };
         assert_eq!(i.imbalance_ppm(), 200_000);
-        let live = SkewParams { gamma_e2: 100_000, ..params() };
+        let live = SkewParams {
+            gamma_e2: 100_000,
+            ..params()
+        };
         let s = compute(&i, 100 * 1_000_000, 10_000, &live, 9_999);
         assert_eq!(s.raw_decibps, 20, "2.0 bp");
         assert_eq!(s.applied_bps, 2);
@@ -711,7 +789,11 @@ mod tests {
         // ... and the live book's own state, which the dry-run log shows: 11.2% off target at
         // sigma 9 bps gives just under a bp, so the feature is visibly on rather than rounding to
         // nothing. This is the sample that says gamma is in the right decade.
-        let live_book = Inventory { base_value: 611_617, quote_share: 388_383, target_ppm: 500_000 };
+        let live_book = Inventory {
+            base_value: 611_617,
+            quote_share: 388_383,
+            target_ppm: 500_000,
+        };
         assert_eq!(live_book.imbalance_ppm(), 111_617);
         let s = compute(&live_book, 81 * 1_000_000, 9_000, &live, 9_999);
         assert_eq!(s.raw_decibps, 9);
@@ -724,9 +806,31 @@ mod tests {
         // The entire reason for reaching for A-S. Doubling volatility must quadruple the skew,
         // not double it — that is what a hand-rolled `kappa * q` gets wrong.
         let i = inv(70);
-        let calm = compute(&i, 900 * 1_000_000, 30_000, &SkewParams { max_positive_bps: 9_999, ..params() }, 9_999);
-        let fast = compute(&i, 3_600 * 1_000_000, 60_000, &SkewParams { max_positive_bps: 9_999, ..params() }, 9_999);
-        assert_eq!(fast.raw_decibps, 4 * calm.raw_decibps, "2x sigma must be 4x skew");
+        let calm = compute(
+            &i,
+            900 * 1_000_000,
+            30_000,
+            &SkewParams {
+                max_positive_bps: 9_999,
+                ..params()
+            },
+            9_999,
+        );
+        let fast = compute(
+            &i,
+            3_600 * 1_000_000,
+            60_000,
+            &SkewParams {
+                max_positive_bps: 9_999,
+                ..params()
+            },
+            9_999,
+        );
+        assert_eq!(
+            fast.raw_decibps,
+            4 * calm.raw_decibps,
+            "2x sigma must be 4x skew"
+        );
     }
 
     #[test]
@@ -740,7 +844,10 @@ mod tests {
         assert_eq!(long.clamp, Clamp::PositiveCap);
         assert_eq!(short.applied_bps, -10);
         assert_eq!(short.clamp, Clamp::NegativeCap);
-        assert!(short.applied_bps.abs() < long.applied_bps, "the book-lifting cap must be tighter");
+        assert!(
+            short.applied_bps.abs() < long.applied_bps,
+            "the book-lifting cap must be tighter"
+        );
     }
 
     #[test]
@@ -759,11 +866,23 @@ mod tests {
         let fair = 1_010_000_000_000_000u128;
         let min_price = 1_000_000_000_000_000u128;
         let cap = min_price_cap_bps(fair, min_price, 5);
-        assert!((90..=99).contains(&cap), "expected ~94 bp of headroom, got {cap}");
+        assert!(
+            (90..=99).contains(&cap),
+            "expected ~94 bp of headroom, got {cap}"
+        );
 
         // A skew the model wants to push past it is held at the floor and says so. sigma of
         // 200 bp over the horizon on a fully-long book wants 200 bp of skew; the floor allows 94.
-        let s = compute(&inv(100), 40_000 * 1_000_000, 200_000, &SkewParams { max_positive_bps: 9_999, ..params() }, cap);
+        let s = compute(
+            &inv(100),
+            40_000 * 1_000_000,
+            200_000,
+            &SkewParams {
+                max_positive_bps: 9_999,
+                ..params()
+            },
+            cap,
+        );
         assert_eq!(s.raw_decibps, 2_000, "the model wants 200 bp");
         assert_eq!(s.applied_bps, i16::try_from(cap).unwrap());
         assert_eq!(s.clamp, Clamp::MinPriceFloor);
@@ -773,15 +892,26 @@ mod tests {
         // does still build a row, and one bp more really would not.
         let row = |skew| {
             ladder::build(&crate::ladder::RowInputs {
-                pair_id: 1, fair, half_spread_bps: 5, width_bps: 25, skew_bps: skew,
+                pair_id: 1,
+                fair,
+                half_spread_bps: 5,
+                width_bps: 25,
+                skew_bps: skew,
                 capture: 20_000_000_000_000_000_000,
                 bid_capacity: 1_000_000_000_000_000_000_000,
                 ask_capacity: 1_000_000_000_000_000_000_000,
-                min_price, price_scale_exp: 24,
+                min_price,
+                price_scale_exp: 24,
             })
         };
-        assert!(row(s.applied_bps).is_ok(), "the clamped skew must still produce a row");
-        assert!(row(s.applied_bps + 1).is_err(), "and one bp more must not — the clamp is tight");
+        assert!(
+            row(s.applied_bps).is_ok(),
+            "the clamped skew must still produce a row"
+        );
+        assert!(
+            row(s.applied_bps + 1).is_err(),
+            "and one bp more must not — the clamp is tight"
+        );
     }
 
     #[test]
@@ -796,7 +926,10 @@ mod tests {
         let cap = min_price_cap_bps(1_943_820_000_000_000, min_price, 5);
         assert_eq!(cap, 4_852);
         assert!(u128::from(cap) < MAX_BPS);
-        assert!(cap > params().max_positive_bps * 100, "the configured cap binds first");
+        assert!(
+            cap > params().max_positive_bps * 100,
+            "the configured cap binds first"
+        );
     }
 
     #[test]
@@ -813,16 +946,27 @@ mod tests {
 
     #[test]
     fn an_empty_book_has_no_imbalance_rather_than_a_division_by_zero() {
-        let i = Inventory { base_value: 0, quote_share: 0, target_ppm: 500_000 };
+        let i = Inventory {
+            base_value: 0,
+            quote_share: 0,
+            target_ppm: 500_000,
+        };
         assert_eq!(i.imbalance_ppm(), 0);
-        assert_eq!(compute(&i, 900 * 1_000_000, 30_000, &params(), 9_999).applied_bps, 0);
+        assert_eq!(
+            compute(&i, 900 * 1_000_000, 30_000, &params(), 9_999).applied_bps,
+            0
+        );
     }
 
     #[test]
     fn the_target_is_configuration_and_moving_it_moves_the_imbalance() {
         // The knob is a share of the book, so the same balances read differently against
         // different targets — which is the whole point of it not being a constant.
-        let holdings = |target| Inventory { base_value: 600, quote_share: 400, target_ppm: target };
+        let holdings = |target| Inventory {
+            base_value: 600,
+            quote_share: 400,
+            target_ppm: target,
+        };
         assert_eq!(holdings(500_000).imbalance_ppm(), 100_000);
         assert_eq!(holdings(600_000).imbalance_ppm(), 0);
         assert_eq!(holdings(800_000).imbalance_ppm(), -200_000);
@@ -838,13 +982,21 @@ mod tests {
         let fair = 1_943_820_000_000_000u128;
         for skew in [-9_999i16, -1_000, -30, -1, 0, 1, 30, 1_000, 9_999] {
             for hs in [1u16, 5, 8, 100] {
-                let b = LadderBuilder { skew_bps: skew, half_spread_bps: hs, ..LadderBuilder::new(fair) };
+                let b = LadderBuilder {
+                    skew_bps: skew,
+                    half_spread_bps: hs,
+                    ..LadderBuilder::new(fair)
+                };
                 let mid = b.skewed_mid().unwrap();
                 let bid = mul_div_floor(mid, BPS - u128::from(hs), BPS).unwrap();
                 let ask = mul_div_ceil(mid, BPS + u128::from(hs), BPS).unwrap();
-                assert!(bid < ask, "skew {skew} / hs {hs} crossed the book: {bid} >= {ask}");
+                assert!(
+                    bid < ask,
+                    "skew {skew} / hs {hs} crossed the book: {bid} >= {ask}"
+                );
                 let l = b.build().unwrap();
-                l.validate(0).expect("every skew in range must still validate on chain");
+                l.validate(0)
+                    .expect("every skew in range must still validate on chain");
             }
         }
     }

@@ -174,7 +174,9 @@ fn expand_env(field: &str, template: &str) -> Result<String, ConfigError> {
         out.push_str(&rest[..start]);
         let after = &rest[start + 2..];
         let end = after.find('}').ok_or_else(|| {
-            invalid(format!("{field}: unterminated `${{` in the URL template; expected `${{VAR}}`"))
+            invalid(format!(
+                "{field}: unterminated `${{` in the URL template; expected `${{VAR}}`"
+            ))
         })?;
         let name = &after[..end];
         match std::env::var(name) {
@@ -231,7 +233,9 @@ fn redact_url(url: &str) -> String {
 ///
 /// Returns how many variables this file actually set.
 pub fn load_dotenv(path: &Path) -> usize {
-    let Ok(text) = std::fs::read_to_string(path) else { return 0 };
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return 0;
+    };
     let mut set = 0;
     for line in text.lines() {
         let line = line.trim();
@@ -239,7 +243,9 @@ pub fn load_dotenv(path: &Path) -> usize {
             continue;
         }
         let line = line.strip_prefix("export ").unwrap_or(line);
-        let Some((key, value)) = line.split_once('=') else { continue };
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
         let key = key.trim();
         if key.is_empty() || std::env::var_os(key).is_some() {
             continue;
@@ -346,22 +352,25 @@ impl RfqConfig {
     /// two, so the section is required to name a source rather than being allowed to default to
     /// none.
     pub fn key_source(&self) -> Result<KeySource, ConfigError> {
-        let source = match (&self.private_key_env, &self.private_key_file) {
-            (Some(_), Some(_)) => {
-                return Err(invalid("rfq: set exactly one of private_key_env / private_key_file, not both"))
-            }
-            (None, None) => {
-                return Err(invalid(
+        let source =
+            match (&self.private_key_env, &self.private_key_file) {
+                (Some(_), Some(_)) => {
+                    return Err(invalid(
+                        "rfq: set exactly one of private_key_env / private_key_file, not both",
+                    ))
+                }
+                (None, None) => return Err(invalid(
                     "rfq: no signing key; set private_key_env or private_key_file, or remove the \
                      [rfq] section to run without the RFQ leg",
-                ))
-            }
-            (Some(v), None) => KeySource::Env(v.clone()),
-            (None, Some(p)) => KeySource::File(p.clone()),
-        };
+                )),
+                (Some(v), None) => KeySource::Env(v.clone()),
+                (None, Some(p)) => KeySource::File(p.clone()),
+            };
         if let KeySource::Env(name) = &source {
             if name.trim().is_empty() {
-                return Err(invalid("rfq.private_key_env: must name an environment variable"));
+                return Err(invalid(
+                    "rfq.private_key_env: must name an environment variable",
+                ));
             }
             if name.starts_with("0x") || name.len() >= 64 {
                 return Err(invalid(
@@ -378,14 +387,20 @@ impl RfqConfig {
     /// # Errors
     /// [`ConfigError::Units`].
     pub fn max_notional_units(&self) -> Result<u128, ConfigError> {
-        Ok(units::parse_fixed(&self.max_notional_per_order, self.quote_decimals)?)
+        Ok(units::parse_fixed(
+            &self.max_notional_per_order,
+            self.quote_decimals,
+        )?)
     }
 
     /// The pricing parameters, as `quoting` wants them.
     ///
     /// # Errors
     /// [`ConfigError::Units`] if the notional cap is not a decimal number.
-    pub fn params(&self, vol_horizon_secs: u64) -> Result<crate::quoting::MakerParams, ConfigError> {
+    pub fn params(
+        &self,
+        vol_horizon_secs: u64,
+    ) -> Result<crate::quoting::MakerParams, ConfigError> {
         Ok(crate::quoting::MakerParams {
             base_half_spread_e2: self.base_half_spread_e2,
             sigma_coefficient_e2: self.sigma_coefficient_e2,
@@ -408,8 +423,10 @@ impl Config {
     /// [`ConfigError`] for an unreadable file, a parse failure (including an unknown field), or
     /// any failed range check.
     pub fn load(path: &Path) -> Result<Self, ConfigError> {
-        let text = std::fs::read_to_string(path)
-            .map_err(|source| ConfigError::Io { path: path.to_path_buf(), source })?;
+        let text = std::fs::read_to_string(path).map_err(|source| ConfigError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
         let cfg: Self = toml::from_str(&text)?;
         cfg.validate()?;
         Ok(cfg)
@@ -437,12 +454,18 @@ impl Config {
         for p in &self.pairs {
             p.validate(self.feed.min_venues)?;
             if !seen_ids.insert(p.pair_id) {
-                return Err(invalid(format!("pairs: pair_id {} appears twice", p.pair_id)));
+                return Err(invalid(format!(
+                    "pairs: pair_id {} appears twice",
+                    p.pair_id
+                )));
             }
             // Two pairs on one symbol is not obviously wrong, but it is never what was meant,
             // and it doubles the quote traffic for one price.
             if !seen_symbols.insert(p.symbol.clone()) {
-                return Err(invalid(format!("pairs: symbol `{}` appears twice", p.symbol)));
+                return Err(invalid(format!(
+                    "pairs: symbol `{}` appears twice",
+                    p.symbol
+                )));
             }
             // A cap below a pair's own half-spread would silently NARROW the configured spread —
             // `spread::compute` refuses to do that, so the config would quietly mean something
@@ -483,7 +506,11 @@ impl Config {
     pub fn venue_symbols(&self, venue: VenueId) -> Vec<(String, String)> {
         self.pairs
             .iter()
-            .filter_map(|p| p.venues.symbol(venue).map(|s| (s.to_string(), p.symbol.clone())))
+            .filter_map(|p| {
+                p.venues
+                    .symbol(venue)
+                    .map(|s| (s.to_string(), p.symbol.clone()))
+            })
             .collect()
     }
 }
@@ -568,6 +595,17 @@ pub struct ChainConfig {
     /// head cadence this timer essentially never fires.
     #[serde(default = "d_fallback_poll_interval_ms")]
     pub fallback_poll_interval_ms: u64,
+    /// How often the quote cycle runs, in milliseconds.
+    ///
+    /// The cycle used to be driven by `newHeads`, which made one second the floor on how often the
+    /// pool could re-price -- and the posted spread has to cover the reference's drift over exactly
+    /// that window, so the clock was setting the spread. It has its own timer now; heads are one
+    /// more thing that can wake it early, not the thing that paces it.
+    ///
+    /// Below the chain reader's own interval the cycle starts seeing the same view twice, which is
+    /// harmless (the reference, not the view, is what moves a quote) but buys nothing.
+    #[serde(default = "d_quote_interval_ms")]
+    pub quote_interval_ms: u64,
     /// Per-request HTTP timeout.
     #[serde(default = "d_request_timeout_ms")]
     pub request_timeout_ms: u64,
@@ -628,6 +666,9 @@ fn d_ws_reconnect_max_ms() -> u64 {
 fn d_fallback_poll_interval_ms() -> u64 {
     2_000
 }
+fn d_quote_interval_ms() -> u64 {
+    200
+}
 fn d_request_timeout_ms() -> u64 {
     8_000
 }
@@ -663,15 +704,21 @@ impl ChainConfig {
     /// that it stays correct if the chain's cadence changes.
     #[must_use]
     pub const fn head_stale_after(&self) -> std::time::Duration {
-        std::time::Duration::from_millis(self.block_time_ms.saturating_mul(self.head_stale_blocks as u64))
+        std::time::Duration::from_millis(
+            self.block_time_ms
+                .saturating_mul(self.head_stale_blocks as u64),
+        )
     }
 
     fn validate(&self) -> Result<(), ConfigError> {
-        for (name, url) in
-            [("rpc_url", &self.rpc_url), ("flashblocks_rpc_url", &self.flashblocks_rpc_url)]
-        {
+        for (name, url) in [
+            ("rpc_url", &self.rpc_url),
+            ("flashblocks_rpc_url", &self.flashblocks_rpc_url),
+        ] {
             if !url.is_http() {
-                return Err(invalid(format!("chain.{name}: must be an http(s) URL, got `{url}`")));
+                return Err(invalid(format!(
+                    "chain.{name}: must be an http(s) URL, got `{url}`"
+                )));
             }
         }
         // A websocket URL is not optional and an http one will never subscribe: the endpoint
@@ -722,18 +769,31 @@ impl ChainConfig {
         if !(500..=120_000).contains(&self.request_timeout_ms) {
             return Err(invalid("chain.request_timeout_ms: must be 500..=120000"));
         }
-        if !(self.requests_per_sec.is_finite() && self.requests_per_sec > 0.0 && self.requests_per_sec <= 1_000.0) {
-            return Err(invalid("chain.requests_per_sec: must be a finite value in (0, 1000]"));
+        if !(self.requests_per_sec.is_finite()
+            && self.requests_per_sec > 0.0
+            && self.requests_per_sec <= 1_000.0)
+        {
+            return Err(invalid(
+                "chain.requests_per_sec: must be a finite value in (0, 1000]",
+            ));
         }
-        if !(self.request_burst.is_finite() && self.request_burst >= 1.0 && self.request_burst <= 2_000.0) {
-            return Err(invalid("chain.request_burst: must be a finite value in [1, 2000]"));
+        if !(self.request_burst.is_finite()
+            && self.request_burst >= 1.0
+            && self.request_burst <= 2_000.0)
+        {
+            return Err(invalid(
+                "chain.request_burst: must be a finite value in [1, 2000]",
+            ));
         }
-        if self.ws_reconnect_initial_ms == 0 || self.ws_reconnect_max_ms < self.ws_reconnect_initial_ms {
+        if self.ws_reconnect_initial_ms == 0
+            || self.ws_reconnect_max_ms < self.ws_reconnect_initial_ms
+        {
             return Err(invalid(
                 "chain.ws_reconnect_max_ms must be >= ws_reconnect_initial_ms, which must be non-zero",
             ));
         }
-        if self.rate_limit_backoff_initial_ms == 0 || self.rate_limit_backoff_max_ms < self.rate_limit_backoff_initial_ms
+        if self.rate_limit_backoff_initial_ms == 0
+            || self.rate_limit_backoff_max_ms < self.rate_limit_backoff_initial_ms
         {
             return Err(invalid(
                 "chain.rate_limit_backoff_max_ms must be >= rate_limit_backoff_initial_ms, which must be non-zero",
@@ -765,7 +825,9 @@ impl ChainConfig {
             return Err(invalid("chain.view_stale_secs: must be non-zero"));
         }
         if self.degraded_extra_half_spread_bps as u128 > dubu_core::ladder::MAX_BPS {
-            return Err(invalid("chain.degraded_extra_half_spread_bps: must be <= 9999"));
+            return Err(invalid(
+                "chain.degraded_extra_half_spread_bps: must be <= 9999",
+            ));
         }
         Ok(())
     }
@@ -925,7 +987,9 @@ impl FeedConfig {
             return Err(invalid("feed.stale_after_ms: must be 100..=600000"));
         }
         if self.reconnect_initial_ms == 0 || self.reconnect_max_ms < self.reconnect_initial_ms {
-            return Err(invalid("feed.reconnect_max_ms must be >= reconnect_initial_ms, which must be non-zero"));
+            return Err(invalid(
+                "feed.reconnect_max_ms must be >= reconnect_initial_ms, which must be non-zero",
+            ));
         }
         if self.read_timeout_ms < self.stale_after_ms {
             return Err(invalid(format!(
@@ -961,7 +1025,9 @@ impl FeedConfig {
             ));
         }
         if !self.max_dispersion_bps.is_finite() || self.max_dispersion_bps <= 0.0 {
-            return Err(invalid("feed.max_dispersion_bps: must be finite and non-zero"));
+            return Err(invalid(
+                "feed.max_dispersion_bps: must be finite and non-zero",
+            ));
         }
         // Otherwise the regime gate fires before the outlier filter is ever consulted, and the
         // bot stops quoting on the ordinary disagreement the floor was chosen to tolerate.
@@ -1080,7 +1146,10 @@ impl SkewConfig {
             return Err(invalid("skew.gamma: must be a finite value in (0, 100000]"));
         }
         let max_bps = dubu_core::ladder::MAX_BPS;
-        for (name, v) in [("max_positive_bps", self.max_positive_bps), ("max_negative_bps", self.max_negative_bps)] {
+        for (name, v) in [
+            ("max_positive_bps", self.max_positive_bps),
+            ("max_negative_bps", self.max_negative_bps),
+        ] {
             if u128::from(v) > max_bps {
                 return Err(invalid(format!("skew.{name}: must be <= {max_bps}")));
             }
@@ -1294,7 +1363,10 @@ impl JumpConfig {
     /// # Errors
     /// [`ConfigError::Units`] if the string is not a decimal.
     pub fn withdraw_priority_fee_wei(&self) -> Result<u128, ConfigError> {
-        Ok(units::parse_fixed(&self.withdraw_priority_fee_per_gas_gwei, 9)?)
+        Ok(units::parse_fixed(
+            &self.withdraw_priority_fee_per_gas_gwei,
+            9,
+        )?)
     }
 
     fn validate(&self, chain: &ChainConfig) -> Result<(), ConfigError> {
@@ -1330,7 +1402,9 @@ impl JumpConfig {
         let max = self.withdraw_max_fee_wei()?;
         let tip = self.withdraw_priority_fee_wei()?;
         if max == 0 {
-            return Err(invalid("jump.withdraw_max_fee_per_gas_gwei: must be non-zero"));
+            return Err(invalid(
+                "jump.withdraw_max_fee_per_gas_gwei: must be non-zero",
+            ));
         }
         if tip > max {
             return Err(invalid(format!(
@@ -1420,9 +1494,9 @@ impl TxConfig {
     /// [`ConfigError::Invalid`] if both sources are set.
     pub fn key_source(&self) -> Result<Option<KeySource>, ConfigError> {
         match (&self.private_key_env, &self.private_key_file) {
-            (Some(_), Some(_)) => {
-                Err(invalid("tx: set exactly one of private_key_env / private_key_file, not both"))
-            }
+            (Some(_), Some(_)) => Err(invalid(
+                "tx: set exactly one of private_key_env / private_key_file, not both",
+            )),
             (Some(v), None) => Ok(Some(KeySource::Env(v.clone()))),
             (None, Some(p)) => Ok(Some(KeySource::File(p.clone()))),
             (None, None) => Ok(None),
@@ -1455,7 +1529,9 @@ impl TxConfig {
         }
         if let Some(KeySource::Env(name)) = &key {
             if name.trim().is_empty() {
-                return Err(invalid("tx.private_key_env: must name an environment variable"));
+                return Err(invalid(
+                    "tx.private_key_env: must name an environment variable",
+                ));
             }
             // A hex string here means someone pasted the key where the variable name goes.
             if name.starts_with("0x") || name.len() >= 64 {
@@ -1543,10 +1619,14 @@ impl RiskConfig {
         let bleed = self.bleed_limit_units()?;
         let budget = self.loss_budget_units()?;
         if bleed == 0 {
-            return Err(invalid("risk.bleed_limit: must be non-zero; a zero limit trips instantly"));
+            return Err(invalid(
+                "risk.bleed_limit: must be non-zero; a zero limit trips instantly",
+            ));
         }
         if budget == 0 {
-            return Err(invalid("risk.loss_budget: must be non-zero; a zero budget trips instantly"));
+            return Err(invalid(
+                "risk.loss_budget: must be non-zero; a zero budget trips instantly",
+            ));
         }
         if budget < bleed {
             return Err(invalid(format!(
@@ -1607,7 +1687,9 @@ impl PairVenues {
 
     /// Every venue this pair is quoted on, in a stable order.
     pub fn iter(&self) -> impl Iterator<Item = (VenueId, &str)> {
-        VenueId::ALL.into_iter().filter_map(|v| self.symbol(v).map(|s| (v, s)))
+        VenueId::ALL
+            .into_iter()
+            .filter_map(|v| self.symbol(v).map(|s| (v, s)))
     }
 
     /// How many venues quote this pair.
@@ -1722,7 +1804,9 @@ impl PairConfig {
     /// [`Self::target_base_share_pct`] in parts per million of the pair's book.
     #[must_use]
     pub fn target_base_share_ppm(&self) -> u32 {
-        (self.target_base_share_pct * 10_000.0).round().clamp(0.0, 1_000_000.0) as u32
+        (self.target_base_share_pct * 10_000.0)
+            .round()
+            .clamp(0.0, 1_000_000.0) as u32
     }
 
     /// [`Self::adverse_drift_bps`] in deci-bps (tenths of a bps), which is the precision
@@ -1741,10 +1825,15 @@ impl PairConfig {
     fn validate(&self, min_venues: u8) -> Result<(), ConfigError> {
         let id = self.pair_id;
         if id == 0 {
-            return Err(invalid("pairs.pair_id: 0 is reserved and is never a real pair"));
+            return Err(invalid(
+                "pairs.pair_id: 0 is reserved and is never a real pair",
+            ));
         }
         if self.symbol.is_empty() || !self.symbol.bytes().all(|b| b.is_ascii_alphanumeric()) {
-            return Err(invalid(format!("pairs[{id}].symbol: must be alphanumeric, got `{}`", self.symbol)));
+            return Err(invalid(format!(
+                "pairs[{id}].symbol: must be alphanumeric, got `{}`",
+                self.symbol
+            )));
         }
         // A pair that names fewer venues than the quorum needs can never quote. Refusing here
         // rather than discovering it as a permanent `no_quorum` at run time is the difference
@@ -1758,20 +1847,30 @@ impl PairConfig {
         }
         for (venue, symbol) in self.venues.iter() {
             if symbol.trim().is_empty() {
-                return Err(invalid(format!("pairs[{id}].venues.{venue}: must not be empty")));
+                return Err(invalid(format!(
+                    "pairs[{id}].venues.{venue}: must not be empty"
+                )));
             }
         }
         if self.base_decimals > 30 || self.quote_decimals > 30 {
-            return Err(invalid(format!("pairs[{id}]: token decimals must be <= 30")));
+            return Err(invalid(format!(
+                "pairs[{id}]: token decimals must be <= 30"
+            )));
         }
         let max_bps = dubu_core::ladder::MAX_BPS;
         if u128::from(self.half_spread_bps) > max_bps {
-            return Err(invalid(format!("pairs[{id}].half_spread_bps: must be <= {max_bps}")));
+            return Err(invalid(format!(
+                "pairs[{id}].half_spread_bps: must be <= {max_bps}"
+            )));
         }
         if u128::from(self.width_bps) > max_bps {
-            return Err(invalid(format!("pairs[{id}].width_bps: must be <= {max_bps}")));
+            return Err(invalid(format!(
+                "pairs[{id}].width_bps: must be <= {max_bps}"
+            )));
         }
-        if !self.target_base_share_pct.is_finite() || !(0.0..=100.0).contains(&self.target_base_share_pct) {
+        if !self.target_base_share_pct.is_finite()
+            || !(0.0..=100.0).contains(&self.target_base_share_pct)
+        {
             return Err(invalid(format!(
                 "pairs[{id}].target_base_share_pct: must be a finite value in [0, 100], got {}",
                 self.target_base_share_pct
@@ -1799,7 +1898,9 @@ impl PairConfig {
         // `PropPool` holds capacity in a uint96.
         for (name, v) in [("bid_capacity", bid_cap), ("ask_capacity", ask_cap)] {
             if v > dubu_core::curve::MAX_AMOUNT {
-                return Err(invalid(format!("pairs[{id}].{name}: exceeds the pool's uint96 capacity field")));
+                return Err(invalid(format!(
+                    "pairs[{id}].{name}: exceeds the pool's uint96 capacity field"
+                )));
             }
         }
         // The solver clamps capture to capacity anyway, but a capture above capacity means the
@@ -1814,13 +1915,19 @@ impl PairConfig {
         }
 
         if self.heartbeat_secs == 0 {
-            return Err(invalid(format!("pairs[{id}].heartbeat_secs: must be non-zero")));
+            return Err(invalid(format!(
+                "pairs[{id}].heartbeat_secs: must be non-zero"
+            )));
         }
         if !self.adverse_drift_bps.is_finite() || !self.favourable_drift_bps.is_finite() {
-            return Err(invalid(format!("pairs[{id}]: drift thresholds must be finite")));
+            return Err(invalid(format!(
+                "pairs[{id}]: drift thresholds must be finite"
+            )));
         }
         if self.adverse_drift_bps <= 0.0 || self.favourable_drift_bps <= 0.0 {
-            return Err(invalid(format!("pairs[{id}]: drift thresholds must be non-zero")));
+            return Err(invalid(format!(
+                "pairs[{id}]: drift thresholds must be non-zero"
+            )));
         }
         if self.adverse_drift_bps > self.favourable_drift_bps {
             return Err(invalid(format!(
@@ -1830,7 +1937,9 @@ impl PairConfig {
             )));
         }
         if !(1..=100).contains(&self.capacity_divergence_pct) {
-            return Err(invalid(format!("pairs[{id}].capacity_divergence_pct: must be 1..=100")));
+            return Err(invalid(format!(
+                "pairs[{id}].capacity_divergence_pct: must be 1..=100"
+            )));
         }
         Ok(())
     }
@@ -1894,7 +2003,10 @@ capacity_divergence_pct = 30
     fn the_reference_config_loads() {
         let cfg = parse(good()).expect("reference config must validate");
         assert_eq!(cfg.pairs.len(), 1);
-        assert_eq!(cfg.pairs[0].capture_units().unwrap(), 20_000_000_000_000_000_000);
+        assert_eq!(
+            cfg.pairs[0].capture_units().unwrap(),
+            20_000_000_000_000_000_000
+        );
         assert_eq!(cfg.pairs[0].target_base_share_ppm(), 500_000);
     }
 
@@ -1918,7 +2030,9 @@ capacity_divergence_pct = 30
         assert_eq!(cfg.jump.params(&cfg.skew).sigma_k_e2, 600);
         // The withdrawal fee is 100x the ordinary tip, which is the point of it existing.
         assert_eq!(cfg.jump.withdraw_priority_fee_wei().unwrap(), 500_000_000);
-        assert!(cfg.jump.withdraw_priority_fee_wei().unwrap() > cfg.tx.max_priority_fee_wei().unwrap());
+        assert!(
+            cfg.jump.withdraw_priority_fee_wei().unwrap() > cfg.tx.max_priority_fee_wei().unwrap()
+        );
     }
 
     #[test]
@@ -1937,7 +2051,9 @@ capacity_divergence_pct = 30
         // config does not do damage — it does something other than what it says, which is what
         // this file exists to catch.
         let s = format!("{}\n[spread]\nmax_half_spread_bps = 3\n", good());
-        assert!(matches!(parse(&s), Err(ConfigError::Invalid(m)) if m.contains("can never narrow")));
+        assert!(
+            matches!(parse(&s), Err(ConfigError::Invalid(m)) if m.contains("can never narrow"))
+        );
     }
 
     #[test]
@@ -1945,7 +2061,9 @@ capacity_divergence_pct = 30
         // The withdrawal transaction would not have confirmed before the resume was already due,
         // which is a flicker rather than a withdrawal.
         let s = format!("{}\n[jump]\ncooloff_secs = 0\n", good());
-        assert!(matches!(parse(&s), Err(ConfigError::Invalid(m)) if m.contains("below one block time")));
+        assert!(
+            matches!(parse(&s), Err(ConfigError::Invalid(m)) if m.contains("below one block time"))
+        );
     }
 
     #[test]
@@ -1953,7 +2071,9 @@ capacity_divergence_pct = 30
         // The fast lane exists to beat the head cadence. Set above it, it detects nothing sooner
         // than the ordinary cycle would and only looks like it does.
         let s = format!("{}\n[jump]\nscan_interval_ms = 2000\n", good());
-        assert!(matches!(parse(&s), Err(ConfigError::Invalid(m)) if m.contains("exceeds chain.block_time_ms")));
+        assert!(
+            matches!(parse(&s), Err(ConfigError::Invalid(m)) if m.contains("exceeds chain.block_time_ms"))
+        );
     }
 
     #[test]
@@ -1984,22 +2104,41 @@ capacity_divergence_pct = 30
     #[test]
     fn a_venue_is_enabled_by_a_pair_naming_it_and_by_nothing_else() {
         let cfg = parse(good()).unwrap();
-        assert_eq!(cfg.venues(), vec![VenueId::Binance, VenueId::Okx, VenueId::Bybit]);
-        assert!(!cfg.venues().contains(&VenueId::Coinbase), "an unnamed venue must not be connected to");
-        assert_eq!(cfg.venue_symbols(VenueId::Okx), vec![("ETH-USDT".to_string(), "ETHUSDT".to_string())]);
+        assert_eq!(
+            cfg.venues(),
+            vec![VenueId::Binance, VenueId::Okx, VenueId::Bybit]
+        );
+        assert!(
+            !cfg.venues().contains(&VenueId::Coinbase),
+            "an unnamed venue must not be connected to"
+        );
+        assert_eq!(
+            cfg.venue_symbols(VenueId::Okx),
+            vec![("ETH-USDT".to_string(), "ETHUSDT".to_string())]
+        );
         assert!(cfg.venue_symbols(VenueId::Coinbase).is_empty());
     }
 
     #[test]
     fn each_venue_falls_back_to_its_public_endpoint() {
         let cfg = parse(good()).unwrap();
-        assert_eq!(cfg.feed.urls.get(VenueId::Bybit), "wss://stream.bybit.com/v5/public/spot");
+        assert_eq!(
+            cfg.feed.urls.get(VenueId::Bybit),
+            "wss://stream.bybit.com/v5/public/spot"
+        );
 
         // The override table has to come after the scalar keys or TOML reads them as its own.
-        let s = format!("{}\n[feed.urls]\nbybit = \"wss://example.test/spot\"\n", good());
+        let s = format!(
+            "{}\n[feed.urls]\nbybit = \"wss://example.test/spot\"\n",
+            good()
+        );
         let cfg = parse(&s).unwrap();
         assert_eq!(cfg.feed.urls.get(VenueId::Bybit), "wss://example.test/spot");
-        assert_eq!(cfg.feed.urls.get(VenueId::Okx), "wss://ws.okx.com:8443/ws/v5/public", "one override must not disturb the rest");
+        assert_eq!(
+            cfg.feed.urls.get(VenueId::Okx),
+            "wss://ws.okx.com:8443/ws/v5/public",
+            "one override must not disturb the rest"
+        );
     }
 
     #[test]
@@ -2013,10 +2152,13 @@ capacity_divergence_pct = 30
 
     #[test]
     fn a_pair_that_could_never_reach_quorum_is_refused_at_startup() {
-        let s = good()
-            .replace(r#"venues = { binance = "ETHUSDT", okx = "ETH-USDT", bybit = "ETHUSDT" }"#,
-                     r#"venues = { binance = "ETHUSDT" }"#);
-        assert!(matches!(parse(&s), Err(ConfigError::Invalid(m)) if m.contains("could never reach quorum")));
+        let s = good().replace(
+            r#"venues = { binance = "ETHUSDT", okx = "ETH-USDT", bybit = "ETHUSDT" }"#,
+            r#"venues = { binance = "ETHUSDT" }"#,
+        );
+        assert!(
+            matches!(parse(&s), Err(ConfigError::Invalid(m)) if m.contains("could never reach quorum"))
+        );
     }
 
     #[test]
@@ -2031,13 +2173,21 @@ capacity_divergence_pct = 30
     fn a_dispersion_limit_below_the_rejection_floor_is_refused() {
         // Otherwise the regime gate fires on the ordinary disagreement the floor exists to
         // tolerate, and the bot stops quoting for a reason that is purely arithmetic.
-        let s = good().replace("min_venues = 2", "min_venues = 2\nmad_floor_bps = 30.0\nmax_dispersion_bps = 25.0");
-        assert!(matches!(parse(&s), Err(ConfigError::Invalid(m)) if m.contains("gates before the filter runs")));
+        let s = good().replace(
+            "min_venues = 2",
+            "min_venues = 2\nmad_floor_bps = 30.0\nmax_dispersion_bps = 25.0",
+        );
+        assert!(
+            matches!(parse(&s), Err(ConfigError::Invalid(m)) if m.contains("gates before the filter runs"))
+        );
     }
 
     #[test]
     fn the_mad_knobs_reach_the_filter_at_deci_bps_resolution() {
-        let s = good().replace("min_venues = 2", "min_venues = 3\nmad_k = 4.5\nmad_floor_bps = 2.5\nmax_dispersion_bps = 25.0");
+        let s = good().replace(
+            "min_venues = 2",
+            "min_venues = 3\nmad_k = 4.5\nmad_floor_bps = 2.5\nmax_dispersion_bps = 25.0",
+        );
         let p = parse(&s).unwrap().feed.mad_params();
         assert_eq!(p.min_venues, 3);
         assert_eq!(p.k_tenths, 45);
@@ -2058,7 +2208,10 @@ capacity_divergence_pct = 30
         assert_eq!(p.max_negative_bps, 10);
         let v = cfg.skew.vol_config();
         assert_eq!(v.tau_ms, 60_000);
-        assert_eq!(v.horizon_secs, 300, "the same window as risk.bleed_window_secs");
+        assert_eq!(
+            v.horizon_secs, 300,
+            "the same window as risk.bleed_window_secs"
+        );
     }
 
     #[test]
@@ -2066,22 +2219,35 @@ capacity_divergence_pct = 30
         // Lifting the book raises the pool's BID toward fair value, which is the pick-off
         // direction. Capping it more loosely than the book-lowering direction inverts the whole
         // argument in `skew::compute`.
-        let s = good().replace("[skew]\n", "[skew]\nmax_positive_bps = 10\nmax_negative_bps = 30\n");
-        assert!(matches!(parse(&s), Err(ConfigError::Invalid(m)) if m.contains("must be the tighter cap")));
+        let s = good().replace(
+            "[skew]\n",
+            "[skew]\nmax_positive_bps = 10\nmax_negative_bps = 30\n",
+        );
+        assert!(
+            matches!(parse(&s), Err(ConfigError::Invalid(m)) if m.contains("must be the tighter cap"))
+        );
     }
 
     #[test]
     fn a_target_inventory_outside_the_book_is_refused() {
         for bad in ["-5", "150"] {
-            let s = good().replace("target_base_share_pct = 50", &format!("target_base_share_pct = {bad}"));
-            assert!(matches!(parse(&s), Err(ConfigError::Invalid(m)) if m.contains("target_base_share_pct")));
+            let s = good().replace(
+                "target_base_share_pct = 50",
+                &format!("target_base_share_pct = {bad}"),
+            );
+            assert!(
+                matches!(parse(&s), Err(ConfigError::Invalid(m)) if m.contains("target_base_share_pct"))
+            );
         }
     }
 
     #[test]
     fn dry_run_is_the_default_and_needs_no_key() {
         let cfg = parse(good()).unwrap();
-        assert!(!cfg.tx.transmit_allowed, "omitting transmit_allowed must mean dry run");
+        assert!(
+            !cfg.tx.transmit_allowed,
+            "omitting transmit_allowed must mean dry run"
+        );
         assert_eq!(cfg.tx.key_source().unwrap(), None);
     }
 
@@ -2097,12 +2263,17 @@ capacity_divergence_pct = 30
             "[tx]\n",
             "[tx]\nprivate_key_env = \"0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d\"\n",
         );
-        assert!(matches!(parse(&s), Err(ConfigError::Invalid(m)) if m.contains("NAME of an environment variable")));
+        assert!(
+            matches!(parse(&s), Err(ConfigError::Invalid(m)) if m.contains("NAME of an environment variable"))
+        );
     }
 
     #[test]
     fn both_key_sources_at_once_is_refused() {
-        let s = good().replace("[tx]\n", "[tx]\nprivate_key_env = \"K\"\nprivate_key_file = \"/k\"\n");
+        let s = good().replace(
+            "[tx]\n",
+            "[tx]\nprivate_key_env = \"K\"\nprivate_key_file = \"/k\"\n",
+        );
         assert!(matches!(parse(&s), Err(ConfigError::Invalid(m)) if m.contains("exactly one")));
     }
 
@@ -2110,9 +2281,15 @@ capacity_divergence_pct = 30
     fn an_unknown_field_is_a_hard_error_not_a_silent_default() {
         // The whole point of deny_unknown_fields: this typo would otherwise quote 5 bp while
         // its author believed it quoted 50.
-        let s = good().replace("half_spread_bps = 5", "half_spred_bps = 50\nhalf_spread_bps = 5");
+        let s = good().replace(
+            "half_spread_bps = 5",
+            "half_spred_bps = 50\nhalf_spread_bps = 5",
+        );
         let err = parse(&s).unwrap_err();
-        assert!(matches!(err, ConfigError::Parse(_)), "expected a parse error, got {err}");
+        assert!(
+            matches!(err, ConfigError::Parse(_)),
+            "expected a parse error, got {err}"
+        );
     }
 
     #[test]
@@ -2120,8 +2297,13 @@ capacity_divergence_pct = 30
         // The fallback exists to catch a dead subscription, not to race a live one. Below the
         // block time it fires between heads and quietly becomes the primary driver again —
         // which is the design the dedicated endpoint made unnecessary.
-        let s = good().replace("fallback_poll_interval_ms = 2000", "fallback_poll_interval_ms = 500");
-        assert!(matches!(parse(&s), Err(ConfigError::Invalid(m)) if m.contains("silently become the primary driver")));
+        let s = good().replace(
+            "fallback_poll_interval_ms = 2000",
+            "fallback_poll_interval_ms = 500",
+        );
+        assert!(
+            matches!(parse(&s), Err(ConfigError::Invalid(m)) if m.contains("silently become the primary driver"))
+        );
     }
 
     #[test]
@@ -2133,12 +2315,17 @@ capacity_divergence_pct = 30
             r#"ws_url = "wss://giwa-sepolia.nodit.io/TESTKEY""#,
             r#"ws_url = "https://giwa-sepolia.nodit.io/TESTKEY""#,
         );
-        assert!(matches!(parse(&s), Err(ConfigError::Invalid(m)) if m.contains("notifications not supported")));
+        assert!(
+            matches!(parse(&s), Err(ConfigError::Invalid(m)) if m.contains("notifications not supported"))
+        );
     }
 
     #[test]
     fn a_one_block_watchdog_window_is_refused() {
-        let s = good().replace("fallback_poll_interval_ms = 2000", "fallback_poll_interval_ms = 2000\nhead_stale_blocks = 1");
+        let s = good().replace(
+            "fallback_poll_interval_ms = 2000",
+            "fallback_poll_interval_ms = 2000\nhead_stale_blocks = 1",
+        );
         assert!(matches!(parse(&s), Err(ConfigError::Invalid(m)) if m.contains("ordinary jitter")));
     }
 
@@ -2150,14 +2337,19 @@ capacity_divergence_pct = 30
             "fallback_poll_interval_ms = 2000",
             "fallback_poll_interval_ms = 2000\nhead_stale_blocks = 900\nhalt_after_secs = 600",
         );
-        assert!(matches!(parse(&s), Err(ConfigError::Invalid(m)) if m.contains("never fire before the halt")));
+        assert!(
+            matches!(parse(&s), Err(ConfigError::Invalid(m)) if m.contains("never fire before the halt"))
+        );
     }
 
     #[test]
     fn the_watchdog_window_is_a_multiple_of_the_block_time() {
         let cfg = parse(good()).unwrap();
         assert_eq!(cfg.chain.block_time_ms, 1_000, "GIWA is a 1s chain");
-        assert_eq!(cfg.chain.head_stale_after(), std::time::Duration::from_secs(10));
+        assert_eq!(
+            cfg.chain.head_stale_after(),
+            std::time::Duration::from_secs(10)
+        );
     }
 
     #[test]
@@ -2169,13 +2361,17 @@ capacity_divergence_pct = 30
     #[test]
     fn a_loss_budget_below_the_bleed_limit_is_refused() {
         let s = good().replace("loss_budget = \"10000\"", "loss_budget = \"100\"");
-        assert!(matches!(parse(&s), Err(ConfigError::Invalid(m)) if m.contains("bleed switch is then dead code")));
+        assert!(
+            matches!(parse(&s), Err(ConfigError::Invalid(m)) if m.contains("bleed switch is then dead code"))
+        );
     }
 
     #[test]
     fn a_zero_half_spread_is_refused() {
         let s = good().replace("half_spread_bps = 5", "half_spread_bps = 0");
-        assert!(matches!(parse(&s), Err(ConfigError::Invalid(m)) if m.contains("quotes both sides at fair value")));
+        assert!(
+            matches!(parse(&s), Err(ConfigError::Invalid(m)) if m.contains("quotes both sides at fair value"))
+        );
     }
 
     #[test]
@@ -2192,7 +2388,9 @@ capacity_divergence_pct = 30
     #[test]
     fn a_duplicate_pair_id_is_refused() {
         let two = format!("{}{}", good(), pair_block());
-        assert!(matches!(parse(&two), Err(ConfigError::Invalid(m)) if m.contains("pair_id 1 appears twice")));
+        assert!(
+            matches!(parse(&two), Err(ConfigError::Invalid(m)) if m.contains("pair_id 1 appears twice"))
+        );
     }
 
     #[test]
@@ -2200,7 +2398,9 @@ capacity_divergence_pct = 30
         // Distinct ids, same symbol: two rows driven by one price, at double the quote traffic.
         let second = pair_block().replace("pair_id = 1", "pair_id = 2");
         let two = format!("{}{second}", good());
-        assert!(matches!(parse(&two), Err(ConfigError::Invalid(m)) if m.contains("`ETHUSDT` appears twice")));
+        assert!(
+            matches!(parse(&two), Err(ConfigError::Invalid(m)) if m.contains("`ETHUSDT` appears twice"))
+        );
     }
 
     #[test]
@@ -2230,7 +2430,10 @@ capacity_divergence_pct = 30
         let displayed = format!("{u}");
         let debugged = format!("{u:?}");
         for rendered in [&displayed, &debugged] {
-            assert!(!rendered.contains(KEY), "the API key reached a formatter: {rendered}");
+            assert!(
+                !rendered.contains(KEY),
+                "the API key reached a formatter: {rendered}"
+            );
         }
         assert_eq!(displayed, "https://giwa-sepolia.nodit.io/***");
         // ... and the host survives, because a redaction that hides which endpoint failed is
@@ -2244,22 +2447,30 @@ capacity_divergence_pct = 30
     fn redaction_covers_query_strings_and_userinfo_too() {
         // Other providers put the key in a query parameter or in userinfo. Neither shape is
         // used here, and both must still be safe if someone points the config at one.
-        let q = EndpointUrl::resolve("chain.rpc_url", "https://rpc.example.com/v1?apikey=SECRET").unwrap();
+        let q = EndpointUrl::resolve("chain.rpc_url", "https://rpc.example.com/v1?apikey=SECRET")
+            .unwrap();
         assert_eq!(q.to_string(), "https://rpc.example.com/***");
-        let ui = EndpointUrl::resolve("chain.rpc_url", "https://user:SECRET@rpc.example.com").unwrap();
+        let ui =
+            EndpointUrl::resolve("chain.rpc_url", "https://user:SECRET@rpc.example.com").unwrap();
         assert_eq!(ui.to_string(), "https://***@rpc.example.com");
         for u in [&q, &ui] {
             assert!(!u.to_string().contains("SECRET"));
         }
         // A key-free URL is left legible.
-        let plain = EndpointUrl::resolve("chain.rpc_url", "https://sepolia-rpc-flashblocks.giwa.io").unwrap();
+        let plain =
+            EndpointUrl::resolve("chain.rpc_url", "https://sepolia-rpc-flashblocks.giwa.io")
+                .unwrap();
         assert_eq!(plain.to_string(), "https://sepolia-rpc-flashblocks.giwa.io");
     }
 
     #[test]
     fn a_url_template_expands_from_the_environment() {
         std::env::set_var("DUBU_TEST_KEY_OK", KEY);
-        let u = EndpointUrl::resolve("chain.ws_url", "wss://giwa-sepolia.nodit.io/${DUBU_TEST_KEY_OK}").unwrap();
+        let u = EndpointUrl::resolve(
+            "chain.ws_url",
+            "wss://giwa-sepolia.nodit.io/${DUBU_TEST_KEY_OK}",
+        )
+        .unwrap();
         assert_eq!(u.expose(), format!("wss://giwa-sepolia.nodit.io/{KEY}"));
         assert_eq!(u.to_string(), "wss://giwa-sepolia.nodit.io/***");
         assert_eq!(u.scheme(), "wss");
@@ -2269,9 +2480,13 @@ capacity_divergence_pct = 30
     #[test]
     fn an_unset_variable_names_the_variable_and_never_the_value() {
         std::env::remove_var("DUBU_TEST_KEY_MISSING");
-        let err = EndpointUrl::resolve("chain.rpc_url", "https://h/${DUBU_TEST_KEY_MISSING}").unwrap_err();
+        let err = EndpointUrl::resolve("chain.rpc_url", "https://h/${DUBU_TEST_KEY_MISSING}")
+            .unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("DUBU_TEST_KEY_MISSING"), "must name the variable: {msg}");
+        assert!(
+            msg.contains("DUBU_TEST_KEY_MISSING"),
+            "must name the variable: {msg}"
+        );
         assert!(msg.contains(".env"), "must say where to put it: {msg}");
     }
 
@@ -2280,7 +2495,8 @@ capacity_divergence_pct = 30
         // `.env` with a blank `NODIT_API_KEY=` is the likely mistake, and a URL with an empty
         // key segment fails as a 401 at the first request — a much worse place to find out.
         std::env::set_var("DUBU_TEST_KEY_BLANK", "   ");
-        let err = EndpointUrl::resolve("chain.rpc_url", "https://h/${DUBU_TEST_KEY_BLANK}").unwrap_err();
+        let err =
+            EndpointUrl::resolve("chain.rpc_url", "https://h/${DUBU_TEST_KEY_BLANK}").unwrap_err();
         assert!(err.to_string().contains("unset or empty"));
         std::env::remove_var("DUBU_TEST_KEY_BLANK");
     }
@@ -2289,13 +2505,22 @@ capacity_divergence_pct = 30
     fn the_config_carries_a_template_and_never_a_literal_key() {
         std::env::set_var("DUBU_TEST_NODIT", KEY);
         let s = good()
-            .replace("wss://giwa-sepolia.nodit.io/TESTKEY", "wss://giwa-sepolia.nodit.io/${DUBU_TEST_NODIT}")
-            .replace("https://giwa-sepolia.nodit.io/TESTKEY", "https://giwa-sepolia.nodit.io/${DUBU_TEST_NODIT}");
+            .replace(
+                "wss://giwa-sepolia.nodit.io/TESTKEY",
+                "wss://giwa-sepolia.nodit.io/${DUBU_TEST_NODIT}",
+            )
+            .replace(
+                "https://giwa-sepolia.nodit.io/TESTKEY",
+                "https://giwa-sepolia.nodit.io/${DUBU_TEST_NODIT}",
+            );
         let cfg = parse(&s).unwrap();
         assert!(cfg.chain.ws_url.expose().ends_with(KEY));
         // The whole config Debug-printed — the shape a panic or a `{:?}` dump would produce —
         // must not contain the key anywhere.
-        assert!(!format!("{cfg:?}").contains(KEY), "the key survived a Debug dump of the config");
+        assert!(
+            !format!("{cfg:?}").contains(KEY),
+            "the key survived a Debug dump of the config"
+        );
         std::env::remove_var("DUBU_TEST_NODIT");
     }
 
@@ -2318,13 +2543,21 @@ capacity_divergence_pct = 30
 
         assert_eq!(load_dotenv(&path), 2, "only the two unset variables");
         assert_eq!(std::env::var("DUBU_TEST_DOTENV_A").unwrap(), "from_file");
-        assert_eq!(std::env::var("DUBU_TEST_DOTENV_B").unwrap(), "quoted", "one layer of quotes is stripped");
+        assert_eq!(
+            std::env::var("DUBU_TEST_DOTENV_B").unwrap(),
+            "quoted",
+            "one layer of quotes is stripped"
+        );
         assert_eq!(std::env::var("DUBU_TEST_DOTENV_C").unwrap(), "from_env");
 
         // A missing file is not an error: production sets real variables and has no `.env`.
         assert_eq!(load_dotenv(&dir.join("nope.env")), 0);
 
-        for k in ["DUBU_TEST_DOTENV_A", "DUBU_TEST_DOTENV_B", "DUBU_TEST_DOTENV_C"] {
+        for k in [
+            "DUBU_TEST_DOTENV_A",
+            "DUBU_TEST_DOTENV_B",
+            "DUBU_TEST_DOTENV_C",
+        ] {
             std::env::remove_var(k);
         }
         let _ = std::fs::remove_dir_all(&dir);

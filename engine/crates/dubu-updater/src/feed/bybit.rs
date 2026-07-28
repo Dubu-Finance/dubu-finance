@@ -87,7 +87,10 @@ impl Client {
     /// Build from `(venue symbol, canonical symbol)` pairs.
     #[must_use]
     pub fn new(symbols: &[(String, String)]) -> Self {
-        Self { symbols: symbols.iter().cloned().collect(), tops: BTreeMap::new() }
+        Self {
+            symbols: symbols.iter().cloned().collect(),
+            tops: BTreeMap::new(),
+        }
     }
 }
 
@@ -107,13 +110,22 @@ impl MarketFeed for Client {
     }
 
     fn subscribe_frames(&self) -> Vec<String> {
-        let args: Vec<String> =
-            self.symbols.keys().map(|s| format!(r#""orderbook.1.{s}""#)).collect();
-        vec![format!(r#"{{"op":"subscribe","args":[{}]}}"#, args.join(","))]
+        let args: Vec<String> = self
+            .symbols
+            .keys()
+            .map(|s| format!(r#""orderbook.1.{s}""#))
+            .collect();
+        vec![format!(
+            r#"{{"op":"subscribe","args":[{}]}}"#,
+            args.join(",")
+        )]
     }
 
     fn keepalive(&self) -> Option<(std::time::Duration, String)> {
-        Some((std::time::Duration::from_secs(KEEPALIVE_SECS), r#"{"op":"ping"}"#.to_string()))
+        Some((
+            std::time::Duration::from_secs(KEEPALIVE_SECS),
+            r#"{"op":"ping"}"#.to_string(),
+        ))
     }
 
     fn on_connect(&mut self) {
@@ -125,8 +137,12 @@ impl MarketFeed for Client {
         if text.starts_with(r#"{"success":false"#) {
             return Err(format!("subscription rejected: {text}"));
         }
-        let Ok(frame) = serde_json::from_str::<Frame>(text) else { return Ok(None) };
-        let Some(symbol) = self.symbols.get(&frame.data.s).cloned() else { return Ok(None) };
+        let Ok(frame) = serde_json::from_str::<Frame>(text) else {
+            return Ok(None);
+        };
+        let Some(symbol) = self.symbols.get(&frame.data.s).cloned() else {
+            return Ok(None);
+        };
 
         let snapshot = frame.kind == "snapshot";
         // A delta before any snapshot has nothing to merge into.
@@ -171,7 +187,11 @@ impl MarketFeed for Client {
             ask: top.ask,
             ask_qty: top.ask_qty,
         };
-        Ok(Some(Update { symbol, tick, reset: snapshot }))
+        Ok(Some(Update {
+            symbol,
+            tick,
+            reset: snapshot,
+        }))
     }
 }
 
@@ -180,7 +200,10 @@ mod tests {
     use super::*;
 
     fn client() -> Client {
-        Client::new(&[("ETHUSDT".into(), "ETHUSDT".into()), ("BTCUSDT".into(), "BTCUSDT".into())])
+        Client::new(&[
+            ("ETHUSDT".into(), "ETHUSDT".into()),
+            ("BTCUSDT".into(), "BTCUSDT".into()),
+        ])
     }
 
     /// Captured verbatim off `wss://stream.bybit.com/v5/public/spot`.
@@ -188,7 +211,10 @@ mod tests {
 
     #[test]
     fn parses_a_real_snapshot_frame() {
-        let u = client().parse(LIVE).unwrap().expect("frame carries a book update");
+        let u = client()
+            .parse(LIVE)
+            .unwrap()
+            .expect("frame carries a book update");
         assert_eq!(u.symbol, "ETHUSDT");
         assert_eq!(u.tick.update_id, 22_742_692);
         assert_eq!(u.tick.bid, 196_952_000_000);
@@ -206,9 +232,15 @@ mod tests {
         c.parse(LIVE).unwrap().unwrap();
 
         let delta = r#"{"topic":"orderbook.1.ETHUSDT","ts":1,"type":"delta","data":{"s":"ETHUSDT","b":[],"a":[["1969.60","3.0"]],"u":22742693},"cts":1}"#;
-        let u = c.parse(delta).unwrap().expect("a one-sided delta is still a book update");
+        let u = c
+            .parse(delta)
+            .unwrap()
+            .expect("a one-sided delta is still a book update");
         assert!(!u.reset, "a delta must stay sequence-checked");
-        assert_eq!(u.tick.bid, 196_952_000_000, "the untouched bid must survive the delta");
+        assert_eq!(
+            u.tick.bid, 196_952_000_000,
+            "the untouched bid must survive the delta"
+        );
         assert_eq!(u.tick.bid_qty, 797_197_000);
         assert_eq!(u.tick.ask, 196_960_000_000);
         assert_eq!(u.tick.ask_qty, 300_000_000);
@@ -221,13 +253,19 @@ mod tests {
         let mut c = client();
         c.parse(LIVE).unwrap().unwrap();
         let deleted = r#"{"topic":"orderbook.1.ETHUSDT","ts":1,"type":"delta","data":{"s":"ETHUSDT","b":[["1969.52","0"]],"a":[],"u":22742694},"cts":1}"#;
-        assert!(c.parse(deleted).unwrap().is_none(), "an empty bid side must not produce a tick");
+        assert!(
+            c.parse(deleted).unwrap().is_none(),
+            "an empty bid side must not produce a tick"
+        );
 
         // ... and the next delta refills it.
         let refill = r#"{"topic":"orderbook.1.ETHUSDT","ts":1,"type":"delta","data":{"s":"ETHUSDT","b":[["1969.40","2.0"]],"a":[],"u":22742695},"cts":1}"#;
         let u = c.parse(refill).unwrap().unwrap();
         assert_eq!(u.tick.bid, 196_940_000_000);
-        assert_eq!(u.tick.ask, 196_953_000_000, "the ask survived the whole exchange");
+        assert_eq!(
+            u.tick.ask, 196_953_000_000,
+            "the ask survived the whole exchange"
+        );
     }
 
     #[test]
@@ -254,7 +292,10 @@ mod tests {
             .parse(r#"{"success":true,"ret_msg":"subscribe","conn_id":"abc","op":"subscribe"}"#)
             .unwrap()
             .is_none());
-        assert!(c.parse(r#"{"op":"pong","success":true}"#).unwrap().is_none());
+        assert!(c
+            .parse(r#"{"op":"pong","success":true}"#)
+            .unwrap()
+            .is_none());
         assert!(c
             .parse(r#"{"success":false,"ret_msg":"Invalid symbol","op":"subscribe"}"#)
             .unwrap_err()
@@ -273,6 +314,7 @@ mod tests {
         assert_eq!(frames.len(), 1);
         assert!(frames[0].contains(r#""orderbook.1.ETHUSDT""#));
         assert!(frames[0].contains(r#""orderbook.1.BTCUSDT""#));
-        serde_json::from_str::<serde_json::Value>(&frames[0]).expect("subscribe frame must be JSON");
+        serde_json::from_str::<serde_json::Value>(&frames[0])
+            .expect("subscribe frame must be JSON");
     }
 }

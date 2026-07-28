@@ -144,7 +144,14 @@ pub async fn run(
                     shared.on_connected(first);
                     first = false;
                     delay = Duration::from_millis(cfg.reconnect_initial_ms);
-                    read_loop(&mut client, &mut socket, &shared, read_timeout, &mut shutdown).await;
+                    read_loop(
+                        &mut client,
+                        &mut socket,
+                        &shared,
+                        read_timeout,
+                        &mut shutdown,
+                    )
+                    .await;
                 }
                 shared.on_disconnected();
                 if subscribe_failed {
@@ -187,7 +194,11 @@ async fn read_loop(
     let venue = client.venue();
     let keepalive = client.keepalive();
     // A period no venue will ever reach, so the `select!` arm below can be unconditional.
-    let mut ticker = tokio::time::interval(keepalive.as_ref().map_or(Duration::from_secs(3_600), |k| k.0));
+    let mut ticker = tokio::time::interval(
+        keepalive
+            .as_ref()
+            .map_or(Duration::from_secs(3_600), |k| k.0),
+    );
     ticker.tick().await; // `interval` fires immediately; the connection is fresh.
 
     loop {

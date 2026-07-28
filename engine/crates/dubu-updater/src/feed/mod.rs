@@ -290,7 +290,12 @@ impl FeedShared {
     pub fn new(venue: VenueId, stale_after: Duration) -> Self {
         Self {
             venue,
-            inner: Mutex::new(Inner { link: Link::Down, symbols: HashMap::new(), reconnects: 0, gaps: 0 }),
+            inner: Mutex::new(Inner {
+                link: Link::Down,
+                symbols: HashMap::new(),
+                reconnects: 0,
+                gaps: 0,
+            }),
             stale_after,
         }
     }
@@ -314,10 +319,14 @@ impl FeedShared {
         if let Some(have) = have {
             if tick.update_id <= have {
                 g.gaps += 1;
-                return Err(Rejected::SequenceRegression { got: tick.update_id, have });
+                return Err(Rejected::SequenceRegression {
+                    got: tick.update_id,
+                    have,
+                });
             }
         }
-        g.symbols.insert(symbol.to_string(), SymbolState { tick, at: now });
+        g.symbols
+            .insert(symbol.to_string(), SymbolState { tick, at: now });
         Ok(())
     }
 
@@ -330,7 +339,8 @@ impl FeedShared {
     /// hole the check exists to close.
     pub fn record_reset(&self, symbol: &str, tick: BookTick, now: Instant) {
         let mut g = self.lock();
-        g.symbols.insert(symbol.to_string(), SymbolState { tick, at: now });
+        g.symbols
+            .insert(symbol.to_string(), SymbolState { tick, at: now });
     }
 
     /// The socket came up.
@@ -365,9 +375,17 @@ impl FeedShared {
             (Link::Down, _, _) => VenueStatus::Disconnected,
             (Link::Up, None, _) => VenueStatus::NoData,
             (Link::Up, Some(_), Some(d)) if d <= self.stale_after => VenueStatus::Live,
-            (Link::Up, _, _) => VenueStatus::Stale { age_ms: age_ms.unwrap_or(u64::MAX) },
+            (Link::Up, _, _) => VenueStatus::Stale {
+                age_ms: age_ms.unwrap_or(u64::MAX),
+            },
         };
-        FeedSnapshot { status, age_ms, reconnects: g.reconnects, gaps: g.gaps, tick: entry.map(|s| s.tick) }
+        FeedSnapshot {
+            status,
+            age_ms,
+            reconnects: g.reconnects,
+            gaps: g.gaps,
+            tick: entry.map(|s| s.tick),
+        }
     }
 
     /// Whether the socket is up, independent of any symbol.
@@ -381,7 +399,9 @@ impl FeedShared {
     /// tick, every consumer re-derives staleness from the timestamp it carries, and taking the
     /// process down would turn a cosmetic panic into a quoting outage.
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
-        self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 }
 
@@ -436,7 +456,10 @@ impl VenueFeeds {
     /// which is precisely the state an absence would hide.
     #[must_use]
     pub fn snapshots(&self, symbol: &str, now: Instant) -> Vec<(VenueId, FeedSnapshot)> {
-        self.feeds.iter().map(|(&v, f)| (v, f.snapshot(symbol, now))).collect()
+        self.feeds
+            .iter()
+            .map(|(&v, f)| (v, f.snapshot(symbol, now)))
+            .collect()
     }
 }
 
@@ -521,7 +544,13 @@ mod tests {
     use super::*;
 
     fn tick(id: u64, bid: u128, ask: u128) -> BookTick {
-        BookTick { update_id: id, bid, bid_qty: 100_000_000, ask, ask_qty: 100_000_000 }
+        BookTick {
+            update_id: id,
+            bid,
+            bid_qty: 100_000_000,
+            ask,
+            ask_qty: 100_000_000,
+        }
     }
 
     fn shared() -> FeedShared {
@@ -539,7 +568,10 @@ mod tests {
         f.on_disconnected();
         let s = f.snapshot("ETHUSDT", now);
         assert_eq!(s.status, VenueStatus::Disconnected);
-        assert!(s.live().is_none(), "a disconnected venue must not hand out a price");
+        assert!(
+            s.live().is_none(),
+            "a disconnected venue must not hand out a price"
+        );
         // ... but the diagnostics path can still see what it died holding.
         assert_eq!(s.last_seen().map(|t| t.bid), Some(100));
     }
@@ -558,7 +590,10 @@ mod tests {
         let just_outside = t0 + Duration::from_millis(5_001);
         let s = f.snapshot("ETHUSDT", just_outside);
         assert!(matches!(s.status, VenueStatus::Stale { .. }));
-        assert!(s.live().is_none(), "a stale venue must not hand out a price");
+        assert!(
+            s.live().is_none(),
+            "a stale venue must not hand out a price"
+        );
         assert_eq!(s.age_ms, Some(5_001));
     }
 
@@ -588,7 +623,11 @@ mod tests {
         assert!(f.record("ETHUSDT", tick(10, 50, 51), now).is_err());
 
         let s = f.snapshot("ETHUSDT", now);
-        assert_eq!(s.live().unwrap().bid, 100, "stale data overwrote newer data");
+        assert_eq!(
+            s.live().unwrap().bid,
+            100,
+            "stale data overwrote newer data"
+        );
         assert_eq!(s.gaps, 2);
 
         // A non-contiguous forward jump is normal on these streams and must be accepted.
@@ -634,7 +673,10 @@ mod tests {
     #[test]
     fn venues_are_independent() {
         // The property the whole design rests on: one venue dying must not touch another.
-        let feeds = VenueFeeds::new(&[VenueId::Binance, VenueId::Okx], Duration::from_millis(5_000));
+        let feeds = VenueFeeds::new(
+            &[VenueId::Binance, VenueId::Okx],
+            Duration::from_millis(5_000),
+        );
         let now = Instant::now();
         for v in [VenueId::Binance, VenueId::Okx] {
             let f = feeds.venue(v).unwrap();
@@ -647,13 +689,20 @@ mod tests {
         assert_eq!(snaps.len(), 2);
         let by = |v| snaps.iter().find(|(id, _)| *id == v).unwrap().1.status;
         assert_eq!(by(VenueId::Binance), VenueStatus::Disconnected);
-        assert_eq!(by(VenueId::Okx), VenueStatus::Live, "one venue dying took another with it");
+        assert_eq!(
+            by(VenueId::Okx),
+            VenueStatus::Live,
+            "one venue dying took another with it"
+        );
     }
 
     #[test]
     fn losing_a_venue_is_an_event_and_a_steady_state_is_not() {
         let mut w = VenueWatch::new();
-        let feeds = VenueFeeds::new(&[VenueId::Binance, VenueId::Okx], Duration::from_millis(5_000));
+        let feeds = VenueFeeds::new(
+            &[VenueId::Binance, VenueId::Okx],
+            Duration::from_millis(5_000),
+        );
         let now = Instant::now();
         for v in [VenueId::Binance, VenueId::Okx] {
             let f = feeds.venue(v).unwrap();
@@ -662,7 +711,9 @@ mod tests {
         }
 
         // Everything healthy on the first look: nothing to say.
-        assert!(w.diff("ETHUSDT", &feeds.snapshots("ETHUSDT", now)).is_empty());
+        assert!(w
+            .diff("ETHUSDT", &feeds.snapshots("ETHUSDT", now))
+            .is_empty());
 
         // One venue drops: exactly one event, naming it.
         feeds.venue(VenueId::Binance).unwrap().on_disconnected();
@@ -673,11 +724,17 @@ mod tests {
         assert!(!ev[0].recovered());
 
         // Still down on the next cycle: silence, because a watchdog that repeats is unread.
-        assert!(w.diff("ETHUSDT", &feeds.snapshots("ETHUSDT", now)).is_empty());
+        assert!(w
+            .diff("ETHUSDT", &feeds.snapshots("ETHUSDT", now))
+            .is_empty());
 
         // Back up: one recovery event.
         feeds.venue(VenueId::Binance).unwrap().on_connected(false);
-        feeds.venue(VenueId::Binance).unwrap().record("ETHUSDT", tick(2, 100, 101), now).unwrap();
+        feeds
+            .venue(VenueId::Binance)
+            .unwrap()
+            .record("ETHUSDT", tick(2, 100, 101), now)
+            .unwrap();
         let ev = w.diff("ETHUSDT", &feeds.snapshots("ETHUSDT", now));
         assert_eq!(ev.len(), 1);
         assert!(ev[0].recovered());
@@ -692,7 +749,9 @@ mod tests {
         let ev = w.diff("ETHUSDT", &feeds.snapshots("ETHUSDT", now));
         assert_eq!(ev.len(), 1);
         assert_eq!(ev[0].to, VenueStatus::Disconnected);
-        assert!(w.diff("ETHUSDT", &feeds.snapshots("ETHUSDT", now)).is_empty());
+        assert!(w
+            .diff("ETHUSDT", &feeds.snapshots("ETHUSDT", now))
+            .is_empty());
     }
 
     #[test]
@@ -706,10 +765,15 @@ mod tests {
         w.diff("ETHUSDT", &feeds.snapshots("ETHUSDT", t0));
 
         let t1 = t0 + Duration::from_millis(2_000);
-        assert_eq!(w.diff("ETHUSDT", &feeds.snapshots("ETHUSDT", t1)).len(), 1, "going stale is an event");
+        assert_eq!(
+            w.diff("ETHUSDT", &feeds.snapshots("ETHUSDT", t1)).len(),
+            1,
+            "going stale is an event"
+        );
         let t2 = t0 + Duration::from_millis(9_000);
         assert!(
-            w.diff("ETHUSDT", &feeds.snapshots("ETHUSDT", t2)).is_empty(),
+            w.diff("ETHUSDT", &feeds.snapshots("ETHUSDT", t2))
+                .is_empty(),
             "`Stale {{ age_ms }}` changes every cycle; it must not re-fire"
         );
     }

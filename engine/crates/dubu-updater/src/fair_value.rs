@@ -136,7 +136,10 @@ pub fn micro_price(t: &BookTick) -> Result<u128, Reject> {
         return Err(Reject::ZeroPrice);
     }
     if t.bid >= t.ask {
-        return Err(Reject::CrossedBook { bid: t.bid, ask: t.ask });
+        return Err(Reject::CrossedBook {
+            bid: t.bid,
+            ask: t.ask,
+        });
     }
     if t.bid_qty == 0 || t.ask_qty == 0 {
         return Err(Reject::ZeroDepth);
@@ -273,8 +276,14 @@ impl Reference {
     #[must_use]
     pub fn venue_summary(&self) -> String {
         let one = |d: &Deviation, bang: &str| {
-            format!("{}{}:{}{}.{}", bang, d.venue, if d.decibps < 0 { "-" } else { "+" },
-                    d.decibps.unsigned_abs() / 10, d.decibps.unsigned_abs() % 10)
+            format!(
+                "{}{}:{}{}.{}",
+                bang,
+                d.venue,
+                if d.decibps < 0 { "-" } else { "+" },
+                d.decibps.unsigned_abs() / 10,
+                d.decibps.unsigned_abs() % 10
+            )
         };
         self.used
             .iter()
@@ -331,10 +340,15 @@ impl ReferenceError {
     pub const fn status(&self) -> FeedStatus {
         match *self {
             Self::NoQuorum { have, need } => FeedStatus::NoQuorum { have, need },
-            Self::QuorumLostToOutliers { survived, need } => {
-                FeedStatus::NoQuorum { have: survived, need }
-            }
-            Self::Dispersed { dispersion_decibps, limit_decibps, venues } => FeedStatus::Dispersed {
+            Self::QuorumLostToOutliers { survived, need } => FeedStatus::NoQuorum {
+                have: survived,
+                need,
+            },
+            Self::Dispersed {
+                dispersion_decibps,
+                limit_decibps,
+                venues,
+            } => FeedStatus::Dispersed {
                 dispersion_bps: dispersion_decibps,
                 limit_bps: limit_decibps,
                 venues,
@@ -433,10 +447,17 @@ pub fn combine(quotes: &[VenueQuote], p: &MadParams) -> Result<Reference, Refere
 
     let devs: Vec<Deviation> = quotes
         .iter()
-        .map(|q| Deviation { venue: q.venue, micro: q.micro, decibps: deviation_decibps(q.micro, median) })
+        .map(|q| Deviation {
+            venue: q.venue,
+            micro: q.micro,
+            decibps: deviation_decibps(q.micro, median),
+        })
         .collect();
 
-    let mut mags: Vec<u128> = devs.iter().map(|d| u128::from(d.decibps.unsigned_abs())).collect();
+    let mut mags: Vec<u128> = devs
+        .iter()
+        .map(|d| u128::from(d.decibps.unsigned_abs()))
+        .collect();
     mags.sort_unstable();
     let mad = median_sorted(&mags).unwrap_or(0);
     let dispersion = u32::try_from(mad).unwrap_or(u32::MAX);
@@ -468,8 +489,9 @@ pub fn combine(quotes: &[VenueQuote], p: &MadParams) -> Result<Reference, Refere
         }
     };
 
-    let (used, rejected): (Vec<Deviation>, Vec<Deviation>) =
-        devs.into_iter().partition(|d| d.decibps.unsigned_abs() <= u64::from(threshold));
+    let (used, rejected): (Vec<Deviation>, Vec<Deviation>) = devs
+        .into_iter()
+        .partition(|d| d.decibps.unsigned_abs() <= u64::from(threshold));
 
     let survived = u8::try_from(used.len()).unwrap_or(u8::MAX);
     if survived < need {
@@ -497,17 +519,35 @@ mod tests {
     use super::*;
 
     fn tick(bid: u128, bid_qty: u128, ask: u128, ask_qty: u128) -> BookTick {
-        BookTick { update_id: 1, bid, bid_qty, ask, ask_qty }
+        BookTick {
+            update_id: 1,
+            bid,
+            bid_qty,
+            ask,
+            ask_qty,
+        }
     }
 
     /// A venue quoting a flat book at `micro`, so the cross-section is easy to reason about.
     fn q(venue: VenueId, micro: u128) -> VenueQuote {
-        VenueQuote { venue, micro, bid: micro, ask: micro + 1, book_spread_bps: 0, age_ms: 10 }
+        VenueQuote {
+            venue,
+            micro,
+            bid: micro,
+            ask: micro + 1,
+            book_spread_bps: 0,
+            age_ms: 10,
+        }
     }
 
     /// Live-shaped parameters: k = 4.0, floor 2 bp, dispersion limit 25 bp, quorum 2.
     fn params() -> MadParams {
-        MadParams { min_venues: 2, k_tenths: 40, floor_decibps: 20, max_dispersion_decibps: 250 }
+        MadParams {
+            min_venues: 2,
+            k_tenths: 40,
+            floor_decibps: 20,
+            max_dispersion_decibps: 250,
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -527,12 +567,18 @@ mod tests {
         assert_eq!(micro_price(&tick(bid, 10, ask, 1)), Ok(10_181_818_181));
 
         let heavy_bid = micro_price(&tick(bid, 1_000, ask, 1)).unwrap();
-        assert!(heavy_bid > mid, "a heavily bid book must price above the mid, got {heavy_bid}");
+        assert!(
+            heavy_bid > mid,
+            "a heavily bid book must price above the mid, got {heavy_bid}"
+        );
         assert!(heavy_bid < ask);
 
         // ... and the mirror.
         let heavy_ask = micro_price(&tick(bid, 1, ask, 1_000)).unwrap();
-        assert!(heavy_ask < mid, "a heavily offered book must price below the mid, got {heavy_ask}");
+        assert!(
+            heavy_ask < mid,
+            "a heavily offered book must price below the mid, got {heavy_ask}"
+        );
         assert!(heavy_ask > bid);
     }
 
@@ -543,14 +589,23 @@ mod tests {
         let t = tick(194_382_000_000, 2_425_800_000, 194_383_000_000, 137_811_000);
         let micro = micro_price(&t).unwrap();
         let mid = (t.bid + t.ask) / 2;
-        assert!(micro > mid, "bid size dwarfs ask size, so fair value sits above the mid");
+        assert!(
+            micro > mid,
+            "bid size dwarfs ask size, so fair value sits above the mid"
+        );
         assert!(micro < t.ask);
     }
 
     #[test]
     fn structurally_broken_books_are_rejected() {
-        assert_eq!(micro_price(&tick(102, 1, 100, 1)), Err(Reject::CrossedBook { bid: 102, ask: 100 }));
-        assert_eq!(micro_price(&tick(100, 1, 100, 1)), Err(Reject::CrossedBook { bid: 100, ask: 100 }));
+        assert_eq!(
+            micro_price(&tick(102, 1, 100, 1)),
+            Err(Reject::CrossedBook { bid: 102, ask: 100 })
+        );
+        assert_eq!(
+            micro_price(&tick(100, 1, 100, 1)),
+            Err(Reject::CrossedBook { bid: 100, ask: 100 })
+        );
         assert_eq!(micro_price(&tick(100, 0, 102, 1)), Err(Reject::ZeroDepth));
         assert_eq!(micro_price(&tick(100, 1, 102, 0)), Err(Reject::ZeroDepth));
         assert_eq!(micro_price(&tick(0, 1, 102, 1)), Err(Reject::ZeroPrice));
@@ -578,7 +633,10 @@ mod tests {
         ];
         let r = combine(&quotes, &params()).unwrap();
         assert_eq!(r.median, 196_930_000_000);
-        assert_eq!(r.micro, 196_930_000_000, "equal weight over three survivors");
+        assert_eq!(
+            r.micro, 196_930_000_000,
+            "equal weight over three survivors"
+        );
         assert_eq!(r.venues_used(), 3);
         assert!(r.rejected.is_empty());
         // Everything agrees to a fraction of a bp, so the floor is what set the threshold.
@@ -600,7 +658,11 @@ mod tests {
         assert_eq!(r.venues_used(), 2);
         // The reference is the mean of the two survivors and is nowhere near the outlier.
         assert_eq!(r.micro, 196_929_500_000);
-        assert!(r.venue_summary().contains("!bybit"), "summary: {}", r.venue_summary());
+        assert!(
+            r.venue_summary().contains("!bybit"),
+            "summary: {}",
+            r.venue_summary()
+        );
     }
 
     #[test]
@@ -620,9 +682,16 @@ mod tests {
         ];
         let r0 = combine(&before, &params()).unwrap();
         let r1 = combine(&after, &params()).unwrap();
-        assert!(r1.rejected.is_empty(), "a market-wide move must not be treated as an outlier");
+        assert!(
+            r1.rejected.is_empty(),
+            "a market-wide move must not be treated as an outlier"
+        );
         assert!(r1.micro > r0.micro);
-        assert_eq!(r1.venues_used(), 3, "and it must cost nothing in venue count");
+        assert_eq!(
+            r1.venues_used(),
+            3,
+            "and it must cost nothing in venue count"
+        );
     }
 
     #[test]
@@ -640,7 +709,11 @@ mod tests {
         ];
         let r = combine(&calm, &params()).unwrap();
         assert_eq!(r.bound, ThresholdBound::Floor);
-        assert_eq!(r.rejected.len(), 1, "3 bp is an outlier when everyone agrees to 0.1 bp");
+        assert_eq!(
+            r.rejected.len(),
+            1,
+            "3 bp is an outlier when everyone agrees to 0.1 bp"
+        );
 
         let fast = [
             q(VenueId::Binance, base),
@@ -649,8 +722,15 @@ mod tests {
             q(VenueId::Coinbase, base + 3 * bp),
         ];
         let r = combine(&fast, &params()).unwrap();
-        assert_eq!(r.bound, ThresholdBound::Mad, "the MAD must bind once the market is moving");
-        assert!(r.rejected.is_empty(), "3 bp is ordinary when the cross-section is 2 bp wide");
+        assert_eq!(
+            r.bound,
+            ThresholdBound::Mad,
+            "the MAD must bind once the market is moving"
+        );
+        assert!(
+            r.rejected.is_empty(),
+            "3 bp is ordinary when the cross-section is 2 bp wide"
+        );
     }
 
     #[test]
@@ -668,7 +748,10 @@ mod tests {
         ];
         let err = combine(&split, &params()).unwrap_err();
         assert!(matches!(err, ReferenceError::Dispersed { .. }), "got {err}");
-        assert!(matches!(err.status(), FeedStatus::Dispersed { venues: 4, .. }));
+        assert!(matches!(
+            err.status(),
+            FeedStatus::Dispersed { venues: 4, .. }
+        ));
     }
 
     #[test]
@@ -677,15 +760,25 @@ mod tests {
         // dispersion gate. Pretending to pick a winner would be inventing an answer.
         let base = 100_000_000_000u128;
         let bp = base / 10_000;
-        let r = combine(&[q(VenueId::Binance, base), q(VenueId::Okx, base + 4 * bp)], &params()).unwrap();
+        let r = combine(
+            &[q(VenueId::Binance, base), q(VenueId::Okx, base + 4 * bp)],
+            &params(),
+        )
+        .unwrap();
         assert_eq!(r.bound, ThresholdBound::Unattributable);
         assert_eq!(r.venues_used(), 2, "neither may be rejected");
         assert_eq!(r.micro, base + 2 * bp);
 
         // Far enough apart and the dispersion gate does the work instead.
-        let err = combine(&[q(VenueId::Binance, base), q(VenueId::Okx, base + 60 * bp)], &params())
-            .unwrap_err();
-        assert!(matches!(err, ReferenceError::Dispersed { venues: 2, .. }), "got {err}");
+        let err = combine(
+            &[q(VenueId::Binance, base), q(VenueId::Okx, base + 60 * bp)],
+            &params(),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, ReferenceError::Dispersed { venues: 2, .. }),
+            "got {err}"
+        );
     }
 
     #[test]
@@ -703,14 +796,23 @@ mod tests {
         // Three venues, a strict quorum of 3, one rejected: the survivors no longer make quorum.
         // Reporting that as plain `NoQuorum` would hide that a venue was actively disagreeing.
         let base = 100_000_000_000u128;
-        let strict = MadParams { min_venues: 3, ..params() };
+        let strict = MadParams {
+            min_venues: 3,
+            ..params()
+        };
         let quotes = [
             q(VenueId::Binance, base),
             q(VenueId::Okx, base + 1),
             q(VenueId::Bybit, base * 2),
         ];
         let err = combine(&quotes, &strict).unwrap_err();
-        assert_eq!(err, ReferenceError::QuorumLostToOutliers { survived: 2, need: 3 });
+        assert_eq!(
+            err,
+            ReferenceError::QuorumLostToOutliers {
+                survived: 2,
+                need: 3
+            }
+        );
         assert_eq!(err.label(), "quorum_lost_to_outliers");
     }
 
@@ -741,7 +843,11 @@ mod tests {
         assert_eq!(median_sorted(&[10, 20, 21, 40]), Some(20));
         // Odd sum, so the halving has to carry.
         assert_eq!(median_sorted(&[1, 1, 2, 2]), Some(1));
-        assert_eq!(median_sorted(&[]), None, "an empty cross-section names no price");
+        assert_eq!(
+            median_sorted(&[]),
+            None,
+            "an empty cross-section names no price"
+        );
         assert_eq!(median_sorted(&[3, 3]), Some(3));
     }
 

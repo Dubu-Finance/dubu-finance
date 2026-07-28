@@ -193,7 +193,10 @@ pub fn build(input: &RowInputs) -> Result<QuoteRow, BuildError> {
 
     // Step 1: the skew, through `dubu-core`'s own implementation so that the sign convention
     // (positive skew pushes the book DOWN) cannot drift from the one documented there.
-    let builder = LadderBuilder { skew_bps: input.skew_bps, ..LadderBuilder::new(input.fair) };
+    let builder = LadderBuilder {
+        skew_bps: input.skew_bps,
+        ..LadderBuilder::new(input.fair)
+    };
     let mid = builder.skewed_mid()?;
 
     // Step 2: the two targets. Floor the bid and ceil the ask — both away from the taker, the
@@ -243,18 +246,26 @@ pub fn build(input: &RowInputs) -> Result<QuoteRow, BuildError> {
     // the line above by construction — and the whole point is that a future refactor which
     // makes it non-redundant fails here rather than on chain, where a rejected `updateQuote`
     // burns the block and leaves the previous quote to go stale.
-    ladder.validate(input.min_price).map_err(BuildError::Invalid)?;
+    ladder
+        .validate(input.min_price)
+        .map_err(BuildError::Invalid)?;
 
     // Step 7: the round trip. What does the chain's arithmetic say this row actually pays over
     // the capture? `dubu-core` guarantees the residual lands on the pool's side of the target
     // and is under one price unit; asserting it here means a regression in the solver shows up
     // as a dropped row rather than as a quote we believed was something else.
     let cap = input.capture.min(input.bid_capacity);
-    let realised_bid =
-        avg_bid_price(ladder.min_bid, ladder.max_bid, input.bid_capacity, 0, cap).map_err(BuildError::Invalid)?;
+    let realised_bid = avg_bid_price(ladder.min_bid, ladder.max_bid, input.bid_capacity, 0, cap)
+        .map_err(BuildError::Invalid)?;
     let ask_cap = input.capture.min(input.ask_capacity);
-    let realised_ask =
-        avg_ask_price(ladder.min_ask, ladder.max_ask, input.ask_capacity, 0, ask_cap).map_err(BuildError::Invalid)?;
+    let realised_ask = avg_ask_price(
+        ladder.min_ask,
+        ladder.max_ask,
+        input.ask_capacity,
+        0,
+        ask_cap,
+    )
+    .map_err(BuildError::Invalid)?;
 
     if realised_bid > bid_target {
         return Err(BuildError::RoundTrip(format!(
@@ -271,11 +282,24 @@ pub fn build(input: &RowInputs) -> Result<QuoteRow, BuildError> {
     // both directions. This is what catches a capacity/price/exponent combination that lands
     // outside the shared `uint128` domain — the pool would revert `AmountOutOfDomain` and the
     // ladder would sit unfillable behind a `QuoteUpdated` event that looked like a success.
-    let bid_capture_cost = amount_out_bid(cap, ladder.min_bid, ladder.max_bid, input.bid_capacity, 0, input.price_scale_exp)
-        .map_err(BuildError::Invalid)?;
-    let ask_capture_cost =
-        amount_in_ask(ask_cap, ladder.min_ask, ladder.max_ask, input.ask_capacity, 0, input.price_scale_exp)
-            .map_err(BuildError::Invalid)?;
+    let bid_capture_cost = amount_out_bid(
+        cap,
+        ladder.min_bid,
+        ladder.max_bid,
+        input.bid_capacity,
+        0,
+        input.price_scale_exp,
+    )
+    .map_err(BuildError::Invalid)?;
+    let ask_capture_cost = amount_in_ask(
+        ask_cap,
+        ladder.min_ask,
+        ladder.max_ask,
+        input.ask_capacity,
+        0,
+        input.price_scale_exp,
+    )
+    .map_err(BuildError::Invalid)?;
     if bid_capture_cost == 0 || ask_capture_cost == 0 {
         return Err(BuildError::RoundTrip(
             "the capture size prices to zero on one side; the row would quote nothing".into(),
@@ -350,7 +374,10 @@ pub struct CapacityPlan {
 /// # Errors
 /// [`CurveError`] only from the shared domain; a caller treats it as "cannot size an epoch".
 pub fn plan_capacity(i: &CapacityInputs) -> Result<CapacityPlan, CurveError> {
-    let base_available = i.base_balance.saturating_sub(i.min_base_reserve).min(MAX_AMOUNT);
+    let base_available = i
+        .base_balance
+        .saturating_sub(i.min_base_reserve)
+        .min(MAX_AMOUNT);
     let ask = i.configured_ask.min(base_available);
 
     let quote_available = i.quote_balance.saturating_sub(i.min_quote_reserve);
@@ -359,10 +386,16 @@ pub fn plan_capacity(i: &CapacityInputs) -> Result<CapacityPlan, CurveError> {
     } else {
         // The least base whose flat-ladder bid quote costs at least the whole budget. One unit
         // below it is, by that minimality, strictly affordable.
-        let affordable =
-            dubu_core::curve::amount_in_bid(quote_available, i.fair, i.fair, MAX_AMOUNT, 0, i.price_scale_exp)
-                .unwrap_or(MAX_AMOUNT)
-                .saturating_sub(1);
+        let affordable = dubu_core::curve::amount_in_bid(
+            quote_available,
+            i.fair,
+            i.fair,
+            MAX_AMOUNT,
+            0,
+            i.price_scale_exp,
+        )
+        .unwrap_or(MAX_AMOUNT)
+        .saturating_sub(1);
         i.configured_bid.min(affordable).min(MAX_AMOUNT)
     };
 
@@ -412,8 +445,8 @@ mod tests {
             half_spread_bps: 5,
             width_bps: 25,
             skew_bps: 0,
-            capture: 20_000_000_000_000_000_000,          // 20 mWETH
-            bid_capacity: 1_000_000_000_000_000_000_000,  // 1000 mWETH
+            capture: 20_000_000_000_000_000_000, // 20 mWETH
+            bid_capacity: 1_000_000_000_000_000_000_000, // 1000 mWETH
             ask_capacity: 1_000_000_000_000_000_000_000,
             min_price: 1_000_000_000_000_000,
             price_scale_exp: 24,
@@ -437,8 +470,18 @@ mod tests {
         assert_eq!(row.ask_target, FAIR * 10_005 / 10_000);
 
         // The bid never sits above fair and the ask never below it.
-        assert!(l.max_bid <= row.mid, "maxBid {} breached the fair-value ceiling {}", l.max_bid, row.mid);
-        assert!(l.min_ask >= row.mid, "minAsk {} breached the fair-value floor {}", l.min_ask, row.mid);
+        assert!(
+            l.max_bid <= row.mid,
+            "maxBid {} breached the fair-value ceiling {}",
+            l.max_bid,
+            row.mid
+        );
+        assert!(
+            l.min_ask >= row.mid,
+            "minAsk {} breached the fair-value floor {}",
+            l.min_ask,
+            row.mid
+        );
 
         // And the round trip lands on the pool's side of both targets, within a price unit.
         assert!(row.realised_bid <= row.bid_target);
@@ -459,7 +502,8 @@ mod tests {
 
         // The pool collects more on the ask than it pays on the bid: that is the spread.
         assert!(row.ask_capture_cost > row.bid_capture_cost);
-        let edge_bps = (row.ask_capture_cost - row.bid_capture_cost) * 10_000 / row.bid_capture_cost;
+        let edge_bps =
+            (row.ask_capture_cost - row.bid_capture_cost) * 10_000 / row.bid_capture_cost;
         assert_eq!(edge_bps, 10, "a 5 bp half-spread is a 10 bp round trip");
     }
 
@@ -478,8 +522,16 @@ mod tests {
 
     #[test]
     fn width_bps_bounds_the_ladder_rather_than_setting_it() {
-        let narrow = build(&RowInputs { width_bps: 1, ..weth_inputs(FAIR) }).unwrap();
-        let wide = build(&RowInputs { width_bps: 1_000, ..weth_inputs(FAIR) }).unwrap();
+        let narrow = build(&RowInputs {
+            width_bps: 1,
+            ..weth_inputs(FAIR)
+        })
+        .unwrap();
+        let wide = build(&RowInputs {
+            width_bps: 1_000,
+            ..weth_inputs(FAIR)
+        })
+        .unwrap();
         let span = |r: &QuoteRow| r.ladder.max_bid - r.ladder.min_bid;
         assert!(span(&narrow) < span(&wide));
         assert_eq!(narrow.bid.binding, WidthBinding::Requested);
@@ -491,18 +543,35 @@ mod tests {
         // `2 * 5bp * 1000 / 20 = 500 bp`, and 1000 bp cannot fit under it.
         assert_eq!(wide.bid.binding, WidthBinding::Boundary);
         assert!(wide.ladder.max_bid <= wide.mid);
-        assert_eq!(build(&RowInputs { width_bps: 500, ..weth_inputs(FAIR) }).unwrap().bid.binding,
-                   WidthBinding::Requested, "500 bp is the last width that still fits");
+        assert_eq!(
+            build(&RowInputs {
+                width_bps: 500,
+                ..weth_inputs(FAIR)
+            })
+            .unwrap()
+            .bid
+            .binding,
+            WidthBinding::Requested,
+            "500 bp is the last width that still fits"
+        );
     }
 
     #[test]
     fn positive_skew_moves_the_whole_book_down() {
         let flat = build(&weth_inputs(FAIR)).unwrap();
-        let short = build(&RowInputs { skew_bps: 20, ..weth_inputs(FAIR) }).unwrap();
+        let short = build(&RowInputs {
+            skew_bps: 20,
+            ..weth_inputs(FAIR)
+        })
+        .unwrap();
         assert!(short.ladder.max_bid < flat.ladder.max_bid);
         assert!(short.ladder.min_ask < flat.ladder.min_ask);
         // Negative skew is the mirror: the pool is short and wants to buy.
-        let long = build(&RowInputs { skew_bps: -20, ..weth_inputs(FAIR) }).unwrap();
+        let long = build(&RowInputs {
+            skew_bps: -20,
+            ..weth_inputs(FAIR)
+        })
+        .unwrap();
         assert!(long.ladder.max_bid > flat.ladder.max_bid);
     }
 
@@ -532,11 +601,17 @@ mod tests {
     #[test]
     fn zero_capacity_is_refused_before_anything_else() {
         assert_eq!(
-            build(&RowInputs { bid_capacity: 0, ..weth_inputs(FAIR) }),
+            build(&RowInputs {
+                bid_capacity: 0,
+                ..weth_inputs(FAIR)
+            }),
             Err(BuildError::ZeroCapacity { side: "bid" })
         );
         assert_eq!(
-            build(&RowInputs { ask_capacity: 0, ..weth_inputs(FAIR) }),
+            build(&RowInputs {
+                ask_capacity: 0,
+                ..weth_inputs(FAIR)
+            }),
             Err(BuildError::ZeroCapacity { side: "ask" })
         );
     }
@@ -544,7 +619,10 @@ mod tests {
     #[test]
     fn a_fair_value_out_of_the_uint56_domain_is_refused() {
         assert!(matches!(build(&weth_inputs(0)), Err(BuildError::Price(_))));
-        assert!(matches!(build(&weth_inputs(MAX_PRICE + 1)), Err(BuildError::Price(_))));
+        assert!(matches!(
+            build(&weth_inputs(MAX_PRICE + 1)),
+            Err(BuildError::Price(_))
+        ));
     }
 
     #[test]
@@ -556,7 +634,7 @@ mod tests {
             half_spread_bps: 8,
             width_bps: 40,
             skew_bps: 0,
-            capture: 20_000_000,        // 0.2 mWBTC
+            capture: 20_000_000,         // 0.2 mWBTC
             bid_capacity: 2_000_000_000, // 20 mWBTC
             ask_capacity: 2_000_000_000,
             min_price: 500_000_000_000_000,
@@ -622,7 +700,10 @@ mod tests {
         assert!(p.bid_cut_by_inventory);
         // And what it costs is genuinely inside the budget — the property that matters.
         let cost = amount_out_bid(p.bid, FAIR, FAIR, p.bid.max(1), 0, 24).unwrap();
-        assert!(cost <= 100_000_000_000, "planned bid epoch costs {cost}, above the 100000 budget");
+        assert!(
+            cost <= 100_000_000_000,
+            "planned bid epoch costs {cost}, above the 100000 budget"
+        );
         // Not needlessly conservative either: one more wei of base would exceed it.
         let over = amount_out_bid(p.bid + 1, FAIR, FAIR, p.bid + 1, 0, 24).unwrap();
         assert!(over >= 100_000_000_000);
@@ -635,13 +716,16 @@ mod tests {
             configured_ask: 1_000_000_000_000_000_000_000,
             base_balance: 10_000_000_000_000_000_000,
             quote_balance: 11_111_000_000_000,
-            min_base_reserve: 4_000_000_000_000_000_000 /* 4 mWETH floor */,
+            min_base_reserve: 4_000_000_000_000_000_000, /* 4 mWETH floor */
             min_quote_reserve: 0,
             fair: FAIR,
             price_scale_exp: 24,
         })
         .unwrap();
-        assert_eq!(p.ask, 6_000_000_000_000_000_000, "the floor must not be quotable");
+        assert_eq!(
+            p.ask, 6_000_000_000_000_000_000,
+            "the floor must not be quotable"
+        );
 
         // A floor above the balance yields zero rather than underflowing.
         let p = plan_capacity(&CapacityInputs {
@@ -653,7 +737,8 @@ mod tests {
             min_quote_reserve: 0,
             fair: FAIR,
             price_scale_exp: 24,
-        }).unwrap();
+        })
+        .unwrap();
         assert_eq!(p.ask, 0);
     }
 }

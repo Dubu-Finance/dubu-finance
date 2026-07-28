@@ -245,15 +245,28 @@ impl SwapWatch {
     /// indexed, which is the position that search just returned.
     #[allow(clippy::indexing_slicing)]
     async fn resolve_timestamps(&self, rpc: &Rpc, out: &mut Polled) -> Result<(), RpcError> {
-        let mut wanted: Vec<u64> =
-            out.fills.iter().filter(|f| f.at_secs == 0).map(|f| f.block_number).collect();
+        let mut wanted: Vec<u64> = out
+            .fills
+            .iter()
+            .filter(|f| f.at_secs == 0)
+            .map(|f| f.block_number)
+            .collect();
         wanted.sort_unstable();
         wanted.dedup();
 
         let mut found: Vec<(u64, u64)> = Vec::with_capacity(wanted.len());
         for block in wanted {
-            let raw = rpc.call("eth_getBlockByNumber", json!([format!("0x{block:x}"), false])).await?;
-            if let Some(ts) = raw.get("timestamp").and_then(serde_json::Value::as_str).and_then(hex_u64) {
+            let raw = rpc
+                .call(
+                    "eth_getBlockByNumber",
+                    json!([format!("0x{block:x}"), false]),
+                )
+                .await?;
+            if let Some(ts) = raw
+                .get("timestamp")
+                .and_then(serde_json::Value::as_str)
+                .and_then(hex_u64)
+            {
                 found.push((block, ts));
             }
         }
@@ -275,7 +288,12 @@ impl SwapWatch {
         Ok(())
     }
 
-    async fn fetch(&self, rpc: &Rpc, from: u64, to: u64) -> Result<Vec<serde_json::Value>, RpcError> {
+    async fn fetch(
+        &self,
+        rpc: &Rpc,
+        from: u64,
+        to: u64,
+    ) -> Result<Vec<serde_json::Value>, RpcError> {
         let filter = json!({
             "fromBlock": format!("0x{from:x}"),
             "toBlock": format!("0x{to:x}"),
@@ -288,7 +306,11 @@ impl SwapWatch {
 
     fn absorb(&mut self, logs: &[serde_json::Value], out: &mut Polled) {
         for log in logs {
-            if log.get("removed").and_then(serde_json::Value::as_bool).unwrap_or(false) {
+            if log
+                .get("removed")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+            {
                 out.removed += 1;
                 continue;
             }
@@ -328,9 +350,17 @@ impl SwapWatch {
 /// amount that does not fit is a divergence between chain and engine rather than a value to
 /// truncate. Truncating would produce a plausible markout for a trade that did not happen.
 fn decode(log: &serde_json::Value) -> Option<SwapLog> {
-    let topics: Vec<B256> =
-        log.get("topics")?.as_array()?.iter().map(|t| t.as_str()?.parse().ok()).collect::<Option<_>>()?;
-    let data = hex_bytes(log.get("data").and_then(serde_json::Value::as_str).unwrap_or("0x"))?;
+    let topics: Vec<B256> = log
+        .get("topics")?
+        .as_array()?
+        .iter()
+        .map(|t| t.as_str()?.parse().ok())
+        .collect::<Option<_>>()?;
+    let data = hex_bytes(
+        log.get("data")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("0x"),
+    )?;
 
     let ev = Swap::decode_raw_log_validate(topics, &data).ok()?;
 
@@ -346,7 +376,11 @@ fn decode(log: &serde_json::Value) -> Option<SwapLog> {
         // Absent on nodes that predate the field; `resolve_timestamps` fills those in. Zero is
         // the sentinel rather than an `Option` because no real block carries timestamp zero and
         // the resolved struct should have one shape, not two.
-        at_secs: log.get("blockTimestamp").and_then(serde_json::Value::as_str).and_then(hex_u64).unwrap_or(0),
+        at_secs: log
+            .get("blockTimestamp")
+            .and_then(serde_json::Value::as_str)
+            .and_then(hex_u64)
+            .unwrap_or(0),
         tx_hash: log.get("transactionHash")?.as_str()?.parse().ok()?,
         log_index: hex_u64(log.get("logIndex")?.as_str()?)?,
     })
@@ -361,7 +395,9 @@ fn hex_bytes(s: &str) -> Option<Vec<u8>> {
     if body.len() % 2 != 0 {
         return None;
     }
-    (0..body.len() / 2).map(|i| u8::from_str_radix(&body[i * 2..i * 2 + 2], 16).ok()).collect()
+    (0..body.len() / 2)
+        .map(|i| u8::from_str_radix(&body[i * 2..i * 2 + 2], 16).ok())
+        .collect()
 }
 
 #[cfg(test)]
@@ -427,15 +463,25 @@ mod tests {
     }
 
     fn one(block: u64, index: u64) -> serde_json::Value {
-        raw_log(Spec { block, index, ..Spec::default() })
+        raw_log(Spec {
+            block,
+            index,
+            ..Spec::default()
+        })
     }
 
     #[test]
     fn decodes_every_field_off_the_wire() {
         let f = decode(&one(42, 5)).expect("well-formed log");
         assert_eq!(f.pair_id, 3);
-        assert_eq!(f.sender, address!("00000000000000000000000000000000000000B1"));
-        assert_eq!(f.receiver, address!("00000000000000000000000000000000000000C2"));
+        assert_eq!(
+            f.sender,
+            address!("00000000000000000000000000000000000000B1")
+        );
+        assert_eq!(
+            f.receiver,
+            address!("00000000000000000000000000000000000000C2")
+        );
         assert!(f.is_bid);
         assert_eq!(f.amount_in, 1_000);
         assert_eq!(f.amount_out, 2_000);
@@ -450,7 +496,9 @@ mod tests {
     #[test]
     fn a_missing_block_timestamp_is_left_for_resolution() {
         let mut log = one(42, 5);
-        log.as_object_mut().expect("object").remove("blockTimestamp");
+        log.as_object_mut()
+            .expect("object")
+            .remove("blockTimestamp");
         assert_eq!(decode(&log).expect("still decodable").at_secs, 0);
     }
 
@@ -459,7 +507,10 @@ mod tests {
     #[test]
     fn refuses_an_amount_outside_the_engine_domain() {
         let too_big = U256::from(u128::MAX) + U256::from(1u64);
-        let log = raw_log(Spec { amount_in: too_big, ..Spec::default() });
+        let log = raw_log(Spec {
+            amount_in: too_big,
+            ..Spec::default()
+        });
         assert!(decode(&log).is_none());
     }
 
@@ -563,9 +614,18 @@ mod tests {
     fn decodes_a_log_captured_from_the_live_chain() {
         let f = decode(&captured_from_chain()).expect("a real Swap log must decode");
         assert_eq!(f.pair_id, 1);
-        assert_eq!(f.sender, address!("16C5A0DF5AD0C8B0A450EDAA67C56593B02D19E2"));
-        assert_eq!(f.receiver, address!("2B10D0B50CA3A7C0C7CCABC969615B4DB3FB9471"));
-        assert_ne!(f.sender, f.receiver, "the routed case: an adapter sent it, a taker received it");
+        assert_eq!(
+            f.sender,
+            address!("16C5A0DF5AD0C8B0A450EDAA67C56593B02D19E2")
+        );
+        assert_eq!(
+            f.receiver,
+            address!("2B10D0B50CA3A7C0C7CCABC969615B4DB3FB9471")
+        );
+        assert_ne!(
+            f.sender, f.receiver,
+            "the routed case: an adapter sent it, a taker received it"
+        );
         assert!(!f.is_bid, "the pool sold base for 1e9 quote units");
         assert_eq!(f.amount_in, 1_000_000_000);
         assert_eq!(f.amount_out, 499_749_812_750_187_054);

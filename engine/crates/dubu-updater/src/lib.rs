@@ -125,7 +125,12 @@
 // Not enabled for `cfg(test)`: an assertion is a panic, and that is what a test is for.
 #![cfg_attr(
     not(test),
-    deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )
 )]
 
 pub mod chain;

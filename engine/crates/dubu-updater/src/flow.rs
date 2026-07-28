@@ -227,7 +227,10 @@ impl Flow {
     /// [`ParamsError`] when the parameters are degenerate or manipulable. See [`Params::validate`].
     pub fn new(params: Params) -> Result<Self, ParamsError> {
         params.validate()?;
-        Ok(Self { params, recent: VecDeque::new() })
+        Ok(Self {
+            params,
+            recent: VecDeque::new(),
+        })
     }
 
     /// The parameters in force.
@@ -292,7 +295,11 @@ impl Flow {
     pub fn tilt(&mut self, now_secs: u64, book_e4: i64) -> Tilt {
         self.expire(now_secs);
 
-        let mut out = Tilt { fills: self.recent.len() as u64, book_e4, ..Tilt::default() };
+        let mut out = Tilt {
+            fills: self.recent.len() as u64,
+            book_e4,
+            ..Tilt::default()
+        };
 
         let mut signed: i128 = 0;
         let mut total: u128 = 0;
@@ -301,7 +308,9 @@ impl Flow {
                 out.unweighted += 1;
                 continue;
             }
-            let w = c.notional.saturating_mul(u128::try_from(c.weight_e4).unwrap_or(0))
+            let w = c
+                .notional
+                .saturating_mul(u128::try_from(c.weight_e4).unwrap_or(0))
                 / u128::try_from(SHIFT_SCALE).unwrap_or(1);
             total = total.saturating_add(w);
             let w = i128::try_from(w).unwrap_or(i128::MAX);
@@ -320,7 +329,10 @@ impl Flow {
             .clamp(-SHIFT_SCALE, SHIFT_SCALE);
 
         let explained = book_e4.saturating_mul(self.params.beta_e4) / SHIFT_SCALE;
-        out.residual_e4 = out.own_e4.saturating_sub(explained).clamp(-SHIFT_SCALE, SHIFT_SCALE);
+        out.residual_e4 = out
+            .own_e4
+            .saturating_sub(explained)
+            .clamp(-SHIFT_SCALE, SHIFT_SCALE);
 
         let want = out.residual_e4.saturating_mul(self.params.gain_bps_e2) / SHIFT_SCALE;
         out.shift_e2 = want.clamp(-self.params.max_shift_bps_e2, self.params.max_shift_bps_e2);
@@ -406,8 +418,14 @@ mod tests {
 
     #[test]
     fn a_manipulable_configuration_is_refused_at_construction() {
-        let bad = Params { max_shift_bps_e2: 5_000, ..params() };
-        assert!(matches!(Flow::new(bad), Err(ParamsError::Exploitable { .. })));
+        let bad = Params {
+            max_shift_bps_e2: 5_000,
+            ..params()
+        };
+        assert!(matches!(
+            Flow::new(bad),
+            Err(ParamsError::Exploitable { .. })
+        ));
     }
 
     /// The bound is an inequality between two products, so raising the epoch alone can break a
@@ -415,13 +433,22 @@ mod tests {
     #[test]
     fn raising_the_epoch_can_invalidate_a_safe_configuration() {
         assert!(params().validate().is_ok());
-        let bigger = Params { epoch_notional: params().epoch_notional * 100, ..params() };
-        assert!(matches!(bigger.validate(), Err(ParamsError::Exploitable { .. })));
+        let bigger = Params {
+            epoch_notional: params().epoch_notional * 100,
+            ..params()
+        };
+        assert!(matches!(
+            bigger.validate(),
+            Err(ParamsError::Exploitable { .. })
+        ));
     }
 
     #[test]
     fn a_window_without_a_notional_floor_is_refused() {
-        let bad = Params { min_window_notional: 0, ..params() };
+        let bad = Params {
+            min_window_notional: 0,
+            ..params()
+        };
         assert_eq!(bad.validate(), Err(ParamsError::NoNotionalFloor));
     }
 
@@ -462,7 +489,10 @@ mod tests {
             m.settle(at + 100);
         }
         let s = m.score_of(&stranger()).expect("seasoned");
-        assert!(s.markout_e2(2).expect("marked") > 0, "the pool won against them");
+        assert!(
+            s.markout_e2(2).expect("marked") > 0,
+            "the pool won against them"
+        );
 
         let mut f = Flow::new(params()).expect("valid");
         f.observe(&m, &stranger(), false, 100_000_000_000, 2_000);
@@ -489,7 +519,10 @@ mod tests {
         let mut up = Flow::new(params()).expect("valid");
         up.observe(&m, &informed(), false, 100_000_000_000, 2_000); // taker bought base
         let t = up.tilt(2_000, 0);
-        assert!(t.shift_e2 > 0, "informed takers buying means the price is going up: {t:?}");
+        assert!(
+            t.shift_e2 > 0,
+            "informed takers buying means the price is going up: {t:?}"
+        );
 
         let mut down = Flow::new(params()).expect("valid");
         down.observe(&m, &informed(), true, 100_000_000_000, 2_000); // taker sold base
@@ -518,7 +551,10 @@ mod tests {
 
         // A gain low enough that the cap does not bind: with both runs capped, the control would
         // be invisible in the output even though it had worked.
-        let uncapped = Params { gain_bps_e2: 200, ..params() };
+        let uncapped = Params {
+            gain_bps_e2: 200,
+            ..params()
+        };
 
         let mut alone = Flow::new(uncapped).expect("valid");
         alone.observe(&m, &informed(), false, 100_000_000_000, 2_000);
@@ -529,7 +565,10 @@ mod tests {
         // A bid-heavy public book explains buying pressure.
         let explained = controlled.tilt(2_000, SHIFT_SCALE);
 
-        assert!(!quiet.capped && !explained.capped, "the cap must not mask the control");
+        assert!(
+            !quiet.capped && !explained.capped,
+            "the cap must not mask the control"
+        );
         assert!(explained.residual_e4 < quiet.residual_e4);
         assert!(explained.shift_e2 < quiet.shift_e2);
     }

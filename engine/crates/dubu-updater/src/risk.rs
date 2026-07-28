@@ -80,8 +80,10 @@ pub enum RiskError {
     ///
     /// Deliberately fatal rather than "start fresh": an unreadable latch is indistinguishable
     /// from a latch that was set, and starting fresh would resume a halted book.
-    #[error("killswitch state at `{path}` is unreadable ({source}); refusing to start, because \
-             a corrupt latch cannot be distinguished from a set one")]
+    #[error(
+        "killswitch state at `{path}` is unreadable ({source}); refusing to start, because \
+             a corrupt latch cannot be distinguished from a set one"
+    )]
     Corrupt {
         /// Path involved.
         path: PathBuf,
@@ -118,11 +120,22 @@ pub struct Position {
 ///
 /// # Errors
 /// [`dubu_core::CurveError`] only from the shared domain.
-pub fn value(base_balance: u128, fair: u128, price_scale_exp: u8) -> Result<u128, dubu_core::CurveError> {
+pub fn value(
+    base_balance: u128,
+    fair: u128,
+    price_scale_exp: u8,
+) -> Result<u128, dubu_core::CurveError> {
     if base_balance == 0 || fair == 0 {
         return Ok(0);
     }
-    amount_out_bid(base_balance.min(MAX_AMOUNT), fair, fair, MAX_AMOUNT, 0, price_scale_exp)
+    amount_out_bid(
+        base_balance.min(MAX_AMOUNT),
+        fair,
+        fair,
+        MAX_AMOUNT,
+        0,
+        price_scale_exp,
+    )
 }
 
 /// A killswitch trip.
@@ -166,11 +179,21 @@ impl Halt {
 impl std::fmt::Display for Halt {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Bleed { drawdown, limit, window_secs } => {
-                write!(f, "bleed: NAV fell {drawdown} against a limit of {limit} within {window_secs}s")
+            Self::Bleed {
+                drawdown,
+                limit,
+                window_secs,
+            } => {
+                write!(
+                    f,
+                    "bleed: NAV fell {drawdown} against a limit of {limit} within {window_secs}s"
+                )
             }
             Self::LossBudget { cumulative, budget } => {
-                write!(f, "loss budget: cumulative gross trade loss {cumulative} exceeds {budget}")
+                write!(
+                    f,
+                    "loss budget: cumulative gross trade loss {cumulative} exceeds {budget}"
+                )
             }
             Self::Liveness { reason } => write!(f, "liveness: {reason}"),
         }
@@ -279,12 +302,24 @@ impl KillSwitch {
     /// # Errors
     /// [`RiskError::Io`] if the file exists and cannot be read, [`RiskError::Corrupt`] if it
     /// exists and does not parse. Neither is recoverable by starting fresh — see the variant.
-    pub fn load(path: &Path, bleed_window_secs: u64, bleed_limit: u128, loss_budget: u128) -> Result<Self, RiskError> {
+    pub fn load(
+        path: &Path,
+        bleed_window_secs: u64,
+        bleed_limit: u128,
+        loss_budget: u128,
+    ) -> Result<Self, RiskError> {
         let state = match std::fs::read_to_string(path) {
-            Ok(text) => serde_json::from_str(&text)
-                .map_err(|source| RiskError::Corrupt { path: path.to_path_buf(), source })?,
+            Ok(text) => serde_json::from_str(&text).map_err(|source| RiskError::Corrupt {
+                path: path.to_path_buf(),
+                source,
+            })?,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => RiskState::fresh(),
-            Err(source) => return Err(RiskError::Io { path: path.to_path_buf(), source }),
+            Err(source) => {
+                return Err(RiskError::Io {
+                    path: path.to_path_buf(),
+                    source,
+                })
+            }
         };
         Ok(Self {
             path: path.to_path_buf(),
@@ -349,7 +384,9 @@ impl KillSwitch {
 
         let mut nav = quote_balance;
         for p in by_pair.values() {
-            nav = nav.saturating_add(value(p.base_balance, p.fair, p.price_scale_exp).map_err(RiskError::Mark)?);
+            nav = nav.saturating_add(
+                value(p.base_balance, p.fair, p.price_scale_exp).map_err(RiskError::Mark)?,
+            );
         }
 
         // The window, and the peak-to-current drawdown inside it.
@@ -369,27 +406,37 @@ impl KillSwitch {
                     // A pair that vanished from the config between observations cannot be
                     // revalued; treat its old fair as still current, which contributes zero.
                     let fair_now = by_pair.get(id).map_or(prev.fair, |p| p.fair);
-                    let then = value(prev.base_balance, prev.fair, prev.price_scale_exp).map_err(RiskError::Mark)?;
-                    let now_v = value(prev.base_balance, fair_now, prev.price_scale_exp).map_err(RiskError::Mark)?;
-                    reval += i128::try_from(now_v).unwrap_or(i128::MAX) - i128::try_from(then).unwrap_or(i128::MAX);
+                    let then = value(prev.base_balance, prev.fair, prev.price_scale_exp)
+                        .map_err(RiskError::Mark)?;
+                    let now_v = value(prev.base_balance, fair_now, prev.price_scale_exp)
+                        .map_err(RiskError::Mark)?;
+                    reval += i128::try_from(now_v).unwrap_or(i128::MAX)
+                        - i128::try_from(then).unwrap_or(i128::MAX);
                 }
                 let mut prev_nav = *prev_quote;
                 for p in prev_positions.values() {
-                    prev_nav = prev_nav
-                        .saturating_add(value(p.base_balance, p.fair, p.price_scale_exp).map_err(RiskError::Mark)?);
+                    prev_nav = prev_nav.saturating_add(
+                        value(p.base_balance, p.fair, p.price_scale_exp)
+                            .map_err(RiskError::Mark)?,
+                    );
                 }
-                let delta = i128::try_from(nav).unwrap_or(i128::MAX) - i128::try_from(prev_nav).unwrap_or(i128::MAX);
+                let delta = i128::try_from(nav).unwrap_or(i128::MAX)
+                    - i128::try_from(prev_nav).unwrap_or(i128::MAX);
                 (reval, delta - reval, false)
             }
         };
 
         if !seeded && !self.state.halted {
             if trade_pnl < 0 {
-                self.state.cumulative_trade_loss =
-                    self.state.cumulative_trade_loss.saturating_add(trade_pnl.unsigned_abs());
+                self.state.cumulative_trade_loss = self
+                    .state
+                    .cumulative_trade_loss
+                    .saturating_add(trade_pnl.unsigned_abs());
             } else {
-                self.state.cumulative_trade_gain =
-                    self.state.cumulative_trade_gain.saturating_add(trade_pnl.unsigned_abs());
+                self.state.cumulative_trade_gain = self
+                    .state
+                    .cumulative_trade_gain
+                    .saturating_add(trade_pnl.unsigned_abs());
             }
             self.state.observations += 1;
         }
@@ -411,9 +458,16 @@ impl KillSwitch {
 
         // Bleed first: it is the faster-moving switch and the more urgent verdict.
         let halt = if drawdown >= self.bleed_limit {
-            Some(Halt::Bleed { drawdown, limit: self.bleed_limit, window_secs: self.bleed_window_secs })
+            Some(Halt::Bleed {
+                drawdown,
+                limit: self.bleed_limit,
+                window_secs: self.bleed_window_secs,
+            })
         } else if self.state.cumulative_trade_loss >= self.loss_budget {
-            Some(Halt::LossBudget { cumulative: self.state.cumulative_trade_loss, budget: self.loss_budget })
+            Some(Halt::LossBudget {
+                cumulative: self.state.cumulative_trade_loss,
+                budget: self.loss_budget,
+            })
         } else {
             None
         };
@@ -433,7 +487,10 @@ impl KillSwitch {
     /// Same directory because `rename` is only atomic within a filesystem. A half-written latch
     /// is the one file in this system that must not exist.
     fn persist(&self) -> Result<(), RiskError> {
-        let io = |source| RiskError::Io { path: self.path.clone(), source };
+        let io = |source| RiskError::Io {
+            path: self.path.clone(),
+            source,
+        };
         if let Some(dir) = self.path.parent() {
             if !dir.as_os_str().is_empty() {
                 std::fs::create_dir_all(dir).map_err(io)?;
@@ -460,14 +517,21 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let p = std::env::temp_dir().join(format!("dubu-risk-{name}-{n}")).join("killswitch.json");
+        let p = std::env::temp_dir()
+            .join(format!("dubu-risk-{name}-{n}"))
+            .join("killswitch.json");
         let _ = std::fs::remove_file(&p);
         p
     }
 
     /// pairId 1's shape: 18-decimal base, 6-decimal quote, priceScaleExp 24.
     fn pos(base: u128, fair: u128) -> Position {
-        Position { pair_id: 1, base_balance: base, fair, price_scale_exp: 24 }
+        Position {
+            pair_id: 1,
+            base_balance: base,
+            fair,
+            price_scale_exp: 24,
+        }
     }
 
     const ETH: u128 = 1_000_000_000_000_000_000;
@@ -504,11 +568,21 @@ mod tests {
         let quote = 1_000_000_000_000u128;
         k.observe(quote, &[pos(4_445 * ETH, FAIR)], 1_000).unwrap();
 
-        for (i, fair) in [FAIR * 12 / 10, FAIR * 8 / 10, FAIR, FAIR * 11 / 10].into_iter().enumerate() {
-            let (obs, halt) =
-                k.observe(quote, &[pos(4_445 * ETH, fair)], 1_001 + i as u64).unwrap();
-            assert_eq!(obs.trade_pnl, 0, "a market move with no fill must attribute no trade PnL");
-            assert_ne!(obs.revaluation, 0, "... but it must still show up as revaluation");
+        for (i, fair) in [FAIR * 12 / 10, FAIR * 8 / 10, FAIR, FAIR * 11 / 10]
+            .into_iter()
+            .enumerate()
+        {
+            let (obs, halt) = k
+                .observe(quote, &[pos(4_445 * ETH, fair)], 1_001 + i as u64)
+                .unwrap();
+            assert_eq!(
+                obs.trade_pnl, 0,
+                "a market move with no fill must attribute no trade PnL"
+            );
+            assert_ne!(
+                obs.revaluation, 0,
+                "... but it must still show up as revaluation"
+            );
             assert_eq!(halt, None);
         }
         assert_eq!(k.state().cumulative_trade_loss, 0);
@@ -520,7 +594,9 @@ mod tests {
         // The pool buys 1 mWETH for 1900 mUSDC while fair is 1943.82: a ~43.82 gain.
         let mut k = ks("fill");
         k.observe(10_000_000_000, &[pos(0, FAIR)], 1_000).unwrap();
-        let (obs, halt) = k.observe(10_000_000_000 - 1_900_000_000, &[pos(ETH, FAIR)], 1_001).unwrap();
+        let (obs, halt) = k
+            .observe(10_000_000_000 - 1_900_000_000, &[pos(ETH, FAIR)], 1_001)
+            .unwrap();
         assert_eq!(obs.revaluation, 0, "the price did not move");
         assert_eq!(obs.trade_pnl, 43_820_000, "43.82 mUSDC of edge");
         assert_eq!(halt, None);
@@ -533,7 +609,9 @@ mod tests {
         let mut k = ks("gross");
         // Buy 1 mWETH for 2000 while fair is 1943.82: a 56.18 loss.
         k.observe(10_000_000_000, &[pos(0, FAIR)], 1_000).unwrap();
-        let (obs, _) = k.observe(10_000_000_000 - 2_000_000_000, &[pos(ETH, FAIR)], 1_001).unwrap();
+        let (obs, _) = k
+            .observe(10_000_000_000 - 2_000_000_000, &[pos(ETH, FAIR)], 1_001)
+            .unwrap();
         assert_eq!(obs.trade_pnl, -56_180_000);
         assert_eq!(k.state().cumulative_trade_loss, 56_180_000);
 
@@ -541,7 +619,11 @@ mod tests {
         // loses 56 and makes 56 has been picked off once, not zero times.
         let (obs, _) = k.observe(10_000_000_000, &[pos(0, FAIR)], 1_002).unwrap();
         assert_eq!(obs.trade_pnl, 56_180_000);
-        assert_eq!(k.state().cumulative_trade_loss, 56_180_000, "gross means gross");
+        assert_eq!(
+            k.state().cumulative_trade_loss,
+            56_180_000,
+            "gross means gross"
+        );
         assert_eq!(k.state().cumulative_trade_gain, 56_180_000);
     }
 
@@ -560,7 +642,10 @@ mod tests {
         for i in 0..12u64 {
             quote -= 1_000_000_000;
             let (obs, h) = k.observe(quote, &[pos(0, FAIR)], 1_400 + i * 400).unwrap();
-            assert_eq!(obs.drawdown, 0, "each step alone must be invisible to the bleed switch");
+            assert_eq!(
+                obs.drawdown, 0,
+                "each step alone must be invisible to the bleed switch"
+            );
             if let Some(h) = h {
                 halted = Some((i, h));
                 break;
@@ -568,7 +653,13 @@ mod tests {
         }
         let (i, h) = halted.expect("the budget must trip");
         assert_eq!(i, 9, "10 x 1000 reaches the 10000 budget");
-        assert_eq!(h, Halt::LossBudget { cumulative: 10_000_000_000, budget: 10_000_000_000 });
+        assert_eq!(
+            h,
+            Halt::LossBudget {
+                cumulative: 10_000_000_000,
+                budget: 10_000_000_000
+            }
+        );
         assert!(k.is_halted());
     }
 
@@ -580,10 +671,18 @@ mod tests {
         let quote = 0u128;
         // 10 mWETH: a 2000-unit drawdown needs the price to fall ~200 a coin.
         k.observe(quote, &[pos(10 * ETH, FAIR)], 1_000).unwrap();
-        let (obs, halt) = k.observe(quote, &[pos(10 * ETH, FAIR - 200_000_000_000_000)], 1_100).unwrap();
+        let (obs, halt) = k
+            .observe(quote, &[pos(10 * ETH, FAIR - 200_000_000_000_000)], 1_100)
+            .unwrap();
         assert_eq!(obs.trade_pnl, 0, "no fill happened");
         assert_eq!(obs.drawdown, 2_000_000_000);
-        assert!(matches!(halt, Some(Halt::Bleed { drawdown: 2_000_000_000, .. })));
+        assert!(matches!(
+            halt,
+            Some(Halt::Bleed {
+                drawdown: 2_000_000_000,
+                ..
+            })
+        ));
         assert!(k.is_halted());
     }
 
@@ -609,7 +708,9 @@ mod tests {
         let path = scratch("restart");
         let mut k = KillSwitch::load(&path, 300, BLEED, BUDGET).unwrap();
         k.observe(0, &[pos(10 * ETH, FAIR)], 1_000).unwrap();
-        let (_, halt) = k.observe(0, &[pos(10 * ETH, FAIR - 200_000_000_000_000)], 1_100).unwrap();
+        let (_, halt) = k
+            .observe(0, &[pos(10 * ETH, FAIR - 200_000_000_000_000)], 1_100)
+            .unwrap();
         assert!(halt.is_some());
         drop(k);
 
@@ -625,8 +726,10 @@ mod tests {
         // which an operator restarting after every trip would never reach.
         let path = scratch("cumulative");
         let mut k = KillSwitch::load(&path, 300, u128::MAX, BUDGET).unwrap();
-        k.observe(1_000_000_000_000, &[pos(0, FAIR)], 1_000).unwrap();
-        k.observe(1_000_000_000_000 - 3_000_000_000, &[pos(0, FAIR)], 1_001).unwrap();
+        k.observe(1_000_000_000_000, &[pos(0, FAIR)], 1_000)
+            .unwrap();
+        k.observe(1_000_000_000_000 - 3_000_000_000, &[pos(0, FAIR)], 1_001)
+            .unwrap();
         assert_eq!(k.state().cumulative_trade_loss, 3_000_000_000);
         drop(k);
 
@@ -639,14 +742,19 @@ mod tests {
         let (obs, _) = k.observe(1, &[pos(0, FAIR)], 2_000).unwrap();
         assert!(obs.seeded);
         assert_eq!(obs.trade_pnl, 0);
-        assert_eq!(k.state().cumulative_trade_loss, 3_000_000_000, "the seed must attribute nothing");
+        assert_eq!(
+            k.state().cumulative_trade_loss,
+            3_000_000_000,
+            "the seed must attribute nothing"
+        );
     }
 
     #[test]
     fn a_halted_switch_stops_moving_its_numbers() {
         let mut k = ks("frozen");
         k.observe(0, &[pos(10 * ETH, FAIR)], 1_000).unwrap();
-        k.observe(0, &[pos(10 * ETH, FAIR - 200_000_000_000_000)], 1_100).unwrap();
+        k.observe(0, &[pos(10 * ETH, FAIR - 200_000_000_000_000)], 1_100)
+            .unwrap();
         assert!(k.is_halted());
         let before = k.state().cumulative_trade_loss;
 
@@ -675,7 +783,13 @@ mod tests {
     fn a_liveness_halt_latches_like_the_measured_ones() {
         let path = scratch("liveness");
         let mut k = KillSwitch::load(&path, 300, BLEED, BUDGET).unwrap();
-        k.halt(&Halt::Liveness { reason: "chain down for 600s".into() }, 5_000).unwrap();
+        k.halt(
+            &Halt::Liveness {
+                reason: "chain down for 600s".into(),
+            },
+            5_000,
+        )
+        .unwrap();
         assert!(k.is_halted());
         drop(k);
         let k = KillSwitch::load(&path, 300, BLEED, BUDGET).unwrap();
@@ -691,24 +805,43 @@ mod tests {
         k.state.cumulative_trade_loss = 123_456_789_012_345_678_901_234_567_890;
         k.persist().unwrap();
         let back = KillSwitch::load(&path, 300, u128::MAX, u128::MAX).unwrap();
-        assert_eq!(back.state().cumulative_trade_loss, 123_456_789_012_345_678_901_234_567_890);
+        assert_eq!(
+            back.state().cumulative_trade_loss,
+            123_456_789_012_345_678_901_234_567_890
+        );
         // And it really is stored as a string.
-        assert!(std::fs::read_to_string(&path).unwrap().contains("\"123456789012345678901234567890\""));
+        assert!(std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("\"123456789012345678901234567890\""));
     }
 
     #[test]
     fn two_pairs_are_marked_and_attributed_together() {
         let mut k = ks("twopair");
-        let btc = |base: u128, fair: u128| Position { pair_id: 2, base_balance: base, fair, price_scale_exp: 12 };
+        let btc = |base: u128, fair: u128| Position {
+            pair_id: 2,
+            base_balance: base,
+            fair,
+            price_scale_exp: 12,
+        };
         let btc_fair = 1_180_000_000_000_000u128; // 118_000 a coin, 8-decimal base
 
-        k.observe(0, &[pos(ETH, FAIR), btc(100_000_000, btc_fair)], 1_000).unwrap();
-        let (obs, _) = k.observe(0, &[pos(ETH, FAIR), btc(100_000_000, btc_fair)], 1_001).unwrap();
+        k.observe(0, &[pos(ETH, FAIR), btc(100_000_000, btc_fair)], 1_000)
+            .unwrap();
+        let (obs, _) = k
+            .observe(0, &[pos(ETH, FAIR), btc(100_000_000, btc_fair)], 1_001)
+            .unwrap();
         assert_eq!(obs.nav, 1_943_820_000 + 118_000_000_000);
         assert_eq!(obs.trade_pnl, 0);
 
         // Only BTC moves: revaluation is non-zero, trade PnL still exactly zero.
-        let (obs, _) = k.observe(0, &[pos(ETH, FAIR), btc(100_000_000, btc_fair * 9 / 10)], 1_002).unwrap();
+        let (obs, _) = k
+            .observe(
+                0,
+                &[pos(ETH, FAIR), btc(100_000_000, btc_fair * 9 / 10)],
+                1_002,
+            )
+            .unwrap();
         assert_eq!(obs.trade_pnl, 0);
         assert_eq!(obs.revaluation, -11_800_000_000);
     }

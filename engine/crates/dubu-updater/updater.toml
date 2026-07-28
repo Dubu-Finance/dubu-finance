@@ -93,6 +93,16 @@ ws_reconnect_max_ms = 30000
 # below `block_time_ms` it is refused at startup precisely because it would quietly become one.
 fallback_poll_interval_ms = 2000
 
+# How often the pool re-prices.
+#
+# This used to be whatever `newHeads` delivered, so one second -- and the posted spread has to cover
+# the reference's drift over exactly the re-quote interval, which meant the block time was setting
+# the spread. At 200ms that term shrinks by sqrt(5), which is what makes a 1bp floor defensible.
+#
+# The chain reader publishes every 330ms, so the cycle sees the same view about twice. That is fine:
+# the reference is what moves a quote, and it arrives on the venue sockets 115-172 times a second.
+quote_interval_ms = 200
+
 # A RUNAWAY GUARD, NOT A BUDGET. This used to be sized against a hostile public endpoint. The
 # dedicated endpoint took 20 rapid calls without a 429, so the numbers are now loose enough that
 # normal operation never touches them, and the validator no longer refuses an interval on the

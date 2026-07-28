@@ -110,7 +110,9 @@ pub struct Signer {
 
 impl std::fmt::Debug for Signer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Signer").field("address", &self.address).finish_non_exhaustive()
+        f.debug_struct("Signer")
+            .field("address", &self.address)
+            .finish_non_exhaustive()
     }
 }
 
@@ -126,9 +128,13 @@ impl Signer {
         let t = hex.trim();
         let raw = unhex(t).ok_or_else(|| TxError::Key("key is not hex".into()))?;
         if raw.len() != 32 {
-            return Err(TxError::Key(format!("key must be 32 bytes, got {}", raw.len())));
+            return Err(TxError::Key(format!(
+                "key must be 32 bytes, got {}",
+                raw.len()
+            )));
         }
-        let key = SigningKey::from_slice(&raw).map_err(|_| TxError::Key("key is not a valid secp256k1 scalar".into()))?;
+        let key = SigningKey::from_slice(&raw)
+            .map_err(|_| TxError::Key("key is not a valid secp256k1 scalar".into()))?;
         let point = key.verifying_key().to_encoded_point(false);
         // Uncompressed SEC1 is 0x04 || X || Y; the address is the last 20 bytes of keccak(X||Y).
         let hash = keccak256(&point.as_bytes()[1..]);
@@ -143,8 +149,9 @@ impl Signer {
     pub fn load(source: &KeySource) -> Result<Self, TxError> {
         match source {
             KeySource::Env(name) => {
-                let v = std::env::var(name)
-                    .map_err(|_| TxError::Key(format!("environment variable `{name}` is not set")))?;
+                let v = std::env::var(name).map_err(|_| {
+                    TxError::Key(format!("environment variable `{name}` is not set"))
+                })?;
                 Self::from_hex(&v)
             }
             KeySource::File(path) => Self::load_file(path),
@@ -170,7 +177,11 @@ impl Signer {
             .sign_prehash_recoverable(hash.as_slice())
             .map_err(|e| TxError::Sign(e.to_string()))?;
         // k256 normalises to low-S, which is what EIP-2 requires and what every node checks.
-        Ok((rec.to_byte() & 1 == 1, U256::from_be_slice(&sig.r().to_bytes()), U256::from_be_slice(&sig.s().to_bytes())))
+        Ok((
+            rec.to_byte() & 1 == 1,
+            U256::from_be_slice(&sig.r().to_bytes()),
+            U256::from_be_slice(&sig.s().to_bytes()),
+        ))
     }
 
     /// Sign a 32-byte digest as `(r, s, v)` with `v` in `{27, 28}` — the shape `ecrecover` takes.
@@ -237,7 +248,11 @@ impl Eip1559 {
         self.value.encode(&mut fields);
         self.input.encode(&mut fields);
         // Empty access list: an RLP list with a zero-length payload, i.e. the single byte 0xc0.
-        alloy_rlp::Header { list: true, payload_length: 0 }.encode(&mut fields);
+        alloy_rlp::Header {
+            list: true,
+            payload_length: 0,
+        }
+        .encode(&mut fields);
         if let Some((y, r, s)) = sig {
             u8::from(y).encode(&mut fields);
             r.encode(&mut fields);
@@ -246,7 +261,11 @@ impl Eip1559 {
 
         let mut out = Vec::with_capacity(fields.len() + 8);
         out.push(0x02);
-        alloy_rlp::Header { list: true, payload_length: fields.len() }.encode(&mut out);
+        alloy_rlp::Header {
+            list: true,
+            payload_length: fields.len(),
+        }
+        .encode(&mut out);
         out.extend_from_slice(&fields);
         out
     }
@@ -324,13 +343,19 @@ impl Intent {
     #[must_use]
     pub fn calldata(self) -> Bytes {
         match self {
-            Self::UpdateQuote { word, .. } => {
-                abi::updateQuoteCall { packed: vec![U256::from_be_bytes(word)] }.abi_encode().into()
+            Self::UpdateQuote { word, .. } => abi::updateQuoteCall {
+                packed: vec![U256::from_be_bytes(word)],
             }
+            .abi_encode()
+            .into(),
             Self::RefreshCapacity { pair_id, bid, ask } => abi::refreshCapacityCall {
                 pairId: pair_id,
-                bidCapacity: alloy_primitives::aliases::U96::from(bid.min(dubu_core::curve::MAX_AMOUNT)),
-                askCapacity: alloy_primitives::aliases::U96::from(ask.min(dubu_core::curve::MAX_AMOUNT)),
+                bidCapacity: alloy_primitives::aliases::U96::from(
+                    bid.min(dubu_core::curve::MAX_AMOUNT),
+                ),
+                askCapacity: alloy_primitives::aliases::U96::from(
+                    ask.min(dubu_core::curve::MAX_AMOUNT),
+                ),
             }
             .abi_encode()
             .into(),
@@ -510,7 +535,10 @@ impl Sender {
     /// Build the envelope, optionally overriding the fees for this one transaction.
     #[must_use]
     pub fn envelope_with_fees(&self, intent: Intent, nonce: u64, fees: Option<Fees>) -> Eip1559 {
-        let f = fees.unwrap_or(Fees { max_fee: self.max_fee, max_priority_fee: self.max_priority_fee });
+        let f = fees.unwrap_or(Fees {
+            max_fee: self.max_fee,
+            max_priority_fee: self.max_priority_fee,
+        });
         Eip1559 {
             chain_id: self.chain_id,
             nonce,
@@ -579,7 +607,10 @@ impl Sender {
             Some(n) => n,
             None => {
                 let n = rpc
-                    .quantity("eth_getTransactionCount", json!([signer.address().to_string(), "pending"]))
+                    .quantity(
+                        "eth_getTransactionCount",
+                        json!([signer.address().to_string(), "pending"]),
+                    )
                     .await?;
                 self.nonce = Some(n);
                 n
@@ -589,7 +620,10 @@ impl Sender {
         let tx = self.envelope_with_fees(intent, nonce, fees);
         let (hash, raw) = tx.sign(signer)?;
 
-        match rpc.call("eth_sendRawTransaction", json!([hex0x(&raw)])).await {
+        match rpc
+            .call("eth_sendRawTransaction", json!([hex0x(&raw)]))
+            .await
+        {
             Ok(v) => {
                 let returned = v.as_str().unwrap_or_default();
                 if !returned.is_empty() && returned != hash.to_string() {
@@ -603,7 +637,12 @@ impl Sender {
                 self.pending
                     .entry(intent.pair_id())
                     .or_default()
-                    .push(Pending { hash, kind: intent.label(), nonce, submitted_at: Instant::now() });
+                    .push(Pending {
+                        hash,
+                        kind: intent.label(),
+                        nonce,
+                        submitted_at: Instant::now(),
+                    });
                 Ok(Sent::Broadcast { hash, nonce })
             }
             Err(e) => {
@@ -635,11 +674,27 @@ impl Sender {
     pub async fn poll_pending(&mut self, rpc: &Rpc) -> Vec<(u16, Pending, Settled)> {
         let mut settled = Vec::new();
         let now = Instant::now();
-        let entries: Vec<(u16, Pending)> =
-            self.pending.iter().flat_map(|(k, v)| v.iter().map(move |p| (*k, *p))).collect();
+        // A transaction younger than this has not had time to land, so asking for its receipt is
+        // a round trip that can only return null. It did not matter while the cycle ran once a
+        // second; at the quote cadence the same transaction would be asked about twice before it
+        // could possibly be there, and the receipt call competes with quote traffic for the same
+        // rate limit.
+        //
+        // Sized under the measured 296ms best-case inclusion so a fast landing is still seen on
+        // the first poll after it happens.
+        const MIN_AGE: Duration = Duration::from_millis(250);
+        let entries: Vec<(u16, Pending)> = self
+            .pending
+            .iter()
+            .flat_map(|(k, v)| v.iter().map(move |p| (*k, *p)))
+            .filter(|(_, p)| now.duration_since(p.submitted_at) >= MIN_AGE)
+            .collect();
 
         for (pair_id, p) in entries {
-            match rpc.call("eth_getTransactionReceipt", json!([p.hash.to_string()])).await {
+            match rpc
+                .call("eth_getTransactionReceipt", json!([p.hash.to_string()]))
+                .await
+            {
                 Ok(v) if !v.is_null() => {
                     let ok = v.get("status").and_then(serde_json::Value::as_str) == Some("0x1");
                     let block = v
@@ -650,7 +705,11 @@ impl Sender {
                     settled.push((
                         pair_id,
                         p,
-                        if ok { Settled::Confirmed { block } } else { Settled::Reverted { block } },
+                        if ok {
+                            Settled::Confirmed { block }
+                        } else {
+                            Settled::Reverted { block }
+                        },
                     ));
                     self.forget(pair_id, p.hash);
                 }
@@ -659,7 +718,13 @@ impl Sender {
                 _ => {
                     let waited = now.saturating_duration_since(p.submitted_at);
                     if waited >= self.pending_timeout {
-                        settled.push((pair_id, p, Settled::TimedOut { waited_secs: waited.as_secs() }));
+                        settled.push((
+                            pair_id,
+                            p,
+                            Settled::TimedOut {
+                                waited_secs: waited.as_secs(),
+                            },
+                        ));
                         // Everything behind a timed-out transaction is dropped with it, not just
                         // the one that expired. If nonce `k` never lands there is a gap, and every
                         // nonce after it is unexecutable however healthy its own transaction looks
@@ -692,13 +757,19 @@ mod tests {
         let s = Signer::from_hex(ANVIL_KEY_0).unwrap();
         assert_eq!(s.address(), ANVIL_ADDR_0.parse::<Address>().unwrap());
         // ... with or without the prefix.
-        assert_eq!(Signer::from_hex(&ANVIL_KEY_0[2..]).unwrap().address(), s.address());
+        assert_eq!(
+            Signer::from_hex(&ANVIL_KEY_0[2..]).unwrap().address(),
+            s.address()
+        );
     }
 
     #[test]
     fn every_malformed_key_is_refused() {
         for bad in ["", "0x", "0xzz", "0x00", "not hex", "0xdeadbeef"] {
-            assert!(Signer::from_hex(bad).is_err(), "`{bad}` was accepted as a key");
+            assert!(
+                Signer::from_hex(bad).is_err(),
+                "`{bad}` was accepted as a key"
+            );
         }
         // 32 bytes of zero is not a valid secp256k1 scalar, and 31 bytes is not a key at all.
         assert!(Signer::from_hex(&format!("0x{}", "00".repeat(32))).is_err());
@@ -712,9 +783,18 @@ mod tests {
         let material = "11".repeat(33);
         let e = Signer::from_hex(&format!("0x{material}")).unwrap_err();
         let msg = format!("{e}");
-        assert!(!msg.contains(&material), "the error quoted the key material: {msg}");
-        assert!(!msg.contains("1111"), "the error quoted the key material: {msg}");
-        assert!(msg.contains("32 bytes"), "... but it must still say what was wrong: {msg}");
+        assert!(
+            !msg.contains(&material),
+            "the error quoted the key material: {msg}"
+        );
+        assert!(
+            !msg.contains("1111"),
+            "the error quoted the key material: {msg}"
+        );
+        assert!(
+            msg.contains("32 bytes"),
+            "... but it must still say what was wrong: {msg}"
+        );
 
         // The env and file loaders name the source and nothing else.
         let e = Signer::load(&KeySource::Env("DUBU_TEST_UNSET_KEY_VAR".into())).unwrap_err();
@@ -729,7 +809,9 @@ mod tests {
             max_priority_fee_per_gas: 5_000_000,
             max_fee_per_gas: 50_000_000,
             gas_limit: 400_000,
-            to: "0xA629071E606F425dB93310c3ecc35E00Fbe16358".parse().unwrap(),
+            to: "0xA629071E606F425dB93310c3ecc35E00Fbe16358"
+                .parse()
+                .unwrap(),
             value: U256::ZERO,
             input: Bytes::from_static(&[0xde, 0xad, 0xbe, 0xef]),
         }
@@ -749,7 +831,11 @@ mod tests {
         let signer = Signer::from_hex(ANVIL_KEY_0).unwrap();
         let (hash, raw) = vector_tx().sign(&signer).unwrap();
         let expected_raw = include_str!("../testdata/eip1559_vector.hex").trim();
-        assert_eq!(hex0x(&raw), expected_raw, "signed envelope diverged from `cast mktx`");
+        assert_eq!(
+            hex0x(&raw),
+            expected_raw,
+            "signed envelope diverged from `cast mktx`"
+        );
         assert_eq!(hash, keccak256(&raw));
     }
 
@@ -777,18 +863,30 @@ mod tests {
             },
         );
         let packed = word.pack().unwrap();
-        let data = Intent::UpdateQuote { pair_id: 1, word: packed }.calldata();
+        let data = Intent::UpdateQuote {
+            pair_id: 1,
+            word: packed,
+        }
+        .calldata();
 
         let decoded = abi::updateQuoteCall::abi_decode(&data).unwrap();
         assert_eq!(decoded.packed.len(), 1);
         assert_eq!(decoded.packed[0].to_be_bytes::<32>(), packed);
         // And the chain will decode the same four prices back out of it.
-        assert_eq!(dubu_core::pack::QuoteWord::unpack(&decoded.packed[0].to_be_bytes::<32>()).unwrap(), word);
+        assert_eq!(
+            dubu_core::pack::QuoteWord::unpack(&decoded.packed[0].to_be_bytes::<32>()).unwrap(),
+            word
+        );
     }
 
     #[test]
     fn refresh_capacity_calldata_carries_base_units_on_both_sides() {
-        let data = Intent::RefreshCapacity { pair_id: 2, bid: 2_000_000_000, ask: 1_500_000_000 }.calldata();
+        let data = Intent::RefreshCapacity {
+            pair_id: 2,
+            bid: 2_000_000_000,
+            ask: 1_500_000_000,
+        }
+        .calldata();
         let d = abi::refreshCapacityCall::abi_decode(&data).unwrap();
         assert_eq!(d.pairId, 2);
         assert_eq!(d.bidCapacity.to::<u128>(), 2_000_000_000);
@@ -799,16 +897,43 @@ mod tests {
     fn a_capacity_above_the_uint96_field_saturates_rather_than_wrapping() {
         // Wrapping would encode a tiny capacity that looks deliberate. The config validator
         // already refuses this, so saturating here is the second line rather than the first.
-        let data = Intent::RefreshCapacity { pair_id: 1, bid: u128::MAX, ask: 0 }.calldata();
+        let data = Intent::RefreshCapacity {
+            pair_id: 1,
+            bid: u128::MAX,
+            ask: 0,
+        }
+        .calldata();
         let d = abi::refreshCapacityCall::abi_decode(&data).unwrap();
         assert_eq!(d.bidCapacity.to::<u128>(), dubu_core::curve::MAX_AMOUNT);
     }
 
     #[test]
     fn intents_key_by_pair_and_label_themselves() {
-        assert_eq!(Intent::UpdateQuote { pair_id: 3, word: [0; 32] }.pair_id(), 3);
-        assert_eq!(Intent::UpdateQuote { pair_id: 3, word: [0; 32] }.label(), "updateQuote");
-        assert_eq!(Intent::RefreshCapacity { pair_id: 4, bid: 1, ask: 1 }.label(), "refreshCapacity");
+        assert_eq!(
+            Intent::UpdateQuote {
+                pair_id: 3,
+                word: [0; 32]
+            }
+            .pair_id(),
+            3
+        );
+        assert_eq!(
+            Intent::UpdateQuote {
+                pair_id: 3,
+                word: [0; 32]
+            }
+            .label(),
+            "updateQuote"
+        );
+        assert_eq!(
+            Intent::RefreshCapacity {
+                pair_id: 4,
+                bid: 1,
+                ask: 1
+            }
+            .label(),
+            "refreshCapacity"
+        );
     }
 
     fn tx_cfg(transmit: bool) -> crate::config::TxConfig {
@@ -826,30 +951,64 @@ mod tests {
 
     #[test]
     fn a_dry_run_sender_signs_nothing_and_needs_no_key() {
-        let s = Sender::new(None, 91_342, Address::ZERO, &tx_cfg(false), 50_000_000, 5_000_000);
+        let s = Sender::new(
+            None,
+            91_342,
+            Address::ZERO,
+            &tx_cfg(false),
+            50_000_000,
+            5_000_000,
+        );
         assert!(!s.transmit_allowed());
         assert_eq!(s.address(), None);
     }
 
     #[test]
     fn the_pending_map_blocks_exactly_the_pair_it_is_for() {
-        let mut s = Sender::new(None, 91_342, Address::ZERO, &tx_cfg(true), 50_000_000, 5_000_000);
+        let mut s = Sender::new(
+            None,
+            91_342,
+            Address::ZERO,
+            &tx_cfg(true),
+            50_000_000,
+            5_000_000,
+        );
         assert!(!s.at_capacity(1));
         assert_eq!(s.in_flight(1), 0);
         s.pending.insert(
             1,
-            vec![Pending { hash: B256::ZERO, kind: "updateQuote", nonce: 3, submitted_at: Instant::now() }],
+            vec![Pending {
+                hash: B256::ZERO,
+                kind: "updateQuote",
+                nonce: 3,
+                submitted_at: Instant::now(),
+            }],
         );
         assert_eq!(s.in_flight(1), 1, "the send must be tracked");
         assert_eq!(s.in_flight(2), 0, "and no other pair may be affected");
-        assert!(!s.at_capacity(1), "one outstanding is inside the depth of two");
+        assert!(
+            !s.at_capacity(1),
+            "one outstanding is inside the depth of two"
+        );
     }
 
     /// The bound is what stops a stall burning nonces without limit. Depth, not a ban.
     #[test]
     fn the_pipeline_is_bounded_by_max_in_flight() {
-        let mut s = Sender::new(None, 91_342, Address::ZERO, &tx_cfg(true), 50_000_000, 5_000_000);
-        let p = |n| Pending { hash: B256::from(U256::from(n)), kind: "updateQuote", nonce: n, submitted_at: Instant::now() };
+        let mut s = Sender::new(
+            None,
+            91_342,
+            Address::ZERO,
+            &tx_cfg(true),
+            50_000_000,
+            5_000_000,
+        );
+        let p = |n| Pending {
+            hash: B256::from(U256::from(n)),
+            kind: "updateQuote",
+            nonce: n,
+            submitted_at: Instant::now(),
+        };
         s.pending.insert(1, vec![p(3)]);
         assert!(!s.at_capacity(1));
         s.pending.entry(1).or_default().push(p(4));
@@ -861,8 +1020,20 @@ mod tests {
     /// it rather than leaving transactions that can never settle.
     #[test]
     fn a_timeout_drops_the_whole_queue_for_that_pair() {
-        let mut s = Sender::new(None, 91_342, Address::ZERO, &tx_cfg(true), 50_000_000, 5_000_000);
-        let p = |n| Pending { hash: B256::from(U256::from(n)), kind: "updateQuote", nonce: n, submitted_at: Instant::now() };
+        let mut s = Sender::new(
+            None,
+            91_342,
+            Address::ZERO,
+            &tx_cfg(true),
+            50_000_000,
+            5_000_000,
+        );
+        let p = |n| Pending {
+            hash: B256::from(U256::from(n)),
+            kind: "updateQuote",
+            nonce: n,
+            submitted_at: Instant::now(),
+        };
         s.pending.insert(1, vec![p(3), p(4)]);
         s.pending.remove(&1); // what the timeout branch does
         assert_eq!(s.in_flight(1), 0);
@@ -872,7 +1043,14 @@ mod tests {
     fn a_failed_send_drops_the_local_nonce() {
         // Building the next transaction on a nonce that may or may not have been consumed is
         // how a queue gets stuck behind a gap.
-        let mut s = Sender::new(None, 91_342, Address::ZERO, &tx_cfg(true), 50_000_000, 5_000_000);
+        let mut s = Sender::new(
+            None,
+            91_342,
+            Address::ZERO,
+            &tx_cfg(true),
+            50_000_000,
+            5_000_000,
+        );
         s.nonce = Some(41);
         s.resync_nonce();
         assert_eq!(s.nonce, None);
@@ -880,10 +1058,30 @@ mod tests {
 
     #[test]
     fn the_envelope_is_deterministic_in_the_nonce_and_nothing_else() {
-        let s = Sender::new(None, 91_342, Address::repeat_byte(0xaa), &tx_cfg(false), 50_000_000, 5_000_000);
-        let i = Intent::UpdateQuote { pair_id: 1, word: [7; 32] };
-        assert_eq!(s.envelope(i, 1).signing_hash(), s.envelope(i, 1).signing_hash());
-        assert_ne!(s.envelope(i, 1).signing_hash(), s.envelope(i, 2).signing_hash());
-        assert_eq!(s.envelope(i, 1).value, U256::ZERO, "neither updater function is payable");
+        let s = Sender::new(
+            None,
+            91_342,
+            Address::repeat_byte(0xaa),
+            &tx_cfg(false),
+            50_000_000,
+            5_000_000,
+        );
+        let i = Intent::UpdateQuote {
+            pair_id: 1,
+            word: [7; 32],
+        };
+        assert_eq!(
+            s.envelope(i, 1).signing_hash(),
+            s.envelope(i, 1).signing_hash()
+        );
+        assert_ne!(
+            s.envelope(i, 1).signing_hash(),
+            s.envelope(i, 2).signing_hash()
+        );
+        assert_eq!(
+            s.envelope(i, 1).value,
+            U256::ZERO,
+            "neither updater function is payable"
+        );
     }
 }
