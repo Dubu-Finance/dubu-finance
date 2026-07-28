@@ -273,14 +273,17 @@ impl RpcError {
             // the exception: they say the endpoint refused to serve *this caller*, which is a
             // property of the key, not of the request. A different key answers it fine.
             //
-            // This is not theoretical. `403 API usage quota has been exceeded` arrives as a
-            // JSON-RPC error object, so it was classified as a node error, and the pool gave up on
-            // the first endpoint while six working keys sat behind it -- the bot could not start.
+            // This is not theoretical, and it has now happened twice with different codes. First
+            // `403 API usage quota has been exceeded` from Nodit; then, after that was whitelisted,
+            // `-32016 over rate limit` from GIWA's public endpoint -- a code that was not on the
+            // list, so the pool gave up on the first endpoint again while seven alternatives sat
+            // behind it. The list is the wrong shape for the problem: anything meaning "not you,
+            // not now" belongs on it, and each new venue brings its own spelling.
             //
             // Safe on the transmit path, where a retry would otherwise risk a second broadcast:
             // these are all refusals issued *before* the request was processed, so nothing was
             // submitted and there is nothing to double.
-            Self::Node { code, .. } => matches!(code, 401 | 403 | 429 | -32005),
+            Self::Node { code, .. } => matches!(code, 401 | 403 | 429 | -32005 | -32016),
             Self::Decode { .. } => false,
         }
     }
@@ -1784,6 +1787,24 @@ mod tests {
             !bad.is_endpoint_fault(),
             "every node answers this identically"
         );
+    }
+
+    /// The same bug, second spelling. `403` was whitelisted this morning; GIWA's public endpoint
+    /// answers `-32016 over rate limit`, which was not, so the pool gave up on the first endpoint
+    /// again -- with seven alternatives configured and idle.
+    #[test]
+    fn a_rate_limit_refusal_fails_over_whatever_the_venue_calls_it() {
+        for code in [-32016, -32005, 429] {
+            let e = RpcError::Node {
+                endpoint: "rpc",
+                code,
+                message: "over rate limit".into(),
+            };
+            assert!(
+                e.is_endpoint_fault(),
+                "code {code} means not-you-not-now, so another endpoint is worth trying"
+            );
+        }
     }
 
     #[test]

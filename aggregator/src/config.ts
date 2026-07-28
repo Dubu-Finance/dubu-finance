@@ -12,6 +12,7 @@ import { getAddress, type Address } from 'viem';
 /** Cloudflare binds these; `wrangler.toml` documents which are secrets. */
 export interface Env {
   RPC_URL?: string;
+  FALLBACK_RPC_URLS?: string;
   ROUTER?: string;
   PROP_POOL?: string;
   PROP_ADAPTER?: string;
@@ -38,6 +39,8 @@ export interface Market {
 export interface Config {
   chainId: number;
   rpcUrl: string;
+  /** Tried in order when `rpcUrl` fails. A single endpoint is a single point of `prop: —`. */
+  fallbackRpcUrls: string[];
   router: Address;
   propPool: Address;
   propAdapter: Address;
@@ -106,6 +109,13 @@ export function loadConfig(env: Env): Config {
   return {
     chainId: CHAIN_ID,
     rpcUrl: env.RPC_URL ?? DEFAULT_RPC,
+    // The plain public RPC is second: it is not flashblocks-aware, so a quote served from it is a
+    // sealed one and up to a second stale. Stale is worse than fresh and far better than absent --
+    // reading nothing shows the pool as having no quote at all.
+    fallbackRpcUrls: (env.FALLBACK_RPC_URLS ?? 'https://sepolia-rpc.giwa.io')
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean),
     router: required(env, 'ROUTER', '0x2B10D0b50ca3A7c0C7CCaBc969615b4Db3fb9471'),
     propPool: required(env, 'PROP_POOL', '0xBbE55E29BbC6d71EcAb1ac011c9Ac5206aB2Fe74'),
     propAdapter: required(env, 'PROP_ADAPTER', '0x16C5A0df5Ad0c8b0A450eDaa67c56593B02D19e2'),

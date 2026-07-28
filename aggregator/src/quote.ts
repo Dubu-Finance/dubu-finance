@@ -1,4 +1,4 @@
-import { createPublicClient, encodeFunctionData, decodeFunctionResult, http, type Address, type PublicClient } from 'viem';
+import { createPublicClient, encodeFunctionData, decodeFunctionResult, fallback, http, type Address, type PublicClient } from 'viem';
 
 import { ERC20_ABI, MULTICALL3_ABI, PROP_POOL_ABI, UNIV2_ROUTER_ABI } from './abi.js';
 import { MULTICALL3, type Config } from './config.js';
@@ -51,7 +51,24 @@ export interface AmmQuote {
 }
 
 export function makeClient(cfg: Config): PublicClient {
-  return createPublicClient({ transport: http(cfg.rpcUrl) });
+  // `fallback`, not a single endpoint, and the reason is a live incident rather than a precaution.
+  //
+  // The worker read one URL. When GIWA's public RPC rate-limited us -- `-32016 over rate limit`,
+  // reproduced by hand on both public endpoints -- the multicall failed, `allowFailure: true`
+  // turned that into `success: false`, `decodeProp` returned 0n, and the pool showed as `prop: —`.
+  // Not "the pool is down": the pool was quoting, one second old, at a price 0.2% off the
+  // reference. It simply could not be read, and a silent zero is indistinguishable from no quote.
+  //
+  // viem's fallback transport moves to the next URL on error and ranks by observed latency, so a
+  // throttled endpoint stops being asked. `rank` is off: reordering during a burst would spread the
+  // burst across every endpoint rather than draining one and moving on.
+  const urls = [cfg.rpcUrl, ...cfg.fallbackRpcUrls].filter((u, i, a) => u && a.indexOf(u) === i);
+  return createPublicClient({
+    transport: fallback(
+      urls.map((u) => http(u, { retryCount: 1, timeout: 4_000 })),
+      { rank: false },
+    ),
+  });
 }
 
 /**
