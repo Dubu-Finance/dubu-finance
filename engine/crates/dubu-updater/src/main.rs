@@ -515,6 +515,13 @@ async fn run(args: &Args) -> Result<i32, Box<dyn std::error::Error>> {
             facts.tokens.clone(),
         ),
     };
+    // The reader publishes our confirmed nonce alongside the state, which is what tells the
+    // in-flight gate a send has landed. See `ChainView::sender_nonce`. Without a signing key there
+    // is nothing to send and nothing to gate, so the extra request is not made.
+    let reader = match sender.address() {
+        Some(a) => reader.with_sender(a),
+        None => reader,
+    };
     let vol: BTreeMap<u16, Volatility> = cfg
         .pairs
         .iter()
@@ -747,6 +754,11 @@ async fn quote_loop(
         // `chain::view` for why that costs nothing: every externally-driven change in here is a
         // swap, and a swap only reduces what is exposed.
         if let Some(v) = rt.view.latest() {
+            // Before anything reads the gate. Everything below this nonce is on chain, so it must
+            // stop occupying a slot now rather than whenever a receipt call gets a turn.
+            if let Some(n) = v.sender_nonce {
+                rt.sender.observe_landed(n);
+            }
             last_view = Some(v);
         }
 

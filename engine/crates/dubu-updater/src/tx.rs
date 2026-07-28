@@ -448,6 +448,8 @@ pub struct Sender {
     pending: BTreeMap<u16, Vec<Pending>>,
     pending_timeout: Duration,
     max_in_flight: usize,
+    /// The chain's confirmed nonce. See [`Sender::observe_landed`].
+    landed_nonce: u64,
 }
 
 impl Sender {
@@ -473,6 +475,7 @@ impl Sender {
             pending: BTreeMap::new(),
             pending_timeout: Duration::from_secs(cfg.pending_timeout_secs),
             max_in_flight: cfg.max_in_flight,
+            landed_nonce: 0,
         }
     }
 
@@ -510,7 +513,24 @@ impl Sender {
     /// How many transactions this pair has outstanding.
     #[must_use]
     pub fn in_flight(&self, pair_id: u16) -> usize {
-        self.pending.get(&pair_id).map_or(0, Vec::len)
+        self.pending.get(&pair_id).map_or(0, |v| {
+            v.iter().filter(|p| p.nonce >= self.landed_nonce).count()
+        })
+    }
+
+    /// Tell the gate what the chain's confirmed nonce is.
+    ///
+    /// Everything below this has landed -- nonce ordering is absolute for one sender -- so it no
+    /// longer occupies an in-flight slot, whatever the receipt poller has managed to ask about.
+    /// The transaction stays in `pending` until a receipt classifies it, because whether it
+    /// succeeded or reverted is a different question from whether it is still in the air, and
+    /// conflating the two is what made the gate hold slots for transactions that were already on
+    /// chain 2s earlier.
+    ///
+    /// Monotone: a view can arrive out of order, and a nonce that went backwards would re-block
+    /// sends that are already settled.
+    pub fn observe_landed(&mut self, confirmed_nonce: u64) {
+        self.landed_nonce = self.landed_nonce.max(confirmed_nonce);
     }
 
     /// The pending transaction for a pair, if any.
@@ -743,6 +763,73 @@ impl Sender {
 
 #[cfg(test)]
 mod tests {
+    /// The gate must reopen on the chain's nonce, not on a receipt arriving.
+    ///
+    /// This is the regression that cost 14.7% of quote cycles: a transaction landed in ~570ms, the
+    /// receipt call reporting it lost to quote traffic at the rate limiter and came back 2.5s
+    /// later, and for those two seconds the gate refused to re-quote over a queue that was already
+    /// empty.
+    #[test]
+    fn the_gate_reopens_on_the_confirmed_nonce() {
+        let mut s = Sender::new(
+            None,
+            91_342,
+            Address::ZERO,
+            &tx_cfg(true),
+            50_000_000,
+            5_000_000,
+        );
+        let p = |b: u8, n: u64| Pending {
+            hash: B256::repeat_byte(b),
+            kind: "updateQuote",
+            nonce: n,
+            submitted_at: Instant::now(),
+        };
+        s.pending.insert(1, vec![p(1, 10), p(2, 11)]);
+        assert!(s.at_capacity(1), "two in flight against max_in_flight 2");
+
+        // Nonce 10 is on chain. No receipt has been asked for, let alone answered.
+        s.observe_landed(11);
+        assert_eq!(s.in_flight(1), 1);
+        assert!(
+            !s.at_capacity(1),
+            "the slot is free the moment the chain says so"
+        );
+
+        // The transaction is still tracked, because "did it land" and "did it succeed" are
+        // different questions and only the receipt answers the second.
+        assert_eq!(s.pending(1).map(|p| p.nonce), Some(10));
+    }
+
+    /// A view can arrive out of order; a nonce that went backwards would re-block settled sends.
+    #[test]
+    fn the_landed_nonce_never_goes_backwards() {
+        let mut s = Sender::new(
+            None,
+            91_342,
+            Address::ZERO,
+            &tx_cfg(true),
+            50_000_000,
+            5_000_000,
+        );
+        s.observe_landed(50);
+        s.observe_landed(7);
+        s.pending.insert(
+            1,
+            vec![Pending {
+                hash: B256::repeat_byte(3),
+                kind: "updateQuote",
+                nonce: 20,
+                submitted_at: Instant::now(),
+            }],
+        );
+        assert_eq!(
+            s.in_flight(1),
+            0,
+            "nonce 20 is below the high-water mark of 50"
+        );
+    }
+
     use super::*;
 
     /// Anvil's first development account. **Published in Foundry's own documentation and in

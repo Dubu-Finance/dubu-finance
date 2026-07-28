@@ -1071,6 +1071,18 @@ pub struct ChainView {
     /// RFQ quote against the pool's balance means signing orders that revert at fill time, which
     /// costs the taker gas and tells them nothing useful.
     pub maker_deliverable: BTreeMap<Address, u128>,
+    /// Our own confirmed nonce, when a sender was configured.
+    ///
+    /// This is what says a transaction has landed, and it says so exactly: nonce ordering is
+    /// absolute for one sender, so a confirmed nonce above a pending transaction's own proves that
+    /// transaction is on chain, however many others are in flight beside it.
+    ///
+    /// It exists because asking for receipts did not scale to the quote cadence. The receipt calls
+    /// competed with quote traffic for the same rate limit, and measured, that made transactions
+    /// which had actually landed in ~570ms get reported 2.5s later -- so the in-flight gate refused
+    /// to re-quote 14.7% of the time over a queue that was already empty. This arrives with a read
+    /// the reader was making anyway.
+    pub sender_nonce: Option<u64>,
     /// When this view was received locally.
     pub at: Instant,
 }
@@ -1100,6 +1112,12 @@ pub struct ChainReader {
     /// `(maker, settler)` when the RFQ leg is on. Its presence is what puts the two extra reads
     /// per token at the end of the batch, so it is also what `read` dispatches on when decoding.
     maker: Option<(Address, Address)>,
+    /// The transaction sender, when the caller wants its confirmed nonce read alongside the state.
+    ///
+    /// Read on the **`latest`** tag, never `pending`: `pending` counts our own unconfirmed
+    /// transactions, so it would report every in-flight send as already landed and free the gate
+    /// instantly, which is the exact opposite of what this is for.
+    sender: Option<Address>,
     calldata: Bytes,
 }
 
@@ -1134,6 +1152,16 @@ impl ChainReader {
         settler: Address,
     ) -> Self {
         Self::build(pool, multicall, pair_ids, tokens, Some((maker, settler)))
+    }
+
+    /// Also read this address's confirmed nonce on every poll.
+    ///
+    /// Costs one extra request per read and replaces up to `max_in_flight` receipt calls per cycle.
+    /// See [`ChainView::sender_nonce`].
+    #[must_use]
+    pub fn with_sender(mut self, sender: Address) -> Self {
+        self.sender = Some(sender);
+        self
     }
 
     fn build(
@@ -1190,6 +1218,7 @@ impl ChainReader {
             pair_ids,
             tokens,
             maker,
+            sender: None,
             calldata,
         }
     }
@@ -1217,9 +1246,28 @@ impl ChainReader {
     /// crate-wide.
     #[allow(clippy::indexing_slicing)]
     pub async fn read(&self, rpc: &Rpc) -> Result<ChainView, RpcError> {
-        let raw = rpc
-            .eth_call(self.multicall, &self.calldata, "pending")
-            .await?;
+        // Issued together rather than in sequence. The nonce is not part of the multicall -- it is
+        // account state, not contract state -- so it costs a second request, and paying for it
+        // serially would add a round trip to the interval that decides how fast the gate reopens.
+        let nonce_call = async {
+            match self.sender {
+                Some(a) => rpc
+                    .call(
+                        "eth_getTransactionCount",
+                        serde_json::json!([a.to_string(), "latest"]),
+                    )
+                    .await
+                    .ok()
+                    .and_then(|v| v.as_str().map(str::to_owned))
+                    .and_then(|h| u64::from_str_radix(h.trim_start_matches("0x"), 16).ok()),
+                None => None,
+            }
+        };
+        let (raw, sender_nonce) = tokio::join!(
+            rpc.eth_call(self.multicall, &self.calldata, "pending"),
+            nonce_call
+        );
+        let raw = raw?;
         let extra = if self.maker.is_some() {
             2 * self.tokens.len()
         } else {
@@ -1278,6 +1326,7 @@ impl ChainReader {
             snaps,
             balances,
             maker_deliverable,
+            sender_nonce,
             at: Instant::now(),
         })
     }
