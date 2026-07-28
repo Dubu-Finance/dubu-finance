@@ -28,6 +28,10 @@ contracts/lib/
 
 **/context 
 **/docs
+**/scripts 
+**/state 
+./aws-ip-ranges.json
+
 
 # Cloudflare Worker build + deps
 aggregator/node_modules/
