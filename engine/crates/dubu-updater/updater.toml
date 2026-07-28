@@ -854,3 +854,60 @@ min_fill_bps = 1000
 
 [rfq.serve]
 bind = "127.0.0.1:8790"
+
+# ---------------------------------------------------------------------------
+# THE HEDGE LEG
+# ---------------------------------------------------------------------------
+#
+# Without this the ladder has to price the risk of holding whatever it buys until somebody happens
+# to sell it back, and that holding time is unbounded. It is why `width_bps` is 25 when the measured
+# cost of actually unwinding 1,000 ETH on Binance is 3.8 bp -- six times steeper than the venue
+# charges, and the whole gap is insurance against a risk this removes.
+#
+# TESTNET ON BOTH SIDES, deliberately. The pool trades mock tokens; hedging that on the live
+# exchange would leave the only real position in the system with nothing behind it. Testnet USD-M
+# tracks the live price closely enough to prove the mechanism -- measured, ETHUSDT read 1,877.06
+# there against 1,877.07 live. What it cannot prove is slippage, so the depth curve is measured
+# against the LIVE public book, which needs no key.
+[hedge]
+base_url = "https://testnet.binancefuture.com"
+key_env = "BINANCE_TESTNET_API_KEY"
+secret_env = "BINANCE_TESTNET_API_SECRET"
+
+# Binance USD-M taker, standard tier: 4 bp. Not a VIP figure -- those need volume we do not have,
+# and assuming them would derive an interval we are not entitled to.
+taker_fee_bps_e2 = 400
+
+timeout_ms = 5000
+
+# Binance compares timestamps against ITS OWN clock, so a host that drifts starts failing every
+# signed call at once with an error that names the timestamp and not the cause. Measured today:
+# -1021 on the first attempt, before the offset was applied.
+clock_resync_secs = 300
+
+# The crossing INTERVAL is not configured. It is derived from the fee above and measured sigma --
+# `(fee/sigma)^2`, about 45 seconds at ETHUSDT's 0.594 bp per root-second. Below that a crossing
+# spends more on fees than the exposure it clears was worth. Whatever drift accumulates in that
+# window becomes the band, so the width adapts to flow without anyone knowing what the flow is.
+
+[[hedge.pairs]]
+pair_id = 1
+symbol = "ETHUSDT"
+# Binance USD-M ETHUSDT steps in 0.001 contracts.
+qty_decimals = 3
+# 0.01 ETH, above the venue's minimum with room to spare.
+min_qty_base = "10000000000000000"
+# 25 ETH. A RISK CHOICE, not a derivation: it bounds what a burst can build up before the derived
+# interval elapses. The interval is what makes the hedge cheap; this is what stops it being slow.
+max_drift_base = "25000000000000000000"
+cooloff_ms = 2000
+
+[[hedge.pairs]]
+pair_id = 2
+symbol = "BTCUSDT"
+qty_decimals = 3
+# 0.001 BTC (8 decimals).
+min_qty_base = "100000"
+# 1 BTC.
+max_drift_base = "100000000"
+cooloff_ms = 2000

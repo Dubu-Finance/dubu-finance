@@ -1084,6 +1084,18 @@ pub struct ChainView {
     /// RFQ quote against the pool's balance means signing orders that revert at fill time, which
     /// costs the taker gas and tells them nothing useful.
     pub maker_deliverable: BTreeMap<Address, u128>,
+    /// The most recent **sealed** block, as `(number, timestamp)`.
+    ///
+    /// The clock. Not [`Self::block_timestamp`], which comes from the `pending` tag and lands about
+    /// twelve seconds in the future; and not the `newHeads` subscription either, which is where it
+    /// used to come from and which dies with whatever key it is on. Six of seven keys exhausted
+    /// today, the socket went with them, and `chain_now` silently fell back to the host clock --
+    /// so quote age, markout stamps and `scan_fills` all quietly stopped meaning anything.
+    ///
+    /// Read here instead because the reader is already making a round trip on a keyless endpoint
+    /// every 330ms. `newHeads` remains as the fast wake signal it is good at; it is no longer the
+    /// only source of the time.
+    pub sealed: Option<(u64, u64)>,
     /// Our own confirmed nonce, when a sender was configured.
     ///
     /// This is what says a transaction has landed, and it says so exactly: nonce ordering is
@@ -1276,9 +1288,25 @@ impl ChainReader {
                 None => None,
             }
         };
-        let (raw, sender_nonce) = tokio::join!(
+        // The sealed head, on the same trip. One more request on a keyless endpoint, against a
+        // websocket that costs a key and takes the clock with it when that key runs out.
+        let sealed_call = async {
+            rpc.call("eth_getBlockByNumber", serde_json::json!(["latest", false]))
+                .await
+                .ok()
+                .and_then(|v| {
+                    let hex = |k: &str| {
+                        v.get(k)
+                            .and_then(serde_json::Value::as_str)
+                            .and_then(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok())
+                    };
+                    Some((hex("number")?, hex("timestamp")?))
+                })
+        };
+        let (raw, sender_nonce, sealed) = tokio::join!(
             rpc.eth_call(self.multicall, &self.calldata, "pending"),
-            nonce_call
+            nonce_call,
+            sealed_call
         );
         let raw = raw?;
         let extra = if self.maker.is_some() {
@@ -1339,6 +1367,7 @@ impl ChainReader {
             snaps,
             balances,
             maker_deliverable,
+            sealed,
             sender_nonce,
             at: Instant::now(),
         })

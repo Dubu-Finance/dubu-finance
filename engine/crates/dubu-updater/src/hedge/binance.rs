@@ -276,6 +276,11 @@ impl Venue {
     /// not fill leaves the position open while reporting success — which is the failure mode this
     /// exists to prevent.
     ///
+    /// Asked for with `newOrderRespType=RESULT`, so the response carries the execution rather than
+    /// just an acknowledgement. The default acknowledges with `status: NEW` and `executedQty: 0`,
+    /// which reads to [`super::Bands::settle`] as "nothing filled" -- the drift stays outstanding
+    /// and the next evaluation crosses the same inventory again.
+    ///
     /// # Errors
     /// [`VenueError`].
     pub async fn market(&self, symbol: &str, side: Side, qty: f64) -> Result<Fill, VenueError> {
@@ -288,6 +293,12 @@ impl Venue {
                     ("side", side.as_str().to_string()),
                     ("type", "MARKET".to_string()),
                     ("quantity", format!("{qty}")),
+                    // Without this the venue answers `ACK` -- `status: NEW`, `executedQty: 0` --
+                    // and the fill is only visible to a later query. `Bands::settle` deducts what
+                    // filled, so an unreported fill leaves the drift outstanding and the next
+                    // evaluation crosses again: measured, one 0.04 ETH fill became a 0.08 ETH
+                    // short before this was found. `RESULT` waits for the execution report.
+                    ("newOrderRespType", "RESULT".to_string()),
                 ],
             )
             .await?;

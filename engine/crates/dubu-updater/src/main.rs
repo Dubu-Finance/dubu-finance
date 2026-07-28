@@ -61,6 +61,7 @@ use dubu_updater::feed::ws::MarketFeed;
 use dubu_updater::feed::{
     binance, bybit, coinbase, okx, FeedStatus, VenueFeeds, VenueId, VenueWatch,
 };
+use dubu_updater::hedge;
 use dubu_updater::jump;
 use dubu_updater::ladder::{self, RowInputs};
 use dubu_updater::maker;
@@ -205,6 +206,8 @@ fn main() {
 struct Runtime {
     /// Whether the clock has been compared against the chain yet. See `check_clock_skew`.
     clock_checked: bool,
+    /// The hedge leg, when configured. See `dubu_updater::hedge`.
+    hedge: Option<HedgeLeg>,
     /// The sealed block timestamp the per-block work last ran at.
     ///
     /// The cycle runs at the quote cadence now, several times per block, but some of what it does
@@ -322,7 +325,15 @@ async fn run(args: &Args) -> Result<i32, Box<dyn std::error::Error>> {
     // budget is the sum of its keys rather than the smallest of them.
     let mut read_urls = vec![cfg.chain.flashblocks_rpc_url.clone()];
     read_urls.extend(cfg.chain.read_rpc_urls.iter().cloned());
-    let flash = Rpc::pooled("flashblocks", &read_urls, Selection::Rotate, &cfg.chain)?;
+    // `Pin`, not `Rotate`. Rotating spread the load so "the pool's budget is the sum of its keys
+    // rather than the smallest of them" -- which was right when every endpoint was a keyed one with
+    // a daily quota. It is not any more: the first endpoint is GIWA's public flashblocks RPC, which
+    // has no key and no quota, and measured, it serves 3 req/s at 29/30. Rotating past it spends
+    // Nodit quota on requests that a free endpoint would have answered, and today that exhausted
+    // six of seven keys -- which took the websocket down with them, and with it the sealed clock.
+    //
+    // So it stays on the free one and moves to a key only when the free one genuinely fails.
+    let flash = Rpc::pooled("flashblocks", &read_urls, Selection::Pin, &cfg.chain)?;
     info!(
         target: "chain", event = "read_pool", endpoints = flash.endpoint_count(),
         transmit = %rpc.url(),
@@ -600,6 +611,7 @@ async fn run(args: &Args) -> Result<i32, Box<dyn std::error::Error>> {
     let cfg_pool = cfg.chain.pool;
     let mut rt = Runtime {
         clock_checked: false,
+        hedge: None,
         last_block_work: 0,
         last_push: BTreeMap::new(),
         cfg,
@@ -623,6 +635,39 @@ async fn run(args: &Args) -> Result<i32, Box<dyn std::error::Error>> {
 
     wait_for_feed(&rt).await;
     wait_for_first_head(&rt).await;
+
+    // Built after the feeds have had a moment, because the crossing interval is derived from
+    // measured sigma and a zero sigma would derive a zero interval -- a hedge that crosses on
+    // every fill, which is the behaviour the band exists to prevent. Falling back to the config's
+    // horizon figure keeps it conservative rather than reckless when the estimator is still cold.
+    let sigma_root_sec = rt
+        .vol
+        .get(&rt.cfg.pairs.first().map_or(0, |p| p.pair_id))
+        .map(|v| v.sigma_millibps())
+        .filter(|s| *s > 0)
+        .map_or(594, |s| {
+            let horizon = f64::from(u32::try_from(rt.cfg.skew.vol_horizon_secs).unwrap_or(300));
+            (s as f64 / horizon.sqrt()) as u64
+        });
+    rt.hedge = start_hedge(&rt.cfg, sigma_root_sec);
+    if let Some(leg) = rt.hedge.as_mut() {
+        match leg.venue.sync_clock().await {
+            Ok(offset) => match leg.venue.available_usdt().await {
+                Ok(usdt) => info!(target: "hedge", event = "venue_ready", offset_ms = offset,
+                                  available_usdt = usdt, "venue reachable and the signature works"),
+                Err(e) => {
+                    error!(target: "hedge", event = "venue_unreachable", error = %e,
+                           "credentials do not work; quoting unhedged");
+                    rt.hedge = None;
+                }
+            },
+            Err(e) => {
+                error!(target: "hedge", event = "venue_unreachable", error = %e,
+                       "cannot reach the venue clock; quoting unhedged");
+                rt.hedge = None;
+            }
+        }
+    }
 
     let limit = if args.once { Some(1) } else { args.cycles };
     let code = quote_loop(&mut rt, limit, head_rx, shutdown_rx).await;
@@ -1147,6 +1192,165 @@ fn start_rfq(cfg: &Config) -> Result<RfqLeg, Box<dyn std::error::Error>> {
     })
 }
 
+/// The venue client, the per-pair bands, and the mapping between pool units and venue units.
+struct HedgeLeg {
+    venue: hedge::binance::Venue,
+    bands: BTreeMap<u16, hedge::Bands>,
+    symbols: BTreeMap<u16, String>,
+    /// Base-unit divisor per pair, so a `u128` of pool units becomes the decimal the venue wants.
+    scale: BTreeMap<u16, f64>,
+    qty_decimals: BTreeMap<u16, u32>,
+    resync: Duration,
+    last_resync: Instant,
+}
+
+/// Build the hedge leg, or explain why there isn't one.
+///
+/// Never fatal. A pool that cannot reach its hedge venue must still quote -- it just has to quote
+/// as though it had no hedge, which is the configuration it was already safe under. Refusing to
+/// start would turn a degraded mode into an outage, the same call `wait_for_first_head` makes.
+fn start_hedge(cfg: &Config, sigma_millibps_per_sqrt_sec: u64) -> Option<HedgeLeg> {
+    let hc = cfg.hedge.as_ref()?;
+    let creds = match hedge::binance::Credentials::from_env(&hc.key_env, &hc.secret_env) {
+        Ok(c) => c,
+        Err(e) => {
+            warn!(target: "hedge", event = "disabled", error = %e,
+                  key_env = %hc.key_env, secret_env = %hc.secret_env,
+                  "hedge configured but no credentials; quoting unhedged");
+            return None;
+        }
+    };
+    let venue = match hedge::binance::Venue::new(
+        hc.base_url.clone(),
+        creds,
+        Duration::from_millis(hc.timeout_ms),
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            warn!(target: "hedge", event = "disabled", error = %e, "cannot build venue client");
+            return None;
+        }
+    };
+
+    // The interval is derived, not configured. See `hedge::derive_hedge_interval`: below
+    // `(fee/sigma)^2` a crossing spends more on fees than the exposure it clears was worth.
+    let interval = hedge::derive_hedge_interval(hc.taker_fee_bps_e2, sigma_millibps_per_sqrt_sec);
+
+    let mut bands = BTreeMap::new();
+    let mut symbols = BTreeMap::new();
+    let mut scale = BTreeMap::new();
+    let mut qty_decimals = BTreeMap::new();
+    for hp in &hc.pairs {
+        let Some(pair) = cfg.pairs.iter().find(|p| p.pair_id == hp.pair_id) else {
+            warn!(target: "hedge", event = "unknown_pair", pair_id = hp.pair_id,
+                  "hedge configured for a pair the bot does not quote; ignored");
+            continue;
+        };
+        let parse = |s: &str| s.parse::<u128>().unwrap_or(0);
+        bands.insert(
+            hp.pair_id,
+            hedge::Bands::new(
+                hp.pair_id,
+                hedge::Band {
+                    interval,
+                    max_drift: parse(&hp.max_drift_base),
+                    min_qty: parse(&hp.min_qty_base),
+                    cooloff: Duration::from_millis(hp.cooloff_ms),
+                },
+            ),
+        );
+        symbols.insert(hp.pair_id, hp.symbol.clone());
+        qty_decimals.insert(hp.pair_id, hp.qty_decimals);
+        scale.insert(hp.pair_id, 10f64.powi(i32::from(pair.base_decimals)));
+    }
+    if bands.is_empty() {
+        warn!(target: "hedge", event = "disabled", "no hedgeable pairs; quoting unhedged");
+        return None;
+    }
+
+    info!(
+        target: "hedge", event = "enabled", base_url = %hc.base_url,
+        pairs = bands.len(), taker_fee_bps_e2 = hc.taker_fee_bps_e2,
+        sigma_millibps_per_sqrt_sec, interval_secs = interval.as_secs(),
+        "hedge leg configured; the crossing interval is derived from fee and sigma, not chosen"
+    );
+    Some(HedgeLeg {
+        venue,
+        bands,
+        symbols,
+        scale,
+        qty_decimals,
+        resync: Duration::from_secs(hc.clock_resync_secs),
+        last_resync: Instant::now(),
+    })
+}
+
+/// Cross out whatever drift has earned a crossing.
+///
+/// Runs after `scan_fills`, on the same cycle, because the fills it reacts to were just recorded.
+/// Sends at most one order per pair per cycle: the cool-off exists to stop a second crossing before
+/// the first is reflected, and cycling faster than the venue answers would defeat it.
+async fn run_hedge(rt: &mut Runtime) {
+    let Some(leg) = rt.hedge.as_mut() else { return };
+    let now = Instant::now();
+
+    // A drifting host clock breaks every signed call at once, with an error that names the
+    // timestamp and not the cause. Re-measure on a timer rather than waiting to find out.
+    if now.saturating_duration_since(leg.last_resync) >= leg.resync {
+        leg.last_resync = now;
+        if let Err(e) = leg.venue.sync_clock().await {
+            warn!(target: "hedge", event = "clock_resync_failed", error = %e,
+                  "keeping the previous offset");
+        }
+    }
+
+    let due: Vec<hedge::Order> = leg
+        .bands
+        .values_mut()
+        .filter_map(|b| b.evaluate(now))
+        .collect();
+
+    for order in due {
+        let Some(symbol) = leg.symbols.get(&order.pair_id).cloned() else {
+            continue;
+        };
+        let scale = leg.scale.get(&order.pair_id).copied().unwrap_or(1.0);
+        let decimals = leg.qty_decimals.get(&order.pair_id).copied().unwrap_or(3);
+
+        // Truncated, never rounded. Rounding up asks the venue for more than the pool actually
+        // holds, and the rejection that follows leaves the drift uncleared while looking like a
+        // transient error.
+        let raw = order.qty as f64 / scale;
+        let step = 10f64.powi(i32::try_from(decimals).unwrap_or(3));
+        let qty = (raw * step).floor() / step;
+        if qty <= 0.0 {
+            continue;
+        }
+
+        match leg.venue.market(&symbol, order.side, qty).await {
+            Ok(fill) => {
+                // Settled on what filled, not on what was asked for. See `hedge::Bands::settle`.
+                let filled_base = (fill.executed_qty * scale) as u128;
+                if let Some(b) = leg.bands.get_mut(&order.pair_id) {
+                    b.settle(Instant::now(), order.side, filled_base);
+                }
+                info!(
+                    target: "hedge", event = "crossed", pair_id = order.pair_id, symbol = %symbol,
+                    side = order.side.as_str(), requested = qty, executed = fill.executed_qty,
+                    avg_price = fill.avg_price, status = %fill.status, order_id = fill.order_id,
+                    drift_left = leg.bands.get(&order.pair_id).map(dubu_updater::hedge::Bands::drift),
+                    "inventory neutralised on the venue"
+                );
+            }
+            Err(e) => error!(
+                target: "hedge", event = "cross_failed", pair_id = order.pair_id, symbol = %symbol,
+                side = order.side.as_str(), qty, error = %e,
+                "the drift stays outstanding and will be retried"
+            ),
+        }
+    }
+}
+
 /// Read the fills that landed since the last cycle, mark the ones that have matured, and log both.
 ///
 /// Runs after the quote decisions rather than before them, deliberately. Markout is a measurement
@@ -1160,8 +1364,16 @@ fn start_rfq(cfg: &Config) -> Result<RfqLeg, Box<dyn std::error::Error>> {
 /// has, so using it would ask for logs from a block that does not exist there yet. With no head,
 /// the scan is skipped rather than guessed at — the cursor does not advance, so the next poll
 /// picks the same range up. That replayability is why this polls instead of subscribing.
-async fn scan_fills(rt: &mut Runtime, head: &heads::HeadSnapshot) {
-    let Some(confirmed) = head.last.map(|h| h.number) else {
+async fn scan_fills(rt: &mut Runtime, head: &heads::HeadSnapshot, view: &ChainView) {
+    // The subscription first, the reader's own sealed read second. Returning here when the socket
+    // is down is what stopped fills being seen at all today -- and with them the hedge, which had
+    // nothing to neutralise because nothing was ever observed. The preconfirmed sub-fetch inside
+    // `SwapWatch::poll` is bounded by this too, so losing the head lost the fast path as well.
+    let Some(confirmed) = head
+        .last
+        .map(|h| h.number)
+        .or_else(|| view.sealed.map(|(n, _)| n))
+    else {
         return;
     };
 
@@ -1233,6 +1445,20 @@ async fn scan_fills(rt: &mut Runtime, head: &heads::HeadSnapshot) {
             block = log.block_number, at_secs = log.at_secs, tx = %log.tx_hash,
             "fill observed"
         );
+
+        // The hedge sees the same fill. `is_bid` is true when the pool BOUGHT base, so the venue
+        // has to sell it: the taker's `amount_in` arrived as base. On the other side the pool paid
+        // base out as `amount_out`, and the venue has to buy it back.
+        if let Some(leg) = rt.hedge.as_mut() {
+            if let Some(b) = leg.bands.get_mut(&log.pair_id) {
+                let delta = if log.is_bid {
+                    i128::try_from(log.amount_in).unwrap_or(i128::MAX)
+                } else {
+                    -i128::try_from(log.amount_out).unwrap_or(i128::MAX)
+                };
+                b.observe(Instant::now(), delta);
+            }
+        }
 
         rt.markout.observe_fill(markout::Fill {
             pair_id: log.pair_id,
@@ -1313,7 +1539,16 @@ async fn run_cycle(
     // Falling back to the local clock when heads are down is a worse approximation than a sealed
     // header and a much better one than a projection: the machine's skew against the sequencer is
     // seconds at worst, where the projection is twelve out by construction.
-    let chain_now = head.last.map_or_else(now_unix, |h| h.timestamp);
+    // Sealed, and from whichever source has one. The subscription is the fast path when it is up;
+    // the reader's own `latest` read is the one that survives a key running out, which is what took
+    // the socket down today and silently moved this to the host clock. Verified sealed rather than
+    // assumed: measured, `latest` advances exactly once per block on both endpoints, where
+    // `pending` advances 2.1 times.
+    let chain_now = head
+        .last
+        .map(|h| h.timestamp)
+        .or_else(|| view.sealed.map(|(_, ts)| ts))
+        .unwrap_or_else(now_unix);
 
     // Hand the RFQ maker the chain's clock. It stamps every signed expiry from this rather than
     // from the host's wall clock -- see `serve::Inner::chain_clock` for why that distinction is the
@@ -1882,7 +2117,8 @@ block_work,
     // waiting a full second for it meant two or three more quotes went out at the same price before
     // we knew. `SwapWatch::poll` now also reads the `pending` tag, so the extra frequency has
     // preconfirmed fills to find rather than re-reading blocks it has already seen.
-    scan_fills(rt, head).await;
+    scan_fills(rt, head, view).await;
+    run_hedge(rt).await;
 
     // The killswitches. Skipped entirely when any pair has no fair value: marking inventory
     // against a price we do not have would be an invention, and an invented NAV is worse than

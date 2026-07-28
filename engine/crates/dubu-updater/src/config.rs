@@ -296,6 +296,13 @@ pub struct Config {
     /// existed must not acquire a signing endpoint merely by being loaded.
     #[serde(default)]
     pub rfq: Option<RfqConfig>,
+    /// The hedge leg. Absent means inventory is neutralised nowhere, which is the assumption the
+    /// ladder's slope was priced under. See [`crate::hedge`].
+    ///
+    /// Opt-in for the same reason as `rfq`: it places orders on an exchange with a live key, and a
+    /// config written before it existed must not acquire that merely by being loaded.
+    #[serde(default)]
+    pub hedge: Option<HedgeConfig>,
     /// One entry per pair the bot quotes.
     pub pairs: Vec<PairConfig>,
 }
@@ -304,6 +311,68 @@ pub struct Config {
 ///
 /// The key is deliberately separate from [`TxConfig`]'s. See `maker`'s module docs — a leaked
 /// updater key posts a wrong ladder the killswitches will notice, and a leaked RFQ key signs away
+/// The hedge leg: where to neutralise inventory, and how patiently.
+///
+/// Absent means no hedging, which is the state the ladder was priced defensively for -- a 25 bp
+/// slope exists because inventory had nowhere to go. See [`crate::hedge`].
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HedgeConfig {
+    /// REST base, e.g. `https://testnet.binancefuture.com`.
+    ///
+    /// Testnet on purpose while the pool trades mock tokens: hedging a fake position on the live
+    /// exchange would leave the only real leg in the system unbacked.
+    pub base_url: String,
+    /// Environment variable holding the venue API key. Never the key itself.
+    pub key_env: String,
+    /// Environment variable holding the venue secret. Never the secret itself.
+    pub secret_env: String,
+    /// The venue's taker fee, in hundredths of a basis point, from its rate card. Half of what
+    /// derives the crossing interval; the other half is measured sigma.
+    pub taker_fee_bps_e2: u32,
+    /// Request timeout, milliseconds.
+    #[serde(default = "d_hedge_timeout_ms")]
+    pub timeout_ms: u64,
+    /// Re-measure the venue's clock this often. Binance compares timestamps against its own clock,
+    /// so a host that drifts starts failing every signed call at once.
+    #[serde(default = "d_hedge_clock_resync_secs")]
+    pub clock_resync_secs: u64,
+    /// One entry per pair to hedge. A pair with no entry is simply not hedged.
+    #[serde(default)]
+    pub pairs: Vec<HedgePair>,
+}
+
+/// How one pair maps onto the venue.
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HedgePair {
+    /// This crate's pair numbering.
+    pub pair_id: u16,
+    /// The venue's contract, e.g. `ETHUSDT`.
+    pub symbol: String,
+    /// Decimals the venue accepts for quantity. Sending more is rejected outright.
+    pub qty_decimals: u32,
+    /// The venue's minimum order size, in the pool's base units.
+    pub min_qty_base: String,
+    /// Cross regardless of the interval once drift reaches this, in the pool's base units. A risk
+    /// choice rather than a derivation: it bounds what a burst builds before the interval elapses.
+    pub max_drift_base: String,
+    /// Don't send again within this many milliseconds. A crossing takes time to fill and to be
+    /// reflected; firing again before then doubles the position instead of correcting it.
+    #[serde(default = "d_hedge_cooloff_ms")]
+    pub cooloff_ms: u64,
+}
+
+fn d_hedge_timeout_ms() -> u64 {
+    5_000
+}
+fn d_hedge_clock_resync_secs() -> u64 {
+    300
+}
+fn d_hedge_cooloff_ms() -> u64 {
+    2_000
+}
+
 /// the maker's balance up to its standing allowance with nothing to notice in time.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
