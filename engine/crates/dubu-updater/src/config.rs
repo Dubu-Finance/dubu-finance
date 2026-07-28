@@ -337,9 +337,30 @@ pub struct HedgeConfig {
     /// so a host that drifts starts failing every signed call at once.
     #[serde(default = "d_hedge_clock_resync_secs")]
     pub clock_resync_secs: u64,
+    /// Hyperliquid's read endpoint, for pairs on [`HedgeVenue::HyperliquidPaper`].
+    ///
+    /// Mainnet, and unauthenticated: the equity books are here and `allMids` needs no key. Weight 2
+    /// against a 1200/minute budget, returning every market in one response.
+    #[serde(default = "d_hyperliquid_url")]
+    pub hyperliquid_url: String,
     /// One entry per pair to hedge. A pair with no entry is simply not hedged.
     #[serde(default)]
     pub pairs: Vec<HedgePair>,
+}
+
+/// Which venue a pair is hedged on.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HedgeVenue {
+    /// Binance USD-M futures, signed and live against whatever `base_url` points at.
+    #[default]
+    Binance,
+    /// Hyperliquid, read-only. The decision is taken and the book is written; no order is sent.
+    ///
+    /// Paper because the equity markets exist on **mainnet only** -- the testnet's HIP-3 list is
+    /// experiments, not equities -- and hedging a mock-token pool with real capital leaves the only
+    /// real position in the system unbacked. Everything is exercised except the fill.
+    HyperliquidPaper,
 }
 
 /// How one pair maps onto the venue.
@@ -348,8 +369,21 @@ pub struct HedgeConfig {
 pub struct HedgePair {
     /// This crate's pair numbering.
     pub pair_id: u16,
-    /// The venue's contract, e.g. `ETHUSDT`.
+    /// The venue's contract, e.g. `ETHUSDT`, or `xyz:TSLA` on Hyperliquid.
     pub symbol: String,
+    /// Where this pair is hedged. Defaults to the signed Binance leg.
+    ///
+    /// Per-pair rather than per-config because the venues do not overlap: Binance USD-M carries the
+    /// crypto pairs and no equities, Hyperliquid carries equities through HIP-3 and is read-only
+    /// here. A pool quoting both has to hedge each where it can be hedged.
+    #[serde(default)]
+    pub venue: HedgeVenue,
+    /// The HIP-3 builder book, for [`HedgeVenue::HyperliquidPaper`]. Empty is the main perp book.
+    ///
+    /// Not a routing detail. Builders attach their own oracles and disagree -- measured in one
+    /// second, `xyz:TSLA` 307.31 against `flx:TSLA` 395.50. Naming the dex is naming a fair value.
+    #[serde(default)]
+    pub dex: String,
     /// Decimals the venue accepts for quantity. Sending more is rejected outright.
     pub qty_decimals: u32,
     /// The venue's minimum order size, in the pool's base units.
@@ -363,6 +397,9 @@ pub struct HedgePair {
     pub cooloff_ms: u64,
 }
 
+fn d_hyperliquid_url() -> String {
+    "https://api.hyperliquid.xyz".into()
+}
 fn d_hedge_timeout_ms() -> u64 {
     5_000
 }

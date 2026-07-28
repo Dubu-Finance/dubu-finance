@@ -928,6 +928,20 @@ okx     = "SOL-USDT"
 bybit   = "SOLUSDT"
 
 
+# ---------------------------------------------------------------------------
+# EQUITIES -- LISTED ON CHAIN, NOT YET QUOTED
+#
+# Pairs 6-9 (mAAPL, mTSLA, mSKHY, mSPCX) exist on the pool and their hedge routes are configured
+# below, but they are absent from this file and therefore not quoted. That is deliberate and the
+# config validator is what made it explicit: a pair with no venues can never reach `min_venues`, so
+# it refused to start rather than run a market that would be silent forever.
+#
+# What is missing is a FEED, not a hedge. `hedge::hyperliquid` reads mids for the hedge leg; the
+# reference the ladder is built from comes from `feed/`, and no adapter there carries equities --
+# Binance, OKX and Bybit list none of them. Until `feed/hyperliquid.rs` exists these markets have no
+# price, and a pool that invented one would be worse than a pool with no market.
+# ---------------------------------------------------------------------------
+
 [rfq]
 private_key_env = "RFQ_PRIVATE_KEY"
 pmm_settle = "0x68CFa6E265AffD5D0DB2C49E4bb9DaEC5A920A9E"
@@ -1052,6 +1066,46 @@ symbol = "SOLUSDT"
 qty_decimals = 2
 min_qty_base = "10000000"
 max_drift_base = "250000000000"
+cooloff_ms = 2000
+
+[[hedge.pairs]]
+pair_id = 6
+symbol = "xyz:AAPL"
+venue = "hyperliquid_paper"
+dex = "xyz"
+qty_decimals = 2
+min_qty_base = "1000000"
+max_drift_base = "10000000000"
+cooloff_ms = 2000
+
+[[hedge.pairs]]
+pair_id = 7
+symbol = "xyz:TSLA"
+venue = "hyperliquid_paper"
+dex = "xyz"
+qty_decimals = 2
+min_qty_base = "1000000"
+max_drift_base = "10000000000"
+cooloff_ms = 2000
+
+[[hedge.pairs]]
+pair_id = 8
+symbol = "xyz:SKHY"
+venue = "hyperliquid_paper"
+dex = "xyz"
+qty_decimals = 2
+min_qty_base = "1000000"
+max_drift_base = "10000000000"
+cooloff_ms = 2000
+
+[[hedge.pairs]]
+pair_id = 9
+symbol = "xyz:SPCX"
+venue = "hyperliquid_paper"
+dex = "xyz"
+qty_decimals = 2
+min_qty_base = "1000000"
+max_drift_base = "10000000000"
 cooloff_ms = 2000
 
 [[hedge.pairs]]

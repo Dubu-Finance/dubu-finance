@@ -38,12 +38,18 @@ contract AddMarkets is DubuScript {
     }
 
     function _newMarkets() internal pure returns (NewMarket[] memory out) {
-        out = new NewMarket[](3);
-        // Decimals mirror each chain's own convention rather than being uniform, for the reason
-        // `MockERC20` documents: identical decimals never exercise `priceScaleExp` at all.
-        out[0] = NewMarket("Mock BNB", "mBNB", 18, 900, "BNBUSDT");
-        out[1] = NewMarket("Mock XRP", "mXRP", 6, 2, "XRPUSDT");
-        out[2] = NewMarket("Mock Solana", "mSOL", 9, 200, "SOLUSDT");
+        out = new NewMarket[](4);
+        // Equities, hedged on Hyperliquid's `xyz` HIP-3 book rather than Binance, which carries
+        // none of them. All four quote there -- including SPCX, which is SpaceX: unlisted, and with
+        // a perp anyway. Reference prices are the mids read on 2026-07-28; only the ratio matters
+        // for the encoding, and the updater overwrites the ladder within a second of starting.
+        //
+        // 8 decimals throughout: equities are quoted to cents and fractional shares are the point,
+        // so the extra precision costs nothing and 18 would waste the price range.
+        out[0] = NewMarket("Mock Apple", "mAAPL", 8, 339, "xyz:AAPL");
+        out[1] = NewMarket("Mock Tesla", "mTSLA", 8, 307, "xyz:TSLA");
+        out[2] = NewMarket("Mock SK Hynix", "mSKHY", 8, 133, "xyz:SKHY");
+        out[3] = NewMarket("Mock SpaceX", "mSPCX", 8, 115, "xyz:SPCX");
     }
 
     /// @dev One market, in its own frame. The loop body was inline and hit "stack too deep": the

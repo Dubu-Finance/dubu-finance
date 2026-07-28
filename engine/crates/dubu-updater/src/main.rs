@@ -1201,6 +1201,12 @@ struct HedgeLeg {
     /// settled fills double-counts the inventory for as long as the venue takes to answer.
     positions: BTreeMap<u16, i128>,
     venue: hedge::binance::Venue,
+    /// The read-only leg, for pairs Binance does not carry. `None` until a pair asks for it.
+    paper: Option<hedge::hyperliquid::Paper>,
+    /// Which venue each pair hedges on, and the HIP-3 book when it is the paper one.
+    routes: BTreeMap<u16, (dubu_updater::config::HedgeVenue, String)>,
+    /// Every distinct HIP-3 book in use, so mids are polled once per book rather than per pair.
+    dexs: Vec<String>,
     bands: BTreeMap<u16, hedge::Bands>,
     symbols: BTreeMap<u16, String>,
     /// Base-unit divisor per pair, so a `u128` of pool units becomes the decimal the venue wants.
@@ -1244,6 +1250,8 @@ fn start_hedge(cfg: &Config, sigma_millibps_per_sqrt_sec: u64) -> Option<HedgeLe
 
     let mut bands = BTreeMap::new();
     let mut symbols = BTreeMap::new();
+    let mut routes = BTreeMap::new();
+    let mut dexs: Vec<String> = Vec::new();
     let mut scale = BTreeMap::new();
     let mut qty_decimals = BTreeMap::new();
     for hp in &hc.pairs {
@@ -1266,6 +1274,11 @@ fn start_hedge(cfg: &Config, sigma_millibps_per_sqrt_sec: u64) -> Option<HedgeLe
             ),
         );
         symbols.insert(hp.pair_id, hp.symbol.clone());
+        routes.insert(hp.pair_id, (hp.venue, hp.dex.clone()));
+        if hp.venue == dubu_updater::config::HedgeVenue::HyperliquidPaper && !dexs.contains(&hp.dex)
+        {
+            dexs.push(hp.dex.clone());
+        }
         qty_decimals.insert(hp.pair_id, hp.qty_decimals);
         scale.insert(hp.pair_id, 10f64.powi(i32::from(pair.base_decimals)));
     }
@@ -1280,9 +1293,34 @@ fn start_hedge(cfg: &Config, sigma_millibps_per_sqrt_sec: u64) -> Option<HedgeLe
         sigma_millibps_per_sqrt_sec, interval_secs = interval.as_secs(),
         "hedge leg configured; the crossing interval is derived from fee and sigma, not chosen"
     );
+    // Built only if some pair asks for it, so a crypto-only config makes no Hyperliquid requests.
+    let paper = if dexs.is_empty() {
+        None
+    } else {
+        match hedge::hyperliquid::Paper::new(
+            hc.hyperliquid_url.clone(),
+            Duration::from_millis(hc.timeout_ms),
+        ) {
+            Ok(p) => {
+                info!(target: "hedge", event = "paper_enabled", url = %hc.hyperliquid_url,
+                      books = dexs.len(),
+                      "equity pairs hedge on paper; the decision is taken and no order is sent");
+                Some(p)
+            }
+            Err(e) => {
+                warn!(target: "hedge", event = "paper_disabled", error = %e,
+                      "those pairs will quote unhedged");
+                None
+            }
+        }
+    };
+
     Some(HedgeLeg {
         positions: BTreeMap::new(),
         venue,
+        paper,
+        routes,
+        dexs,
         bands,
         symbols,
         scale,
@@ -1309,6 +1347,19 @@ async fn run_hedge(rt: &mut Runtime) {
             warn!(target: "hedge", event = "clock_resync_failed", error = %e,
                   "keeping the previous offset");
         }
+    }
+
+    // Mids first, and once per book rather than once per pair: `allMids` returns the whole book at
+    // weight 2, so per-symbol polling would be the same information at fifty times the cost.
+    let dexs = leg.dexs.clone();
+    if let Some(paper) = leg.paper.as_mut() {
+        for dex in &dexs {
+            if let Err(e) = paper.poll_mids(dex).await {
+                warn!(target: "hedge", event = "paper_poll_failed", dex = %dex, error = %e,
+                      "the book keeps its previous mids");
+            }
+        }
+        paper.warn_if_stale(now, Duration::from_secs(10));
     }
 
     let due: Vec<hedge::Order> = leg
@@ -1342,6 +1393,45 @@ async fn run_hedge(rt: &mut Runtime) {
             hedge::Side::Buy => committed,
         };
         *leg.positions.entry(order.pair_id).or_insert(0) += signed;
+
+        let route = leg
+            .routes
+            .get(&order.pair_id)
+            .map_or(dubu_updater::config::HedgeVenue::Binance, |(v, _)| *v);
+
+        // Paper: the same decision, the same book, no order. A write that cannot be priced is
+        // refused rather than invented -- an imaginary mid reports a cost that never existed, and
+        // the drift would be settled against it exactly as if it had.
+        if route == dubu_updater::config::HedgeVenue::HyperliquidPaper {
+            let written = leg
+                .paper
+                .as_mut()
+                .ok_or_else(|| "no paper book".to_string())
+                .and_then(|p| p.write(&symbol, order.side, qty).map_err(|e| e.to_string()));
+            match written {
+                Ok(fill) => {
+                    if let Some(b) = leg.bands.get_mut(&order.pair_id) {
+                        b.settle(Instant::now(), order.side, order.qty);
+                    }
+                    info!(
+                        target: "hedge", event = "crossed_paper", pair_id = order.pair_id,
+                        symbol = %symbol, side = order.side.as_str(), qty,
+                        mid = fill.mid, position = fill.position,
+                        "hedge decided and booked; no order was sent"
+                    );
+                }
+                Err(e) => {
+                    // Back out the commitment, exactly as a rejected live order does.
+                    *leg.positions.entry(order.pair_id).or_insert(0) -= signed;
+                    warn!(
+                        target: "hedge", event = "paper_failed", pair_id = order.pair_id,
+                        symbol = %symbol, error = %e,
+                        "the drift stays outstanding"
+                    );
+                }
+            }
+            continue;
+        }
 
         match leg.venue.market(&symbol, order.side, qty).await {
             Ok(fill) => {

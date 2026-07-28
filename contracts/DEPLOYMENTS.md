@@ -151,3 +151,22 @@ The three exponents differ because the tokens carry each chain's own decimals ra
 
 ⚠️ The quote leg was not topped up. All five markets draw on the same mUSDC reserve, so the pool now
 splits one balance five ways -- fund it before raising capacity.
+
+### Equities, added 2026-07-28
+
+| pair | token | address | decimals | hedge |
+|---|---|---|---|---|
+| 6 | mAAPL | `0xab3F1C8A9358Feb5872F81330FC811C3c53Ae9ff` | 8 | `xyz:AAPL` |
+| 7 | mTSLA | `0xf5456CF225efaf7807cBC14079733b211eAc84d7` | 8 | `xyz:TSLA` |
+| 8 | mSKHY | `0x37D1e1307eba9B489844B9A1198b5F77577630FD` | 8 | `xyz:SKHY` |
+| 9 | mSPCX | `0x38EfEf195b347B9EcEf07185C716C9A93E232B9a` | 8 | `xyz:SPCX` |
+
+⚠️ **Listed but not quoted.** The updater builds its reference from Binance, OKX and Bybit, and none
+of the three carries a share. A pair with no venues cannot reach `feed.min_venues`, and the config
+validator refuses to start rather than run a market that would be silent forever -- so these are
+absent from `updater.toml` and noted there.
+
+What is missing is a FEED, not a hedge. The hedge route is configured and points at Hyperliquid's
+`xyz` HIP-3 book, where all four quote -- including SPCX, which is SpaceX: unlisted, and with a perp
+anyway. `hedge::hyperliquid` reads mids for that leg. The reference the ladder is built from comes
+from `feed/`, and `feed/hyperliquid.rs` does not exist yet.
