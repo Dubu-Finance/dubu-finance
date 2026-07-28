@@ -42,6 +42,23 @@ ws_url = "wss://giwa-sepolia.nodit.io/${NODIT_API_KEY}"
 # one: `eth_sendRawTransaction` only has to reach the sequencer, and the in-flight gate no longer
 # waits on receipts -- it reads our confirmed nonce out of the chain view, which comes from the
 # rotating read pool. The keyed endpoints stay behind this as fallbacks.
+# Deliberately NOT the flashblocks endpoint. That was tried and reverted, and the reason is worth
+# keeping because it is not obvious.
+#
+# A flashblocks-aware endpoint returns a receipt as soon as the transaction is preconfirmed, ~200ms,
+# rather than when the block seals. It buys nothing here: receipts are only requested after
+# `landed_nonce` has passed the transaction, and that nonce is read on the `latest` tag, which is the
+# SEALED nonce. The poll therefore cannot happen before sealing however early the answer exists.
+# Measured, pointing this at the rate-limited flashblocks endpoint made reported latency WORSE --
+# 523ms median to 1319ms -- for no gain at all.
+#
+# Reading the nonce on `pending` would not fix it either: measured, `pending` runs 0-4 ahead of
+# `latest` because it counts our own unsealed sends, so the gate would free slots for transactions
+# that have not landed. That is the exact bug the nonce gate exists to prevent.
+#
+# What the two together mean: our sent-to-confirmed number carries ~700ms of our own polling, and is
+# not a measurement of inclusion. Inclusion measured against block timestamps is <= 1 block, which
+# is what the explorer also reports.
 rpc_url = "https://sepolia-rpc.giwa.io"
 
 # Fallbacks for the write path, tried in order after `rpc_url`.
@@ -64,6 +81,8 @@ write_rpc_urls = [
   "https://giwa-sepolia.nodit.io/${NODIT_API_KEY_5}",
   "https://giwa-sepolia.nodit.io/${NODIT_API_KEY_6}",
   "https://giwa-sepolia.nodit.io/${NODIT_API_KEY_7}",
+  # Flashblocks-aware, kept as a last fallback rather than the primary. See the note on `rpc_url`.
+  "https://sepolia-rpc-flashblocks.giwa.io",
 ]
 
 # THE FRESHEST READ, and still worth a separate endpoint. Read-only, and only under the
@@ -91,6 +110,8 @@ read_rpc_urls = [
   "https://giwa-sepolia.nodit.io/${NODIT_API_KEY_5}",
   "https://giwa-sepolia.nodit.io/${NODIT_API_KEY_6}",
   "https://giwa-sepolia.nodit.io/${NODIT_API_KEY_7}",
+  # Flashblocks-aware, kept as a last fallback rather than the primary. See the note on `rpc_url`.
+  "https://sepolia-rpc-flashblocks.giwa.io",
 ]
 
 chain_id = 91342
