@@ -20,6 +20,10 @@ tokio = { workspace = true }
 tokio-tungstenite = { workspace = true }
 futures-util = { workspace = true }
 reqwest = { workspace = true }
+# HMAC-SHA256 for Binance request signing. Both are already in the tree via `k256`, so this adds
+# no new resolution -- see `hedge::binance`.
+hmac = "0.12"
+sha2 = "0.10"
 
 # ABI encode/decode, RLP, and signing. Deliberately NOT `alloy`'s provider stack: the
 # rate-limit requirement needs the raw HTTP status of every RPC response (a 429 is a liveness
