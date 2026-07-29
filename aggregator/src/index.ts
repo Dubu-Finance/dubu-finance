@@ -164,7 +164,8 @@ async function handleQuote(request: Request, env: Env): Promise<Response> {
         error: 'no venue would fill that size',
         detail:
           'Every venue returned zero. For the prop AMM that means the epoch capacity is spent, ' +
-          'the quote is stale, or the pair is paused — all of which resolve on their own.',
+          'the quote is stale, or the pair is paused — all of which resolve on their own — or ' +
+          'that the engine pricing it could not be reached, which does not.',
         solo: { prop: amm.solo.prop.toString(), univ2: amm.solo.univ2.toString() },
       },
       404,
