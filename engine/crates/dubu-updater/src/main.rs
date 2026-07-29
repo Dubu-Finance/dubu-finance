@@ -250,7 +250,8 @@ struct Runtime {
     /// Fees for a jump withdrawal, and only for one. See [`dubu_updater::tx::Sender::send_with_fees`].
     withdraw_fees: Fees,
     sender: Sender,
-    kill: KillSwitch,
+    /// One per correlation group. A group's loss budget is its own; see where these are loaded.
+    kills: BTreeMap<String, KillSwitch>,
     /// Shared with the reader task, which is where read successes and failures now come from.
     health: Arc<Mutex<ChainHealth>>,
     /// Follows our own `Swap` logs. Read off the canonical RPC, not the flashblocks one: markout
@@ -387,12 +388,45 @@ async fn run(args: &Args) -> Result<i32, Box<dyn std::error::Error>> {
         }
     }
 
-    let kill = KillSwitch::load(
-        &cfg.risk.state_path,
-        cfg.risk.bleed_window_secs,
-        cfg.risk.bleed_limit_units()?,
-        cfg.risk.loss_budget_units()?,
-    )?;
+    // One killswitch per correlation group, not one for the book.
+    //
+    // The switch trips on a NAV drawdown and latches to disk, and a single instance made SK Hynix's
+    // losses ETH's problem -- the same defect the jump detector's contagion had. Groups are the
+    // claim about what moves together, so they are what a loss budget should be shared across.
+    //
+    // Each gets its own state file, so a latched group stays latched across restarts on its own and
+    // an operator clears them one at a time.
+    let groups: Vec<String> = {
+        let mut g: Vec<String> = cfg.pairs.iter().map(|p| p.jump_group.clone()).collect();
+        g.sort_unstable();
+        g.dedup();
+        g
+    };
+    let mut kills: BTreeMap<String, KillSwitch> = BTreeMap::new();
+    for g in &groups {
+        let path = if g.is_empty() {
+            cfg.risk.state_path.clone()
+        } else {
+            let stem = cfg.risk.state_path.file_stem().unwrap_or_default();
+            cfg.risk.state_path.with_file_name(format!(
+                "{}-{g}.{}",
+                stem.to_string_lossy(),
+                cfg.risk
+                    .state_path
+                    .extension()
+                    .map_or_else(|| "json".into(), |e| e.to_string_lossy())
+            ))
+        };
+        kills.insert(
+            g.clone(),
+            KillSwitch::load(
+                &path,
+                cfg.risk.bleed_window_secs,
+                cfg.risk.bleed_limit_units()?,
+                cfg.risk.loss_budget_units()?,
+            )?,
+        );
+    }
 
     let mut sender = Sender::new(
         signer,
@@ -450,7 +484,20 @@ async fn run(args: &Args) -> Result<i32, Box<dyn std::error::Error>> {
 
     // Stay-down. A restart is the first thing an operator does, and it must not resume a book
     // that a killswitch took down.
-    if kill.is_halted() {
+    let latched: Vec<&String> = kills
+        .iter()
+        .filter(|(_, k)| k.is_halted())
+        .map(|(g, _)| g)
+        .collect();
+    if !latched.is_empty() && latched.len() < kills.len() {
+        for g in &latched {
+            error!(target: "risk", event = "stay_down_group", group = %g,
+                   reason = kills[*g].halt_reason().unwrap_or("(unrecorded)"),
+                   "this group is latched from a previous run; its pairs will not quote");
+        }
+    }
+    if kills.values().all(KillSwitch::is_halted) {
+        let kill = kills.values().next().expect("at least one group");
         error!(
             target: "risk", event = "stay_down",
             reason = kill.halt_reason().unwrap_or("(unrecorded)"),
@@ -647,7 +694,7 @@ async fn run(args: &Args) -> Result<i32, Box<dyn std::error::Error>> {
         jump: jump_book,
         withdraw_fees,
         sender,
-        kill,
+        kills,
         health,
         swaps: SwapWatch::new(cfg_pool),
         markout: Markout::new(),
@@ -940,7 +987,10 @@ async fn quote_loop(
                    stall = stall.label(), best_block,
                    heads = head.status.label(),
                    "chain liveness is gone; halting and withdrawing quotes");
-            let _ = rt.kill.halt(&halt, now_unix());
+            // Chain liveness is not a per-group fact, so every group latches.
+            for k in rt.kills.values_mut() {
+                let _ = k.halt(&halt, now_unix());
+            }
             halted = true;
         }
 
@@ -1837,6 +1887,24 @@ async fn run_cycle(
 
     for i in 0..rt.cfg.pairs.len() {
         let pair = rt.cfg.pairs[i].clone();
+        // A latched group quotes nothing. Withdrawal is the halt path's job; this stops the row
+        // from being rebuilt underneath it on the next cycle.
+        if rt
+            .kills
+            .get(&pair.jump_group)
+            .is_some_and(KillSwitch::is_halted)
+        {
+            // Only when the chain still shows capacity, so a group that is already down does not
+            // re-send `refreshCapacity(pair, 0, 0)` every cycle and burn a nonce for nothing.
+            if view
+                .snaps
+                .get(&pair.pair_id)
+                .is_some_and(|s| s.bid_capacity != 0 || s.ask_capacity != 0)
+            {
+                reassert.push(pair.pair_id);
+            }
+            continue;
+        }
         let Some(meta) = rt.facts.pairs.get(&pair.pair_id).copied() else {
             continue;
         };
@@ -2217,7 +2285,7 @@ block_work,
             planned: row.as_ref().map(|r| r.ladder),
             capacity,
             min_price: meta.min_price,
-            halted: rt.kill.is_halted(),
+            halted: rt.kills.values().all(KillSwitch::is_halted),
             feed: feed_status,
             chain: status,
             view_age_secs: view_age,
@@ -2367,25 +2435,61 @@ block_work,
     // no observation at all.
     if positions.len() == rt.cfg.pairs.len() {
         let quote_balance = view.balances.get(&rt.facts.nav_token).copied().unwrap_or(0);
-        match rt.kill.observe(quote_balance, &positions, now_unix()) {
-            Ok((obs, halt)) => {
-                trace_at!(
-                block_work,
+        // Per group, each against its own share of the shared quote token.
+        //
+        // The even split is the same simplification `skew::Inventory::quote_share` already makes and
+        // is named as one there: both groups draw bids from the same mUSDC and nothing yet caps the
+        // sum of their liabilities against it.
+        let groups: Vec<String> = rt.kills.keys().cloned().collect();
+        let pairs_total = rt.cfg.pairs.len().max(1);
+        for g in groups {
+            let ids: Vec<u16> = rt
+                .cfg
+                .pairs
+                .iter()
+                .filter(|p| p.jump_group == g)
+                .map(|p| p.pair_id)
+                .collect();
+            let mine: Vec<dubu_updater::risk::Position> = positions
+                .iter()
+                .filter(|p| ids.contains(&p.pair_id))
+                .copied()
+                .collect();
+            if mine.is_empty() {
+                continue;
+            }
+            let share = quote_balance / pairs_total as u128 * ids.len() as u128;
+            let Some(kill) = rt.kills.get_mut(&g) else {
+                continue;
+            };
+            match kill.observe(share, &mine, now_unix()) {
+                Ok((obs, halt)) => {
+                    trace_at!(
+                    block_work,
 
-                                    target: "risk", event = "mark",
-                                    nav = %obs.nav, revaluation = %obs.revaluation, trade_pnl = %obs.trade_pnl,
-                                    drawdown = %obs.drawdown, cumulative_trade_loss = %obs.cumulative_trade_loss,
-                                    seeded = obs.seeded, "NAV marked"
-                                );
-                if let Some(h) = halt {
-                    error!(target: "risk", event = "halt", switch = h.label(), reason = %h,
-                           "KILLSWITCH TRIPPED; withdrawing quotes and exiting");
-                    return true;
+                                        target: "risk", event = "mark", group = %g,
+                                        nav = %obs.nav, revaluation = %obs.revaluation,
+                                        trade_pnl = %obs.trade_pnl, drawdown = %obs.drawdown,
+                                        cumulative_trade_loss = %obs.cumulative_trade_loss,
+                                        seeded = obs.seeded, "NAV marked"
+                                    );
+                    if let Some(h) = halt {
+                        error!(target: "risk", event = "halt", group = %g, switch = h.label(),
+                               reason = %h, pairs = ids.len(),
+                               "KILLSWITCH TRIPPED for this group; its pairs stop quoting");
+                    }
+                }
+                Err(e) => {
+                    warn!(target: "risk", event = "mark_failed", group = %g, error = %e,
+                          "could not mark NAV")
                 }
             }
-            Err(e) => {
-                warn!(target: "risk", event = "mark_failed", error = %e, "could not mark NAV")
-            }
+        }
+        // Only when every group is down is there nothing left to quote.
+        if rt.kills.values().all(KillSwitch::is_halted) {
+            error!(target: "risk", event = "halt_all",
+                   "every group is halted; withdrawing quotes and exiting");
+            return true;
         }
     } else {
         info!(target: "risk", event = "mark_skipped", have = positions.len(), want = rt.cfg.pairs.len(),
