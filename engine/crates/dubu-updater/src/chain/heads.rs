@@ -351,7 +351,7 @@ pub async fn run(
 ) {
     let url: EndpointUrl = cfg.ws_url.clone();
     let mut delay = Duration::from_millis(cfg.ws_reconnect_initial_ms);
-    let max_delay = Duration::from_millis(cfg.ws_reconnect_max_ms);
+    let delay_max = Duration::from_millis(cfg.ws_reconnect_max_ms);
     // No frame at all inside the watchdog window means the socket is dead. A head is due every
     // block time, so this is many blocks of silence.
     let read_timeout = cfg.head_stale_after();
@@ -444,7 +444,7 @@ pub async fn run(
             _ = shutdown.changed() => return,
             () = tokio::time::sleep(delay) => {}
         }
-        delay = (delay * 2).min(max_delay);
+        delay = (delay * 2).min(delay_max);
     }
 }
 

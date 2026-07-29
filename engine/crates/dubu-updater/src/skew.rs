@@ -85,7 +85,7 @@
 //! skew in range. `minBid` past `minAsk` is not a failure mode of this design; a test pins it
 //! across the whole clamp range.
 //!
-//! The floor is the real constraint, and it is handled by [`min_price_cap_bps`] rather than left
+//! The floor is the real constraint, and it is handled by [`price_cap_bps_min`] rather than left
 //! to be discovered downstream: a large positive skew can push the bid target under the pair's
 //! `minPrice`, at which point `ladder::build` correctly refuses the row — but a refused row is a
 //! quoting outage, and clamping the skew to the largest value that still clears the floor keeps
@@ -93,7 +93,7 @@
 
 use std::time::Instant;
 
-use dubu_core::ladder::{BPS, MAX_BPS};
+use dubu_core::ladder::{BPS, BPS_MAX};
 use dubu_core::math::{mul_div_ceil, mul_div_floor};
 
 /// Relative returns are carried as parts per `10^8`, matching [`crate::units::FEED_SCALE`].
@@ -112,10 +112,10 @@ pub struct VolConfig {
     /// The horizon the reported volatility is scaled to, in seconds. See [`Volatility`].
     pub horizon_secs: u64,
     /// Samples closer together than this are skipped rather than divided by a tiny `dt`.
-    pub min_sample_ms: u64,
+    pub sample_ms_min: u64,
     /// A gap longer than this is not a return, it is an outage. The estimator re-anchors and
     /// contributes nothing.
-    pub max_sample_ms: u64,
+    pub sample_ms_max: u64,
 }
 
 /// EWMA of squared relative returns, kept as a **per-second variance** and scaled to a horizon.
@@ -197,12 +197,12 @@ impl Volatility {
         };
         let dt_ms =
             u64::try_from(now.saturating_duration_since(t0).as_millis()).unwrap_or(u64::MAX);
-        if dt_ms < self.cfg.min_sample_ms {
+        if dt_ms < self.cfg.sample_ms_min {
             // Too close together to divide by. Keep the old anchor so the next sample spans a
             // sensible interval rather than starting over.
             return;
         }
-        if dt_ms > self.cfg.max_sample_ms || prev == 0 {
+        if dt_ms > self.cfg.sample_ms_max || prev == 0 {
             self.last = Some((price, now));
             return;
         }
@@ -393,10 +393,10 @@ pub struct SkewParams {
     pub gamma_e2: u64,
     /// Cap on a **positive** skew, in bps. Positive moves the book down: the pool is long and
     /// wants to sell.
-    pub max_positive_bps: u16,
+    pub positive_bps_max: u16,
     /// Cap on a **negative** skew, as a magnitude in bps. Negative moves the book up: the pool is
     /// short and wants to buy.
-    pub max_negative_bps: u16,
+    pub negative_bps_max: u16,
 }
 
 /// Which bound, if any, held the skew back.
@@ -404,9 +404,9 @@ pub struct SkewParams {
 pub enum Clamp {
     /// The model's own number was used unchanged.
     Unbound,
-    /// `max_positive_bps` bound it.
+    /// `positive_bps_max` bound it.
     PositiveCap,
-    /// `max_negative_bps` bound it.
+    /// `negative_bps_max` bound it.
     NegativeCap,
     /// The pair's `minPrice` floor bound it: any more skew would push the bid target under the
     /// pool's absolute floor and the row would be refused outright.
@@ -469,8 +469,8 @@ pub struct Skew {
 /// `mid >= ceil(min_price * BPS / (BPS - hs)) + 1`, where the `+ 1` absorbs the floor in the
 /// second step. Solving for the skew and rounding conservatively gives the value returned here.
 #[must_use]
-pub fn min_price_cap_bps(fair: u128, min_price: u128, half_spread_bps: u16) -> u16 {
-    let hs = u128::from(half_spread_bps).min(MAX_BPS);
+pub fn price_cap_bps_min(fair: u128, min_price: u128, half_spread_bps: u16) -> u16 {
+    let hs = u128::from(half_spread_bps).min(BPS_MAX);
     if fair == 0 {
         return 0;
     }
@@ -486,14 +486,14 @@ pub fn min_price_cap_bps(fair: u128, min_price: u128, half_spread_bps: u16) -> u
         return 0;
     };
     let cap = BPS.saturating_sub(needed);
-    u16::try_from(cap.min(MAX_BPS)).unwrap_or(0)
+    u16::try_from(cap.min(BPS_MAX)).unwrap_or(0)
 }
 
 /// Compute the Avellaneda–Stoikov linear skew for one row.
 ///
 /// # The clamp, and why it is asymmetric
 ///
-/// `max_positive_bps` is deliberately the looser of the two, and the asymmetry is about which
+/// `positive_bps_max` is deliberately the looser of the two, and the asymmetry is about which
 /// direction writes a free option.
 ///
 /// A **positive** skew moves the book down. The pool is long, wants to sell, and both its bid and
@@ -501,7 +501,7 @@ pub fn min_price_cap_bps(fair: u128, min_price: u128, half_spread_bps: u16) -> u
 /// what the market says the asset is worth — and the ask falling is the point, because a cheaper
 /// ask is what actually works the position off. Neither side of that is a gift to a taker. The
 /// bound that matters in this direction is structural rather than economic, and it is the
-/// `minPrice` floor, which is why [`min_price_cap_bps`] is folded in here rather than left to
+/// `minPrice` floor, which is why [`price_cap_bps_min`] is folded in here rather than left to
 /// downstream refusal.
 ///
 /// A **negative** skew moves the book up. The pool is short base, wants to buy, and its **bid**
@@ -547,10 +547,10 @@ pub fn compute(
         raw_decibps.saturating_sub(5) / 10
     };
 
-    let positive_cap = i32::from(params.max_positive_bps.min(floor_cap_bps));
-    let negative_cap = -i32::from(params.max_negative_bps);
+    let positive_cap = i32::from(params.positive_bps_max.min(floor_cap_bps));
+    let negative_cap = -i32::from(params.negative_bps_max);
     let (applied, clamp) = if rounded > positive_cap {
-        let by = if i32::from(floor_cap_bps) < i32::from(params.max_positive_bps) {
+        let by = if i32::from(floor_cap_bps) < i32::from(params.positive_bps_max) {
             Clamp::MinPriceFloor
         } else {
             Clamp::PositiveCap
@@ -670,16 +670,16 @@ mod tests {
         VolConfig {
             tau_ms: 60_000,
             horizon_secs: 300,
-            min_sample_ms: 100,
-            max_sample_ms: 10_000,
+            sample_ms_min: 100,
+            sample_ms_max: 10_000,
         }
     }
 
     fn params() -> SkewParams {
         SkewParams {
             gamma_e2: 10_000,
-            max_positive_bps: 30,
-            max_negative_bps: 10,
+            positive_bps_max: 30,
+            negative_bps_max: 10,
         }
     }
 
@@ -946,7 +946,7 @@ mod tests {
             900 * 1_000_000,
             30_000,
             &SkewParams {
-                max_positive_bps: 9_999,
+                positive_bps_max: 9_999,
                 ..params()
             },
             9_999,
@@ -956,7 +956,7 @@ mod tests {
             3_600 * 1_000_000,
             60_000,
             &SkewParams {
-                max_positive_bps: 9_999,
+                positive_bps_max: 9_999,
                 ..params()
             },
             9_999,
@@ -1000,7 +1000,7 @@ mod tests {
         // of $1010 there is only ~94 bp of room before the bid target breaches the floor.
         let fair = 1_010_000_000_000_000u128;
         let min_price = 1_000_000_000_000_000u128;
-        let cap = min_price_cap_bps(fair, min_price, 5);
+        let cap = price_cap_bps_min(fair, min_price, 5);
         assert!(
             (90..=99).contains(&cap),
             "expected ~94 bp of headroom, got {cap}"
@@ -1013,7 +1013,7 @@ mod tests {
             40_000 * 1_000_000,
             200_000,
             &SkewParams {
-                max_positive_bps: 9_999,
+                positive_bps_max: 9_999,
                 ..params()
             },
             cap,
@@ -1052,17 +1052,17 @@ mod tests {
     #[test]
     fn a_fair_value_at_the_floor_leaves_no_room_to_skew_down_at_all() {
         let min_price = 1_000_000_000_000_000u128;
-        assert_eq!(min_price_cap_bps(min_price, min_price, 5), 0);
-        assert_eq!(min_price_cap_bps(min_price / 2, min_price, 5), 0);
-        assert_eq!(min_price_cap_bps(0, min_price, 5), 0);
+        assert_eq!(price_cap_bps_min(min_price, min_price, 5), 0);
+        assert_eq!(price_cap_bps_min(min_price / 2, min_price, 5), 0);
+        assert_eq!(price_cap_bps_min(0, min_price, 5), 0);
 
         // Far above the floor — $1943 against a $1000 floor — the floor allows roughly half the
         // price in skew, so it is nowhere near the binding constraint at the configured 30 bp cap.
-        let cap = min_price_cap_bps(1_943_820_000_000_000, min_price, 5);
+        let cap = price_cap_bps_min(1_943_820_000_000_000, min_price, 5);
         assert_eq!(cap, 4_852);
-        assert!(u128::from(cap) < MAX_BPS);
+        assert!(u128::from(cap) < BPS_MAX);
         assert!(
-            cap > params().max_positive_bps * 100,
+            cap > params().positive_bps_max * 100,
             "the configured cap binds first"
         );
     }

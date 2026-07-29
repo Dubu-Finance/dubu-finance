@@ -89,7 +89,7 @@
 //! `floor(x) <= N <=> x < N + 1`, and `W*a < d*(N+1)` over the integers is `W*a <= d*(N+1) - 1`.
 //!
 //! **Boundary bound** (the near endpoint must stay under a ceiling `P_hi` — the reference-oracle
-//! deviation clamp of archi_v2 §5.4, or simply `MAX_PRICE`). With `H_i = P_hi - T` we need
+//! deviation clamp of archi_v2 §5.4, or simply `PRICE_MAX`). With `H_i = P_hi - T` we need
 //! `impact = floor(W*K/(2C)) <= H_i`, which is lemma (B) with `a = K`, `d = 2C`:
 //!
 //! ```text
@@ -146,7 +146,7 @@
 //! defined. The previous revision needed a special case here (`m == C` was reachable once the
 //! midpoint ceiled); working in doubled units removes it.
 //!
-//! Finally `W = min(W_requested, W_boundary, W_endpoint, MAX_PRICE)`.
+//! Finally `W = min(W_requested, W_boundary, W_endpoint, PRICE_MAX)`.
 //!
 //! # 5. Ask side
 //!
@@ -163,7 +163,7 @@
 //! must never be overstated. A narrower ladder posts less depth behind the same price, which
 //! costs the pool volume, never money.
 
-use crate::curve::{amount_out_bid, avg_bid_price, Ladder, MAX_AMOUNT, MAX_PRICE};
+use crate::curve::{amount_out_bid, avg_bid_price, Ladder, AMOUNT_MAX, PRICE_MAX};
 use crate::error::LadderError;
 use crate::math::{mul_div_floor, mul_div_rem};
 
@@ -178,7 +178,7 @@ pub enum WidthBinding {
     Boundary,
     /// The price floor on the far endpoint bound it (`W_endpoint`).
     Endpoint,
-    /// Nothing bound it; the width saturated at [`MAX_PRICE`].
+    /// Nothing bound it; the width saturated at [`PRICE_MAX`].
     Saturated,
 }
 
@@ -194,11 +194,11 @@ pub struct SolveInput {
     pub capture: u128,
     /// Total base capacity posted for this epoch.
     pub capacity: u128,
-    /// Width the strategy would like, in price units. Use `MAX_PRICE` for "as wide as safe".
+    /// Width the strategy would like, in price units. Use `PRICE_MAX` for "as wide as safe".
     pub requested_width: u128,
     /// Hard floor: no price in the produced ladder may fall below this.
     pub min_price: u128,
-    /// Hard ceiling: no price in the produced ladder may rise above this. Cap it at [`MAX_PRICE`]
+    /// Hard ceiling: no price in the produced ladder may rise above this. Cap it at [`PRICE_MAX`]
     /// at minimum; tighten it with the reference-oracle clamp.
     pub max_price: u128,
 }
@@ -255,15 +255,15 @@ pub fn widest_width(
     // is `W*K <= 2C*(H_i+1) - 1`. Under the previous ceiled impact this bound was a bare floor
     // division, and keeping that form here would overstate the safe width by one.
     let boundary = if capture == 0 {
-        MAX_PRICE
+        PRICE_MAX
     } else {
         // 2C*(H_i + 1) reaches 2^97 * 2^56 = 2^153, so it needs the 256-bit intermediate. A
-        // quotient above u128 means the bound is far beyond MAX_PRICE.
+        // quotient above u128 means the bound is far beyond PRICE_MAX.
         match mul_div_rem(twice_capacity, headroom_impact.saturating_add(1), capture) {
             // 2C*(H_i+1) >= 2C > K, so q >= 1 and the -1 borrows cleanly.
             Some((q, 0)) => q - 1,
             Some((q, _)) => q,
-            None => MAX_PRICE,
+            None => PRICE_MAX,
         }
     };
 
@@ -273,11 +273,11 @@ pub fn widest_width(
     // `ceil(W*n/2C)`, and a ceiling is bounded by `H_e` exactly when the real quotient is, so
     // there is no `-1` correction to apply.
     let endpoint =
-        mul_div_floor(headroom_span, twice_capacity, twice_capacity - capture).unwrap_or(MAX_PRICE);
+        mul_div_floor(headroom_span, twice_capacity, twice_capacity - capture).unwrap_or(PRICE_MAX);
 
     // Order matters only for the reported binding; ties report the earlier cause, which is the
     // one the operator can act on.
-    let mut width = MAX_PRICE;
+    let mut width = PRICE_MAX;
     let mut binding = WidthBinding::Saturated;
     for (candidate, cause) in [
         (requested, WidthBinding::Requested),
@@ -296,10 +296,10 @@ fn check_input(input: &SolveInput) -> Result<u128, LadderError> {
     if input.capacity == 0 {
         return Err(LadderError::ZeroCapacity);
     }
-    if input.capacity > MAX_AMOUNT || input.capture > MAX_AMOUNT {
+    if input.capacity > AMOUNT_MAX || input.capture > AMOUNT_MAX {
         return Err(LadderError::AmountOutOfRange);
     }
-    if input.target > MAX_PRICE || input.max_price > MAX_PRICE || input.min_price > MAX_PRICE {
+    if input.target > PRICE_MAX || input.max_price > PRICE_MAX || input.min_price > PRICE_MAX {
         return Err(LadderError::PriceOutOfRange);
     }
     if input.min_price > input.max_price {
@@ -426,7 +426,7 @@ pub struct TwoSided {
 ///
 /// # Errors
 /// [`LadderError`] from either side, or [`LadderError::InfeasibleBounds`] when the repair would
-/// push a price past [`MAX_PRICE`].
+/// push a price past [`PRICE_MAX`].
 pub fn solve_two_sided(bid: &SolveInput, ask: &SolveInput) -> Result<TwoSided, LadderError> {
     let bid_sol = solve_bid(bid)?;
     let ask_sol = solve_ask(ask)?;
@@ -447,7 +447,7 @@ pub fn solve_two_sided(bid: &SolveInput, ask: &SolveInput) -> Result<TwoSided, L
             .checked_add(1)
             .ok_or(LadderError::InfeasibleBounds)?;
     }
-    if max_ask > MAX_PRICE || min_ask > MAX_PRICE {
+    if max_ask > PRICE_MAX || min_ask > PRICE_MAX {
         return Err(LadderError::InfeasibleBounds);
     }
 
@@ -503,9 +503,9 @@ mod tests {
             target,
             capture,
             capacity,
-            requested_width: MAX_PRICE,
+            requested_width: PRICE_MAX,
             min_price: 0,
-            max_price: MAX_PRICE,
+            max_price: PRICE_MAX,
         }
     }
 
@@ -621,9 +621,9 @@ mod tests {
             target: 1_000,
             capture: 1_000,
             capacity: 1_000,
-            requested_width: MAX_PRICE,
+            requested_width: PRICE_MAX,
             min_price: 900,
-            max_price: MAX_PRICE,
+            max_price: PRICE_MAX,
         };
         let sol = solve_bid(&input).unwrap();
         assert_eq!(sol.binding, WidthBinding::Endpoint);
@@ -650,7 +650,7 @@ mod tests {
             target: 1_000,
             capture: 1_000,
             capacity: 1_000,
-            requested_width: MAX_PRICE,
+            requested_width: PRICE_MAX,
             min_price: 0,
             max_price: 1_010,
         };
@@ -687,7 +687,7 @@ mod tests {
             target: 500,
             capture: 100,
             capacity: 100,
-            requested_width: MAX_PRICE,
+            requested_width: PRICE_MAX,
             min_price: 500,
             max_price: 500,
         };
@@ -701,9 +701,9 @@ mod tests {
             target: 3_100_000_000_000_000,
             capture: 4_000_000,
             capacity: 10_000_000,
-            requested_width: MAX_PRICE,
+            requested_width: PRICE_MAX,
             min_price: 1,
-            max_price: MAX_PRICE,
+            max_price: PRICE_MAX,
         };
         let sol = solve_ask(&input).unwrap();
         // K = 4_000_000, 2C = 20_000_000, so 2C/K = 5 and H_i = T - 1.
@@ -839,8 +839,8 @@ mod tests {
         let mut i = bid_input(100, 1, 10);
         i.max_price = 50;
         assert_eq!(solve_bid(&i), Err(LadderError::TargetAboveCeiling));
-        let mut i = bid_input(MAX_PRICE + 1, 1, 10);
-        i.max_price = MAX_PRICE;
+        let mut i = bid_input(PRICE_MAX + 1, 1, 10);
+        i.max_price = PRICE_MAX;
         assert_eq!(solve_bid(&i), Err(LadderError::PriceOutOfRange));
     }
 }

@@ -37,8 +37,8 @@
 //! # Numeric domain
 //!
 //! `makerAmount` and `takerAmount` are `uint256` on chain and `u128` here, and that is **not**
-//! a narrowing: `PmmSettle.MAX_AMOUNT` rejects anything wider, for the same reason and at the
-//! same value as [`crate::curve::MAX_AMOUNT_OUT`]. `chainId` is `uint256` on chain and `u64`
+//! a narrowing: `PmmSettle.AMOUNT_MAX` rejects anything wider, for the same reason and at the
+//! same value as [`crate::curve::AMOUNT_OUT_MAX`]. `chainId` is `uint256` on chain and `u64`
 //! here, which *is* a narrowing, and a safe one — the field is an EIP-155 chain id, no real
 //! chain has ever come close to `2^64`, and a mirror that refuses to encode an impossible chain
 //! cannot lose money.
@@ -209,9 +209,9 @@ pub struct Order {
     pub maker_asset: [u8; 20],
     /// What the maker receives.
     pub taker_asset: [u8; 20],
-    /// Maker leg at full size — the quoted amount. Bounded by `PmmSettle.MAX_AMOUNT`.
+    /// Maker leg at full size — the quoted amount. Bounded by `PmmSettle.AMOUNT_MAX`.
     pub maker_amount: u128,
-    /// Taker leg at full size. Bounded by `PmmSettle.MAX_AMOUNT`.
+    /// Taker leg at full size. Bounded by `PmmSettle.AMOUNT_MAX`.
     pub taker_amount: u128,
     /// The maker's cancellation handle. Not the replay guard; the fill accounting is.
     pub nonce: u64,
@@ -225,7 +225,7 @@ pub struct Order {
     /// it above.
     pub decay_cap: u32,
     /// The maker's floor on a single fill, in bps of `maker_amount`, measured after the decay.
-    pub min_fill_bps: u16,
+    pub fill_bps_min: u16,
 }
 
 impl Order {
@@ -251,7 +251,7 @@ impl Order {
         write_u64(&mut buf[256..288], self.decay_start);
         write_u64(&mut buf[288..320], u64::from(self.decay_per_sec));
         write_u64(&mut buf[320..352], u64::from(self.decay_cap));
-        write_u64(&mut buf[352..384], u64::from(self.min_fill_bps));
+        write_u64(&mut buf[352..384], u64::from(self.fill_bps_min));
         buf
     }
 
@@ -355,7 +355,7 @@ pub mod vectors {
                     decay_start: 0,
                     decay_per_sec: 0,
                     decay_cap: 0,
-                    min_fill_bps: 0,
+                    fill_bps_min: 0,
                 },
                 domain: Domain::new(0, [0; 20]),
                 struct_hash: hex32(
@@ -376,7 +376,7 @@ pub mod vectors {
                     decay_start: 1_800_000_000,
                     decay_per_sec: 250,
                     decay_cap: 50_000,
-                    min_fill_bps: 0,
+                    fill_bps_min: 0,
                 },
                 domain: Domain::new(91_342, addr(0x11)),
                 struct_hash: hex32(
@@ -397,7 +397,7 @@ pub mod vectors {
                     decay_start: 0,
                     decay_per_sec: 0,
                     decay_cap: 0,
-                    min_fill_bps: 10_000,
+                    fill_bps_min: 10_000,
                 },
                 domain: Domain::new(1, addr(0xde)),
                 struct_hash: hex32(
@@ -418,7 +418,7 @@ pub mod vectors {
                     decay_start: u64::MAX,
                     decay_per_sec: u32::MAX,
                     decay_cap: u32::MAX,
-                    min_fill_bps: u16::MAX,
+                    fill_bps_min: u16::MAX,
                 },
                 domain: Domain::new(u64::MAX, addr(0xee)),
                 struct_hash: hex32(
@@ -427,7 +427,7 @@ pub mod vectors {
                 digest: hex32("f4a14b260933d10c42a3e7f80909e898e396b8e92accc08c1c72466797bb581e"),
             },
             Vector {
-                // Identical to `weth_usdc` except `min_fill_bps`. If the narrowest member were
+                // Identical to `weth_usdc` except `fill_bps_min`. If the narrowest member were
                 // dropped from `encodeData`, this vector and that one would collide.
                 name: "weth_usdc_min_fill",
                 order: Order {
@@ -441,7 +441,7 @@ pub mod vectors {
                     decay_start: 1_800_000_000,
                     decay_per_sec: 250,
                     decay_cap: 50_000,
-                    min_fill_bps: 1,
+                    fill_bps_min: 1,
                 },
                 domain: Domain::new(91_342, addr(0x11)),
                 struct_hash: hex32(
@@ -518,7 +518,7 @@ mod tests {
             decay_start: 3,
             decay_per_sec: u32::MAX,
             decay_cap: 4,
-            min_fill_bps: u16::MAX,
+            fill_bps_min: u16::MAX,
         };
         let buf = order.encode_data();
         assert_eq!(buf.len(), 32 * ORDER_ENCODE_DATA_WORDS);
@@ -554,7 +554,7 @@ mod tests {
         let all = vectors::all();
         let a = all.iter().find(|v| v.name == "weth_usdc").unwrap();
         let b = all.iter().find(|v| v.name == "weth_usdc_min_fill").unwrap();
-        assert_eq!(a.order.min_fill_bps + 1, b.order.min_fill_bps);
+        assert_eq!(a.order.fill_bps_min + 1, b.order.fill_bps_min);
         assert_ne!(a.digest, b.digest);
     }
 
@@ -576,14 +576,14 @@ mod tests {
             decay_start in any::<u64>(),
             decay_per_sec in any::<u32>(),
             decay_cap in any::<u32>(),
-            min_fill_bps in any::<u16>(),
+            fill_bps_min in any::<u16>(),
             chain_id in any::<u64>(),
             verifying in prop::array::uniform20(any::<u8>()),
             which in 0usize..13,
         ) {
             let base = Order {
                 maker, maker_asset, taker_asset, maker_amount, taker_amount,
-                nonce, expiry, decay_start, decay_per_sec, decay_cap, min_fill_bps,
+                nonce, expiry, decay_start, decay_per_sec, decay_cap, fill_bps_min,
             };
             let domain = Domain::new(chain_id, verifying);
 
@@ -600,7 +600,7 @@ mod tests {
                 7 => other.decay_start ^= 1,
                 8 => other.decay_per_sec ^= 1,
                 9 => other.decay_cap ^= 1,
-                10 => other.min_fill_bps ^= 1,
+                10 => other.fill_bps_min ^= 1,
                 11 => other_domain.chain_id ^= 1,
                 _ => other_domain.verifying_contract[0] ^= 1,
             }

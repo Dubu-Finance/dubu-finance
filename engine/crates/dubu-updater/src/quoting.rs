@@ -82,14 +82,14 @@ pub struct MakerParams {
     /// together.
     pub sigma_coefficient_e2: u32,
     /// Ceiling on the half-spread however volatile it gets.
-    pub max_half_spread_e2: u32,
+    pub half_spread_e2_max: u32,
     /// Largest notional a single order may commit, in the quote token's own units.
     ///
     /// Notional rather than base, and the distinction is not cosmetic: a cap of "50" means 50
     /// mWETH on one pair and 50 mWBTC on another, which at these prices is a fifty-fold difference
     /// in the risk one order can take. A limit a maker sets is a statement about money, so it is
     /// denominated in money and converted to base at the pair's own fair value.
-    pub max_notional_per_order: u128,
+    pub notional_per_order_max: u128,
     /// How long a signed order stays fillable. Also how long its reservation is held, and the
     /// window whose option value [`Self::ttl_premium_e2`] charges for.
     pub ttl_secs: u64,
@@ -99,7 +99,7 @@ pub struct MakerParams {
     /// decision to give the TTL away and therefore one that has to be typed out.
     pub sigma_horizon_secs: u64,
     /// Floor on a single fill, in bps of the maker leg. Stops an order being nibbled into dust.
-    pub min_fill_bps: u16,
+    pub fill_bps_min: u16,
 }
 
 impl MakerParams {
@@ -143,7 +143,7 @@ impl MakerParams {
             .saturating_add(self.ttl_premium_e2(sigma_millibps));
         u32::try_from(scaled)
             .unwrap_or(u32::MAX)
-            .min(self.max_half_spread_e2)
+            .min(self.half_spread_e2_max)
     }
 
     /// What the TTL costs, in hundredths of a bp.
@@ -205,7 +205,7 @@ pub struct MarketState {
 pub enum Refusal {
     /// The pair is not one this maker quotes.
     UnknownPair,
-    /// Zero, or more than `max_notional_per_order` once converted.
+    /// Zero, or more than `notional_per_order_max` once converted.
     SizeOutOfRange,
     /// The inventory left after the curve's epoch and outstanding reservations will not cover it.
     InsufficientInventory,
@@ -235,7 +235,7 @@ pub struct Quote {
     /// Last second at which the order may be filled.
     pub expiry: u64,
     /// Floor on a single fill, in bps of the maker leg.
-    pub min_fill_bps: u16,
+    pub fill_bps_min: u16,
 }
 
 /// One outstanding commitment.
@@ -354,7 +354,7 @@ impl Book {
                 return Err(Refusal::Undefined);
             }
             // The taker's leg is already the notional here, so the cap applies to it directly.
-            if taker_amount > params.max_notional_per_order {
+            if taker_amount > params.notional_per_order_max {
                 return Err(Refusal::SizeOutOfRange);
             }
             let base = taker_amount.checked_mul(scale).ok_or(Refusal::Undefined)? / price;
@@ -363,7 +363,7 @@ impl Book {
             // Selling base, so the notional is the maker's leg. Bound the base first so the
             // multiply below cannot overflow, then check what it comes to.
             let ceiling = params
-                .max_notional_per_order
+                .notional_per_order_max
                 .checked_mul(scale)
                 .ok_or(Refusal::Undefined)?
                 .checked_div(state.fair.max(1))
@@ -377,7 +377,7 @@ impl Book {
                 .ok_or(Refusal::Undefined)?
                 / num;
             let quote = taker_amount.checked_mul(price).ok_or(Refusal::Undefined)? / scale;
-            if quote > params.max_notional_per_order {
+            if quote > params.notional_per_order_max {
                 return Err(Refusal::SizeOutOfRange);
             }
             (quote, taker_amount)
@@ -419,7 +419,7 @@ impl Book {
             base_amount,
             half_spread_e2: half,
             expiry,
-            min_fill_bps: params.min_fill_bps,
+            fill_bps_min: params.fill_bps_min,
         })
     }
 
@@ -473,11 +473,11 @@ mod tests {
         MakerParams {
             base_half_spread_e2: 300, // 3 bp
             sigma_coefficient_e2: 10,
-            max_half_spread_e2: 2_000,
-            max_notional_per_order: 100 * ONE_ETH_IN_USDC, // $200k
+            half_spread_e2_max: 2_000,
+            notional_per_order_max: 100 * ONE_ETH_IN_USDC, // $200k
             ttl_secs: 30,
             sigma_horizon_secs: 300,
-            min_fill_bps: 1_000,
+            fill_bps_min: 1_000,
         }
     }
 
@@ -625,7 +625,7 @@ mod tests {
         assert!(params().half_spread_e2(50_000) > params().half_spread_e2(0));
         assert_eq!(
             params().half_spread_e2(u64::MAX),
-            params().max_half_spread_e2
+            params().half_spread_e2_max
         );
     }
 
@@ -774,7 +774,7 @@ mod tests {
             .quote(&params(), &state(), false, ONE_ETH, 1_000)
             .expect("quotable");
         assert_eq!(q.expiry, 1_000 + params().ttl_secs);
-        assert_eq!(q.min_fill_bps, params().min_fill_bps);
+        assert_eq!(q.fill_bps_min, params().fill_bps_min);
     }
 
     /// Which asset is on which leg is the field most likely to be silently inverted, and an

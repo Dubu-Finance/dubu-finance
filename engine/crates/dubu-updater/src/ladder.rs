@@ -51,7 +51,7 @@
 //! usage*, so the decision to push is made on the price a taker would really get.
 
 use dubu_core::curve::{
-    amount_in_ask, amount_out_bid, avg_ask_price, avg_bid_price, Ladder, MAX_AMOUNT, MAX_PRICE,
+    amount_in_ask, amount_out_bid, avg_ask_price, avg_bid_price, Ladder, AMOUNT_MAX, PRICE_MAX,
 };
 use dubu_core::inverse::{solve_two_sided, Solution, SolveInput, WidthBinding};
 use dubu_core::ladder::{LadderBuilder, BPS_E2};
@@ -187,7 +187,7 @@ pub fn build(input: &RowInputs) -> Result<QuoteRow, BuildError> {
     if input.ask_capacity == 0 {
         return Err(BuildError::ZeroCapacity { side: "ask" });
     }
-    if input.fair == 0 || input.fair > MAX_PRICE {
+    if input.fair == 0 || input.fair > PRICE_MAX {
         return Err(BuildError::Price("fair value is zero or above uint56"));
     }
 
@@ -201,12 +201,12 @@ pub fn build(input: &RowInputs) -> Result<QuoteRow, BuildError> {
 
     // Step 2: the two targets. Floor the bid and ceil the ask — both away from the taker, the
     // same direction every rounding in `dubu-core` takes.
-    let hs = u128::from(input.half_spread_bps_e2).min(dubu_core::ladder::MAX_BPS_E2);
+    let hs = u128::from(input.half_spread_bps_e2).min(dubu_core::ladder::BPS_E2_MAX);
     let bid_target =
         mul_div_floor(mid, BPS_E2 - hs, BPS_E2).ok_or(BuildError::Price("bid target"))?;
     let ask_target =
         mul_div_ceil(mid, BPS_E2 + hs, BPS_E2).ok_or(BuildError::Price("ask target"))?;
-    if ask_target > MAX_PRICE {
+    if ask_target > PRICE_MAX {
         return Err(BuildError::Price("ask target above uint56"));
     }
     // A half-spread that rounds away to nothing on a tiny price would quote a locked book. The
@@ -236,7 +236,7 @@ pub fn build(input: &RowInputs) -> Result<QuoteRow, BuildError> {
         capacity: input.ask_capacity,
         requested_width: ask_width,
         min_price: input.min_price.max(mid),
-        max_price: MAX_PRICE,
+        max_price: PRICE_MAX,
     };
 
     // Step 5: solve. `solve_two_sided` runs `validate_ladder` against `bid_in.min_price`, which
@@ -379,7 +379,7 @@ pub fn plan_capacity(i: &CapacityInputs) -> Result<CapacityPlan, CurveError> {
     let base_available = i
         .base_balance
         .saturating_sub(i.min_base_reserve)
-        .min(MAX_AMOUNT);
+        .min(AMOUNT_MAX);
     let ask = i.configured_ask.min(base_available);
 
     let quote_available = i.quote_balance.saturating_sub(i.min_quote_reserve);
@@ -392,13 +392,13 @@ pub fn plan_capacity(i: &CapacityInputs) -> Result<CapacityPlan, CurveError> {
             quote_available,
             i.fair,
             i.fair,
-            MAX_AMOUNT,
+            AMOUNT_MAX,
             0,
             i.price_scale_exp,
         )
-        .unwrap_or(MAX_AMOUNT)
+        .unwrap_or(AMOUNT_MAX)
         .saturating_sub(1);
-        i.configured_bid.min(affordable).min(MAX_AMOUNT)
+        i.configured_bid.min(affordable).min(AMOUNT_MAX)
     };
 
     Ok(CapacityPlan {
@@ -622,7 +622,7 @@ mod tests {
     fn a_fair_value_out_of_the_uint56_domain_is_refused() {
         assert!(matches!(build(&weth_inputs(0)), Err(BuildError::Price(_))));
         assert!(matches!(
-            build(&weth_inputs(MAX_PRICE + 1)),
+            build(&weth_inputs(PRICE_MAX + 1)),
             Err(BuildError::Price(_))
         ));
     }

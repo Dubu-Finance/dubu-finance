@@ -110,7 +110,7 @@ pub enum Trigger {
     /// quoting the *pre-jump* price with a full epoch behind it — which is the exact fill the
     /// withdrawal was for.
     LadderStaleWithoutCapacity,
-    /// Nothing has been pushed for `max_push_interval_ms`, measured on our own clock.
+    /// Nothing has been pushed for `push_interval_ms_max`, measured on our own clock.
     ///
     /// Separate from [`Self::Heartbeat`], and the separation is forced by the chain: the heartbeat
     /// compares `quote_age_secs`, which comes from the pool's `updatedAt` field, a uint32 of
@@ -437,7 +437,7 @@ pub struct Context<'a> {
     pub heartbeat_secs: u64,
     /// Push at least this often, in milliseconds, measured from our own last send. `None` disables
     /// the cadence trigger and leaves the chain-derived heartbeat as the only time-based one.
-    pub max_push_interval_ms: Option<u64>,
+    pub push_interval_ms_max: Option<u64>,
     /// Milliseconds since this pair's last send. `None` when nothing has been sent yet, which the
     /// other triggers already cover.
     pub since_last_push_ms: Option<u64>,
@@ -497,7 +497,7 @@ impl Context<'_> {
     /// fillable, so the pool spends the round-trip latency of every heartbeat quoting nothing.
     #[must_use]
     pub const fn heartbeat_limit(&self) -> u64 {
-        let chain_bound = (self.snap.max_stale_secs as u64) * 4 / 5;
+        let chain_bound = (self.snap.stale_secs_max as u64) * 4 / 5;
         if self.heartbeat_secs < chain_bound {
             self.heartbeat_secs
         } else {
@@ -574,7 +574,7 @@ pub fn evaluate_quote(ctx: &Context<'_>) -> Result<Decision, CurveError> {
     //
     // After the drift triggers, not before: a cycle where the reference actually moved should be
     // reported as the move it was. This only fires when nothing else had anything to say.
-    if let (Some(limit_ms), Some(since_ms)) = (ctx.max_push_interval_ms, ctx.since_last_push_ms) {
+    if let (Some(limit_ms), Some(since_ms)) = (ctx.push_interval_ms_max, ctx.since_last_push_ms) {
         if since_ms >= limit_ms {
             let t = Trigger::Cadence { since_ms };
             return Ok(finish(Decision::Send(t), ctx, &planned));
@@ -725,7 +725,7 @@ mod tests {
                                  // worth posting, that no drift threshold considers urgent.
         c.adverse_drift_bps = 1_000;
         c.favourable_drift_bps = 1_000;
-        c.max_push_interval_ms = Some(330);
+        c.push_interval_ms_max = Some(330);
 
         c.since_last_push_ms = Some(200);
         assert!(
@@ -750,7 +750,7 @@ mod tests {
         let s = snap(l, 1_000, 0, 100);
         let mut c = ctx(&s, Some(l));
         c.block_timestamp = 100;
-        c.max_push_interval_ms = None;
+        c.push_interval_ms_max = None;
         c.since_last_push_ms = Some(999_999);
         assert!(
             !matches!(
@@ -778,7 +778,7 @@ mod tests {
             used_gen: 1,
             flags: 0,
             price_scale_exp: 24,
-            max_stale_secs: 3_600,
+            stale_secs_max: 3_600,
         }
     }
 
@@ -794,7 +794,7 @@ mod tests {
     /// A healthy context: nothing gated, quote fresh, row identical to what is stored.
     fn ctx<'a>(s: &'a Snap, planned: Option<Ladder>) -> Context<'a> {
         Context {
-            max_push_interval_ms: None,
+            push_interval_ms_max: None,
             since_last_push_ms: None,
             block_timestamp: s.updated_at + 10,
             snap: s,
@@ -1095,7 +1095,7 @@ mod tests {
         };
         assert_eq!(c.heartbeat_limit(), 2_880);
         assert!(
-            c.heartbeat_limit() < u64::from(s.max_stale_secs),
+            c.heartbeat_limit() < u64::from(s.stale_secs_max),
             "the quote must never expire between pushes"
         );
     }

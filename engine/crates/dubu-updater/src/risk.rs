@@ -62,7 +62,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use dubu_core::curve::{amount_out_bid, MAX_AMOUNT};
+use dubu_core::curve::{amount_out_bid, AMOUNT_MAX};
 use serde::{Deserialize, Serialize};
 
 /// Why the state file could not be used.
@@ -129,10 +129,10 @@ pub fn value(
         return Ok(0);
     }
     amount_out_bid(
-        base_balance.min(MAX_AMOUNT),
+        base_balance.min(AMOUNT_MAX),
         fair,
         fair,
-        MAX_AMOUNT,
+        AMOUNT_MAX,
         0,
         price_scale_exp,
     )

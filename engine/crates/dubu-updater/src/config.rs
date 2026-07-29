@@ -398,7 +398,7 @@ pub struct HedgePair {
     /// Decimals the venue accepts for quantity. Sending more is rejected outright.
     pub qty_decimals: u32,
     /// The venue's minimum order size, in the pool's base units.
-    pub min_qty_base: String,
+    pub qty_base_min: String,
     /// RMS net exposure this pair is willing to carry unhedged, in the pool's base units.
     ///
     /// A RISK BUDGET, not a measurement, and the only input the band needs -- see
@@ -408,12 +408,12 @@ pub struct HedgePair {
     pub carry_base: String,
     /// Largest single order, in the pool's base units. Empty or `"0"` means no clip.
     ///
-    /// An EXECUTION limit, not a risk filter -- see [`crate::hedge::Band::max_order`]. Every unit of
+    /// An EXECUTION limit, not a risk filter -- see [`crate::hedge::Band::order_max`]. Every unit of
     /// exposure gets hedged either way; this only decides how much goes out per order, which is what
     /// keeps a pool converging on a long-standing position from paying to move the book against
     /// itself on the first cycle.
     #[serde(default)]
-    pub max_order_base: String,
+    pub order_base_max: String,
     /// Don't send again within this many milliseconds. A crossing takes time to fill and to be
     /// reflected; firing again before then doubles the position instead of correcting it.
     #[serde(default = "d_hedge_cooloff_ms")]
@@ -456,10 +456,10 @@ pub struct RfqConfig {
     #[serde(default)]
     pub sigma_coefficient_e2: u32,
     /// Ceiling on the half-spread.
-    pub max_half_spread_e2: u32,
+    pub half_spread_e2_max: u32,
     /// Largest notional a single order may commit, in whole quote tokens. A decimal string
     /// because TOML integers are `i64` and this is a `u128` once scaled.
-    pub max_notional_per_order: String,
+    pub notional_per_order_max: String,
     /// Decimals of the quote token these markets are denominated in.
     pub quote_decimals: u8,
     /// How long a signed order stays fillable, how long its inventory stays reserved, and the
@@ -467,7 +467,7 @@ pub struct RfqConfig {
     pub ttl_secs: u64,
     /// Floor on a single fill, in bps of the maker leg.
     #[serde(default)]
-    pub min_fill_bps: u16,
+    pub fill_bps_min: u16,
 }
 
 impl RfqConfig {
@@ -511,13 +511,13 @@ impl RfqConfig {
         Ok(source)
     }
 
-    /// [`Self::max_notional_per_order`] in the quote token's own units.
+    /// [`Self::notional_per_order_max`] in the quote token's own units.
     ///
     /// # Errors
     /// [`ConfigError::Units`].
-    pub fn max_notional_units(&self) -> Result<u128, ConfigError> {
+    pub fn notional_units_max(&self) -> Result<u128, ConfigError> {
         Ok(units::parse_fixed(
-            &self.max_notional_per_order,
+            &self.notional_per_order_max,
             self.quote_decimals,
         )?)
     }
@@ -533,14 +533,14 @@ impl RfqConfig {
         Ok(crate::quoting::MakerParams {
             base_half_spread_e2: self.base_half_spread_e2,
             sigma_coefficient_e2: self.sigma_coefficient_e2,
-            max_half_spread_e2: self.max_half_spread_e2,
-            max_notional_per_order: self.max_notional_units()?,
+            half_spread_e2_max: self.half_spread_e2_max,
+            notional_per_order_max: self.notional_units_max()?,
             ttl_secs: self.ttl_secs,
             // Taken from the skew estimator rather than configured twice. Two numbers meaning
             // "the window sigma is measured over" is two things to keep in step and two ways to
             // misprice the TTL.
             sigma_horizon_secs: vol_horizon_secs,
-            min_fill_bps: self.min_fill_bps,
+            fill_bps_min: self.fill_bps_min,
         })
     }
 }
@@ -581,7 +581,7 @@ impl Config {
         let mut seen_ids = BTreeSet::new();
         let mut seen_symbols = BTreeSet::new();
         for p in &self.pairs {
-            p.validate(self.feed.min_venues)?;
+            p.validate(self.feed.venues_min)?;
             if !seen_ids.insert(p.pair_id) {
                 return Err(invalid(format!(
                     "pairs: pair_id {} appears twice",
@@ -599,12 +599,12 @@ impl Config {
             // A cap below a pair's own half-spread would silently NARROW the configured spread —
             // `spread::compute` refuses to do that, so the config would quietly mean something
             // other than what it says. Caught here, naming both numbers.
-            if f64::from(self.spread.max_half_spread_bps) < p.half_spread_bps {
+            if f64::from(self.spread.half_spread_bps_max) < p.half_spread_bps {
                 return Err(invalid(format!(
-                    "spread.max_half_spread_bps ({}) is below pairs[{}].half_spread_bps ({}); \
+                    "spread.half_spread_bps_max ({}) is below pairs[{}].half_spread_bps ({}); \
                      the cap bounds the VOLATILITY TERM and can never narrow the configured spread, \
                      so this combination would silently disable the term for that pair",
-                    self.spread.max_half_spread_bps, p.pair_id, p.half_spread_bps
+                    self.spread.half_spread_bps_max, p.pair_id, p.half_spread_bps
                 )));
             }
         }
@@ -966,7 +966,7 @@ impl ChainConfig {
         if self.view_stale_secs == 0 {
             return Err(invalid("chain.view_stale_secs: must be non-zero"));
         }
-        if self.degraded_extra_half_spread_bps as u128 > dubu_core::ladder::MAX_BPS {
+        if self.degraded_extra_half_spread_bps as u128 > dubu_core::ladder::BPS_MAX {
             return Err(invalid(
                 "chain.degraded_extra_half_spread_bps: must be <= 9999",
             ));
@@ -1059,8 +1059,8 @@ pub struct FeedConfig {
     /// **The quorum.** Venues that must survive the MAD filter for a reference price to exist at
     /// all. Below it the bot quotes nothing and says `no_quorum`. Must be at least 2: a single
     /// venue is the single-source oracle this whole change exists to stop being.
-    #[serde(default = "d_min_venues")]
-    pub min_venues: u8,
+    #[serde(default = "d_venues_min")]
+    pub venues_min: u8,
     /// Multiplier on the median absolute deviation. A venue further than `mad_k * MAD` from the
     /// cross-venue median is an outlier and is dropped.
     #[serde(default = "d_mad_k")]
@@ -1074,8 +1074,8 @@ pub struct FeedConfig {
     /// **The regime gate.** Cross-venue MAD above this, in bps, means the venues do not agree —
     /// not that one of them is wrong. The bot refuses to quote rather than averaging through a
     /// split market. Must exceed `mad_floor_bps`.
-    #[serde(default = "d_max_dispersion_bps")]
-    pub max_dispersion_bps: f64,
+    #[serde(default = "d_dispersion_bps_max")]
+    pub dispersion_bps_max: f64,
 }
 
 fn d_feed_stale_ms() -> u64 {
@@ -1090,7 +1090,7 @@ fn d_reconnect_max_ms() -> u64 {
 fn d_read_timeout_ms() -> u64 {
     45_000
 }
-fn d_min_venues() -> u8 {
+fn d_venues_min() -> u8 {
     2
 }
 fn d_mad_k() -> f64 {
@@ -1099,7 +1099,7 @@ fn d_mad_k() -> f64 {
 fn d_mad_floor_bps() -> f64 {
     2.0
 }
-fn d_max_dispersion_bps() -> f64 {
+fn d_dispersion_bps_max() -> f64 {
     25.0
 }
 
@@ -1124,7 +1124,7 @@ impl FeedConfig {
         self.mad_params_with(None)
     }
 
-    /// The same, with a pair's [`PairConfig::min_venues`] override applied.
+    /// The same, with a pair's [`PairConfig::venues_min`] override applied.
     ///
     /// Only the quorum is per-pair. The MAD multiplier and the dispersion ceiling are not: those
     /// describe how much venues may disagree before the disagreement is the signal, and that is a
@@ -1132,10 +1132,10 @@ impl FeedConfig {
     #[must_use]
     pub fn mad_params_with(&self, over: Option<u8>) -> MadParams {
         MadParams {
-            min_venues: over.unwrap_or(self.min_venues),
+            venues_min: over.unwrap_or(self.venues_min),
             k_tenths: (self.mad_k * 10.0).round().max(0.0) as u32,
             floor_decibps: decibps(self.mad_floor_bps),
-            max_dispersion_decibps: decibps(self.max_dispersion_bps),
+            dispersion_decibps_max: decibps(self.dispersion_bps_max),
         }
     }
 
@@ -1166,17 +1166,17 @@ impl FeedConfig {
         // One venue is a single-source oracle: the ladder and the bounds that are supposed to
         // check it would both come from the same number. That is the shape this change exists to
         // remove, and allowing it back in through a config value would remove it right back.
-        if self.min_venues < 2 {
+        if self.venues_min < 2 {
             return Err(invalid(format!(
-                "feed.min_venues is {}, and must be at least 2; quoting off a single venue makes \
+                "feed.venues_min is {}, and must be at least 2; quoting off a single venue makes \
                  the ladder's own price bounds a check against the number that produced them",
-                self.min_venues
+                self.venues_min
             )));
         }
-        if usize::from(self.min_venues) > VenueId::ALL.len() {
+        if usize::from(self.venues_min) > VenueId::ALL.len() {
             return Err(invalid(format!(
-                "feed.min_venues ({}) exceeds the {} venues this crate can speak to",
-                self.min_venues,
+                "feed.venues_min ({}) exceeds the {} venues this crate can speak to",
+                self.venues_min,
                 VenueId::ALL.len()
             )));
         }
@@ -1189,18 +1189,18 @@ impl FeedConfig {
                  venue but the median as soon as the venues agree closely",
             ));
         }
-        if !self.max_dispersion_bps.is_finite() || self.max_dispersion_bps <= 0.0 {
+        if !self.dispersion_bps_max.is_finite() || self.dispersion_bps_max <= 0.0 {
             return Err(invalid(
-                "feed.max_dispersion_bps: must be finite and non-zero",
+                "feed.dispersion_bps_max: must be finite and non-zero",
             ));
         }
         // Otherwise the regime gate fires before the outlier filter is ever consulted, and the
         // bot stops quoting on the ordinary disagreement the floor was chosen to tolerate.
-        if self.max_dispersion_bps <= self.mad_floor_bps {
+        if self.dispersion_bps_max <= self.mad_floor_bps {
             return Err(invalid(format!(
-                "feed.max_dispersion_bps ({}) must exceed feed.mad_floor_bps ({}); \
+                "feed.dispersion_bps_max ({}) must exceed feed.mad_floor_bps ({}); \
                  a dispersion limit at or below the rejection floor gates before the filter runs",
-                self.max_dispersion_bps, self.mad_floor_bps
+                self.dispersion_bps_max, self.mad_floor_bps
             )));
         }
         Ok(())
@@ -1249,17 +1249,17 @@ pub struct SkewConfig {
     pub gamma: f64,
     /// Cap on a **positive** skew (book down, the pool is long and selling), in bps.
     #[serde(default = "d_skew_max_positive_bps")]
-    pub max_positive_bps: u16,
+    pub positive_bps_max: u16,
     /// Cap on a **negative** skew (book up, the pool is short and buying), as a magnitude in bps.
     /// Deliberately the tighter of the two; [`crate::skew::compute`] argues why at length.
     #[serde(default = "d_skew_max_negative_bps")]
-    pub max_negative_bps: u16,
+    pub negative_bps_max: u16,
 }
 
 fn d_vol_tau_ms() -> u64 {
     60_000
 }
-fn d_max_in_flight() -> usize {
+fn d_in_flight_max() -> usize {
     2
 }
 
@@ -1294,8 +1294,8 @@ impl SkewConfig {
         VolConfig {
             tau_ms: self.vol_tau_ms,
             horizon_secs: self.vol_horizon_secs,
-            min_sample_ms: self.vol_min_sample_ms,
-            max_sample_ms: self.vol_max_sample_ms,
+            sample_ms_min: self.vol_min_sample_ms,
+            sample_ms_max: self.vol_max_sample_ms,
         }
     }
 
@@ -1304,8 +1304,8 @@ impl SkewConfig {
     pub fn params(&self) -> SkewParams {
         SkewParams {
             gamma_e2: (self.gamma * 100.0).round().max(0.0) as u64,
-            max_positive_bps: self.max_positive_bps,
-            max_negative_bps: self.max_negative_bps,
+            positive_bps_max: self.positive_bps_max,
+            negative_bps_max: self.negative_bps_max,
         }
     }
 
@@ -1324,25 +1324,25 @@ impl SkewConfig {
         if !self.gamma.is_finite() || self.gamma <= 0.0 || self.gamma > 100_000.0 {
             return Err(invalid("skew.gamma: must be a finite value in (0, 100000]"));
         }
-        let max_bps = dubu_core::ladder::MAX_BPS;
+        let bps_max = dubu_core::ladder::BPS_MAX;
         for (name, v) in [
-            ("max_positive_bps", self.max_positive_bps),
-            ("max_negative_bps", self.max_negative_bps),
+            ("positive_bps_max", self.positive_bps_max),
+            ("negative_bps_max", self.negative_bps_max),
         ] {
-            if u128::from(v) > max_bps {
-                return Err(invalid(format!("skew.{name}: must be <= {max_bps}")));
+            if u128::from(v) > bps_max {
+                return Err(invalid(format!("skew.{name}: must be <= {bps_max}")));
             }
         }
         // The asymmetry runs one way for a reason. A negative skew lifts the pool's BID toward
         // and past fair value, which is a free option written to whoever notices; a positive one
         // lowers both sides, which is defensive. Capping the book-lifting direction more loosely
         // than the book-lowering one inverts that and is never what was meant.
-        if self.max_negative_bps > self.max_positive_bps {
+        if self.negative_bps_max > self.positive_bps_max {
             return Err(invalid(format!(
-                "skew.max_negative_bps ({}) exceeds skew.max_positive_bps ({}); \
+                "skew.negative_bps_max ({}) exceeds skew.positive_bps_max ({}); \
                  the book-LIFTING direction raises the pool's bid toward fair value and is the \
                  pick-off direction, so it must be the tighter cap, not the looser one",
-                self.max_negative_bps, self.max_positive_bps
+                self.negative_bps_max, self.positive_bps_max
             )));
         }
         Ok(())
@@ -1375,14 +1375,14 @@ pub struct SpreadConfig {
     /// 30 bp is exactly UniV2's fee, which makes the rule statable: the pool never quotes worse
     /// than the constant-fee AMM it is trying to beat, it simply does not quote 30 bp in a calm
     /// market. The degraded-chain widening is added *after* this cap, deliberately.
-    #[serde(default = "d_max_half_spread_bps")]
-    pub max_half_spread_bps: u16,
+    #[serde(default = "d_half_spread_bps_max")]
+    pub half_spread_bps_max: u16,
 }
 
 fn d_vol_coefficient() -> f64 {
     0.5
 }
-fn d_max_half_spread_bps() -> u16 {
+fn d_half_spread_bps_max() -> u16 {
     30
 }
 
@@ -1390,7 +1390,7 @@ impl Default for SpreadConfig {
     fn default() -> Self {
         Self {
             vol_coefficient: d_vol_coefficient(),
-            max_half_spread_bps: d_max_half_spread_bps(),
+            half_spread_bps_max: d_half_spread_bps_max(),
         }
     }
 }
@@ -1401,7 +1401,7 @@ impl SpreadConfig {
     pub fn params(&self) -> crate::spread::SpreadParams {
         crate::spread::SpreadParams {
             vol_coefficient_e2: (self.vol_coefficient * 100.0).round().max(0.0) as u32,
-            max_half_spread_bps_e2: u32::from(self.max_half_spread_bps) * 100,
+            half_spread_bps_e2_max: u32::from(self.half_spread_bps_max) * 100,
         }
     }
 
@@ -1412,11 +1412,11 @@ impl SpreadConfig {
                  volatility term and restores the constant half-spread",
             ));
         }
-        if self.max_half_spread_bps == 0 {
-            return Err(invalid("spread.max_half_spread_bps_e2: must be non-zero"));
+        if self.half_spread_bps_max == 0 {
+            return Err(invalid("spread.half_spread_bps_e2_max: must be non-zero"));
         }
-        if u128::from(self.max_half_spread_bps) > dubu_core::ladder::MAX_BPS {
-            return Err(invalid("spread.max_half_spread_bps_e2: must be <= 9999"));
+        if u128::from(self.half_spread_bps_max) > dubu_core::ladder::BPS_MAX {
+            return Err(invalid("spread.half_spread_bps_e2_max: must be <= 9999"));
         }
         Ok(())
     }
@@ -1518,8 +1518,8 @@ impl JumpConfig {
         crate::jump::Params {
             sigma_k_e2: (self.sigma_k * 100.0).round().max(0.0) as u32,
             cooloff: std::time::Duration::from_secs(self.cooloff_secs),
-            min_sample: std::time::Duration::from_millis(skew.vol_min_sample_ms),
-            max_sample: std::time::Duration::from_millis(skew.vol_max_sample_ms),
+            sample_min: std::time::Duration::from_millis(skew.vol_min_sample_ms),
+            sample_max: std::time::Duration::from_millis(skew.vol_max_sample_ms),
         }
     }
 
@@ -1649,8 +1649,8 @@ pub struct TxConfig {
     /// `updateQuote` is an idempotent overwrite — see `tx::Sender::at_capacity`. What it is NOT
     /// safe to make unbounded: a stall at the head blocks everything behind it, and each queued
     /// transaction is a nonce that has to be recovered.
-    #[serde(default = "d_max_in_flight")]
-    pub max_in_flight: usize,
+    #[serde(default = "d_in_flight_max")]
+    pub in_flight_max: usize,
 }
 
 fn d_gas_limit() -> u64 {
@@ -1908,7 +1908,7 @@ pub struct PairConfig {
     /// Canonical symbol of the **real** asset this pair's mock base token tracks. See the struct
     /// docs — this is not a market in the mock token.
     pub symbol: String,
-    /// Venues that must agree before this pair has a reference, overriding [`FeedConfig::min_venues`].
+    /// Venues that must agree before this pair has a reference, overriding [`FeedConfig::venues_min`].
     ///
     /// Set this only where a second independent source does not exist, and know what it costs. The
     /// cross-venue median is what catches a single venue publishing a wrong price with full
@@ -1922,7 +1922,7 @@ pub struct PairConfig {
     /// toward it, which is worse than a quorum of one because it LOOKS met. SKHY and SPCX have no
     /// second builder at all.
     #[serde(default)]
-    pub min_venues: Option<u8>,
+    pub venues_min: Option<u8>,
 
     /// Correlation group, for jump contagion. Pairs in the same group withdraw together.
     ///
@@ -1965,7 +1965,7 @@ pub struct PairConfig {
     /// posted quote near the interval the spread is actually priced for. Unset leaves only the
     /// second-resolution heartbeat. See `policy::Trigger::Cadence`.
     #[serde(default)]
-    pub max_push_interval_ms: Option<u64>,
+    pub push_interval_ms_max: Option<u64>,
     /// **Target inventory, as a share of this pair's book, in percent.**
     ///
     /// Configuration rather than a constant, and a *share* rather than an amount so that it stays
@@ -2053,7 +2053,7 @@ impl PairConfig {
         bps_e2(self.half_spread_bps)
     }
 
-    fn validate(&self, min_venues: u8) -> Result<(), ConfigError> {
+    fn validate(&self, venues_min: u8) -> Result<(), ConfigError> {
         let id = self.pair_id;
         if id == 0 {
             return Err(invalid(
@@ -2070,15 +2070,15 @@ impl PairConfig {
         // rather than discovering it as a permanent `no_quorum` at run time is the difference
         // between a startup error and a bot that looks healthy and quotes nothing.
         let venues = self.venues.count();
-        let min_venues = self.min_venues.unwrap_or(min_venues);
-        if min_venues == 0 {
+        let venues_min = self.venues_min.unwrap_or(venues_min);
+        if venues_min == 0 {
             return Err(invalid(format!(
-                "pairs[{id}].min_venues: 0 would mean a reference with no venue behind it"
+                "pairs[{id}].venues_min: 0 would mean a reference with no venue behind it"
             )));
         }
-        if venues < usize::from(min_venues) {
+        if venues < usize::from(venues_min) {
             return Err(invalid(format!(
-                "pairs[{id}].venues names {venues} venue(s) but the quorum is {min_venues}; \
+                "pairs[{id}].venues names {venues} venue(s) but the quorum is {venues_min}; \
                  this pair could never reach quorum and would never quote"
             )));
         }
@@ -2094,15 +2094,15 @@ impl PairConfig {
                 "pairs[{id}]: token decimals must be <= 30"
             )));
         }
-        let max_bps = dubu_core::ladder::MAX_BPS;
-        if u128::from(self.half_spread_bps_e2()) > dubu_core::ladder::MAX_BPS_E2 {
+        let bps_max = dubu_core::ladder::BPS_MAX;
+        if u128::from(self.half_spread_bps_e2()) > dubu_core::ladder::BPS_E2_MAX {
             return Err(invalid(format!(
-                "pairs[{id}].half_spread_bps: must be <= {max_bps}"
+                "pairs[{id}].half_spread_bps: must be <= {bps_max}"
             )));
         }
-        if u128::from(self.width_bps) > max_bps {
+        if u128::from(self.width_bps) > bps_max {
             return Err(invalid(format!(
-                "pairs[{id}].width_bps: must be <= {max_bps}"
+                "pairs[{id}].width_bps: must be <= {bps_max}"
             )));
         }
         if !self.target_base_share_pct.is_finite()
@@ -2134,7 +2134,7 @@ impl PairConfig {
         }
         // `PropPool` holds capacity in a uint96.
         for (name, v) in [("bid_capacity", bid_cap), ("ask_capacity", ask_cap)] {
-            if v > dubu_core::curve::MAX_AMOUNT {
+            if v > dubu_core::curve::AMOUNT_MAX {
                 return Err(invalid(format!(
                     "pairs[{id}].{name}: exceeds the pool's uint96 capacity field"
                 )));
@@ -2199,7 +2199,7 @@ multicall3 = "0xcA11bde05977b3631167028862bE2a173976CA11"
 fallback_poll_interval_ms = 2000
 
 [feed]
-min_venues = 2
+venues_min = 2
 
 [tx]
 
@@ -2257,7 +2257,7 @@ capacity_divergence_pct = 30
         // through a jump are the defects these fix, so absence must not mean off.
         let cfg = parse(good()).unwrap();
         assert!((cfg.spread.vol_coefficient - 0.5).abs() < 1e-9);
-        assert_eq!(cfg.spread.max_half_spread_bps, 30);
+        assert_eq!(cfg.spread.half_spread_bps_max, 30);
         assert_eq!(cfg.spread.params().vol_coefficient_e2, 50);
         assert!(cfg.jump.enabled);
         assert!((cfg.jump.sigma_k - 6.0).abs() < 1e-9);
@@ -2287,7 +2287,7 @@ capacity_divergence_pct = 30
         // `spread::compute` floors at `s0` and would never narrow the configured spread, so this
         // config does not do damage — it does something other than what it says, which is what
         // this file exists to catch.
-        let s = format!("{}\n[spread]\nmax_half_spread_bps = 3\n", good());
+        let s = format!("{}\n[spread]\nhalf_spread_bps_max = 3\n", good());
         assert!(
             matches!(parse(&s), Err(ConfigError::Invalid(m)) if m.contains("can never narrow"))
         );
@@ -2330,8 +2330,8 @@ capacity_divergence_pct = 30
         // re-anchors on it and the detector trips on it, and they must agree about where it is.
         let cfg = parse(good()).unwrap();
         let p = cfg.jump.params(&cfg.skew);
-        assert_eq!(p.max_sample.as_millis() as u64, cfg.skew.vol_max_sample_ms);
-        assert_eq!(p.min_sample.as_millis() as u64, cfg.skew.vol_min_sample_ms);
+        assert_eq!(p.sample_max.as_millis() as u64, cfg.skew.vol_max_sample_ms);
+        assert_eq!(p.sample_min.as_millis() as u64, cfg.skew.vol_min_sample_ms);
     }
 
     // -----------------------------------------------------------------------
@@ -2402,7 +2402,7 @@ capacity_divergence_pct = 30
     fn a_single_venue_quorum_is_refused() {
         // One venue is the single-source oracle this whole design exists to stop being, and a
         // config value must not be able to put it back.
-        let s = good().replace("min_venues = 2", "min_venues = 1");
+        let s = good().replace("venues_min = 2", "venues_min = 1");
         assert!(matches!(parse(&s), Err(ConfigError::Invalid(m)) if m.contains("at least 2")));
     }
 
@@ -2411,8 +2411,8 @@ capacity_divergence_pct = 30
         // Otherwise the regime gate fires on the ordinary disagreement the floor exists to
         // tolerate, and the bot stops quoting for a reason that is purely arithmetic.
         let s = good().replace(
-            "min_venues = 2",
-            "min_venues = 2\nmad_floor_bps = 30.0\nmax_dispersion_bps = 25.0",
+            "venues_min = 2",
+            "venues_min = 2\nmad_floor_bps = 30.0\ndispersion_bps_max = 25.0",
         );
         assert!(
             matches!(parse(&s), Err(ConfigError::Invalid(m)) if m.contains("gates before the filter runs"))
@@ -2422,14 +2422,14 @@ capacity_divergence_pct = 30
     #[test]
     fn the_mad_knobs_reach_the_filter_at_deci_bps_resolution() {
         let s = good().replace(
-            "min_venues = 2",
-            "min_venues = 3\nmad_k = 4.5\nmad_floor_bps = 2.5\nmax_dispersion_bps = 25.0",
+            "venues_min = 2",
+            "venues_min = 3\nmad_k = 4.5\nmad_floor_bps = 2.5\ndispersion_bps_max = 25.0",
         );
         let p = parse(&s).unwrap().feed.mad_params();
-        assert_eq!(p.min_venues, 3);
+        assert_eq!(p.venues_min, 3);
         assert_eq!(p.k_tenths, 45);
         assert_eq!(p.floor_decibps, 25);
-        assert_eq!(p.max_dispersion_decibps, 250);
+        assert_eq!(p.dispersion_decibps_max, 250);
     }
 
     // -----------------------------------------------------------------------
@@ -2441,8 +2441,8 @@ capacity_divergence_pct = 30
         let cfg = parse(good()).unwrap();
         let p = cfg.skew.params();
         assert_eq!(p.gamma_e2, 100_000, "gamma = 1000");
-        assert_eq!(p.max_positive_bps, 30);
-        assert_eq!(p.max_negative_bps, 10);
+        assert_eq!(p.positive_bps_max, 30);
+        assert_eq!(p.negative_bps_max, 10);
         let v = cfg.skew.vol_config();
         assert_eq!(v.tau_ms, 60_000);
         assert_eq!(
@@ -2458,7 +2458,7 @@ capacity_divergence_pct = 30
         // argument in `skew::compute`.
         let s = good().replace(
             "[skew]\n",
-            "[skew]\nmax_positive_bps = 10\nmax_negative_bps = 30\n",
+            "[skew]\npositive_bps_max = 10\nnegative_bps_max = 30\n",
         );
         assert!(
             matches!(parse(&s), Err(ConfigError::Invalid(m)) if m.contains("must be the tighter cap"))

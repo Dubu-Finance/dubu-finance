@@ -109,7 +109,7 @@ pub async fn run(
     let venue = client.venue();
     let url = client.url(&base_url);
     let mut delay = Duration::from_millis(cfg.reconnect_initial_ms);
-    let max_delay = Duration::from_millis(cfg.reconnect_max_ms);
+    let delay_max = Duration::from_millis(cfg.reconnect_max_ms);
     let read_timeout = Duration::from_millis(cfg.read_timeout_ms);
     let mut first = true;
 
@@ -177,7 +177,7 @@ pub async fn run(
             _ = shutdown.changed() => return,
             () = tokio::time::sleep(delay) => {}
         }
-        delay = (delay * 2).min(max_delay);
+        delay = (delay * 2).min(delay_max);
     }
 }
 

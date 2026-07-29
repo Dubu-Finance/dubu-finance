@@ -128,12 +128,12 @@
 //! [`CurveError::AmountOutOfDomain`] is emitted by the two kinds that *return* a quote amount —
 //! `amountOutBid` and `amountInAsk` — at `exp == 0` with `uint56` prices and a `uint96` size,
 //! where the product reaches ~2^152: a value `uint256` holds and `u128` does not. `PropCurve`
-//! reverts there (`MAX_AMOUNT_OUT == type(uint128).max`) precisely so the two domains coincide,
+//! reverts there (`AMOUNT_OUT_MAX == type(uint128).max`) precisely so the two domains coincide,
 //! so those are *shared* reverts and must be emitted, not skipped.
 //!
 //! The two kinds whose *argument* is quote-denominated (`amountInBid`, `amountOutAsk`) also
-//! reject above `MAX_AMOUNT_OUT` on chain, but that check is unrepresentable in this port —
-//! `MAX_AMOUNT_OUT == u128::MAX`, so the argument's own type enforces it — and therefore emits
+//! reject above `AMOUNT_OUT_MAX` on chain, but that check is unrepresentable in this port —
+//! `AMOUNT_OUT_MAX == u128::MAX`, so the argument's own type enforces it — and therefore emits
 //! no vector. The domains still coincide; there is simply nothing to assert.
 //!
 //! # What is never emitted
@@ -151,8 +151,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::curve::{
     amount_in_ask, amount_in_bid, amount_out_ask, amount_out_bid, executable_top_ask,
-    executable_top_bid, validate_ladder, MAX_AMOUNT, MAX_AMOUNT_OUT, MAX_PRICE,
-    MAX_PRICE_SCALE_EXP, NO_ASK,
+    executable_top_bid, validate_ladder, AMOUNT_MAX, AMOUNT_OUT_MAX, NO_ASK, PRICE_MAX,
+    PRICE_SCALE_EXP_MAX,
 };
 use crate::error::CurveError;
 
@@ -568,7 +568,7 @@ pub fn generate() -> Vec<Vector> {
 
     // -- amountOutBid: every supported priceScaleExp -------------------------------------
     // amountIn * avgBid stays under 2^128 for these, so exp = 0..=7 are representable too.
-    for exp in 0..=MAX_PRICE_SCALE_EXP {
+    for exp in 0..=PRICE_SCALE_EXP_MAX {
         v.push(bid(
             &format!("bid/price_scale_exp_{exp}"),
             Inputs {
@@ -587,21 +587,21 @@ pub fn generate() -> Vec<Vector> {
     v.push(bid(
         "bid/max_u56_prices_max_exp",
         Inputs {
-            amount_in: MAX_AMOUNT,
-            min_bid: MAX_PRICE - 1,
-            max_bid: MAX_PRICE,
-            capacity: MAX_AMOUNT,
-            exp: MAX_PRICE_SCALE_EXP,
+            amount_in: AMOUNT_MAX,
+            min_bid: PRICE_MAX - 1,
+            max_bid: PRICE_MAX,
+            capacity: AMOUNT_MAX,
+            exp: PRICE_SCALE_EXP_MAX,
             ..Inputs::default()
         },
     ));
     v.push(bid(
         "bid/max_u56_prices_exp_8",
         Inputs {
-            amount_in: MAX_AMOUNT,
+            amount_in: AMOUNT_MAX,
             min_bid: 0,
-            max_bid: MAX_PRICE,
-            capacity: MAX_AMOUNT,
+            max_bid: PRICE_MAX,
+            capacity: AMOUNT_MAX,
             exp: 8,
             ..Inputs::default()
         },
@@ -609,29 +609,29 @@ pub fn generate() -> Vec<Vector> {
     v.push(bid(
         "bid/max_u56_prices_full_span_half_used",
         Inputs {
-            amount_in: MAX_AMOUNT / 2,
+            amount_in: AMOUNT_MAX / 2,
             min_bid: 0,
-            max_bid: MAX_PRICE,
-            capacity: MAX_AMOUNT,
-            used: MAX_AMOUNT / 2,
+            max_bid: PRICE_MAX,
+            capacity: AMOUNT_MAX,
+            used: AMOUNT_MAX / 2,
             exp: 20,
             ..Inputs::default()
         },
     ));
 
-    // -- MAX_AMOUNT_OUT: the shared domain edge, asserted as a revert on both sides ---------
+    // -- AMOUNT_OUT_MAX: the shared domain edge, asserted as a revert on both sides ---------
     //
     // These are the vectors the `expectRevert` half of the schema exists for. `exp = 0` means
     // no decimal alignment at all, so `amountIn * avgBid` is the raw ~2^152 product: uint256
-    // holds it, `MAX_AMOUNT_OUT` (== type(uint128).max) rejects it, and the port's u128 cannot
+    // holds it, `AMOUNT_OUT_MAX` (== type(uint128).max) rejects it, and the port's u128 cannot
     // represent it either. Agreement on *where the domain ends* is the point.
     v.push(bid(
         "bid/amount_out_of_domain_flat_ladder_exp_0",
         Inputs {
-            amount_in: MAX_AMOUNT,
-            min_bid: MAX_PRICE,
-            max_bid: MAX_PRICE,
-            capacity: MAX_AMOUNT,
+            amount_in: AMOUNT_MAX,
+            min_bid: PRICE_MAX,
+            max_bid: PRICE_MAX,
+            capacity: AMOUNT_MAX,
             exp: 0,
             ..Inputs::default()
         },
@@ -641,10 +641,10 @@ pub fn generate() -> Vec<Vector> {
     v.push(bid(
         "bid/amount_out_just_inside_the_domain",
         Inputs {
-            amount_in: MAX_AMOUNT,
+            amount_in: AMOUNT_MAX,
             min_bid: 1,
             max_bid: 1,
-            capacity: MAX_AMOUNT,
+            capacity: AMOUNT_MAX,
             exp: 0,
             ..Inputs::default()
         },
@@ -866,35 +866,35 @@ pub fn generate() -> Vec<Vector> {
     v.push(ask_in(
         "ask_in/max_u56_prices_max_exp",
         Inputs {
-            amount_in: MAX_AMOUNT,
-            min_ask: MAX_PRICE - 1,
-            max_ask: MAX_PRICE,
-            capacity: MAX_AMOUNT,
-            exp: MAX_PRICE_SCALE_EXP,
+            amount_in: AMOUNT_MAX,
+            min_ask: PRICE_MAX - 1,
+            max_ask: PRICE_MAX,
+            capacity: AMOUNT_MAX,
+            exp: PRICE_SCALE_EXP_MAX,
             ..Inputs::default()
         },
     ));
     v.push(ask_in(
         "ask_in/max_u56_prices_full_span",
         Inputs {
-            amount_in: MAX_AMOUNT,
+            amount_in: AMOUNT_MAX,
             min_ask: 1,
-            max_ask: MAX_PRICE,
-            capacity: MAX_AMOUNT,
+            max_ask: PRICE_MAX,
+            capacity: AMOUNT_MAX,
             exp: 30,
             ..Inputs::default()
         },
     ));
     // The shared domain edge on the quote-returning ask path: exp = 0 means no decimal
-    // alignment, so the cost is the raw ~2^152 product. uint256 holds it, MAX_AMOUNT_OUT
+    // alignment, so the cost is the raw ~2^152 product. uint256 holds it, AMOUNT_OUT_MAX
     // rejects it, u128 cannot represent it.
     v.push(ask_in(
         "ask_in/amount_out_of_domain_flat_ladder_exp_0",
         Inputs {
-            amount_in: MAX_AMOUNT,
-            min_ask: MAX_PRICE,
-            max_ask: MAX_PRICE,
-            capacity: MAX_AMOUNT,
+            amount_in: AMOUNT_MAX,
+            min_ask: PRICE_MAX,
+            max_ask: PRICE_MAX,
+            capacity: AMOUNT_MAX,
             exp: 0,
             ..Inputs::default()
         },
@@ -903,10 +903,10 @@ pub fn generate() -> Vec<Vector> {
     v.push(ask_in(
         "ask_in/amount_in_just_inside_the_domain",
         Inputs {
-            amount_in: MAX_AMOUNT,
+            amount_in: AMOUNT_MAX,
             min_ask: 1,
             max_ask: 1,
-            capacity: MAX_AMOUNT,
+            capacity: AMOUNT_MAX,
             exp: 0,
             ..Inputs::default()
         },
@@ -986,10 +986,10 @@ pub fn generate() -> Vec<Vector> {
     v.push(ask_out(
         "ask_out/max_u56_prices_full_span",
         Inputs {
-            amount_in: MAX_AMOUNT_OUT,
+            amount_in: AMOUNT_OUT_MAX,
             min_ask: 1,
-            max_ask: MAX_PRICE,
-            capacity: MAX_AMOUNT,
+            max_ask: PRICE_MAX,
+            capacity: AMOUNT_MAX,
             exp: 30,
             ..Inputs::default()
         },
@@ -997,7 +997,7 @@ pub fn generate() -> Vec<Vector> {
 
     // Every supported exponent, on both ask directions, with the inversion seeded by the exact
     // cost the forward direction just produced.
-    for exp in 0..=MAX_PRICE_SCALE_EXP {
+    for exp in 0..=PRICE_SCALE_EXP_MAX {
         let shape = Inputs {
             amount_in: 1_000_000,
             min_ask: 50_000_000_000_000_000,
@@ -1008,7 +1008,7 @@ pub fn generate() -> Vec<Vector> {
             ..Inputs::default()
         };
         v.push(ask_in(&format!("ask_in/price_scale_exp_{exp}"), shape));
-        // Above MAX_AMOUNT_OUT the forward direction reverts, so there is no budget to invert;
+        // Above AMOUNT_OUT_MAX the forward direction reverts, so there is no budget to invert;
         // the `ask_in` record above already asserts the shared revert.
         if let Ok(cost) = amount_in_ask(
             shape.amount_in,
@@ -1140,15 +1140,15 @@ pub fn generate() -> Vec<Vector> {
         "bid_in/max_u56_prices_exp_8",
         Inputs {
             amount_in: 1_000_000_000_000_000_000,
-            min_bid: MAX_PRICE - 1,
-            max_bid: MAX_PRICE,
-            capacity: MAX_AMOUNT,
+            min_bid: PRICE_MAX - 1,
+            max_bid: PRICE_MAX,
+            capacity: AMOUNT_MAX,
             exp: 8,
             ..Inputs::default()
         },
     ));
     // Every supported exponent, seeded by the forward direction so the round trip is asserted.
-    for exp in 0..=MAX_PRICE_SCALE_EXP {
+    for exp in 0..=PRICE_SCALE_EXP_MAX {
         let shape = Inputs {
             min_bid: 999_000_000_000_000,
             max_bid: 1_000_000_000_000_000,
@@ -1222,11 +1222,11 @@ pub fn generate() -> Vec<Vector> {
     v.push(val(
         "validate/ok_max_u56",
         Inputs {
-            min_bid: MAX_PRICE - 1,
-            max_bid: MAX_PRICE - 1,
-            min_ask: MAX_PRICE - 1,
-            max_ask: MAX_PRICE,
-            min_price: MAX_PRICE - 1,
+            min_bid: PRICE_MAX - 1,
+            max_bid: PRICE_MAX - 1,
+            min_ask: PRICE_MAX - 1,
+            max_ask: PRICE_MAX,
+            min_price: PRICE_MAX - 1,
             ..Inputs::default()
         },
     ));
@@ -1300,10 +1300,10 @@ pub fn generate() -> Vec<Vector> {
     v.push(val(
         "validate/reject_max_ask_equals_min_bid_at_u56_max",
         Inputs {
-            min_bid: MAX_PRICE,
-            max_bid: MAX_PRICE,
-            min_ask: MAX_PRICE,
-            max_ask: MAX_PRICE,
+            min_bid: PRICE_MAX,
+            max_bid: PRICE_MAX,
+            min_ask: PRICE_MAX,
+            max_ask: PRICE_MAX,
             min_price: 0,
             ..Inputs::default()
         },
@@ -1390,9 +1390,9 @@ pub fn generate() -> Vec<Vector> {
         "top_bid/max_u56_span",
         Inputs {
             min_bid: 0,
-            max_bid: MAX_PRICE,
-            capacity: MAX_AMOUNT,
-            used: MAX_AMOUNT / 3,
+            max_bid: PRICE_MAX,
+            capacity: AMOUNT_MAX,
+            used: AMOUNT_MAX / 3,
             ..Inputs::default()
         },
     ));
@@ -1448,9 +1448,9 @@ pub fn generate() -> Vec<Vector> {
         "top_ask/max_u56_span",
         Inputs {
             min_ask: 0,
-            max_ask: MAX_PRICE,
-            capacity: MAX_AMOUNT,
-            used: MAX_AMOUNT / 3,
+            max_ask: PRICE_MAX,
+            capacity: AMOUNT_MAX,
+            used: AMOUNT_MAX / 3,
             ..Inputs::default()
         },
     ));
@@ -1503,7 +1503,7 @@ mod tests {
             assert!(all.iter().any(|v| v.kind == kind), "no vectors for {kind}");
         }
         // Every supported exponent, on all four quote paths.
-        for exp in 0..=MAX_PRICE_SCALE_EXP {
+        for exp in 0..=PRICE_SCALE_EXP_MAX {
             let e = exp.to_string();
             for kind in ["amountOutBid", "amountInBid", "amountInAsk"] {
                 assert!(
@@ -1515,7 +1515,7 @@ mod tests {
         // `amountOutAsk` is seeded from `amountInAsk`, so it covers every exponent whose forward
         // cost is inside the shared domain — which is all of them here, but assert it rather
         // than assume it.
-        for exp in 0..=MAX_PRICE_SCALE_EXP {
+        for exp in 0..=PRICE_SCALE_EXP_MAX {
             let e = exp.to_string();
             assert!(
                 all.iter()
@@ -1524,7 +1524,7 @@ mod tests {
             );
         }
         // Every named Solidity revert is exercised — including AmountOutOfDomain, which the
-        // MAX_AMOUNT_OUT amendment turned from a port-only refusal into a shared revert.
+        // AMOUNT_OUT_MAX amendment turned from a port-only refusal into a shared revert.
         for err in SOLIDITY_ERRORS {
             assert!(
                 all.iter().any(|v| v.expectRevert == err),
@@ -1532,13 +1532,13 @@ mod tests {
             );
         }
         // The two kinds that RETURN a quote amount must exercise the shared domain edge. The two
-        // whose *argument* is quote-denominated cannot: `MAX_AMOUNT_OUT == u128::MAX`, so their
+        // whose *argument* is quote-denominated cannot: `AMOUNT_OUT_MAX == u128::MAX`, so their
         // on-chain input bound is enforced by the argument's type here and emits no vector.
         for kind in ["amountOutBid", "amountInAsk"] {
             assert!(
                 all.iter()
                     .any(|v| v.kind == kind && v.expectRevert == "AmountOutOfDomain"),
-                "{kind} never reaches MAX_AMOUNT_OUT"
+                "{kind} never reaches AMOUNT_OUT_MAX"
             );
         }
         // The ask side's ZeroPrice guard is asserted in both directions.

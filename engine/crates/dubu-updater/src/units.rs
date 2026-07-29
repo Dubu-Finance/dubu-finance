@@ -249,14 +249,14 @@ mod tests {
         // 1943.82 USDC per WETH -> 1_943_820_000_000_000 in the pool's scale.
         let p = to_pool_price(parse_fixed("1943.82", FEED_SCALE).unwrap(), 12).unwrap();
         assert_eq!(p, 1_943_820_000_000_000);
-        assert!(p <= dubu_core::curve::MAX_PRICE);
+        assert!(p <= dubu_core::curve::PRICE_MAX);
         assert_eq!(from_pool_price(p, 12), Some(194_382_000_000));
 
         // pairId 2, mWBTC/mUSDC, 8/6, priceScaleExp 12.
         assert_eq!(price_shift(12, 8, 6), 10);
         let p = to_pool_price(parse_fixed("118000", FEED_SCALE).unwrap(), 10).unwrap();
         assert_eq!(p, 1_180_000_000_000_000);
-        assert!(p <= dubu_core::curve::MAX_PRICE);
+        assert!(p <= dubu_core::curve::PRICE_MAX);
     }
 
     #[test]

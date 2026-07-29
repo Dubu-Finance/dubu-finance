@@ -20,7 +20,7 @@
 //!    `0..=9_999`; `skew_bps` to `-9_999..=9_999`. `u16`/`i16` admit values past 10 000, and
 //!    `10_000 - bps` must stay positive or the whole construction inverts.
 //! 2. **Skew the mid.** `m = mid * (10_000 - skew) / 10_000`, floored, then clamped to
-//!    `1..=MAX_PRICE`. Positive skew pushes the whole book *down* (the pool is long and wants
+//!    `1..=PRICE_MAX`. Positive skew pushes the whole book *down* (the pool is long and wants
 //!    to sell); negative pushes it up. Clamping to `>= 1` keeps a zero reference from
 //!    collapsing the row into the all-zero ladder the validator rejects.
 //! 3. **Project the four prices**, bid side floored and ask side ceiled — both directions
@@ -29,16 +29,16 @@
 //!    ever enabled the two will differ by one unit on the ask. See
 //!    [`LadderBuilder::round_ask_up`].
 //! 4. **Clamp into a monotone chain, bottom up**, each price bounded below by its
-//!    predecessor and above by `MAX_PRICE - 1` (`MAX_PRICE` for `max_ask`). This single sweep
+//!    predecessor and above by `PRICE_MAX - 1` (`PRICE_MAX` for `max_ask`). This single sweep
 //!    subsumes the floor clamp, the ceiling clamp, and the ordering repair, and it is why no
 //!    later step can undo an earlier one.
 //! 5. **Open the book by one unit** if `max_ask == min_bid`, because `validateLadder`'s
 //!    `maxAsk > minBid` is strict. Step 4 reserves the room for this by capping the first
-//!    three prices at `MAX_PRICE - 1`.
+//!    three prices at `PRICE_MAX - 1`.
 //! 6. **Assert.** Run the on-chain validator. A failure here is a bug in this module, and
 //!    the row is dropped rather than sent.
 
-use crate::curve::{validate_ladder, Ladder, MAX_PRICE};
+use crate::curve::{validate_ladder, Ladder, PRICE_MAX};
 use crate::error::LadderError;
 use crate::math::{mul_div_ceil, mul_div_floor};
 
@@ -58,10 +58,10 @@ pub const BPS_E2: u128 = 1_000_000;
 
 /// Largest bps value any knob may take. `10_000` would zero out a price outright and
 /// anything above it would invert the sign of `10_000 - bps`.
-pub const MAX_BPS: u128 = 9_999;
+pub const BPS_MAX: u128 = 9_999;
 
-/// [`MAX_BPS`] in hundredths of a basis point.
-pub const MAX_BPS_E2: u128 = 999_999;
+/// [`BPS_MAX`] in hundredths of a basis point.
+pub const BPS_E2_MAX: u128 = 999_999;
 
 /// Strategy inputs for one quote row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -101,36 +101,36 @@ impl LadderBuilder {
     /// The skewed mid, step 2 of the clamping order.
     ///
     /// # Errors
-    /// [`LadderError::PriceOutOfRange`] if `reference_mid` is above [`MAX_PRICE`].
+    /// [`LadderError::PriceOutOfRange`] if `reference_mid` is above [`PRICE_MAX`].
     pub fn skewed_mid(&self) -> Result<u128, LadderError> {
-        if self.reference_mid > MAX_PRICE {
+        if self.reference_mid > PRICE_MAX {
             return Err(LadderError::PriceOutOfRange);
         }
-        let skew = i128::from(self.skew_bps).clamp(-(MAX_BPS as i128), MAX_BPS as i128);
+        let skew = i128::from(self.skew_bps).clamp(-(BPS_MAX as i128), BPS_MAX as i128);
         // 10_000 - skew lands in 1..=19_999, always positive.
         let factor = (BPS as i128 - skew) as u128;
-        let m = mul_div_floor(self.reference_mid, factor, BPS).unwrap_or(MAX_PRICE);
-        Ok(m.clamp(1, MAX_PRICE))
+        let m = mul_div_floor(self.reference_mid, factor, BPS).unwrap_or(PRICE_MAX);
+        Ok(m.clamp(1, PRICE_MAX))
     }
 
     /// Build the row. Always produces something `PropCurve.validateLadder` accepts.
     ///
     /// # Errors
-    /// [`LadderError::PriceOutOfRange`] if `reference_mid` exceeds [`MAX_PRICE`];
+    /// [`LadderError::PriceOutOfRange`] if `reference_mid` exceeds [`PRICE_MAX`];
     /// [`LadderError::InfeasibleBounds`] if `min_price` leaves no room for the strict
-    /// `maxAsk > minBid` (that is, `min_price >= MAX_PRICE`);
+    /// `maxAsk > minBid` (that is, `min_price >= PRICE_MAX`);
     /// [`LadderError::Rejected`] never — it is the module's own assertion and its firing
     /// would mean a proof above is wrong.
     pub fn build(&self) -> Result<Ladder, LadderError> {
-        // Step 5 needs one unit of headroom below MAX_PRICE for max_ask to sit above min_bid.
-        if self.min_price >= MAX_PRICE {
+        // Step 5 needs one unit of headroom below PRICE_MAX for max_ask to sit above min_bid.
+        if self.min_price >= PRICE_MAX {
             return Err(LadderError::InfeasibleBounds);
         }
         let m = self.skewed_mid()?;
 
         // Step 1. Both in hundredths of a bp -- see [`BPS_E2`].
-        let hs = u128::from(self.half_spread_bps_e2).min(MAX_BPS_E2);
-        let w = u128::from(self.width_bps_e2).min(MAX_BPS_E2);
+        let hs = u128::from(self.half_spread_bps_e2).min(BPS_E2_MAX);
+        let w = u128::from(self.width_bps_e2).min(BPS_E2_MAX);
 
         // Step 3. Bid side down, ask side (by default) up.
         let raw_max_bid = mul_div_floor(m, BPS_E2 - hs, BPS_E2).unwrap_or(0);
@@ -139,14 +139,14 @@ impl LadderBuilder {
         let raw_min_ask = round(up, m, BPS_E2 + hs, BPS_E2);
         let raw_max_ask = round(up, raw_min_ask, BPS_E2 + w, BPS_E2);
 
-        // Step 4. Monotone bottom-up sweep. `hi_body = MAX_PRICE - 1` is >= min_price by the
+        // Step 4. Monotone bottom-up sweep. `hi_body = PRICE_MAX - 1` is >= min_price by the
         // guard above, so every clamp below has `lo <= hi`.
-        let hi_body = MAX_PRICE - 1;
+        let hi_body = PRICE_MAX - 1;
         let min_bid = raw_min_bid.clamp(self.min_price, hi_body);
         let max_bid = raw_max_bid.clamp(min_bid, hi_body);
         let min_ask = raw_min_ask.clamp(max_bid, hi_body);
         // Step 5, folded into the lower bound: max_ask >= max(min_ask, min_bid + 1).
-        let max_ask = raw_max_ask.clamp(min_ask.max(min_bid + 1), MAX_PRICE);
+        let max_ask = raw_max_ask.clamp(min_ask.max(min_bid + 1), PRICE_MAX);
 
         let ladder = Ladder {
             min_bid,
@@ -160,7 +160,7 @@ impl LadderBuilder {
     }
 }
 
-/// `ceil(a*b/d)` when `up`, else `floor`. Saturates at [`MAX_PRICE`] rather than failing:
+/// `ceil(a*b/d)` when `up`, else `floor`. Saturates at [`PRICE_MAX`] rather than failing:
 /// step 4 clamps every price into range anyway, and a saturating projection keeps `build`
 /// total.
 fn round(up: bool, a: u128, b: u128, d: u128) -> u128 {
@@ -169,7 +169,7 @@ fn round(up: bool, a: u128, b: u128, d: u128) -> u128 {
     } else {
         mul_div_floor(a, b, d)
     };
-    r.unwrap_or(MAX_PRICE).min(MAX_PRICE)
+    r.unwrap_or(PRICE_MAX).min(PRICE_MAX)
 }
 
 #[cfg(test)]
@@ -234,33 +234,33 @@ mod tests {
         assert!(l.max_ask > l.min_bid);
 
         // Mid at the ceiling with no spread: max_ask must still clear min_bid.
-        let l = LadderBuilder::new(MAX_PRICE).build().unwrap();
+        let l = LadderBuilder::new(PRICE_MAX).build().unwrap();
         l.validate(0).unwrap();
         assert!(l.max_ask > l.min_bid);
-        assert!(l.max_ask <= MAX_PRICE);
+        assert!(l.max_ask <= PRICE_MAX);
 
         // Floor pinned one unit below the ceiling: the tightest feasible row.
         let l = LadderBuilder {
-            min_price: MAX_PRICE - 1,
-            ..LadderBuilder::new(MAX_PRICE)
+            min_price: PRICE_MAX - 1,
+            ..LadderBuilder::new(PRICE_MAX)
         }
         .build()
         .unwrap();
-        assert_eq!(l.min_bid, MAX_PRICE - 1);
-        assert_eq!(l.max_ask, MAX_PRICE);
-        l.validate(MAX_PRICE - 1).unwrap();
+        assert_eq!(l.min_bid, PRICE_MAX - 1);
+        assert_eq!(l.max_ask, PRICE_MAX);
+        l.validate(PRICE_MAX - 1).unwrap();
     }
 
     #[test]
     fn out_of_range_inputs_are_rejected() {
         assert_eq!(
-            LadderBuilder::new(MAX_PRICE + 1).build(),
+            LadderBuilder::new(PRICE_MAX + 1).build(),
             Err(LadderError::PriceOutOfRange)
         );
         assert_eq!(
             LadderBuilder {
-                min_price: MAX_PRICE,
-                ..LadderBuilder::new(MAX_PRICE)
+                min_price: PRICE_MAX,
+                ..LadderBuilder::new(PRICE_MAX)
             }
             .build(),
             Err(LadderError::InfeasibleBounds)

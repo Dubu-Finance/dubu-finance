@@ -14,8 +14,8 @@ use core::fmt;
 /// The last two are *not* Solidity custom errors. They exist because this port narrows
 /// `uint256` to `u128`, and honesty about where that narrowing bites is worth more than a
 /// tidy enum. Neither is reachable inside the documented domain
-/// ([`crate::curve::MAX_PRICE`] / [`crate::curve::MAX_AMOUNT`] /
-/// [`crate::curve::MAX_PRICE_SCALE_EXP`]) with `priceScaleExp >= 8`; see
+/// ([`crate::curve::PRICE_MAX`] / [`crate::curve::AMOUNT_MAX`] /
+/// [`crate::curve::PRICE_SCALE_EXP_MAX`]) with `priceScaleExp >= 8`; see
 /// [`crate::curve`] module docs for the proof and the one gap.
 ///
 /// # Why `AmountOutOfDomain` is now a Solidity error
@@ -43,7 +43,7 @@ pub enum CurveError {
     /// `PropCurve.BidBelowMinPrice()` — `minBid < minPrice`.
     BidBelowMinPrice,
     /// `PropCurve.AmountOutOfDomain()` — the computed output exceeds
-    /// `PropCurve.MAX_AMOUNT_OUT` (`type(uint128).max`). Both sides reject it.
+    /// `PropCurve.AMOUNT_OUT_MAX` (`type(uint128).max`). Both sides reject it.
     AmountOutOfDomain,
 
     /// Not a custom error. Solidity 0.8 would raise `Panic(0x11)` (arithmetic
@@ -52,14 +52,14 @@ pub enum CurveError {
     ArithmeticPanic,
     /// Not a custom error, and the chain does **not** reject these inputs.
     ///
-    /// Raised when `priceScaleExp > MAX_PRICE_SCALE_EXP`. `PropCurve` itself does not check
+    /// Raised when `priceScaleExp > PRICE_SCALE_EXP_MAX`. `PropCurve` itself does not check
     /// the exponent — `10 ** 39` computes perfectly well in `uint256` — so on this input the
     /// chain succeeds where the port refuses. That asymmetry is deliberate and safe in one
     /// direction only: refusing to quote can never lose money, whereas quoting something the
     /// chain would price differently can.
     ///
     /// It is also unreachable in practice, because the bound is enforced one level up:
-    /// `PropPool.addPair` rejects `priceScaleExp > PropCurve.MAX_PRICE_SCALE_EXP`, so no pair
+    /// `PropPool.addPair` rejects `priceScaleExp > PropCurve.PRICE_SCALE_EXP_MAX`, so no pair
     /// carrying such an exponent can exist to be quoted.
     DomainOverflow,
 }
@@ -99,9 +99,9 @@ impl fmt::Display for CurveError {
             Self::ZeroPrice => "average price resolved to zero",
             Self::CrossedBook => "ladder is crossed or inverted",
             Self::BidBelowMinPrice => "minBid is below the pair's minPrice floor",
-            Self::AmountOutOfDomain => "output exceeds PropCurve.MAX_AMOUNT_OUT",
+            Self::AmountOutOfDomain => "output exceeds PropCurve.AMOUNT_OUT_MAX",
             Self::ArithmeticPanic => "on-chain arithmetic panic (0x11/0x12)",
-            Self::DomainOverflow => "priceScaleExp above PropCurve.MAX_PRICE_SCALE_EXP",
+            Self::DomainOverflow => "priceScaleExp above PropCurve.PRICE_SCALE_EXP_MAX",
         };
         f.write_str(s)
     }
@@ -116,9 +116,9 @@ impl std::error::Error for CurveError {}
 pub enum LadderError {
     /// Capacity is zero, so there is no interval to average a price over.
     ZeroCapacity,
-    /// A price argument exceeds [`crate::curve::MAX_PRICE`] (`uint56`).
+    /// A price argument exceeds [`crate::curve::PRICE_MAX`] (`uint56`).
     PriceOutOfRange,
-    /// An amount argument exceeds [`crate::curve::MAX_AMOUNT`] (`uint96`).
+    /// An amount argument exceeds [`crate::curve::AMOUNT_MAX`] (`uint96`).
     AmountOutOfRange,
     /// `target < min_price`: the requested price is already below the floor, so no ladder
     /// with that average exists.
@@ -159,7 +159,7 @@ impl From<CurveError> for LadderError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[non_exhaustive]
 pub enum PackError {
-    /// A price field exceeds [`crate::curve::MAX_PRICE`] (`uint56`) and cannot be packed.
+    /// A price field exceeds [`crate::curve::PRICE_MAX`] (`uint56`) and cannot be packed.
     PriceOutOfRange,
     /// The word has bits set above bit 239, which no encoder of ours produces. Rejecting
     /// these keeps `unpack(pack(x)) == x` and `pack(unpack(w)) == w` both total.

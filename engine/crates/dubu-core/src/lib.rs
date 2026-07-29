@@ -54,7 +54,7 @@
 //!     target,
 //!     capture: 5_000_000_000_000_000_000,           // 5 WETH
 //!     capacity: 20_000_000_000_000_000_000,         // 20 WETH posted this epoch
-//!     requested_width: curve::MAX_PRICE,
+//!     requested_width: curve::PRICE_MAX,
 //!     min_price: target * 99 / 100,
 //!     max_price: target * 101 / 100,
 //! };
@@ -119,8 +119,8 @@ pub mod vectors;
 
 pub use curve::{
     amount_in_ask, amount_in_bid, amount_out_ask, amount_out_bid, avg_ask_price, avg_bid_price,
-    executable_top_ask, executable_top_bid, validate_ladder, Ladder, MAX_AMOUNT, MAX_AMOUNT_OUT,
-    MAX_PRICE, MAX_PRICE_SCALE_EXP, NO_ASK,
+    executable_top_ask, executable_top_bid, validate_ladder, Ladder, AMOUNT_MAX, AMOUNT_OUT_MAX,
+    NO_ASK, PRICE_MAX, PRICE_SCALE_EXP_MAX,
 };
 pub use error::{CurveError, LadderError, PackError};
 pub use inverse::{

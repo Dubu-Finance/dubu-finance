@@ -941,7 +941,7 @@ pub struct Snap {
     /// Decimal alignment for this pair.
     pub price_scale_exp: u8,
     /// How long a quote stays fillable.
-    pub max_stale_secs: u32,
+    pub stale_secs_max: u32,
 }
 
 impl Snap {
@@ -1016,7 +1016,7 @@ impl Snap {
             used_gen: a.usedGen,
             flags: a.flags,
             price_scale_exp: a.priceScaleExp,
-            max_stale_secs: a.maxStaleSecs,
+            stale_secs_max: a.maxStaleSecs,
         }
     }
 }
@@ -1031,7 +1031,7 @@ pub struct PairMeta {
     /// Decimal alignment.
     pub price_scale_exp: u8,
     /// Freshness window the pool enforces.
-    pub max_stale_secs: u32,
+    pub stale_secs_max: u32,
     /// Absolute floor on `minBid`, oracle-independent.
     pub min_price: u128,
     /// Base-token reserve floor.
@@ -1184,7 +1184,7 @@ impl ChainReader {
 
     /// Also read this address's confirmed nonce on every poll.
     ///
-    /// Costs one extra request per read and replaces up to `max_in_flight` receipt calls per cycle.
+    /// Costs one extra request per read and replaces up to `in_flight_max` receipt calls per cycle.
     /// See [`ChainView::sender_nonce`].
     #[must_use]
     pub fn with_sender(mut self, sender: Address) -> Self {
@@ -1575,7 +1575,7 @@ pub async fn verify_against_chain(
                 base: c.base,
                 quote: c.quote,
                 price_scale_exp: c.priceScaleExp,
-                max_stale_secs: c.maxStaleSecs,
+                stale_secs_max: c.maxStaleSecs,
                 min_price: c.minPrice.to::<u128>(),
                 min_base_reserve: c.minBaseReserve.to::<u128>(),
                 min_quote_reserve: c.minQuoteReserve.to::<u128>(),
@@ -1625,7 +1625,7 @@ mod tests {
             used_gen,
             flags: 0,
             price_scale_exp: 24,
-            max_stale_secs: 3_600,
+            stale_secs_max: 3_600,
         }
     }
 

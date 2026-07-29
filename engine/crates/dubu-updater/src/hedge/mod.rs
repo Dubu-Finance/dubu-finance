@@ -99,7 +99,7 @@ pub struct Band {
     pub width: u128,
     /// The venue's minimum order size, in base units. A crossing below this is not sent — it would
     /// be rejected and the drift would be counted as hedged when it was not.
-    pub min_qty: u128,
+    pub qty_min: u128,
     /// Don't send again within this window. A hedge takes time to fill and to be reflected; firing
     /// again before then doubles the position rather than correcting it.
     pub cooloff: Duration,
@@ -110,16 +110,16 @@ pub struct Band {
     /// holding 3,507 ETH that has never hedged needs 3,507 ETH of hedge -- but sending it as one
     /// market order would pay for the privilege of moving the book against itself. Clipping
     /// converges over several crossings instead, one `cooloff` apart.
-    pub max_order: u128,
+    pub order_max: u128,
 }
 
 impl Default for Band {
     fn default() -> Self {
         Self {
             width: 0,
-            min_qty: 0,
+            qty_min: 0,
             cooloff: Duration::from_secs(2),
-            max_order: 0,
+            order_max: 0,
         }
     }
 }
@@ -241,7 +241,7 @@ impl Bands {
         // straight back. This is what the theory prescribes (Kallsen-Muhle-Karbe: trade the minimal
         // amount to stay inside) and what production hedgers offer as "just get within delta range".
         let magnitude = excess;
-        if magnitude < self.band.min_qty {
+        if magnitude < self.band.qty_min {
             self.suppressed_small = self.suppressed_small.saturating_add(1);
             return None;
         }
@@ -254,8 +254,8 @@ impl Bands {
         }
         // Clipped, not skipped. The rest is still real exposure and the next crossing takes the
         // next slice; what this avoids is one order large enough to move the book it is hedging in.
-        let qty = if self.band.max_order > 0 {
-            magnitude.min(self.band.max_order)
+        let qty = if self.band.order_max > 0 {
+            magnitude.min(self.band.order_max)
         } else {
             magnitude
         };
@@ -351,9 +351,9 @@ mod tests {
     fn band(width: u128) -> Band {
         Band {
             width,
-            min_qty: 1,
+            qty_min: 1,
             cooloff: Duration::ZERO,
-            max_order: 0,
+            order_max: 0,
         }
     }
 
@@ -427,9 +427,9 @@ mod tests {
             1,
             Band {
                 width: 100,
-                min_qty: 1,
+                qty_min: 1,
                 cooloff: Duration::ZERO,
-                max_order: 1_000,
+                order_max: 1_000,
             },
         );
         let t0 = Instant::now();
@@ -505,9 +505,9 @@ mod tests {
             1,
             Band {
                 width: 10,
-                min_qty: 1,
+                qty_min: 1,
                 cooloff: Duration::from_secs(5),
-                max_order: 0,
+                order_max: 0,
             },
         );
         let t0 = Instant::now();
@@ -531,9 +531,9 @@ mod tests {
             1,
             Band {
                 width: 10,
-                min_qty: 500,
+                qty_min: 500,
                 cooloff: Duration::ZERO,
-                max_order: 0,
+                order_max: 0,
             },
         );
         b.observe(1_050, -1_000);

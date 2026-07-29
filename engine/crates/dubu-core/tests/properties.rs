@@ -17,8 +17,8 @@
 
 use dubu_core::curve::{
     amount_in_ask, amount_in_bid, amount_out_ask, amount_out_bid, avg_ask_price, avg_bid_price,
-    executable_top_ask, executable_top_bid, validate_ladder, MAX_AMOUNT, MAX_PRICE,
-    MAX_PRICE_SCALE_EXP, NO_ASK,
+    executable_top_ask, executable_top_bid, validate_ladder, AMOUNT_MAX, NO_ASK, PRICE_MAX,
+    PRICE_SCALE_EXP_MAX,
 };
 use dubu_core::error::{CurveError, LadderError};
 use dubu_core::inverse::{solve_ask, solve_bid, solve_two_sided, SolveInput, WidthBinding};
@@ -34,21 +34,21 @@ use proptest::prelude::*;
 /// In-domain price (`uint56`).
 fn price() -> impl Strategy<Value = u128> {
     prop_oneof![
-        3 => 0u128..=MAX_PRICE,
+        3 => 0u128..=PRICE_MAX,
         1 => Just(0u128),
         1 => Just(1u128),
-        1 => Just(MAX_PRICE),
-        1 => Just(MAX_PRICE - 1),
+        1 => Just(PRICE_MAX),
+        1 => Just(PRICE_MAX - 1),
     ]
 }
 
 /// In-domain amount (`uint96`).
 fn amount() -> impl Strategy<Value = u128> {
     prop_oneof![
-        3 => 0u128..=MAX_AMOUNT,
+        3 => 0u128..=AMOUNT_MAX,
         1 => Just(0u128),
         1 => Just(1u128),
-        1 => Just(MAX_AMOUNT),
+        1 => Just(AMOUNT_MAX),
     ]
 }
 
@@ -56,7 +56,7 @@ fn amount() -> impl Strategy<Value = u128> {
 fn wild() -> impl Strategy<Value = u128> {
     prop_oneof![
         2 => any::<u128>(),
-        1 => 0u128..=MAX_AMOUNT,
+        1 => 0u128..=AMOUNT_MAX,
         1 => Just(u128::MAX),
         1 => Just(0u128),
     ]
@@ -64,23 +64,23 @@ fn wild() -> impl Strategy<Value = u128> {
 
 /// An ordered pair of in-domain prices, `(low, high)`.
 fn ladder_pair() -> impl Strategy<Value = (u128, u128)> {
-    (0u128..=MAX_PRICE, 0u128..=MAX_PRICE).prop_map(|(a, b)| (a.min(b), a.max(b)))
+    (0u128..=PRICE_MAX, 0u128..=PRICE_MAX).prop_map(|(a, b)| (a.min(b), a.max(b)))
 }
 
 /// An ordered, in-domain ladder that `validateLadder` accepts against `min_price = 0`.
 fn valid_ladder() -> impl Strategy<Value = (u128, u128, u128, u128)> {
     (
-        0u128..=MAX_PRICE,
-        0u128..=MAX_PRICE,
-        0u128..=MAX_PRICE,
-        0u128..=MAX_PRICE,
+        0u128..=PRICE_MAX,
+        0u128..=PRICE_MAX,
+        0u128..=PRICE_MAX,
+        0u128..=PRICE_MAX,
     )
         .prop_map(|(a, b, c, d)| {
             let mut v = [a, b, c, d];
             v.sort_unstable();
             // Guarantee the strict maxAsk > minBid the validator demands.
             if v[3] == v[0] {
-                if v[3] < MAX_PRICE {
+                if v[3] < PRICE_MAX {
                     v[3] += 1;
                 } else {
                     v[0] -= 1;
@@ -173,7 +173,7 @@ proptest! {
         p1 in price(),
         capacity in amount(),
         used in amount(),
-        exp in 0u8..=MAX_PRICE_SCALE_EXP,
+        exp in 0u8..=PRICE_SCALE_EXP_MAX,
     ) {
         let _ = amount_out_bid(arg, p0, p1, capacity, used, exp);
         let _ = amount_in_bid(arg, p0, p1, capacity, used, exp);
@@ -229,7 +229,7 @@ proptest! {
         match bldr.build() {
             Ok(l) => {
                 prop_assert_eq!(l.validate(min_price), Ok(()));
-                prop_assert!(l.max_ask <= MAX_PRICE);
+                prop_assert!(l.max_ask <= PRICE_MAX);
             }
             Err(e) => prop_assert!(
                 matches!(e, LadderError::PriceOutOfRange | LadderError::InfeasibleBounds),
@@ -263,11 +263,11 @@ proptest! {
     #[test]
     fn bid_output_is_non_decreasing_in_input(
         (min_bid, max_bid) in ladder_pair(),
-        capacity in 1u128..=MAX_AMOUNT,
+        capacity in 1u128..=AMOUNT_MAX,
         used in amount(),
         q in amount(),
-        delta in 1u128..=MAX_AMOUNT,
-        exp in 0u8..=MAX_PRICE_SCALE_EXP,
+        delta in 1u128..=AMOUNT_MAX,
+        exp in 0u8..=PRICE_SCALE_EXP_MAX,
     ) {
         let used = used % capacity;
         let room = capacity - used;
@@ -294,10 +294,10 @@ proptest! {
     #[test]
     fn one_more_unit_never_returns_less(
         (min_bid, max_bid) in ladder_pair(),
-        capacity in 2u128..=MAX_AMOUNT,
+        capacity in 2u128..=AMOUNT_MAX,
         used in amount(),
         q in amount(),
-        exp in 0u8..=MAX_PRICE_SCALE_EXP,
+        exp in 0u8..=PRICE_SCALE_EXP_MAX,
     ) {
         let used = used % capacity;
         let room = capacity - used;
@@ -330,25 +330,25 @@ proptest! {
     /// by mutation: reinstating the pre-amendment form leaves both of them green.
     ///
     /// This one derives the capacity from the domain bound instead of rejecting afterwards. With
-    /// `q * maxBid / scale <= MAX_AMOUNT_OUT` guaranteed by construction, every quote below is
+    /// `q * maxBid / scale <= AMOUNT_OUT_MAX` guaranteed by construction, every quote below is
     /// in domain, no case is discarded, and `q -> q + 1` is checked with nothing swallowed. The
     /// same construction sharpens the ask leg.
     #[test]
     fn monotonic_wei_by_wei_with_the_domain_bound_built_in(
-        max_bid in 1u128..=MAX_PRICE,
+        max_bid in 1u128..=PRICE_MAX,
         width_bps in 0u128..=2_000,
-        exp in 0u8..=MAX_PRICE_SCALE_EXP,
+        exp in 0u8..=PRICE_SCALE_EXP_MAX,
         capacity_seed: u128,
         offset: u128,
         used_seed: u128,
     ) {
         let scale = 10u128.pow(u32::from(exp));
         let min_bid = max_bid - max_bid * width_bps / 10_000;
-        // Largest size whose quote leg still fits `MAX_AMOUNT_OUT`, since the leg is bounded
+        // Largest size whose quote leg still fits `AMOUNT_OUT_MAX`, since the leg is bounded
         // above by `q * maxBid / scale`.
         let q_cap = dubu_core::math::mul_div_floor(u128::MAX, scale, max_bid)
-            .unwrap_or(MAX_AMOUNT)
-            .clamp(2, MAX_AMOUNT);
+            .unwrap_or(AMOUNT_MAX)
+            .clamp(2, AMOUNT_MAX);
         let capacity = 2 + capacity_seed % (q_cap - 1);
         let used = used_seed % capacity;
         let room = capacity - used;
@@ -398,7 +398,7 @@ proptest! {
     /// The amended form cannot express that, because there is no intermediate price to step.
     #[test]
     fn the_quantisation_witness_family_is_monotonic(
-        m in 4u128..=(MAX_PRICE - 1) / 2,
+        m in 4u128..=(PRICE_MAX - 1) / 2,
         exp in 0u8..=3,
     ) {
         let m = m * 2; // even, so `u = m/2` is exact
@@ -421,11 +421,11 @@ proptest! {
     #[test]
     fn ask_inversion_is_non_decreasing_in_budget(
         (min_ask, max_ask) in ladder_pair(),
-        capacity in 1u128..=MAX_AMOUNT,
+        capacity in 1u128..=AMOUNT_MAX,
         used in amount(),
         x in amount(),
-        delta in 1u128..=MAX_AMOUNT,
-        exp in 0u8..=MAX_PRICE_SCALE_EXP,
+        delta in 1u128..=AMOUNT_MAX,
+        exp in 0u8..=PRICE_SCALE_EXP_MAX,
     ) {
         let used = used % capacity;
         let x2 = x.saturating_add(delta);
@@ -455,10 +455,10 @@ proptest! {
     #[test]
     fn bid_leg_is_the_floored_exact_integral(
         (min_bid, max_bid) in ladder_pair(),
-        capacity in 1u128..=MAX_AMOUNT,
+        capacity in 1u128..=AMOUNT_MAX,
         used in amount(),
         q in amount(),
-        exp in 0u8..=MAX_PRICE_SCALE_EXP,
+        exp in 0u8..=PRICE_SCALE_EXP_MAX,
     ) {
         let used = used % capacity;
         let q = q % (capacity - used + 1);
@@ -475,10 +475,10 @@ proptest! {
     #[test]
     fn ask_leg_is_the_ceiled_exact_integral(
         (min_ask, max_ask) in ladder_pair(),
-        capacity in 1u128..=MAX_AMOUNT,
+        capacity in 1u128..=AMOUNT_MAX,
         used in amount(),
         q in amount(),
-        exp in 0u8..=MAX_PRICE_SCALE_EXP,
+        exp in 0u8..=PRICE_SCALE_EXP_MAX,
     ) {
         prop_assume!(max_ask > 0);
         let used = used % capacity;
@@ -516,9 +516,9 @@ proptest! {
     #[test]
     fn splitting_never_beats_one_shot_on_either_side(
         (lo_price, hi_price) in ladder_pair(),
-        capacity in 1u128..=MAX_AMOUNT,
-        q in 2u128..=MAX_AMOUNT,
-        exp in 0u8..=MAX_PRICE_SCALE_EXP,
+        capacity in 1u128..=AMOUNT_MAX,
+        q in 2u128..=AMOUNT_MAX,
+        exp in 0u8..=PRICE_SCALE_EXP_MAX,
         n in 1u32..=8,
     ) {
         let q = q % capacity.max(2);
@@ -572,9 +572,9 @@ proptest! {
     #[test]
     fn no_decomposition_beats_the_exact_curve(
         (lo_price, hi_price) in ladder_pair(),
-        capacity in 1u128..=MAX_AMOUNT,
-        q in 2u128..=MAX_AMOUNT,
-        exp in 0u8..=MAX_PRICE_SCALE_EXP,
+        capacity in 1u128..=AMOUNT_MAX,
+        q in 2u128..=AMOUNT_MAX,
+        exp in 0u8..=PRICE_SCALE_EXP_MAX,
         n in 1u32..=8,
     ) {
         let q = q % capacity.max(2);
@@ -640,10 +640,10 @@ proptest! {
     #[test]
     fn splitting_a_quote_denominated_ask_never_buys_more_base(
         (min_ask, max_ask) in ladder_pair(),
-        capacity in 1u128..=MAX_AMOUNT,
-        x1 in 1u128..=MAX_AMOUNT,
-        x2 in 1u128..=MAX_AMOUNT,
-        exp in 0u8..=MAX_PRICE_SCALE_EXP,
+        capacity in 1u128..=AMOUNT_MAX,
+        x1 in 1u128..=AMOUNT_MAX,
+        x2 in 1u128..=AMOUNT_MAX,
+        exp in 0u8..=PRICE_SCALE_EXP_MAX,
     ) {
         prop_assume!(max_ask > 0);
         let Ok(q1) = amount_out_ask(x1, min_ask, max_ask, capacity, 0, exp) else { return Ok(()) };
@@ -657,10 +657,10 @@ proptest! {
     #[test]
     fn the_ask_inversion_never_gives_away_more_than_it_collects(
         (min_ask, max_ask) in ladder_pair(),
-        capacity in 1u128..=MAX_AMOUNT,
+        capacity in 1u128..=AMOUNT_MAX,
         used in amount(),
-        x in 1u128..=MAX_AMOUNT,
-        exp in 0u8..=MAX_PRICE_SCALE_EXP,
+        x in 1u128..=AMOUNT_MAX,
+        exp in 0u8..=PRICE_SCALE_EXP_MAX,
     ) {
         prop_assume!(max_ask > 0);
         let used = used % capacity;
@@ -674,7 +674,7 @@ proptest! {
         if used + q < capacity {
             match amount_in_ask(q + 1, min_ask, max_ask, capacity, used, exp) {
                 Ok(more) => prop_assert!(more > x, "q={q} was not maximal for budget {x}"),
-                // Above MAX_AMOUNT_OUT is certainly above `x <= MAX_AMOUNT`.
+                // Above AMOUNT_OUT_MAX is certainly above `x <= AMOUNT_MAX`.
                 Err(CurveError::AmountOutOfDomain) => {}
                 Err(e) => prop_assert!(false, "unexpected {e:?}"),
             }
@@ -685,10 +685,10 @@ proptest! {
     #[test]
     fn the_bid_exact_output_path_is_minimal(
         (min_bid, max_bid) in ladder_pair(),
-        capacity in 1u128..=MAX_AMOUNT,
+        capacity in 1u128..=AMOUNT_MAX,
         used in amount(),
-        y in 1u128..=MAX_AMOUNT,
-        exp in 0u8..=MAX_PRICE_SCALE_EXP,
+        y in 1u128..=AMOUNT_MAX,
+        exp in 0u8..=PRICE_SCALE_EXP_MAX,
     ) {
         let used = used % capacity;
         let Ok(q) = amount_in_bid(y, min_bid, max_bid, capacity, used, exp) else { return Ok(()) };
@@ -708,12 +708,12 @@ proptest! {
 
 fn solve_input() -> impl Strategy<Value = SolveInput> {
     (
-        0u128..=MAX_PRICE,
+        0u128..=PRICE_MAX,
         amount(),
-        1u128..=MAX_AMOUNT,
-        prop_oneof![Just(MAX_PRICE), 0u128..=MAX_PRICE],
-        0u128..=MAX_PRICE,
-        0u128..=MAX_PRICE,
+        1u128..=AMOUNT_MAX,
+        prop_oneof![Just(PRICE_MAX), 0u128..=PRICE_MAX],
+        0u128..=PRICE_MAX,
+        0u128..=PRICE_MAX,
     )
         .prop_map(|(target, capture, capacity, requested_width, a, c)| {
             let (min_price, max_price) = (a.min(c), a.max(c));
@@ -758,12 +758,12 @@ proptest! {
         prop_assert_eq!(sol.high - sol.low, sol.width);
         prop_assert!(sol.low >= input.min_price);
         prop_assert!(sol.high <= input.max_price);
-        prop_assert!(sol.high <= MAX_PRICE);
+        prop_assert!(sol.high <= PRICE_MAX);
         prop_assert!(sol.width <= input.requested_width);
         prop_assert_eq!(sol.effective_capture, input.capture.min(input.capacity));
 
         // In amount terms: never pays a taker more than a flat ladder posted at the target.
-        for exp in [8u8, 18, 24, MAX_PRICE_SCALE_EXP] {
+        for exp in [8u8, 18, 24, PRICE_SCALE_EXP_MAX] {
             let solved = amount_out_bid(sol.effective_capture, sol.low, sol.high, input.capacity, 0, exp);
             let flat = amount_out_bid(sol.effective_capture, input.target, input.target, input.capacity, 0, exp);
             if let (Ok(solved), Ok(flat)) = (solved, flat) {
@@ -786,7 +786,7 @@ proptest! {
         prop_assert!(sol.width <= input.requested_width);
 
         // In amount terms: never charges a taker less than a flat ladder posted at the target.
-        for exp in [8u8, 18, 24, MAX_PRICE_SCALE_EXP] {
+        for exp in [8u8, 18, 24, PRICE_SCALE_EXP_MAX] {
             let solved = amount_in_ask(sol.effective_capture, sol.low, sol.high, input.capacity, 0, exp);
             let flat = amount_in_ask(sol.effective_capture, input.target, input.target, input.capacity, 0, exp);
             if let (Ok(solved), Ok(flat)) = (solved, flat) {
@@ -806,9 +806,9 @@ proptest! {
         let sol = solve_bid(&input).expect("in-domain input must solve");
         match sol.binding {
             WidthBinding::Requested => prop_assert_eq!(sol.width, input.requested_width),
-            WidthBinding::Saturated => prop_assert_eq!(sol.width, MAX_PRICE),
+            WidthBinding::Saturated => prop_assert_eq!(sol.width, PRICE_MAX),
             WidthBinding::Boundary | WidthBinding::Endpoint => {
-                prop_assert!(sol.width < MAX_PRICE && sol.width < input.requested_width);
+                prop_assert!(sol.width < PRICE_MAX && sol.width < input.requested_width);
                 let w = sol.width + 1;
                 let impact =
                     dubu_core::math::mul_div_floor(w, sol.effective_capture, 2 * input.capacity).unwrap();
@@ -864,7 +864,7 @@ proptest! {
     #[test]
     fn executable_top_is_exactly_the_zero_size_average(
         (lo_price, hi_price) in ladder_pair(),
-        capacity in 1u128..=MAX_AMOUNT,
+        capacity in 1u128..=AMOUNT_MAX,
         used in amount(),
     ) {
         let top_bid = executable_top_bid(lo_price, hi_price, capacity, used).unwrap();
@@ -941,7 +941,7 @@ proptest! {
     #[test]
     fn validator_accepts_every_well_ordered_ladder(
         (min_bid, max_bid, min_ask, max_ask) in valid_ladder(),
-        floor in 0u128..=MAX_PRICE,
+        floor in 0u128..=PRICE_MAX,
     ) {
         let min_price = floor.min(min_bid);
         prop_assert_eq!(validate_ladder(min_bid, max_bid, min_ask, max_ask, min_price), Ok(()));
@@ -997,7 +997,7 @@ fn generated_vectors_are_self_consistent() {
     }
     assert!(
         all.iter().any(|v| v.expectRevert == "AmountOutOfDomain"),
-        "no vector asserts the shared MAX_AMOUNT_OUT boundary"
+        "no vector asserts the shared AMOUNT_OUT_MAX boundary"
     );
     assert!(
         all.iter().any(|v| v.expectRevert == "ZeroPrice"),

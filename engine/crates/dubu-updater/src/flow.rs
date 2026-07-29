@@ -47,9 +47,9 @@
 //!    actually beating us repeatedly — which is expensive, and is the cost that makes the rest of
 //!    this hold.
 //! 2. **The window must carry real notional before it says anything.** Below
-//!    [`Params::min_window_notional`] the shift is zero, so one fill can never dominate.
+//!    [`Params::window_notional_min`] the shift is zero, so one fill can never dominate.
 //! 3. **The shift is capped, and the cap is checked against the epoch.** Manufacturing a shift of
-//!    `max_shift_bps` costs the attacker the spread on at least `min_window_notional`; exploiting
+//!    `max_shift_bps` costs the attacker the spread on at least `window_notional_min`; exploiting
 //!    it earns at most `max_shift_bps` on the epoch capacity. [`Params::validate`] refuses a
 //!    configuration where the second exceeds the first, so an exploitable set of numbers fails at
 //!    startup instead of in production.
@@ -78,11 +78,11 @@ pub struct Params {
     pub window_secs: u64,
     /// Weighted notional the window must hold before the signal is anything but zero. The
     /// single-fill bound, and the denominator of the manipulation arithmetic.
-    pub min_window_notional: u128,
+    pub window_notional_min: u128,
     /// Settled fills a counterparty needs before its score carries any weight.
-    pub min_fills: u64,
+    pub fills_min: u64,
     /// Notional a counterparty needs before its score carries any weight.
-    pub min_notional: u128,
+    pub notional_min: u128,
     /// Markout, in hundredths of a bp against us, at which a counterparty reaches full weight. A
     /// counterparty costing us more than this is not weighted further; the cap is what stops one
     /// catastrophic fill from owning the signal.
@@ -92,7 +92,7 @@ pub struct Params {
     /// Shift produced by a residual imbalance of one, before the cap.
     pub gain_bps_e2: i64,
     /// Hard cap on the shift, in hundredths of a bp.
-    pub max_shift_bps_e2: i64,
+    pub shift_bps_e2_max: i64,
     /// Largest notional a single epoch can be drained for. The exploit side of the inequality.
     pub epoch_notional: u128,
     /// Half-spread the pool charges, in hundredths of a bp. The attacker's cost of manufacturing.
@@ -106,20 +106,20 @@ pub enum ParamsError {
     #[error("window_secs must be non-zero")]
     EmptyWindow,
     /// Without a notional floor, one fill is the whole window and the signal is trivially forged.
-    #[error("min_window_notional must be non-zero; without it a single fill owns the signal")]
+    #[error("window_notional_min must be non-zero; without it a single fill owns the signal")]
     NoNotionalFloor,
     /// Weighting divides by this.
     #[error("full_weight_at_e2 must be positive")]
     NoWeightScale,
     /// The shift a counterparty can manufacture is worth more than manufacturing it costs.
     #[error(
-        "manipulation is profitable: manufacturing {max_shift_bps_e2}e-2bp costs at most \
+        "manipulation is profitable: manufacturing {shift_bps_e2_max}e-2bp costs at most \
          {cost} but exploiting it on an epoch of {epoch_notional} earns up to {gain}. \
-         Lower max_shift_bps_e2, raise min_window_notional, or widen the spread"
+         Lower shift_bps_e2_max, raise window_notional_min, or widen the spread"
     )]
     Exploitable {
         /// The cap that would have been allowed.
-        max_shift_bps_e2: i64,
+        shift_bps_e2_max: i64,
         /// Epoch capacity the attacker could drain at the distorted price.
         epoch_notional: u128,
         /// What manufacturing the shift costs the attacker, in quote units.
@@ -132,7 +132,7 @@ pub enum ParamsError {
 impl Params {
     /// Refuses a configuration a counterparty could profitably manipulate.
     ///
-    /// Manufacturing the maximum shift means trading at least `min_window_notional` against us and
+    /// Manufacturing the maximum shift means trading at least `window_notional_min` against us and
     /// paying the half-spread on it. Exploiting the resulting distortion earns at most the shift
     /// applied to everything the epoch can be drained for. If the second is not strictly smaller
     /// than the first, the signal is a subsidy, and this is the last place that can be noticed
@@ -144,7 +144,7 @@ impl Params {
         if self.window_secs == 0 {
             return Err(ParamsError::EmptyWindow);
         }
-        if self.min_window_notional == 0 {
+        if self.window_notional_min == 0 {
             return Err(ParamsError::NoNotionalFloor);
         }
         if self.full_weight_at_e2 <= 0 {
@@ -152,19 +152,19 @@ impl Params {
         }
 
         let cost = self
-            .min_window_notional
+            .window_notional_min
             .saturating_mul(u128::try_from(self.half_spread_e2.max(0)).unwrap_or(0))
             / u128::try_from(SHIFT_SCALE).unwrap_or(1)
             / 100;
         let gain = self
             .epoch_notional
-            .saturating_mul(u128::try_from(self.max_shift_bps_e2.max(0)).unwrap_or(0))
+            .saturating_mul(u128::try_from(self.shift_bps_e2_max.max(0)).unwrap_or(0))
             / u128::try_from(SHIFT_SCALE).unwrap_or(1)
             / 100;
 
         if gain >= cost {
             return Err(ParamsError::Exploitable {
-                max_shift_bps_e2: self.max_shift_bps_e2,
+                shift_bps_e2_max: self.shift_bps_e2_max,
                 epoch_notional: self.epoch_notional,
                 cost,
                 gain,
@@ -267,7 +267,7 @@ impl Flow {
     /// counterparty costs us and saturates at [`Params::full_weight_at_e2`], so no single
     /// catastrophic fill can own the signal.
     fn weight_of(&self, score: &Score) -> i64 {
-        if !score.is_actionable(self.params.min_fills, self.params.min_notional) {
+        if !score.is_actionable(self.params.fills_min, self.params.notional_min) {
             return 0;
         }
         // The longest horizon: the one-second mark is mostly the next tick's noise.
@@ -318,7 +318,7 @@ impl Flow {
         }
         out.weighted_notional = total;
 
-        if total < self.params.min_window_notional {
+        if total < self.params.window_notional_min {
             out.below_floor = true;
             return out;
         }
@@ -335,7 +335,7 @@ impl Flow {
             .clamp(-SHIFT_SCALE, SHIFT_SCALE);
 
         let want = out.residual_e4.saturating_mul(self.params.gain_bps_e2) / SHIFT_SCALE;
-        out.shift_e2 = want.clamp(-self.params.max_shift_bps_e2, self.params.max_shift_bps_e2);
+        out.shift_e2 = want.clamp(-self.params.shift_bps_e2_max, self.params.shift_bps_e2_max);
         out.capped = want != out.shift_e2;
         out
     }
@@ -372,13 +372,13 @@ mod tests {
     fn params() -> Params {
         Params {
             window_secs: 300,
-            min_window_notional: 1_000_000_000,
-            min_fills: 3,
-            min_notional: 1_000_000,
+            window_notional_min: 1_000_000_000,
+            fills_min: 3,
+            notional_min: 1_000_000,
             full_weight_at_e2: 1_000, // 10 bp against us is full weight
             beta_e4: 5_000,           // half the public book's imbalance is subtracted
             gain_bps_e2: 500,         // a residual of 1 wants 5 bp
-            max_shift_bps_e2: 200,    // capped at 2 bp
+            shift_bps_e2_max: 200,    // capped at 2 bp
             epoch_notional: 1_000_000_000,
             half_spread_e2: 1_750, // 17.5 bp, the absorption limit
         }
@@ -419,7 +419,7 @@ mod tests {
     #[test]
     fn a_manipulable_configuration_is_refused_at_construction() {
         let bad = Params {
-            max_shift_bps_e2: 5_000,
+            shift_bps_e2_max: 5_000,
             ..params()
         };
         assert!(matches!(
@@ -446,7 +446,7 @@ mod tests {
     #[test]
     fn a_window_without_a_notional_floor_is_refused() {
         let bad = Params {
-            min_window_notional: 0,
+            window_notional_min: 0,
             ..params()
         };
         assert_eq!(bad.validate(), Err(ParamsError::NoNotionalFloor));
@@ -539,7 +539,7 @@ mod tests {
             f.observe(&m, &informed(), false, 100_000_000_000, 2_000 + i);
         }
         let t = f.tilt(2_020, 0);
-        assert_eq!(t.shift_e2, params().max_shift_bps_e2);
+        assert_eq!(t.shift_e2, params().shift_bps_e2_max);
         assert!(t.capped);
     }
 

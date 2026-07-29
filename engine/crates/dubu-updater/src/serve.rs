@@ -205,7 +205,7 @@ struct OrderJson {
     decay_start: String,
     decay_per_sec: u32,
     decay_cap: u32,
-    min_fill_bps: u16,
+    fill_bps_min: u16,
 }
 
 #[derive(Debug, Serialize)]
@@ -358,7 +358,7 @@ async fn quote(
             decay_start: signed.order.decay_start.to_string(),
             decay_per_sec: signed.order.decay_per_sec,
             decay_cap: signed.order.decay_cap,
-            min_fill_bps: signed.order.min_fill_bps,
+            fill_bps_min: signed.order.fill_bps_min,
         },
         signature: format!("0x{}", alloy_primitives::hex::encode(signed.signature)),
         digest: format!("{:#x}", signed.digest),
@@ -492,11 +492,11 @@ mod tests {
         MakerParams {
             base_half_spread_e2: 300,
             sigma_coefficient_e2: 10,
-            max_half_spread_e2: 2_000,
-            max_notional_per_order: 100 * ONE_ETH_IN_USDC,
+            half_spread_e2_max: 2_000,
+            notional_per_order_max: 100 * ONE_ETH_IN_USDC,
             ttl_secs: 30,
             sigma_horizon_secs: 300,
-            min_fill_bps: 1_000,
+            fill_bps_min: 1_000,
         }
     }
 

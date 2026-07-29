@@ -106,7 +106,7 @@
 //! longer be one block, the 300 s horizon would stop being generous, and a ramp would earn its
 //! place. Until that is measured, adding it would be a third coefficient chosen by feel.
 
-use dubu_core::ladder::MAX_BPS_E2;
+use dubu_core::ladder::BPS_E2_MAX;
 
 /// Rescale a sigma measured over one window to the window a quote is actually exposed for.
 ///
@@ -151,7 +151,7 @@ pub struct SpreadParams {
     pub vol_coefficient_e2: u32,
     /// The ceiling on `s0 + s1 * sigma`, in bps. The degraded-chain widening is added *after* it;
     /// see [`compute`].
-    pub max_half_spread_bps_e2: u32,
+    pub half_spread_bps_e2_max: u32,
 }
 
 /// Everything one half-spread computation produced. All of it is logged, every row, every cycle —
@@ -169,7 +169,7 @@ pub struct Spread {
     /// `min(s0 + s1 * sigma, cap)`, in bps. What the volatility path produced, before the
     /// degraded-chain widening.
     pub vol_scaled_e2: u32,
-    /// Whether [`SpreadParams::max_half_spread_bps`] bound it.
+    /// Whether [`SpreadParams::half_spread_bps_max`] bound it.
     pub capped: bool,
     /// The degraded-chain widening that was added on top.
     pub degraded_extra_e2: u32,
@@ -196,11 +196,11 @@ impl Spread {
 /// against a chain view that cannot be refreshed — and letting the volatility cap swallow the
 /// degraded widening would silently disable the second whenever the first was already at its
 /// ceiling, which is precisely when both are needed. The final value is clamped to `dubu-core`'s
-/// `MAX_BPS` so it can never leave the domain [`crate::ladder::build`] validates in.
+/// `BPS_MAX` so it can never leave the domain [`crate::ladder::build`] validates in.
 ///
 /// # Composition with the inventory skew
 ///
-/// The result is the half-spread that [`crate::skew::min_price_cap_bps`] is asked about, so the
+/// The result is the half-spread that [`crate::skew::price_cap_bps_min`] is asked about, so the
 /// skew's floor clamp is computed against the spread that will actually be posted. A wider spread
 /// pushes the bid target lower and therefore leaves *less* room to skew down; feeding the
 /// unwidened value in would let the skew push a row through the pair's `minPrice` floor and have
@@ -225,7 +225,7 @@ pub fn compute(
     let vol_e2 = vol_decibps.saturating_mul(10);
 
     let wanted = s0_bps_e2.saturating_add(vol_e2);
-    let cap = params.max_half_spread_bps_e2;
+    let cap = params.half_spread_bps_e2_max;
     // `.max(s0_bps_e2)`: a cap below the configured spread must never *narrow* it. `s0` is the
     // operator's floor, not a suggestion — the volatility term simply contributes nothing there.
     // `config` refuses that combination at startup, so this is the second belt.
@@ -237,7 +237,7 @@ pub fn compute(
 
     let half_spread_e2 = vol_scaled_e2
         .saturating_add(degraded_extra_e2)
-        .min(u32::try_from(MAX_BPS_E2).unwrap_or(u32::MAX));
+        .min(u32::try_from(BPS_E2_MAX).unwrap_or(u32::MAX));
 
     Spread {
         s0_bps_e2,
@@ -259,7 +259,7 @@ mod tests {
     fn params() -> SpreadParams {
         SpreadParams {
             vol_coefficient_e2: 50,
-            max_half_spread_bps_e2: 3000,
+            half_spread_bps_e2_max: 3000,
         }
     }
 
@@ -350,7 +350,7 @@ mod tests {
         // combination at startup; this is the behaviour if it ever gets past.
         let tight = SpreadParams {
             vol_coefficient_e2: 50,
-            max_half_spread_bps_e2: 300,
+            half_spread_bps_e2_max: 300,
         };
         let s = compute(500, sigma(10), 0, &tight);
         assert_eq!(
@@ -426,8 +426,8 @@ mod tests {
         // refused outright, which is a quoting outage rather than a slightly-less-skewed book.
         let min_price = 1_000_000_000_000_000u128;
         let fair = 1_010_000_000_000_000u128;
-        let narrow = crate::skew::min_price_cap_bps(fair, min_price, 5);
-        let wide = crate::skew::min_price_cap_bps(fair, min_price, 30);
+        let narrow = crate::skew::price_cap_bps_min(fair, min_price, 5);
+        let wide = crate::skew::price_cap_bps_min(fair, min_price, 30);
         assert!(
             wide < narrow,
             "a wider spread must leave less headroom, got {wide} vs {narrow}"

@@ -343,7 +343,7 @@ pub struct DepthPoint {
 ///
 /// `levels` is `(price, size)` best-first. Returns points in increasing cumulative size.
 #[must_use]
-pub fn depth_curve(levels: &[(f64, f64)], mid: f64, max_cumulative: f64) -> Vec<DepthPoint> {
+pub fn depth_curve(levels: &[(f64, f64)], mid: f64, cumulative_max: f64) -> Vec<DepthPoint> {
     if mid <= 0.0 {
         return Vec::new();
     }
@@ -359,7 +359,7 @@ pub fn depth_curve(levels: &[(f64, f64)], mid: f64, max_cumulative: f64) -> Vec<
             cumulative: cum,
             concession_bps_e2: rel as u32,
         });
-        if cum >= max_cumulative {
+        if cum >= cumulative_max {
             break;
         }
     }

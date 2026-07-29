@@ -201,14 +201,14 @@ impl VenueQuote {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MadParams {
     /// Venues that must survive for a reference to exist at all.
-    pub min_venues: u8,
+    pub venues_min: u8,
     /// Multiplier on the MAD, in tenths: `40` is `k = 4.0`.
     pub k_tenths: u32,
     /// Floor under the rejection threshold, in deci-bps of the median.
     pub floor_decibps: u32,
     /// Dispersion above which the venues are treated as disagreeing rather than as noisy, in
     /// deci-bps of the median.
-    pub max_dispersion_decibps: u32,
+    pub dispersion_decibps_max: u32,
 }
 
 /// One venue's position in the cross-section.
@@ -370,7 +370,7 @@ impl ReferenceError {
 /// Median of a sorted slice. Even lengths take the mean of the two middle values.
 ///
 /// `None` on an empty slice rather than a panic. The quorum check in [`combine`] already makes
-/// that unreachable — but it does so two frames away and through a configured `min_venues`, and a
+/// that unreachable — but it does so two frames away and through a configured `venues_min`, and a
 /// defence that lives behind a config value is a defence until somebody sets the value to zero.
 /// On an empty slice the even branch would evaluate `xs[0 / 2 - 1]`, which underflows `usize`
 /// before it ever indexes, so the failure would not even read as an out-of-bounds.
@@ -424,13 +424,13 @@ fn deviation_decibps(x: u128, from: u128) -> i64 {
 /// efficiency from the average. As venues drop out the reference stays continuous in *value* —
 /// each survivor is within `threshold` of the median by construction, so losing one moves the
 /// reference by at most `threshold / n` — and the venue count is in every log line so the loss of
-/// redundancy is visible even though the price barely moves. Below `min_venues` there is no
+/// redundancy is visible even though the price barely moves. Below `venues_min` there is no
 /// reference at all.
 ///
 /// # Errors
 /// [`ReferenceError`], one variant per way the cross-section can fail to name a price.
 pub fn combine(quotes: &[VenueQuote], p: &MadParams) -> Result<Reference, ReferenceError> {
-    let need = p.min_venues;
+    let need = p.venues_min;
     let n = u8::try_from(quotes.len()).unwrap_or(u8::MAX);
     if n < need {
         return Err(ReferenceError::NoQuorum { have: n, need });
@@ -465,10 +465,10 @@ pub fn combine(quotes: &[VenueQuote], p: &MadParams) -> Result<Reference, Refere
     // The regime gate. One venue away from the pack barely moves the MAD; half the venues away
     // from the other half moves it to roughly half the gap, which is what this catches. See the
     // module docs on why this is measured on the dispersion and not on a rejection count.
-    if dispersion > p.max_dispersion_decibps {
+    if dispersion > p.dispersion_decibps_max {
         return Err(ReferenceError::Dispersed {
             dispersion_decibps: dispersion,
-            limit_decibps: p.max_dispersion_decibps,
+            limit_decibps: p.dispersion_decibps_max,
             venues: n,
         });
     }
@@ -479,7 +479,7 @@ pub fn combine(quotes: &[VenueQuote], p: &MadParams) -> Result<Reference, Refere
     // dispersion gate above is the entire defence in that case, and pretending otherwise by
     // rejecting the "worse" one would be inventing an answer.
     let (threshold, bound) = if quotes.len() < 3 {
-        (p.max_dispersion_decibps, ThresholdBound::Unattributable)
+        (p.dispersion_decibps_max, ThresholdBound::Unattributable)
     } else {
         let scaled = u32::try_from(mad * u128::from(p.k_tenths) / 10).unwrap_or(u32::MAX);
         if scaled >= p.floor_decibps {
@@ -543,10 +543,10 @@ mod tests {
     /// Live-shaped parameters: k = 4.0, floor 2 bp, dispersion limit 25 bp, quorum 2.
     fn params() -> MadParams {
         MadParams {
-            min_venues: 2,
+            venues_min: 2,
             k_tenths: 40,
             floor_decibps: 20,
-            max_dispersion_decibps: 250,
+            dispersion_decibps_max: 250,
         }
     }
 
@@ -797,7 +797,7 @@ mod tests {
         // Reporting that as plain `NoQuorum` would hide that a venue was actively disagreeing.
         let base = 100_000_000_000u128;
         let strict = MadParams {
-            min_venues: 3,
+            venues_min: 3,
             ..params()
         };
         let quotes = [

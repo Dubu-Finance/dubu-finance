@@ -23,7 +23,7 @@
 //! discarding bits would make `pack(unpack(w)) != w` and would hide an encoder bug in the
 //! one place it matters.
 
-use crate::curve::{Ladder, MAX_PRICE};
+use crate::curve::{Ladder, PRICE_MAX};
 use crate::error::PackError;
 
 /// Bit offset of each field.
@@ -62,11 +62,11 @@ impl QuoteWord {
     /// Pack into `(lo, hi)` limbs, where the word is `hi * 2^128 + lo`.
     ///
     /// # Errors
-    /// [`PackError::PriceOutOfRange`] if any price exceeds [`MAX_PRICE`].
+    /// [`PackError::PriceOutOfRange`] if any price exceeds [`PRICE_MAX`].
     pub fn pack_limbs(&self) -> Result<(u128, u128), PackError> {
         let l = &self.ladder;
         for p in [l.min_bid, l.max_bid, l.min_ask, l.max_ask] {
-            if p > MAX_PRICE {
+            if p > PRICE_MAX {
                 return Err(PackError::PriceOutOfRange);
             }
         }
@@ -82,7 +82,7 @@ impl QuoteWord {
     /// Pack into a big-endian 32-byte EVM word, ready to concatenate into calldata.
     ///
     /// # Errors
-    /// [`PackError::PriceOutOfRange`] if any price exceeds [`MAX_PRICE`].
+    /// [`PackError::PriceOutOfRange`] if any price exceeds [`PRICE_MAX`].
     pub fn pack(&self) -> Result<[u8; 32], PackError> {
         let (lo, hi) = self.pack_limbs()?;
         let mut out = [0u8; 32];
@@ -126,7 +126,7 @@ impl QuoteWord {
     /// `0x`-prefixed hex of the packed word.
     ///
     /// # Errors
-    /// [`PackError::PriceOutOfRange`] if any price exceeds [`MAX_PRICE`].
+    /// [`PackError::PriceOutOfRange`] if any price exceeds [`PRICE_MAX`].
     pub fn to_hex(&self) -> Result<String, PackError> {
         const HEX: &[u8; 16] = b"0123456789abcdef";
         let w = self.pack()?;
@@ -187,7 +187,7 @@ mod tests {
 
     #[test]
     fn min_ask_straddles_the_limb_boundary() {
-        let w = word(0, 0, MAX_PRICE, 0, 0);
+        let w = word(0, 0, PRICE_MAX, 0, 0);
         let (lo, hi) = w.pack_limbs().unwrap();
         assert_eq!(lo, M_MIN_ASK_LOW << OFF_MIN_ASK);
         assert_eq!(hi, M_MIN_ASK_HIGH);
@@ -196,7 +196,7 @@ mod tests {
 
     #[test]
     fn full_word_at_the_domain_corner() {
-        let w = word(MAX_PRICE, MAX_PRICE, MAX_PRICE, MAX_PRICE, u16::MAX);
+        let w = word(PRICE_MAX, PRICE_MAX, PRICE_MAX, PRICE_MAX, u16::MAX);
         let bytes = w.pack().unwrap();
         assert_eq!(QuoteWord::unpack(&bytes).unwrap(), w);
         // 240 bits set, top 16 clear.
@@ -209,11 +209,11 @@ mod tests {
     #[test]
     fn out_of_range_price_is_refused() {
         assert_eq!(
-            word(MAX_PRICE + 1, 0, 0, 0, 0).pack(),
+            word(PRICE_MAX + 1, 0, 0, 0, 0).pack(),
             Err(PackError::PriceOutOfRange)
         );
         assert_eq!(
-            word(0, 0, 0, MAX_PRICE + 1, 0).pack(),
+            word(0, 0, 0, PRICE_MAX + 1, 0).pack(),
             Err(PackError::PriceOutOfRange)
         );
     }
@@ -240,10 +240,10 @@ mod tests {
     proptest! {
         #[test]
         fn round_trip(
-            min_bid in 0u128..=MAX_PRICE,
-            max_bid in 0u128..=MAX_PRICE,
-            min_ask in 0u128..=MAX_PRICE,
-            max_ask in 0u128..=MAX_PRICE,
+            min_bid in 0u128..=PRICE_MAX,
+            max_bid in 0u128..=PRICE_MAX,
+            min_ask in 0u128..=PRICE_MAX,
+            max_ask in 0u128..=PRICE_MAX,
             pair_id: u16,
         ) {
             let w = word(min_bid, max_bid, min_ask, max_ask, pair_id);

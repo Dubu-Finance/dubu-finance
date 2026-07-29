@@ -62,7 +62,7 @@
 //!
 //! # A gap in the reference is a jump
 //!
-//! An observation separated from the previous one by more than `max_sample` is not a return, it is
+//! An observation separated from the previous one by more than `sample_max` is not a return, it is
 //! a hole — the venues went away, or the process was blocked. During that hole the pool was
 //! quoting a fixed ladder against a market nobody was watching, and `FeedNotLive` gates *pushes*
 //! but does not withdraw *capacity*, so the epoch stayed armed the whole time. Treating the gap as
@@ -164,10 +164,10 @@ pub struct Params {
     pub cooloff: Duration,
     /// Observations closer together than this are recorded but not tested, so a fast-lane scan
     /// landing 10 ms before a cycle scan does not divide a rounding error by a tiny interval.
-    pub min_sample: Duration,
+    pub sample_min: Duration,
     /// A separation longer than this is a hole in the reference, not a return. See the module
     /// docs: it trips.
-    pub max_sample: Duration,
+    pub sample_max: Duration,
 }
 
 /// One pair's economic bounds, in hundredths of a bp.
@@ -272,7 +272,7 @@ impl Bound {
 pub enum Reason {
     /// One observation moved further than the threshold.
     Move,
-    /// The reference disappeared for longer than `max_sample`. See the module docs.
+    /// The reference disappeared for longer than `sample_max`. See the module docs.
     FeedGap,
     /// Another pair tripped and the scope is [`Scope::Book`].
     Contagion,
@@ -440,7 +440,7 @@ impl Detector {
     /// second estimator.
     pub fn observe(&mut self, price: u128, now: Instant, vol: &Volatility) -> Observation {
         // The window first, so the settle test below always sees the newest sample and so a
-        // sub-`min_sample` observation still contributes to the range.
+        // sub-`sample_min` observation still contributes to the range.
         if price > 0 {
             self.window.push_back((price, now));
         }
@@ -471,14 +471,14 @@ impl Detector {
             ..Measured::default()
         };
 
-        if dt < self.params.min_sample {
+        if dt < self.params.sample_min {
             // Too close together to test. Keep the old anchor so the next observation spans a
             // sensible interval rather than starting over.
             let resumed = self.maybe_resume(now);
             return self.report(Measured { resumed, ..base });
         }
 
-        if dt > self.params.max_sample || prev == 0 {
+        if dt > self.params.sample_max || prev == 0 {
             // A hole in the reference. Not a return, and not safe to assume nothing happened.
             self.anchor = Some((price, now));
             let edge = self.trip(now, Reason::FeedGap);
@@ -558,7 +558,7 @@ impl Detector {
         let Some(&(_, last_t)) = self.window.back() else {
             return false;
         };
-        if now.saturating_duration_since(last_t) > self.params.max_sample {
+        if now.saturating_duration_since(last_t) > self.params.sample_max {
             return false;
         }
         if self.window.len() < 2 {
@@ -820,8 +820,8 @@ mod tests {
         VolConfig {
             tau_ms: 60_000,
             horizon_secs: 300,
-            min_sample_ms: 100,
-            max_sample_ms: 10_000,
+            sample_ms_min: 100,
+            sample_ms_max: 10_000,
         }
     }
 
@@ -829,8 +829,8 @@ mod tests {
         Params {
             sigma_k_e2: 600, // k = 6
             cooloff: Duration::from_secs(30),
-            min_sample: Duration::from_millis(100),
-            max_sample: Duration::from_secs(10),
+            sample_min: Duration::from_millis(100),
+            sample_max: Duration::from_secs(10),
         }
     }
 

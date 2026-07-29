@@ -124,7 +124,7 @@ impl MakerKey {
             decay_start: 0,
             decay_per_sec: 0,
             decay_cap: 0,
-            min_fill_bps: quote.min_fill_bps,
+            fill_bps_min: quote.fill_bps_min,
         };
 
         let digest = B256::from(order.digest(&self.domain));
@@ -175,11 +175,11 @@ mod tests {
         MakerParams {
             base_half_spread_e2: 300,
             sigma_coefficient_e2: 10,
-            max_half_spread_e2: 2_000,
-            max_notional_per_order: 100 * ONE_ETH_IN_USDC,
+            half_spread_e2_max: 2_000,
+            notional_per_order_max: 100 * ONE_ETH_IN_USDC,
             ttl_secs: 30,
             sigma_horizon_secs: 300,
-            min_fill_bps: 1_000,
+            fill_bps_min: 1_000,
         }
     }
 
@@ -297,7 +297,7 @@ mod tests {
         assert_ne!(key().sign(&later, 0).expect("signable").digest, base.digest);
 
         let mut fussier = q;
-        fussier.min_fill_bps += 1;
+        fussier.fill_bps_min += 1;
         assert_ne!(
             key().sign(&fussier, 0).expect("signable").digest,
             base.digest

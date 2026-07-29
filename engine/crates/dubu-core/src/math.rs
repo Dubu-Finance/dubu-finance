@@ -33,13 +33,13 @@
 //!
 //! The quotients are bounded by `q * maxBid / S < 2^152`, which still exceeds `u128` when `S`
 //! is small — so both dividers return `Option<u128>` and `None` means "above
-//! `PropCurve.MAX_AMOUNT_OUT`", a *shared* domain edge rather than a port narrowing.
+//! `PropCurve.AMOUNT_OUT_MAX`", a *shared* domain edge rather than a port narrowing.
 
 /// Low 64 bits set.
 const MASK64: u128 = u64::MAX as u128;
 
 /// `10**exp` for every `exp` this crate accepts. `10**38 < 2^127`, so the whole table fits
-/// `u128`; `10**39` does not, which is exactly why [`crate::curve::MAX_PRICE_SCALE_EXP`] is 38.
+/// `u128`; `10**39` does not, which is exactly why [`crate::curve::PRICE_SCALE_EXP_MAX`] is 38.
 // Indexed rather than iterated because this is a `const` block, where iterators are not
 // available. Both indices are bounded by the same literal 39 that sizes the array, and the whole
 // expression is evaluated at compile time — an out-of-bounds here would be a build error, not a
@@ -58,7 +58,7 @@ const POW10: [u128; 39] = {
 /// `10**exp`, or `None` when `exp > 38` and the result would not fit `u128`.
 ///
 /// Note the deliberate divergence from Solidity documented on
-/// [`crate::curve::MAX_PRICE_SCALE_EXP`]: on chain `10 ** exp` is fine up to `exp == 77`.
+/// [`crate::curve::PRICE_SCALE_EXP_MAX`]: on chain `10 ** exp` is fine up to `exp == 77`.
 /// `PropPool` never configures a pair above 38, so refusing 39..=77 here converts a
 /// misconfiguration into a loud failure instead of a silently different quote.
 #[inline]
@@ -356,7 +356,7 @@ impl U256 {
 /// Exact `floor(num / den)` narrowed to `u128`.
 ///
 /// `None` when `den == 0` (Solidity would `Panic(0x12)`) or when the quotient exceeds `u128`,
-/// which for every caller in this crate is exactly `PropCurve.MAX_AMOUNT_OUT` being exceeded —
+/// which for every caller in this crate is exactly `PropCurve.AMOUNT_OUT_MAX` being exceeded —
 /// a shared revert, not a port narrowing.
 #[inline]
 #[must_use]

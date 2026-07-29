@@ -19,7 +19,7 @@
 //!
 //! # One venue is below quorum, and that is the honest state
 //!
-//! `feed.min_venues` is 2. A pair fed only from here will sit below quorum and quote nothing, which
+//! `feed.venues_min` is 2. A pair fed only from here will sit below quorum and quote nothing, which
 //! is correct and not a limitation to work around: a single price source has nobody to disagree
 //! with it, and the whole cross-venue arrangement exists to stop one venue's malfunction being
 //! read as the truth. Quoting equities means a second equity source — another HIP-3 builder is the

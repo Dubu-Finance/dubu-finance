@@ -459,17 +459,17 @@ async fn run(args: &Args) -> Result<i32, Box<dyn std::error::Error>> {
         requests_per_sec = cfg.chain.requests_per_sec,
         nav_token = %facts.nav_token,
         venues = %cfg.venues().iter().map(ToString::to_string).collect::<Vec<_>>().join(","),
-        min_venues = cfg.feed.min_venues,
+        venues_min = cfg.feed.venues_min,
         mad_k = cfg.feed.mad_k,
         mad_floor_bps = cfg.feed.mad_floor_bps,
-        max_dispersion_bps = cfg.feed.max_dispersion_bps,
+        dispersion_bps_max = cfg.feed.dispersion_bps_max,
         gamma = cfg.skew.gamma,
         vol_horizon_secs = cfg.skew.vol_horizon_secs,
         vol_tau_ms = cfg.skew.vol_tau_ms,
-        skew_cap_bps = cfg.skew.max_positive_bps,
-        skew_floor_bps = -i32::from(cfg.skew.max_negative_bps),
+        skew_cap_bps = cfg.skew.positive_bps_max,
+        skew_floor_bps = -i32::from(cfg.skew.negative_bps_max),
         spread_vol_coefficient = cfg.spread.vol_coefficient,
-        spread_max_half_spread_bps = cfg.spread.max_half_spread_bps,
+        spread_max_half_spread_bps = cfg.spread.half_spread_bps_max,
         jump_enabled = cfg.jump.enabled,
         jump_sigma_k = cfg.jump.sigma_k,
         jump_cooloff_secs = cfg.jump.cooloff_secs,
@@ -784,8 +784,8 @@ async fn wait_for_feed(rt: &Runtime) {
     loop {
         let now = Instant::now();
         // Each pair against ITS OWN quorum, not against the global one. The equity pairs run at a
-        // quorum of one because a second honest source does not exist (see `PairConfig::min_venues`),
-        // and measuring them against `feed.min_venues` would leave this probe permanently unsatisfied
+        // quorum of one because a second honest source does not exist (see `PairConfig::venues_min`),
+        // and measuring them against `feed.venues_min` would leave this probe permanently unsatisfied
         // -- every boot would burn the full deadline and log "not ready" while the pool was fine.
         let short = rt
             .cfg
@@ -798,7 +798,7 @@ async fn wait_for_feed(rt: &Runtime) {
                     .iter()
                     .filter(|(_, s)| s.status.is_live())
                     .count();
-                let need = usize::from(p.min_venues.unwrap_or(rt.cfg.feed.min_venues));
+                let need = usize::from(p.venues_min.unwrap_or(rt.cfg.feed.venues_min));
                 (live < need).then_some((p.symbol.as_str(), live, need))
             })
             .next();
@@ -809,7 +809,7 @@ async fn wait_for_feed(rt: &Runtime) {
         };
         if Instant::now() >= deadline {
             warn!(target: "feed", event = "not_ready", symbol = %symbol,
-                  venues_live = live, min_venues = need,
+                  venues_live = live, venues_min = need,
                   "starting the loop without quorum on every symbol; pushes will be gated until it arrives");
             return;
         }
@@ -1098,7 +1098,7 @@ async fn jump_scan(rt: &mut Runtime) {
 
     for i in 0..rt.cfg.pairs.len() {
         let (pair_id, symbol) = (rt.cfg.pairs[i].pair_id, rt.cfg.pairs[i].symbol.clone());
-        let quorum = rt.cfg.pairs[i].min_venues;
+        let quorum = rt.cfg.pairs[i].venues_min;
         let snaps = rt.feeds.snapshots(&symbol, now);
         let mut quotes: Vec<VenueQuote> = Vec::new();
         for (venue, s) in &snaps {
@@ -1373,9 +1373,9 @@ fn start_hedge(cfg: &Config, sigma_millibps_per_sqrt_sec: u64) -> Option<HedgeLe
                 hp.pair_id,
                 hedge::Band {
                     width: hedge::derive_band(parse(&hp.carry_base)),
-                    min_qty: parse(&hp.min_qty_base),
+                    qty_min: parse(&hp.qty_base_min),
                     cooloff: Duration::from_millis(hp.cooloff_ms),
-                    max_order: parse(&hp.max_order_base),
+                    order_max: parse(&hp.order_base_max),
                 },
             ),
         );
@@ -1966,7 +1966,7 @@ async fn run_cycle(
             }
         }
 
-        let reference = fair_value::combine(&quotes, &rt.cfg.feed.mad_params_with(pair.min_venues));
+        let reference = fair_value::combine(&quotes, &rt.cfg.feed.mad_params_with(pair.venues_min));
         let feed_status = match &reference {
             Ok(_) => FeedStatus::Live,
             Err(e) => e.status(),
@@ -2000,7 +2000,7 @@ async fn run_cycle(
                     target: "feed", event = "no_reference", pair_id = pair.pair_id,
                     symbol = %pair.symbol, reason = e.label(), error = %e,
                     venues_live = quotes.len(), venues_configured = snaps.len(),
-                    min_venues = rt.cfg.feed.min_venues,
+                    venues_min = rt.cfg.feed.venues_min,
                     "NO REFERENCE PRICE: not quoting this pair until the venues agree"
                 );
                 None
@@ -2114,7 +2114,7 @@ async fn run_cycle(
         // --- the half-spread ---------------------------------------------------------------
         //
         // `half_spread = min(s0 + s1 * sigma, cap) + degraded_extra`, from the SAME sigma the
-        // skew below uses. Computed before the skew, because `min_price_cap_bps` needs the spread
+        // skew below uses. Computed before the skew, because `price_cap_bps_min` needs the spread
         // that will actually be posted: a wider spread pushes the bid target lower and therefore
         // leaves less room to skew down, and clamping against the unwidened value would let the
         // skew push a row under the pair's `minPrice` and have it refused outright.
@@ -2149,7 +2149,7 @@ async fn run_cycle(
                     vol_e2 = spread.vol_e2(),
                     vol_scaled_e2 = spread.vol_scaled_e2,
                     capped = spread.capped,
-                    cap_bps = rt.cfg.spread.max_half_spread_bps,
+                    cap_bps = rt.cfg.spread.half_spread_bps_max,
                     degraded_extra_e2 = spread.degraded_extra_e2,
                     half_spread_e2 = spread.half_spread_e2,
                     absorption_e2 = spread.half_spread_e2 + u32::from(pair.width_bps) * 50,
@@ -2192,7 +2192,7 @@ async fn run_cycle(
             // The skew still works in whole bps. Rounded UP, which is the conservative
             // direction: a larger half-spread leaves LESS room to skew down before the row hits
             // the pair's `minPrice`, so ceiling here can only tighten the cap, never loosen it.
-            let floor_cap = skew::min_price_cap_bps(
+            let floor_cap = skew::price_cap_bps_min(
                 f,
                 meta.min_price,
                 u16::try_from(half_spread.div_ceil(100)).unwrap_or(u16::MAX),
@@ -2297,7 +2297,7 @@ block_work,
                 .detector(pair.pair_id)
                 .map_or(0, |d| d.cooloff_remaining_ms(now)),
             heartbeat_secs: pair.heartbeat_secs,
-            max_push_interval_ms: pair.max_push_interval_ms,
+            push_interval_ms_max: pair.push_interval_ms_max,
             since_last_push_ms: rt.last_push.get(&pair.pair_id).map(|t| {
                 now.saturating_duration_since(*t)
                     .as_millis()

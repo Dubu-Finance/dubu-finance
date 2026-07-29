@@ -4,7 +4,7 @@
 //! port was written, and each amendment moved the chain toward this port or fixed a defect this
 //! port then mirrored:
 //!
-//! 1. **`MAX_AMOUNT_OUT`** (`== type(uint128).max`). The quote paths revert with
+//! 1. **`AMOUNT_OUT_MAX`** (`== type(uint128).max`). The quote paths revert with
 //!    `AmountOutOfDomain` above it. Before, the chain would settle a trade whose amount this
 //!    port cannot represent — the engine would treat a size as unquotable while the pool filled
 //!    it, which is a silent-loss bug rather than a crash.
@@ -94,7 +94,7 @@
 //!
 //! # What they do not share: three divergences, all deliberate
 //!
-//! 1. [`MAX_PRICE_SCALE_EXP`] is **not enforced on chain**. `10 ** 39` evaluates fine in
+//! 1. [`PRICE_SCALE_EXP_MAX`] is **not enforced on chain**. `10 ** 39` evaluates fine in
 //!    `uint256` (up to `exp == 77`), so the chain succeeds where this port returns
 //!    [`CurveError::DomainOverflow`]. Safe in one direction only: refusing to quote cannot lose
 //!    money. `PropPool.addPair` is where the bound is actually enforced. Not emittable as a
@@ -125,9 +125,9 @@
 //!
 //! | quantity                              | on-chain type | bound          |
 //! |---------------------------------------|---------------|----------------|
-//! | `minBid` / `maxBid` / `minAsk` / `maxAsk` | `uint56`  | [`MAX_PRICE`]  |
-//! | `bidCapacity` / `askCapacity` / `bidUsed` / `askUsed` | `uint96` | [`MAX_AMOUNT`] |
-//! | `priceScaleExp`                       | `uint8`       | [`MAX_PRICE_SCALE_EXP`] |
+//! | `minBid` / `maxBid` / `minAsk` / `maxAsk` | `uint56`  | [`PRICE_MAX`]  |
+//! | `bidCapacity` / `askCapacity` / `bidUsed` / `askUsed` | `uint96` | [`AMOUNT_MAX`] |
+//! | `priceScaleExp`                       | `uint8`       | [`PRICE_SCALE_EXP_MAX`] |
 //!
 //! The overflow argument is re-derived from scratch, because the previous one described
 //! arithmetic that no longer exists (it bounded `amountIn * 10**38` at `2^223`; the new
@@ -144,11 +144,11 @@
 //!   bits with 6 bits of headroom.
 //! * The denominator `2*C*S < 2^97 * 10^38 < 2^97 * 2^127 = 2^224`. **Exceeds `u128`.**
 //! * The quotients are bounded by `q * maxBid / S < 2^152`, which still exceeds `u128` for small
-//!   `S`. That is exactly [`MAX_AMOUNT_OUT`], so a `None` from the divider is the *shared*
+//!   `S`. That is exactly [`AMOUNT_OUT_MAX`], so a `None` from the divider is the *shared*
 //!   [`CurveError::AmountOutOfDomain`], not a port-only refusal.
 //! * The bisection bracket seeds multiply a quote amount by `S`: `2^128 * 10^38 < 2^255`. This
 //!   is the single tightest intermediate in the library and it is bounded *only* because
-//!   [`MAX_AMOUNT_OUT`] caps the quote-denominated argument at `uint128`.
+//!   [`AMOUNT_OUT_MAX`] caps the quote-denominated argument at `uint128`.
 //!
 //! Debug builds additionally `debug_assert!` the input bounds so that a caller drifting out of
 //! the domain is caught in tests rather than in production.
@@ -158,26 +158,26 @@ use crate::math::{mul_div_ceil, mul_div_floor, pow10, U256};
 
 /// Largest representable price. Prices are `uint56` in `IPropPool.PairSnapshot` and in the
 /// packed `updateQuote` word.
-pub const MAX_PRICE: u128 = (1u128 << 56) - 1;
+pub const PRICE_MAX: u128 = (1u128 << 56) - 1;
 
 /// Largest representable amount / capacity. `uint96` in `IPropPool.PairSnapshot`.
-pub const MAX_AMOUNT: u128 = (1u128 << 96) - 1;
+pub const AMOUNT_MAX: u128 = (1u128 << 96) - 1;
 
-/// Mirror of `PropCurve.MAX_AMOUNT_OUT` (`type(uint128).max`).
+/// Mirror of `PropCurve.AMOUNT_OUT_MAX` (`type(uint128).max`).
 ///
 /// The ceiling on every quote-denominated amount the library returns or accepts. See the
 /// constant's doc comment in `PropCurve.sol`: it exists to make the on-chain and off-chain
 /// domains coincide exactly, so a trade the engine cannot represent is one the chain refuses.
-pub const MAX_AMOUNT_OUT: u128 = u128::MAX;
+pub const AMOUNT_OUT_MAX: u128 = u128::MAX;
 
-/// Mirror of `PropCurve.MAX_PRICE_SCALE_EXP`.
+/// Mirror of `PropCurve.PRICE_SCALE_EXP_MAX`.
 ///
 /// Divergence, deliberate: `PropCurve`'s quote paths do **not** enforce this — they just
 /// evaluate `10 ** priceScaleExp`, which succeeds on chain up to `exp == 77`. This port refuses
 /// `exp > 38` with [`CurveError::DomainOverflow`]. `PropPool.addPair` is responsible for
 /// enforcing the constant at configuration time; refusing here turns a misconfiguration into a
 /// dropped row instead of a divergent quote.
-pub const MAX_PRICE_SCALE_EXP: u8 = 38;
+pub const PRICE_SCALE_EXP_MAX: u8 = 38;
 
 /// What [`executable_top_ask`] returns when `askCapacity == 0`.
 ///
@@ -219,12 +219,12 @@ impl Ladder {
 
 #[inline]
 fn in_price_domain(p: u128) -> bool {
-    p <= MAX_PRICE
+    p <= PRICE_MAX
 }
 
 #[inline]
 fn in_amount_domain(a: u128) -> bool {
-    a <= MAX_AMOUNT
+    a <= AMOUNT_MAX
 }
 
 #[inline]
@@ -232,7 +232,7 @@ fn check_exp(price_scale_exp: u8) -> Result<u128, CurveError> {
     // Returned, not asserted. This runs in the quoting hot path, and a panic here takes the
     // updater process down — after which the pool goes stale and stops quoting at all. A bad
     // input must not escalate into a liveness failure; refusing to quote is recoverable.
-    if price_scale_exp > MAX_PRICE_SCALE_EXP {
+    if price_scale_exp > PRICE_SCALE_EXP_MAX {
         return Err(CurveError::DomainOverflow);
     }
     pow10(price_scale_exp).ok_or(CurveError::DomainOverflow)
@@ -244,7 +244,7 @@ fn check_exp(price_scale_exp: u8) -> Result<u128, CurveError> {
 //
 // These mirror `PropCurve._bidGross` / `PropCurve._askCost` and, like them, are **uncapped**:
 // they return the raw quotient as a `U256`. That is not laziness, it is required. The bisections
-// compare a gross against a target that is itself bounded by `MAX_AMOUNT_OUT`, so narrowing here
+// compare a gross against a target that is itself bounded by `AMOUNT_OUT_MAX`, so narrowing here
 // would refuse a request the epoch can in fact fill. Solidity gets this for free from `uint256`;
 // the port has to be explicit about it.
 
@@ -431,8 +431,8 @@ pub fn amount_in_bid(
     if bid_used >= bid_capacity {
         return Err(CurveError::AmountExceedsCapacity);
     }
-    // No `amount_out > MAX_AMOUNT_OUT` check: on chain that guards the `amountOut * scale`
-    // bracket seed against a `uint256` argument, but here `MAX_AMOUNT_OUT == u128::MAX`, so the
+    // No `amount_out > AMOUNT_OUT_MAX` check: on chain that guards the `amountOut * scale`
+    // bracket seed against a `uint256` argument, but here `AMOUNT_OUT_MAX == u128::MAX`, so the
     // argument's own type already enforces it. The domains coincide, which is the whole point of
     // the constant; `amount_out_of_domain_is_a_type_bound_in_the_port` pins the reasoning.
 
@@ -624,9 +624,9 @@ pub fn amount_out_ask(
     if max_ask == 0 {
         return Err(CurveError::ZeroPrice);
     }
-    // On chain there is an `amountIn > MAX_AMOUNT_OUT` check here — an *input* bound, because
+    // On chain there is an `amountIn > AMOUNT_OUT_MAX` check here — an *input* bound, because
     // the bracket seeds multiply the argument by `10**38`. It is unrepresentable as a check in
-    // this port: `MAX_AMOUNT_OUT == u128::MAX`, so the argument's type already enforces it.
+    // this port: `AMOUNT_OUT_MAX == u128::MAX`, so the argument's type already enforces it.
 
     let room = ask_capacity - ask_used;
     let budget = U256::from_u128(amount_in);
@@ -1030,12 +1030,12 @@ mod tests {
             Err(CurveError::ZeroPrice)
         );
         assert_eq!(
-            amount_in_ask(MAX_AMOUNT, 0, 0, MAX_AMOUNT, 0, E),
+            amount_in_ask(AMOUNT_MAX, 0, 0, AMOUNT_MAX, 0, E),
             Err(CurveError::ZeroPrice)
         );
         // One unit of span is enough to price the interval: ceil lifts any nonzero cost to 1.
         assert_eq!(amount_in_ask(1, 0, 1, 1_000_000, 0, E), Ok(1));
-        assert_eq!(amount_in_ask(1, 0, MAX_PRICE, MAX_AMOUNT, 0, 0), Ok(1));
+        assert_eq!(amount_in_ask(1, 0, PRICE_MAX, AMOUNT_MAX, 0, 0), Ok(1));
     }
 
     #[test]
@@ -1177,7 +1177,7 @@ mod tests {
     #[test]
     fn realistic_wbtc_usdc_8_6() {
         let px = 60_000 * 100_000_000_000u128;
-        assert!(px <= MAX_PRICE);
+        assert!(px <= PRICE_MAX);
         assert_eq!(
             amount_out_bid(100_000_000, px, px, 1_000_000_000, 0, 13),
             Ok(60_000_000_000)
@@ -1187,7 +1187,7 @@ mod tests {
     #[test]
     fn realistic_usdc_weth_6_18() {
         let px = 33_333_333_333_333_300u128;
-        assert!(px <= MAX_PRICE);
+        assert!(px <= PRICE_MAX);
         assert_eq!(
             amount_out_bid(1_000_000, px, px, 1_000_000_000_000, 0, 8),
             Ok(333_333_333_333_333)
@@ -1196,21 +1196,21 @@ mod tests {
 
     #[test]
     fn domain_edges_are_reported_not_wrapped() {
-        // exp = 0 at the corner: `q * maxBid` is ~2^152, above `MAX_AMOUNT_OUT`. Shared revert.
+        // exp = 0 at the corner: `q * maxBid` is ~2^152, above `AMOUNT_OUT_MAX`. Shared revert.
         assert_eq!(
-            amount_out_bid(MAX_AMOUNT, MAX_PRICE, MAX_PRICE, MAX_AMOUNT, 0, 0),
+            amount_out_bid(AMOUNT_MAX, PRICE_MAX, PRICE_MAX, AMOUNT_MAX, 0, 0),
             Err(CurveError::AmountOutOfDomain)
         );
         assert_eq!(
-            amount_in_ask(MAX_AMOUNT, MAX_PRICE, MAX_PRICE, MAX_AMOUNT, 0, 0),
+            amount_in_ask(AMOUNT_MAX, PRICE_MAX, PRICE_MAX, AMOUNT_MAX, 0, 0),
             Err(CurveError::AmountOutOfDomain)
         );
         // One unit under the boundary on the same shape: avgBid == 1, so out == q < 2^96.
         assert_eq!(
-            amount_out_bid(MAX_AMOUNT, 1, 1, MAX_AMOUNT, 0, 0),
-            Ok(MAX_AMOUNT)
+            amount_out_bid(AMOUNT_MAX, 1, 1, AMOUNT_MAX, 0, 0),
+            Ok(AMOUNT_MAX)
         );
-        // exp above MAX_PRICE_SCALE_EXP: still port-only, and it is checked first.
+        // exp above PRICE_SCALE_EXP_MAX: still port-only, and it is checked first.
         assert_eq!(
             amount_out_bid(1, 1, 1, 1, 0, 39),
             Err(CurveError::DomainOverflow)

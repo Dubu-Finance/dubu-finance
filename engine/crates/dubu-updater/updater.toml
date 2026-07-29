@@ -236,7 +236,7 @@ read_timeout_ms = 45000
 # nothing, logging `no_quorum`. Refused below 2 at startup: one venue is the single-source oracle
 # this whole arrangement exists to stop being. With three venues configured, losing one still
 # quotes and is logged as an event; losing two stops the pair.
-min_venues = 2
+venues_min = 2
 
 # THE MAD OUTLIER FILTER. A venue further than `mad_k * MAD` from the cross-venue median is
 # dropped for that cycle. MAD *is* the market's current disagreement, so the band widens by
@@ -257,7 +257,7 @@ mad_floor_bps = 2.0
 # the mean of them is a number no venue is showing. The bot refuses to quote rather than
 # averaging through a regime change. 25 bps is ~5x the ETH half-spread and ~25x the observed
 # calm-market MAD, so it cannot fire on ordinary conditions.
-max_dispersion_bps = 25.0
+dispersion_bps_max = 25.0
 
 [tx]
 # NON-NEGOTIABLE DEFAULT. Nothing is broadcast unless this is explicitly true. `--dry-run`
@@ -296,7 +296,7 @@ pending_timeout_secs = 10
 #
 # Depth is not risk here: updateQuote is an idempotent overwrite, so a send that never lands needs
 # no retry and the one behind it supersedes it entirely.
-max_in_flight = 3
+in_flight_max = 3
 
 [skew]
 # ---------------------------------------------------------------------------
@@ -381,11 +381,11 @@ gamma = 1000.0
 # Both caps also stop a single wild sigma print from inverting the strategy: sigma^2 is
 # quadratic, so a 10x volatility error is a 100x skew error.
 #
-# The pair's own minPrice floor is folded in on top of max_positive_bps and clamps tighter when
+# The pair's own minPrice floor is folded in on top of positive_bps_max and clamps tighter when
 # fair value is near it — logged as clamp="min_price_floor". Clamping there keeps the pool
 # quoting a less-skewed book instead of having the row refused outright.
-max_positive_bps = 30
-max_negative_bps = 10
+positive_bps_max = 30
+negative_bps_max = 10
 
 [spread]
 # ---------------------------------------------------------------------------
@@ -482,7 +482,7 @@ vol_coefficient = 0.29
 # exactly when both are needed. Refused at startup if it is below any pair's own
 # half_spread_bps, because the cap bounds the volatility TERM and can never narrow
 # the configured spread.
-max_half_spread_bps = 30
+half_spread_bps_max = 30
 
 # STALENESS-SCALED SPREAD: CONSIDERED, NOT IMPLEMENTED. Two reasons, both
 # measurements rather than opinions. (1) The horizon already pays for it seventeen
@@ -670,9 +670,9 @@ jump_floor_bps = 5
 # express this: it compares `updatedAt`, a uint32 of SECONDS, so sub-second staleness is invisible
 # there. See `policy::Trigger::Cadence`.
 #
-# Inclusion runs ~440ms, longer than the cadence, so sends pipeline -- max_in_flight has to be
+# Inclusion runs ~440ms, longer than the cadence, so sends pipeline -- in_flight_max has to be
 # above 1 for this to hold, and the tail of the inclusion distribution is what will bind.
-max_push_interval_ms = 330
+push_interval_ms_max = 330
 
 # TARGET INVENTORY, as a share of this pair's book — configuration, not a constant, and a share
 # rather than an amount so it stays meaningful as the pool grows or shrinks. The book is this
@@ -704,7 +704,7 @@ ask_capacity = "1000"
 # reason, and what pairDecay / maxStaleSecs on chain are sized against below.
 #
 # Cost: 2 pairs x 12 pushes a minute x 0.00000012 ETH = 0.0041 ETH a day.
-heartbeat_secs = 5
+heartbeat_secs = 2
 
 # Drift is measured against the EXECUTABLE TOP at the current usage, never against maxBid.
 #
@@ -763,7 +763,7 @@ width_bps = 9
 jump_floor_bps = 8
 
 # Same as pair 1.
-max_push_interval_ms = 330
+push_interval_ms_max = 330
 
 # See pairId 1. Same balanced target; the imbalance and the resulting skew are logged per row.
 target_base_share_pct = 50
@@ -784,7 +784,7 @@ ask_capacity = "20"
 # reason, and what pairDecay / maxStaleSecs on chain are sized against below.
 #
 # Cost: 2 pairs x 12 pushes a minute x 0.00000012 ETH = 0.0041 ETH a day.
-heartbeat_secs = 5
+heartbeat_secs = 2
 adverse_drift_bps = 0.5
 favourable_drift_bps = 5
 capacity_divergence_pct = 30
@@ -847,10 +847,10 @@ capacity_divergence_pct = 30
 half_spread_bps = 0.5
 width_bps = 9
 jump_floor_bps = 5
-max_push_interval_ms = 330
+push_interval_ms_max = 330
 adverse_drift_bps = 0.3
 favourable_drift_bps = 4
-heartbeat_secs = 5
+heartbeat_secs = 2
 
 # Every venue's own spelling. Naming a venue here is what enables it; OKX hyphenates where the
 # other two do not, and getting that wrong drops the pair below its quorum rather than erroring.
@@ -889,10 +889,10 @@ capacity_divergence_pct = 30
 half_spread_bps = 0.5
 width_bps = 14
 jump_floor_bps = 8
-max_push_interval_ms = 330
+push_interval_ms_max = 330
 adverse_drift_bps = 0.5
 favourable_drift_bps = 5
-heartbeat_secs = 5
+heartbeat_secs = 2
 
 # Every venue's own spelling. Naming a venue here is what enables it; OKX hyphenates where the
 # other two do not, and getting that wrong drops the pair below its quorum rather than erroring.
@@ -931,10 +931,10 @@ capacity_divergence_pct = 30
 half_spread_bps = 0.5
 width_bps = 18
 jump_floor_bps = 7
-max_push_interval_ms = 330
+push_interval_ms_max = 330
 adverse_drift_bps = 0.4
 favourable_drift_bps = 5
-heartbeat_secs = 5
+heartbeat_secs = 2
 
 # Every venue's own spelling. Naming a venue here is what enables it; OKX hyphenates where the
 # other two do not, and getting that wrong drops the pair below its quorum rather than erroring.
@@ -1003,14 +1003,14 @@ capacity_divergence_pct = 30
 half_spread_bps = 8
 width_bps = 6
 jump_floor_bps = 15
-max_push_interval_ms = 330
+push_interval_ms_max = 330
 adverse_drift_bps = 0.8
 favourable_drift_bps = 8
-heartbeat_secs = 5
+heartbeat_secs = 2
 
 # The builder prefix is part of the venue's name for this market, not decoration: `flx:AAPL` is a
 # different market that happens to share a ticker. See `feed/hyperliquid.rs`.
-min_venues = 1
+venues_min = 1
 
 # Jump contagion travels inside this group only. Crypto pairs are 80-90% correlated so
 # one's jump is information about the others; an equity's is not.
@@ -1043,12 +1043,12 @@ capacity_divergence_pct = 30
 half_spread_bps = 8
 width_bps = 6
 jump_floor_bps = 15
-max_push_interval_ms = 330
+push_interval_ms_max = 330
 adverse_drift_bps = 0.8
 favourable_drift_bps = 8
-heartbeat_secs = 5
+heartbeat_secs = 2
 
-min_venues = 1
+venues_min = 1
 
 # Jump contagion travels inside this group only. Crypto pairs are 80-90% correlated so
 # one's jump is information about the others; an equity's is not.
@@ -1078,12 +1078,12 @@ capacity_divergence_pct = 30
 half_spread_bps = 8
 width_bps = 43
 jump_floor_bps = 15
-max_push_interval_ms = 330
+push_interval_ms_max = 330
 adverse_drift_bps = 0.8
 favourable_drift_bps = 8
-heartbeat_secs = 5
+heartbeat_secs = 2
 
-min_venues = 1
+venues_min = 1
 
 # Jump contagion travels inside this group only. Crypto pairs are 80-90% correlated so
 # one's jump is information about the others; an equity's is not.
@@ -1113,12 +1113,12 @@ capacity_divergence_pct = 30
 half_spread_bps = 8
 width_bps = 6
 jump_floor_bps = 15
-max_push_interval_ms = 330
+push_interval_ms_max = 330
 adverse_drift_bps = 0.8
 favourable_drift_bps = 8
-heartbeat_secs = 5
+heartbeat_secs = 2
 
-min_venues = 1
+venues_min = 1
 
 # Jump contagion travels inside this group only. Crypto pairs are 80-90% correlated so
 # one's jump is information about the others; an equity's is not.
@@ -1146,10 +1146,10 @@ base_half_spread_e2 = 100
 # is rescaled to the TTL, so the two are not the same multiplier. Kept at the curve's slope
 # so the two surfaces widen together in a volatile market.
 sigma_coefficient_e2 = 29
-max_half_spread_e2 = 2000
+half_spread_e2_max = 2000
 # $100k in one order. Denominated in money rather than tokens: "50" would mean 50 mWETH on one
 # pair and 50 mWBTC on another, a fifty-fold difference in the risk one order can take.
-max_notional_per_order = "100000"
+notional_per_order_max = "100000"
 quote_decimals = 6
 # 5 seconds, not 30. A signed order is an option the taker exercises when it suits them, and its
 # value grows with sqrt(TTL) -- so the spread charges for it (see quoting::ttl_premium_e2) and a
@@ -1178,7 +1178,7 @@ quote_decimals = 6
 # that expires in flight -- and an expired order costs the taker gas for a revert, which is worse
 # than never quoting.
 ttl_secs = 2
-min_fill_bps = 1000
+fill_bps_min = 1000
 
 [rfq.serve]
 bind = "127.0.0.1:8790"
@@ -1260,7 +1260,7 @@ venue = "binance_paper"
 # Binance USD-M ETHUSDT steps in 0.001 contracts.
 qty_decimals = 3
 # 0.01 ETH, above the venue's minimum with room to spare.
-min_qty_base = "10000000000000000"
+qty_base_min = "10000000000000000"
 # 25 ETH. A RISK CHOICE, not a derivation: it bounds what a burst can build up before the derived
 # interval elapses. The interval is what makes the hedge cheap; this is what stops it being slow.
 # 2% of the 3,487 ETH the pool holds, as an RMS exposure it accepts unhedged.
@@ -1268,8 +1268,8 @@ min_qty_base = "10000000000000000"
 # because removing the exposure costs more in fees than carrying it costs in risk.
 carry_base = "69740000000000000000"
 # One order at a time, 25 ETH. An EXECUTION limit -- the rest of the exposure is
-# still owed and comes out on the next crossings. See `hedge::Band::max_order`.
-max_order_base = "25000000000000000000"
+# still owed and comes out on the next crossings. See `hedge::Band::order_max`.
+order_base_max = "25000000000000000000"
 cooloff_ms = 2000
 
 [[hedge.pairs]]
@@ -1277,14 +1277,14 @@ pair_id = 3
 symbol = "BNBUSDT"
 venue = "binance_paper"
 qty_decimals = 2
-min_qty_base = "10000000000000000"
+qty_base_min = "10000000000000000"
 # 2% of the 11,111 BNB the pool holds, as an RMS exposure it accepts unhedged.
 # The band is sqrt(3) x this = 384.9 BNB; inside it nothing is sent,
 # because removing the exposure costs more in fees than carrying it costs in risk.
 carry_base = "222220000000000000000"
 # One order at a time, 30 BNB. An EXECUTION limit -- the rest of the exposure is
-# still owed and comes out on the next crossings. See `hedge::Band::max_order`.
-max_order_base = "30000000000000000000"
+# still owed and comes out on the next crossings. See `hedge::Band::order_max`.
+order_base_max = "30000000000000000000"
 cooloff_ms = 2000
 
 [[hedge.pairs]]
@@ -1292,14 +1292,14 @@ pair_id = 4
 symbol = "XRPUSDT"
 venue = "binance_paper"
 qty_decimals = 1
-min_qty_base = "1000000"
+qty_base_min = "1000000"
 # 2% of the 20,000,000 XRP the pool holds, as an RMS exposure it accepts unhedged.
 # The band is sqrt(3) x this = 692,820.3 XRP; inside it nothing is sent,
 # because removing the exposure costs more in fees than carrying it costs in risk.
 carry_base = "400000000000"
 # One order at a time, 20,000 XRP. An EXECUTION limit -- the rest of the exposure is
-# still owed and comes out on the next crossings. See `hedge::Band::max_order`.
-max_order_base = "20000000000"
+# still owed and comes out on the next crossings. See `hedge::Band::order_max`.
+order_base_max = "20000000000"
 cooloff_ms = 2000
 
 [[hedge.pairs]]
@@ -1307,14 +1307,14 @@ pair_id = 5
 symbol = "SOLUSDT"
 venue = "binance_paper"
 qty_decimals = 2
-min_qty_base = "10000000"
+qty_base_min = "10000000"
 # 2% of the 136,500 SOL the pool holds, as an RMS exposure it accepts unhedged.
 # The band is sqrt(3) x this = 4,728.5 SOL; inside it nothing is sent,
 # because removing the exposure costs more in fees than carrying it costs in risk.
 carry_base = "2730000000000"
 # One order at a time, 100 SOL. An EXECUTION limit -- the rest of the exposure is
-# still owed and comes out on the next crossings. See `hedge::Band::max_order`.
-max_order_base = "100000000000"
+# still owed and comes out on the next crossings. See `hedge::Band::order_max`.
+order_base_max = "100000000000"
 cooloff_ms = 2000
 
 [[hedge.pairs]]
@@ -1323,14 +1323,14 @@ symbol = "xyz:AAPL"
 venue = "hyperliquid_paper"
 dex = "xyz"
 qty_decimals = 2
-min_qty_base = "1000000"
+qty_base_min = "1000000"
 # 2% of the 29,498 AAPL the pool holds, as an RMS exposure it accepts unhedged.
 # The band is sqrt(3) x this = 1,021.8 AAPL; inside it nothing is sent,
 # because removing the exposure costs more in fees than carrying it costs in risk.
 carry_base = "58996000000"
 # One order at a time, 2,000 shares. An EXECUTION limit -- the rest of the exposure is
-# still owed and comes out on the next crossings. See `hedge::Band::max_order`.
-max_order_base = "200000000000"
+# still owed and comes out on the next crossings. See `hedge::Band::order_max`.
+order_base_max = "200000000000"
 cooloff_ms = 2000
 
 [[hedge.pairs]]
@@ -1339,14 +1339,14 @@ symbol = "xyz:TSLA"
 venue = "hyperliquid_paper"
 dex = "xyz"
 qty_decimals = 2
-min_qty_base = "1000000"
+qty_base_min = "1000000"
 # 2% of the 32,573 TSLA the pool holds, as an RMS exposure it accepts unhedged.
 # The band is sqrt(3) x this = 1,128.4 TSLA; inside it nothing is sent,
 # because removing the exposure costs more in fees than carrying it costs in risk.
 carry_base = "65146000000"
 # One order at a time, 2,000 shares. An EXECUTION limit -- the rest of the exposure is
-# still owed and comes out on the next crossings. See `hedge::Band::max_order`.
-max_order_base = "200000000000"
+# still owed and comes out on the next crossings. See `hedge::Band::order_max`.
+order_base_max = "200000000000"
 cooloff_ms = 2000
 
 [[hedge.pairs]]
@@ -1355,14 +1355,14 @@ symbol = "xyz:SKHY"
 venue = "hyperliquid_paper"
 dex = "xyz"
 qty_decimals = 2
-min_qty_base = "1000000"
+qty_base_min = "1000000"
 # 2% of the 75,188 SKHY the pool holds, as an RMS exposure it accepts unhedged.
 # The band is sqrt(3) x this = 2,604.6 SKHY; inside it nothing is sent,
 # because removing the exposure costs more in fees than carrying it costs in risk.
 carry_base = "150376000000"
 # One order at a time, 5,000 shares. An EXECUTION limit -- the rest of the exposure is
-# still owed and comes out on the next crossings. See `hedge::Band::max_order`.
-max_order_base = "500000000000"
+# still owed and comes out on the next crossings. See `hedge::Band::order_max`.
+order_base_max = "500000000000"
 cooloff_ms = 2000
 
 [[hedge.pairs]]
@@ -1371,14 +1371,14 @@ symbol = "xyz:SPCX"
 venue = "hyperliquid_paper"
 dex = "xyz"
 qty_decimals = 2
-min_qty_base = "1000000"
+qty_base_min = "1000000"
 # 2% of the 86,956 SPCX the pool holds, as an RMS exposure it accepts unhedged.
 # The band is sqrt(3) x this = 3,012.2 SPCX; inside it nothing is sent,
 # because removing the exposure costs more in fees than carrying it costs in risk.
 carry_base = "173912000000"
 # One order at a time, 5,000 shares. An EXECUTION limit -- the rest of the exposure is
-# still owed and comes out on the next crossings. See `hedge::Band::max_order`.
-max_order_base = "500000000000"
+# still owed and comes out on the next crossings. See `hedge::Band::order_max`.
+order_base_max = "500000000000"
 cooloff_ms = 2000
 
 [[hedge.pairs]]
@@ -1387,13 +1387,13 @@ symbol = "BTCUSDT"
 venue = "binance_paper"
 qty_decimals = 3
 # 0.001 BTC (8 decimals).
-min_qty_base = "100000"
+qty_base_min = "100000"
 # 1 BTC.
 # 2% of the 100 BTC the pool holds, as an RMS exposure it accepts unhedged.
 # The band is sqrt(3) x this = 3.5 BTC; inside it nothing is sent,
 # because removing the exposure costs more in fees than carrying it costs in risk.
 carry_base = "200000000"
 # One order at a time, 0.5 BTC. An EXECUTION limit -- the rest of the exposure is
-# still owed and comes out on the next crossings. See `hedge::Band::max_order`.
-max_order_base = "50000000"
+# still owed and comes out on the next crossings. See `hedge::Band::order_max`.
+order_base_max = "50000000"
 cooloff_ms = 2000

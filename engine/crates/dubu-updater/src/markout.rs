@@ -186,8 +186,8 @@ impl Score {
     /// the counterparty's information. Requiring both a fill count and a notional floor stops a
     /// counterparty earning a punitive spread by being unlucky once, and stops one earning a
     /// tight spread with a handful of dust trades.
-    pub fn is_actionable(&self, min_fills: u64, min_notional: u128) -> bool {
-        self.fills >= min_fills && self.notional >= min_notional
+    pub fn is_actionable(&self, fills_min: u64, notional_min: u128) -> bool {
+        self.fills >= fills_min && self.notional >= notional_min
     }
 }
 

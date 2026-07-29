@@ -28,7 +28,7 @@
 //!
 //! # A bounded pipeline, not one at a time
 //!
-//! Up to [`crate::config::TxConfig::max_in_flight`] unconfirmed transactions per pair, tracked in
+//! Up to [`crate::config::TxConfig::in_flight_max`] unconfirmed transactions per pair, tracked in
 //! [`Sender::pending`]. Beyond that [`crate::policy`] gates the pair with `PushInFlight` and
 //! computes nothing new for it.
 //!
@@ -351,10 +351,10 @@ impl Intent {
             Self::RefreshCapacity { pair_id, bid, ask } => abi::refreshCapacityCall {
                 pairId: pair_id,
                 bidCapacity: alloy_primitives::aliases::U96::from(
-                    bid.min(dubu_core::curve::MAX_AMOUNT),
+                    bid.min(dubu_core::curve::AMOUNT_MAX),
                 ),
                 askCapacity: alloy_primitives::aliases::U96::from(
-                    ask.min(dubu_core::curve::MAX_AMOUNT),
+                    ask.min(dubu_core::curve::AMOUNT_MAX),
                 ),
             }
             .abi_encode()
@@ -447,7 +447,7 @@ pub struct Sender {
     /// send path pipelines — see [`Sender::at_capacity`].
     pending: BTreeMap<u16, Vec<Pending>>,
     pending_timeout: Duration,
-    max_in_flight: usize,
+    in_flight_max: usize,
     /// The chain's confirmed nonce. See [`Sender::observe_landed`].
     landed_nonce: u64,
 }
@@ -474,7 +474,7 @@ impl Sender {
             nonce: None,
             pending: BTreeMap::new(),
             pending_timeout: Duration::from_secs(cfg.pending_timeout_secs),
-            max_in_flight: cfg.max_in_flight,
+            in_flight_max: cfg.in_flight_max,
             landed_nonce: 0,
         }
     }
@@ -507,7 +507,7 @@ impl Sender {
     /// retry: the next cycle computes a fresh row from the current reference and sends that. A
     /// pipeline of quotes is therefore safe in a way a pipeline of orders would not be.
     pub fn at_capacity(&self, pair_id: u16) -> bool {
-        self.in_flight(pair_id) >= self.max_in_flight
+        self.in_flight(pair_id) >= self.in_flight_max
     }
 
     /// How many transactions this pair has outstanding.
@@ -881,7 +881,7 @@ mod tests {
             submitted_at: Instant::now(),
         };
         s.pending.insert(1, vec![p(1, 10), p(2, 11)]);
-        assert!(s.at_capacity(1), "two in flight against max_in_flight 2");
+        assert!(s.at_capacity(1), "two in flight against in_flight_max 2");
 
         // Nonce 10 is on chain. No receipt has been asked for, let alone answered.
         s.observe_landed(11);
@@ -1086,7 +1086,7 @@ mod tests {
         }
         .calldata();
         let d = abi::refreshCapacityCall::abi_decode(&data).unwrap();
-        assert_eq!(d.bidCapacity.to::<u128>(), dubu_core::curve::MAX_AMOUNT);
+        assert_eq!(d.bidCapacity.to::<u128>(), dubu_core::curve::AMOUNT_MAX);
     }
 
     #[test]
@@ -1127,7 +1127,7 @@ mod tests {
             max_fee_per_gas_gwei: "0.05".into(),
             max_priority_fee_per_gas_gwei: "0.005".into(),
             pending_timeout_secs: 120,
-            max_in_flight: 2,
+            in_flight_max: 2,
         }
     }
 
