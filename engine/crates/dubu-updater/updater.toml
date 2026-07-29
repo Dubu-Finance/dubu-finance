@@ -1182,9 +1182,33 @@ clock_resync_secs = 300
 # spends more on fees than the exposure it clears was worth. Whatever drift accumulates in that
 # window becomes the band, so the width adapts to flow without anyone knowing what the flow is.
 
+# ---------------------------------------------------------------------------
+# WHY EVERY PAIR HEDGES ON PAPER
+#
+# The signed Binance leg worked -- it filled 25 ETH, 0.5 BTC and 30 BNB on the first cycle after
+# the hedge switched to absolute exposure, and then returned `-2019 Margin is insufficient` eighty
+# times. The account holds $5,000. The pool holds 3,487 ETH, 100 BTC, 11,111 BNB and four equities
+# at ~$10M each. The hedge venue is capitalised at about 0.01% of what there is to hedge.
+#
+# That gap is an artifact of a testnet faucet, not a fact about the design, and there is no version
+# of it worth chasing: funding it is impossible and shrinking the pool would delete the capital
+# efficiency the whole thing exists to demonstrate. So the crypto pairs move to the same paper book
+# the equities already use -- Hyperliquid core carries ETH, BTC, BNB, XRP and SOL, so this is a
+# route change and not new machinery.
+#
+# WHAT THIS COSTS, stated plainly: paper never rejects, never partially fills, and has no margin.
+# It cannot surface the class of problem it was just used to find. The signed path is not deleted --
+# the venue stays configured and its startup probe still exercises the clock sync and the HMAC --
+# but no order goes through it, so from here on "the hedge works" means the control loop works,
+# not that execution does.
+# ---------------------------------------------------------------------------
+
 [[hedge.pairs]]
 pair_id = 1
-symbol = "ETHUSDT"
+symbol = "ETH"
+venue = "hyperliquid_paper"
+# Core book, no builder prefix -- see `feed/hyperliquid.rs` for why the prefix matters elsewhere.
+dex = ""
 # Binance USD-M ETHUSDT steps in 0.001 contracts.
 qty_decimals = 3
 # 0.01 ETH, above the venue's minimum with room to spare.
@@ -1192,30 +1216,51 @@ min_qty_base = "10000000000000000"
 # 25 ETH. A RISK CHOICE, not a derivation: it bounds what a burst can build up before the derived
 # interval elapses. The interval is what makes the hedge cheap; this is what stops it being slow.
 max_drift_base = "25000000000000000000"
+# One order at a time, 25 ETH. An EXECUTION limit -- the rest of the exposure is
+# still owed and comes out on the next crossings. See `hedge::Band::max_order`.
+max_order_base = "25000000000000000000"
 cooloff_ms = 2000
 
 [[hedge.pairs]]
 pair_id = 3
-symbol = "BNBUSDT"
+symbol = "BNB"
+venue = "hyperliquid_paper"
+# Core book, no builder prefix -- see `feed/hyperliquid.rs` for why the prefix matters elsewhere.
+dex = ""
 qty_decimals = 2
 min_qty_base = "10000000000000000"
 max_drift_base = "50000000000000000000"
+# One order at a time, 30 BNB. An EXECUTION limit -- the rest of the exposure is
+# still owed and comes out on the next crossings. See `hedge::Band::max_order`.
+max_order_base = "30000000000000000000"
 cooloff_ms = 2000
 
 [[hedge.pairs]]
 pair_id = 4
-symbol = "XRPUSDT"
+symbol = "XRP"
+venue = "hyperliquid_paper"
+# Core book, no builder prefix -- see `feed/hyperliquid.rs` for why the prefix matters elsewhere.
+dex = ""
 qty_decimals = 1
 min_qty_base = "1000000"
 max_drift_base = "20000000000"
+# One order at a time, 20,000 XRP. An EXECUTION limit -- the rest of the exposure is
+# still owed and comes out on the next crossings. See `hedge::Band::max_order`.
+max_order_base = "20000000000"
 cooloff_ms = 2000
 
 [[hedge.pairs]]
 pair_id = 5
-symbol = "SOLUSDT"
+symbol = "SOL"
+venue = "hyperliquid_paper"
+# Core book, no builder prefix -- see `feed/hyperliquid.rs` for why the prefix matters elsewhere.
+dex = ""
 qty_decimals = 2
 min_qty_base = "10000000"
 max_drift_base = "250000000000"
+# One order at a time, 100 SOL. An EXECUTION limit -- the rest of the exposure is
+# still owed and comes out on the next crossings. See `hedge::Band::max_order`.
+max_order_base = "100000000000"
 cooloff_ms = 2000
 
 [[hedge.pairs]]
@@ -1226,6 +1271,9 @@ dex = "xyz"
 qty_decimals = 2
 min_qty_base = "1000000"
 max_drift_base = "10000000000"
+# One order at a time, 2,000 shares. An EXECUTION limit -- the rest of the exposure is
+# still owed and comes out on the next crossings. See `hedge::Band::max_order`.
+max_order_base = "200000000000"
 cooloff_ms = 2000
 
 [[hedge.pairs]]
@@ -1236,6 +1284,9 @@ dex = "xyz"
 qty_decimals = 2
 min_qty_base = "1000000"
 max_drift_base = "10000000000"
+# One order at a time, 2,000 shares. An EXECUTION limit -- the rest of the exposure is
+# still owed and comes out on the next crossings. See `hedge::Band::max_order`.
+max_order_base = "200000000000"
 cooloff_ms = 2000
 
 [[hedge.pairs]]
@@ -1246,6 +1297,9 @@ dex = "xyz"
 qty_decimals = 2
 min_qty_base = "1000000"
 max_drift_base = "10000000000"
+# One order at a time, 5,000 shares. An EXECUTION limit -- the rest of the exposure is
+# still owed and comes out on the next crossings. See `hedge::Band::max_order`.
+max_order_base = "500000000000"
 cooloff_ms = 2000
 
 [[hedge.pairs]]
@@ -1256,14 +1310,23 @@ dex = "xyz"
 qty_decimals = 2
 min_qty_base = "1000000"
 max_drift_base = "10000000000"
+# One order at a time, 5,000 shares. An EXECUTION limit -- the rest of the exposure is
+# still owed and comes out on the next crossings. See `hedge::Band::max_order`.
+max_order_base = "500000000000"
 cooloff_ms = 2000
 
 [[hedge.pairs]]
 pair_id = 2
-symbol = "BTCUSDT"
+symbol = "BTC"
+venue = "hyperliquid_paper"
+# Core book, no builder prefix -- see `feed/hyperliquid.rs` for why the prefix matters elsewhere.
+dex = ""
 qty_decimals = 3
 # 0.001 BTC (8 decimals).
 min_qty_base = "100000"
 # 1 BTC.
 max_drift_base = "100000000"
+# One order at a time, 0.5 BTC. An EXECUTION limit -- the rest of the exposure is
+# still owed and comes out on the next crossings. See `hedge::Band::max_order`.
+max_order_base = "50000000"
 cooloff_ms = 2000

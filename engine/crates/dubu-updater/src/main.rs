@@ -665,21 +665,45 @@ async fn run(args: &Args) -> Result<i32, Box<dyn std::error::Error>> {
         });
     rt.hedge = start_hedge(&rt.cfg, sigma_root_sec);
     if let Some(leg) = rt.hedge.as_mut() {
-        match leg.venue.sync_clock().await {
-            Ok(offset) => match leg.venue.available_usdt().await {
-                Ok(usdt) => info!(target: "hedge", event = "venue_ready", offset_ms = offset,
-                                  available_usdt = usdt, "venue reachable and the signature works"),
+        // Probed only if a pair actually routes there, and a failure costs only those pairs.
+        //
+        // This used to set `rt.hedge = None` on any Binance error, which quietly took the paper
+        // venue down with it -- so an exchange the equities never touch could leave them unhedged.
+        // The venues are independent and the failure has to be too.
+        let signed: Vec<u16> = leg
+            .routes
+            .iter()
+            .filter(|(_, (v, _))| *v == dubu_updater::config::HedgeVenue::Binance)
+            .map(|(id, _)| *id)
+            .collect();
+        if signed.is_empty() {
+            info!(target: "hedge", event = "venue_skipped",
+                  "no pair routes to the signed venue; not probing it");
+        } else {
+            let probe = match leg.venue.sync_clock().await {
+                Ok(offset) => leg.venue.available_usdt().await.map(|u| (offset, u)),
+                Err(e) => Err(e),
+            };
+            match probe {
+                Ok((offset, usdt)) => {
+                    info!(target: "hedge", event = "venue_ready", offset_ms = offset,
+                          available_usdt = usdt, pairs = signed.len(),
+                          "venue reachable and the signature works");
+                }
                 Err(e) => {
                     error!(target: "hedge", event = "venue_unreachable", error = %e,
-                           "credentials do not work; quoting unhedged");
-                    rt.hedge = None;
+                           pairs = signed.len(),
+                           "those pairs quote unhedged; the other venues are unaffected");
+                    for id in &signed {
+                        leg.bands.remove(id);
+                        leg.routes.remove(id);
+                    }
                 }
-            },
-            Err(e) => {
-                error!(target: "hedge", event = "venue_unreachable", error = %e,
-                       "cannot reach the venue clock; quoting unhedged");
-                rt.hedge = None;
             }
+        }
+        if leg.bands.is_empty() {
+            warn!(target: "hedge", event = "disabled", "no pair has a reachable venue");
+            rt.hedge = None;
         }
     }
 
@@ -1292,6 +1316,7 @@ fn start_hedge(cfg: &Config, sigma_millibps_per_sqrt_sec: u64) -> Option<HedgeLe
                     max_drift: parse(&hp.max_drift_base),
                     min_qty: parse(&hp.min_qty_base),
                     cooloff: Duration::from_millis(hp.cooloff_ms),
+                    max_order: parse(&hp.max_order_base),
                 },
             ),
         );
@@ -1357,9 +1382,30 @@ fn start_hedge(cfg: &Config, sigma_millibps_per_sqrt_sec: u64) -> Option<HedgeLe
 /// Runs after `scan_fills`, on the same cycle, because the fills it reacts to were just recorded.
 /// Sends at most one order per pair per cycle: the cool-off exists to stop a second crossing before
 /// the first is reflected, and cycling faster than the venue answers would defeat it.
-async fn run_hedge(rt: &mut Runtime) {
+async fn run_hedge(rt: &mut Runtime, view: &ChainView) {
     let Some(leg) = rt.hedge.as_mut() else { return };
     let now = Instant::now();
+
+    // Where every band gets its exposure from, and the only place it comes from.
+    //
+    // Two absolutes: the pool's balance, already read this cycle for the skew, and the venue
+    // position this leg has been tracking. No `eth_getLogs`, no cursor, no ledger of what was sent.
+    // A pair whose balance did not make it into this view is SKIPPED rather than observed as zero --
+    // a missing read is not a flat book, and treating it as one would unwind a live hedge.
+    for (pair_id, band) in &mut leg.bands {
+        let Some(meta) = rt.facts.pairs.get(pair_id) else {
+            continue;
+        };
+        let Some(&pool_base) = view.balances.get(&meta.base) else {
+            continue;
+        };
+        let venue_base = leg.positions.get(pair_id).copied().unwrap_or(0);
+        band.observe(
+            now,
+            i128::try_from(pool_base).unwrap_or(i128::MAX),
+            venue_base,
+        );
+    }
 
     // A drifting host clock breaks every signed call at once, with an error that names the
     // timestamp and not the cause. Re-measure on a timer rather than waiting to find out.
@@ -1475,7 +1521,7 @@ async fn run_hedge(rt: &mut Runtime) {
                     target: "hedge", event = "crossed", pair_id = order.pair_id, symbol = %symbol,
                     side = order.side.as_str(), requested = qty, executed = fill.executed_qty,
                     avg_price = fill.avg_price, status = %fill.status, order_id = fill.order_id,
-                    drift_left = leg.bands.get(&order.pair_id).map(dubu_updater::hedge::Bands::drift),
+                    deviation_left = leg.bands.get(&order.pair_id).map(dubu_updater::hedge::Bands::deviation),
                     "inventory neutralised on the venue"
                 );
             }
@@ -1589,19 +1635,11 @@ async fn scan_fills(rt: &mut Runtime, head: &heads::HeadSnapshot, view: &ChainVi
             "fill observed"
         );
 
-        // The hedge sees the same fill. `is_bid` is true when the pool BOUGHT base, so the venue
-        // has to sell it: the taker's `amount_in` arrived as base. On the other side the pool paid
-        // base out as `amount_out`, and the venue has to buy it back.
-        if let Some(leg) = rt.hedge.as_mut() {
-            if let Some(b) = leg.bands.get_mut(&log.pair_id) {
-                let delta = if log.is_bid {
-                    i128::try_from(log.amount_in).unwrap_or(i128::MAX)
-                } else {
-                    -i128::try_from(log.amount_out).unwrap_or(i128::MAX)
-                };
-                b.observe(Instant::now(), delta);
-            }
-        }
+        // The hedge is NOT told about this fill, and that is deliberate. It reads the pool's balance
+        // and the venue's position directly -- see `hedge::Bands` -- so a fill it never hears about
+        // still shows up as exposure on the next cycle. Feeding it deltas here as well would count
+        // the same trade twice. What the fill is still needed for is `markout`, below, which scores
+        // the price it happened at and cannot get that from a balance.
 
         rt.markout.observe_fill(markout::Fill {
             pair_id: log.pair_id,
@@ -2278,7 +2316,7 @@ block_work,
     // we knew. `SwapWatch::poll` now also reads the `pending` tag, so the extra frequency has
     // preconfirmed fills to find rather than re-reading blocks it has already seen.
     scan_fills(rt, head, view).await;
-    run_hedge(rt).await;
+    run_hedge(rt, view).await;
 
     // The killswitches. Skipped entirely when any pair has no fair value: marking inventory
     // against a price we do not have would be an invention, and an invented NAV is worse than

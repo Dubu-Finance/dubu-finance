@@ -94,6 +94,14 @@ pub struct Band {
     /// Don't send again within this window. A hedge takes time to fill and to be reflected; firing
     /// again before then doubles the position rather than correcting it.
     pub cooloff: Duration,
+    /// Largest single order, in base units. Zero means no clip.
+    ///
+    /// This is an EXECUTION limit, not a risk filter. Every unit of deviation is real exposure and
+    /// deserves a hedge; what this bounds is how much of it may go to the venue in one order. A pool
+    /// holding 3,507 ETH that has never hedged needs 3,507 ETH of hedge -- but sending it as one
+    /// market order would pay for the privilege of moving the book against itself. Clipping
+    /// converges over several crossings instead, one `cooloff` apart.
+    pub max_order: u128,
 }
 
 impl Default for Band {
@@ -103,23 +111,44 @@ impl Default for Band {
             max_drift: 0,
             min_qty: 0,
             cooloff: Duration::from_secs(2),
+            max_order: 0,
         }
     }
 }
 
-/// The net position a pair has drifted since its last hedge, and the rule for acting on it.
+/// How far a pair's net exposure sits from flat, and the rule for acting on it.
 ///
-/// Deliberately signed and *relative*: this tracks drift since the last crossing, not absolute
-/// inventory. Absolute inventory is the skew's job and is a slow control on the quoting centre;
-/// this is a fast control on the venue position, and conflating them would make one of the two
-/// wrong every time the other acted.
+/// # Absolute, not incremental, and that is the whole design
+///
+/// This used to accumulate deltas: every observed fill was added to a running `drift` and every
+/// confirmed hedge was subtracted from it. Three separate defects came out of that one choice.
+///
+/// * **The standing position was invisible.** A pool holding 3,507 ETH that had never hedged read
+///   as drift zero, because nothing had changed *since the last crossing*. The exposure the hedge
+///   exists to neutralise was exactly the exposure it could not see.
+/// * **A deposit had to be special-cased.** Under an incremental model a balance that jumps looks
+///   like a giant fill, so the obvious reflex is to filter it out. That reflex is wrong: a pool
+///   that receives a token is long that token, and where the exposure came from is a question the
+///   risk does not ask.
+/// * **Error accumulated forever.** A missed observation, or a fill counted twice, moved the
+///   running total permanently -- there was no reading that could correct it. That is precisely
+///   how 0.04 ETH was once hedged twice into a 0.08 short that nothing could unwind.
+///
+/// So the deviation is now recomputed from two absolutes every cycle: what the pool holds, and what
+/// the venue is short. It is self-correcting by construction -- a cycle that observes nothing
+/// leaves the next cycle reading the truth rather than a stale sum -- and it needs no ledger of
+/// what was sent, which is the ledger that used to be wrong.
+///
+/// The skew still owns absolute inventory as a slow control on the quoting *centre*. This is a fast
+/// control on the venue *position*. They read the same balance and act on different things.
 #[derive(Debug)]
 pub struct Bands {
     pair_id: u16,
     band: Band,
-    /// Positive: the pool holds more base than at the last hedge, so the venue must sell.
-    drift: i128,
-    /// When the current drift started accumulating. See [`Bands::observe`].
+    /// Net exposure: what the pool holds plus what the venue is short. Positive means long overall,
+    /// so the venue must sell. Zero is flat, which is the target.
+    deviation: i128,
+    /// When the deviation last became actionable. See [`Bands::observe`].
     since: Option<Instant>,
     last_sent: Option<Instant>,
     crossings: u64,
@@ -134,7 +163,7 @@ impl Bands {
         Self {
             pair_id,
             band,
-            drift: 0,
+            deviation: 0,
             since: None,
             last_sent: None,
             crossings: 0,
@@ -143,26 +172,34 @@ impl Bands {
         }
     }
 
-    /// Record a fill's effect on inventory.
+    /// Record where the pool and the venue actually stand.
     ///
-    /// `base_delta` is signed from the **pool's** point of view: positive when the pool received
-    /// base. The hedge is always the opposite sign.
+    /// `pool_base` is the pool's holding, read from the chain; `venue_base` is the venue position,
+    /// signed (negative when short). Neither is a delta and neither is remembered from last time --
+    /// that is the point. No `eth_getLogs`, no cursor, no ledger of what was sent.
     ///
-    /// `now` starts the interval clock on the first fill after a crossing. Without it "never sent"
-    /// reads as "the interval has already elapsed", and the very first fill -- however trivial --
-    /// crosses immediately and pays a fee on nothing. The interval measures how long a drift has
-    /// been *sitting*, so it has to begin when the drift does.
-    pub fn observe(&mut self, now: Instant, base_delta: i128) {
-        if self.drift == 0 && base_delta != 0 {
+    /// `now` starts the interval clock when the deviation first becomes worth acting on. Without it
+    /// "never sent" reads as "the interval has already elapsed", and the first trivial deviation
+    /// crosses immediately and pays a fee on nothing. The interval measures how long an exposure has
+    /// been *sitting*, so it begins when the exposure does. A deviation below `min_qty` is not
+    /// actionable, so it stops the clock rather than holding it open on a quantity that can never be
+    /// sent.
+    pub fn observe(&mut self, now: Instant, pool_base: i128, venue_base: i128) {
+        let next = pool_base.saturating_add(venue_base);
+        let was = self.deviation.unsigned_abs() >= self.band.min_qty && self.deviation != 0;
+        let is = next.unsigned_abs() >= self.band.min_qty && next != 0;
+        if is && !was {
             self.since = Some(now);
+        } else if !is {
+            self.since = None;
         }
-        self.drift = self.drift.saturating_add(base_delta);
+        self.deviation = next;
     }
 
-    /// Net drift since the last crossing, from the pool's point of view.
+    /// Net exposure, from the pool's point of view. Positive is long.
     #[must_use]
-    pub const fn drift(&self) -> i128 {
-        self.drift
+    pub const fn deviation(&self) -> i128 {
+        self.deviation
     }
 
     /// Crossings sent since start.
@@ -194,7 +231,7 @@ impl Bands {
         if self.band.interval.is_zero() && self.band.max_drift == 0 {
             return None;
         }
-        let magnitude = self.drift.unsigned_abs();
+        let magnitude = self.deviation.unsigned_abs();
         if magnitude == 0 {
             return None;
         }
@@ -225,30 +262,36 @@ impl Bands {
             self.suppressed_cooloff = self.suppressed_cooloff.saturating_add(1);
             return None;
         }
+        // Clipped, not skipped. The rest is still real exposure and the next crossing takes the
+        // next slice; what this avoids is one order large enough to move the book it is hedging in.
+        let qty = if self.band.max_order > 0 {
+            magnitude.min(self.band.max_order)
+        } else {
+            magnitude
+        };
         Some(Order {
             pair_id: self.pair_id,
-            side: if self.drift > 0 {
+            side: if self.deviation > 0 {
                 Side::Sell
             } else {
                 Side::Buy
             },
-            qty: magnitude,
+            qty,
         })
     }
 
-    /// Confirm that the venue took `qty` in `side`, and remove exactly that much from the drift.
+    /// Record that a crossing went out, and arm the cool-off.
     ///
-    /// `qty` is what actually filled, which is not always what was asked for. A partial fill leaves
-    /// the remainder in the drift, where the next evaluation sees it — which is the whole reason
-    /// this is separate from [`Self::evaluate`].
-    pub fn settle(&mut self, now: Instant, side: Side, qty: u128) {
-        let signed = i128::try_from(qty).unwrap_or(i128::MAX);
-        self.drift = match side {
-            Side::Sell => self.drift.saturating_sub(signed),
-            Side::Buy => self.drift.saturating_add(signed),
-        };
+    /// Nothing is deducted here, and that is the change the absolute model buys. Under the
+    /// incremental one this had to subtract exactly what filled -- so a partial fill, a rejection,
+    /// or a reply that never arrived left the running total wrong with no way back. Now the next
+    /// [`Self::observe`] reads both sides and the deviation is simply correct again.
+    ///
+    /// What still matters is the cool-off. A hedge takes time to fill and longer to be reflected in
+    /// the venue position, so between sending and seeing it the deviation still reads un-hedged.
+    /// Firing again inside that window is how one exposure becomes two.
+    pub fn settle(&mut self, now: Instant, _side: Side, _qty: u128) {
         self.last_sent = Some(now);
-        self.since = if self.drift == 0 { None } else { Some(now) };
         self.crossings = self.crossings.saturating_add(1);
     }
 }
@@ -292,7 +335,19 @@ mod tests {
             max_drift,
             min_qty: 1,
             cooloff: Duration::ZERO,
+            max_order: 0,
         }
+    }
+
+    /// Flat is `pool + venue == 0`, not `pool == 0`. A market maker holding 1,000 base against a
+    /// 1,000 short carries no price risk and must not trade.
+    #[test]
+    fn holding_inventory_against_an_equal_short_is_flat() {
+        let mut b = Bands::new(1, band(100));
+        let t0 = Instant::now();
+        b.observe(t0, 1_000, -1_000);
+        assert_eq!(b.deviation(), 0);
+        assert_eq!(b.evaluate(t0 + Duration::from_secs(600)), None);
     }
 
     /// Small fills that cancel must not cross. This is the entire reason for a band: paying the
@@ -301,13 +356,17 @@ mod tests {
     fn offsetting_fills_never_reach_the_venue() {
         let mut b = Bands::new(1, band(100));
         let t0 = Instant::now();
-        let t = t0;
         for _ in 0..20 {
-            b.observe(t0, 30);
-            b.observe(t0, -30);
-            assert_eq!(b.evaluate(t), None);
+            b.observe(t0, 1_030, -1_000);
+            assert_eq!(
+                b.evaluate(t0),
+                None,
+                "30 is under the cap and inside the interval"
+            );
+            b.observe(t0, 1_000, -1_000);
+            assert_eq!(b.evaluate(t0), None);
         }
-        assert_eq!(b.drift(), 0);
+        assert_eq!(b.deviation(), 0);
         assert_eq!(b.crossings(), 0);
     }
 
@@ -316,13 +375,13 @@ mod tests {
     fn one_sided_flow_crosses_the_other_way() {
         let mut b = Bands::new(1, band(100));
         let t0 = Instant::now();
-        b.observe(t0, 60);
+        b.observe(t0, 1_060, -1_000);
         assert_eq!(
             b.evaluate(t0),
             None,
             "under the cap and inside the interval"
         );
-        b.observe(t0, 60);
+        b.observe(t0, 1_120, -1_000);
         assert_eq!(
             b.evaluate(t0),
             Some(Order {
@@ -334,30 +393,65 @@ mod tests {
         );
     }
 
-    /// The interval fires on its own, without the cap. This is the fee-optimal path: a drift too
+    /// A pool that has held a position since before the hedge existed is exposed by exactly that
+    /// position, and the incremental model could not see it: nothing had *changed*, so drift read
+    /// zero while 3,507 ETH sat unhedged. This is the regression that motivated the rewrite.
+    #[test]
+    fn a_standing_position_is_exposure_even_though_nothing_moved() {
+        let mut b = Bands::new(1, band(100));
+        let t0 = Instant::now();
+        b.observe(t0, 3_507, 0);
+        assert_eq!(b.deviation(), 3_507);
+        assert_eq!(
+            b.evaluate(t0).map(|o| (o.side, o.qty)),
+            Some((Side::Sell, 3_507)),
+            "never traded, never hedged, fully exposed"
+        );
+    }
+
+    /// A deposit is exposure. Receiving a token makes the pool long it, and where the length came
+    /// from is a question the risk does not ask -- so this must hedge, not filter.
+    #[test]
+    fn a_deposit_is_hedged_like_any_other_length() {
+        let mut b = Bands::new(1, band(100));
+        let t0 = Instant::now();
+        b.observe(t0, 1_000, -1_000);
+        assert_eq!(b.evaluate(t0), None, "flat");
+
+        b.observe(t0, 2_000, -1_000);
+        assert_eq!(
+            b.evaluate(t0).map(|o| (o.side, o.qty)),
+            Some((Side::Sell, 1_000)),
+            "1,000 arrived; 1,000 of price risk arrived with it"
+        );
+    }
+
+    /// The interval fires on its own, without the cap. This is the fee-optimal path: a deviation too
     /// small to be urgent still gets cleared once holding it stops being cheaper than the fee.
     #[test]
-    fn the_interval_clears_a_drift_the_cap_would_never_reach() {
+    fn the_interval_clears_a_deviation_the_cap_would_never_reach() {
         let mut b = Bands::new(1, band(10_000));
         let t0 = Instant::now();
-        b.observe(t0, 5);
+        b.observe(t0, 1_005, -1_000);
         assert_eq!(
             b.evaluate(t0),
             None,
-            "the clock starts at this fill, so nothing is due yet"
+            "the clock starts here, so nothing is due yet"
         );
         assert!(
             b.evaluate(t0 + Duration::from_secs(46)).is_some(),
-            "and it is due once the drift has sat for the interval"
+            "and it is due once the deviation has sat for the interval"
         );
-        b.settle(t0 + Duration::from_secs(46), Side::Sell, 5);
-        assert_eq!(b.drift(), 0);
 
-        // Cleared to flat, so the clock stops until the next fill restarts it.
+        // The venue took it, so the next reading is flat -- and the clock stops on its own.
+        let t1 = t0 + Duration::from_secs(46);
+        b.settle(t1, Side::Sell, 5);
+        b.observe(t1, 1_005, -1_005);
+        assert_eq!(b.deviation(), 0);
         assert_eq!(
             b.evaluate(t0 + Duration::from_secs(200)),
             None,
-            "no drift, nothing to cross"
+            "nothing to cross"
         );
     }
 
@@ -367,35 +461,88 @@ mod tests {
     fn the_cap_overrides_the_interval() {
         let mut b = Bands::new(1, band(100));
         let t0 = Instant::now();
-        b.observe(t0, 20);
+        b.observe(t0, 1_020, -1_000);
         assert_eq!(b.evaluate(t0), None, "small and fresh");
-        b.observe(t0, 500);
+        b.observe(t0, 1_520, -1_000);
         assert!(
             b.evaluate(t0 + Duration::from_millis(1)).is_some(),
             "past the cap, so the interval does not hold it"
         );
     }
 
-    /// A partial fill leaves its remainder in the drift. Deducting the requested amount instead
-    /// would leave the pool believing it was flat while still carrying the difference.
+    /// A partial fill leaves its remainder exposed, and nothing has to remember that. The venue
+    /// moved by what filled, so the next reading simply shows what is left.
+    ///
+    /// Under the incremental model this was the dangerous case: `settle` had to subtract exactly
+    /// what filled, and subtracting what was *requested* instead left the pool believing it was flat
+    /// while still carrying the difference.
     #[test]
     fn a_partial_fill_leaves_the_remainder_behind() {
         let mut b = Bands::new(1, band(100));
         let t0 = Instant::now();
-        b.observe(t0, 150);
+        b.observe(t0, 1_150, -1_000);
         assert_eq!(b.evaluate(t0).expect("past the cap").qty, 150);
 
         b.settle(t0, Side::Sell, 90);
-        assert_eq!(b.drift(), 60, "60 still unhedged");
+        b.observe(t0, 1_150, -1_090);
         assert_eq!(
-            b.evaluate(t0),
-            None,
-            "under the cap and inside the interval"
+            b.deviation(),
+            60,
+            "60 still unhedged, read rather than remembered"
         );
     }
 
+    /// The reading is the truth, so a hedge sent twice by mistake corrects itself on the next cycle
+    /// instead of poisoning a running total forever. This is the 0.04-ETH-hedged-twice incident.
+    #[test]
+    fn an_over_hedge_is_corrected_rather_than_accumulated() {
+        let mut b = Bands::new(1, band(1));
+        let t0 = Instant::now();
+        b.observe(t0, 1_040, -1_000);
+        assert_eq!(b.evaluate(t0).expect("past the cap").qty, 40);
+
+        // Sent twice: the venue is now 80 short against 40 of length.
+        b.observe(t0, 1_040, -1_080);
+        assert_eq!(b.deviation(), -40, "over-hedged, and visibly so");
+        assert_eq!(
+            b.evaluate(t0 + Duration::from_secs(46)).map(|o| o.side),
+            Some(Side::Buy),
+            "the correction is just the next crossing, in the other direction"
+        );
+    }
+
+    /// The clip bounds the order, never the exposure. What is left over is still owed and comes out
+    /// on the following crossings.
+    #[test]
+    fn a_large_position_converges_in_clipped_orders() {
+        let mut b = Bands::new(
+            1,
+            Band {
+                interval: Duration::from_secs(45),
+                max_drift: 100,
+                min_qty: 1,
+                cooloff: Duration::ZERO,
+                max_order: 1_000,
+            },
+        );
+        let t0 = Instant::now();
+        let pool: i128 = 3_507;
+        let mut venue: i128 = 0;
+        let mut sent = 0u32;
+        for _ in 0..10 {
+            b.observe(t0, pool, venue);
+            let Some(o) = b.evaluate(t0) else { break };
+            assert!(o.qty <= 1_000, "no order may exceed the clip");
+            venue -= i128::try_from(o.qty).unwrap();
+            b.settle(t0, o.side, o.qty);
+            sent += 1;
+        }
+        assert_eq!(sent, 4, "3,507 in clips of 1,000");
+        assert_eq!(pool + venue, 0, "and it lands exactly flat");
+    }
+
     /// The cool-off stops a second crossing before the first is reflected. Without it a slow venue
-    /// turns one drift into two positions in the same direction.
+    /// turns one deviation into two positions in the same direction.
     #[test]
     fn the_cooloff_stops_doubling_the_position() {
         let mut b = Bands::new(
@@ -405,14 +552,16 @@ mod tests {
                 max_drift: 100,
                 min_qty: 1,
                 cooloff: Duration::from_secs(5),
+                max_order: 0,
             },
         );
         let t0 = Instant::now();
-        b.observe(t0, 150);
+        b.observe(t0, 1_150, -1_000);
         assert!(b.evaluate(t0).is_some(), "past the cap");
         b.settle(t0, Side::Sell, 150);
 
-        b.observe(t0, 150);
+        // The venue has not reflected the fill yet, so the deviation still reads un-hedged.
+        b.observe(t0, 1_150, -1_000);
         assert_eq!(b.evaluate(t0), None, "inside the cool-off");
         assert_eq!(b.suppressed_cooloff(), 1);
         assert!(
@@ -432,17 +581,18 @@ mod tests {
                 max_drift: 10,
                 min_qty: 500,
                 cooloff: Duration::ZERO,
+                max_order: 0,
             },
         );
         let t0 = Instant::now();
-        b.observe(t0, 50);
+        b.observe(t0, 1_050, -1_000);
         assert_eq!(
             b.evaluate(t0),
             None,
             "past the cap, but under the venue minimum"
         );
         assert_eq!(b.suppressed_small(), 1);
-        assert_eq!(b.drift(), 50, "still owed");
+        assert_eq!(b.deviation(), 50, "still owed");
     }
 
     /// Both triggers off is how the hedge is disabled.
@@ -455,9 +605,10 @@ mod tests {
                 max_drift: 0,
                 min_qty: 1,
                 cooloff: Duration::ZERO,
+                max_order: 0,
             },
         );
-        b.observe(Instant::now(), 1_000_000);
+        b.observe(Instant::now(), 1_000_000, 0);
         assert_eq!(b.evaluate(Instant::now()), None);
     }
 

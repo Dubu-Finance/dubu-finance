@@ -71,10 +71,21 @@ sol! {
 /// Blocks re-read on every poll, below the cursor.
 ///
 /// Covers a log that arrives late or lands in a different block after a sequencer reorg. GIWA
-/// blocks are two seconds, so this is roughly twenty seconds of overlap — comfortably longer than
-/// any reorg an OP Stack sequencer produces in normal operation, and cheap because the dedup ring
-/// throws the repeats away without them ever reaching `markout`.
-pub const OVERLAP_BLOCKS: u64 = 10;
+/// blocks are ONE second, so this is two seconds of overlap, and the dedup ring throws the repeats
+/// away without them ever reaching `markout`.
+///
+/// It was 10, on a comment that said blocks were two seconds — they are not, so the overlap was
+/// half what it claimed. Ten was also enough to break the scan outright: a poll asks for
+/// `cursor - OVERLAP ..= head`, so ten blocks of overlap makes an eleven-block request to learn
+/// about one new block, and the Nodit free tier caps `eth_getLogs` at exactly ten. Every poll that
+/// ran while the read pool had failed over to Nodit returned `-32604`, the cursor never advanced,
+/// and no fill was ever seen. Two costs one block of request width and keeps the whole thing inside
+/// the tightest cap we know of.
+///
+/// The overlap is now the *only* reorg defence that matters here, because the hedge no longer reads
+/// this path at all — see `hedge::Bands`. What is left downstream is `markout`, where a missed fill
+/// is a hole in a score rather than an unhedged position, and holes are counted rather than hidden.
+pub const OVERLAP_BLOCKS: u64 = 2;
 
 /// Largest span requested in one `eth_getLogs` call.
 ///
@@ -84,8 +95,8 @@ pub const MAX_RANGE_BLOCKS: u64 = 500;
 
 /// How far behind the head the cursor may fall before the watcher gives up and jumps forward.
 ///
-/// At two-second blocks this is about twenty minutes, well past the point where the reference
-/// history needed to mark those fills has been retired.
+/// At one-second blocks this is about ten minutes, well past the point where the reference history
+/// needed to mark those fills has been retired.
 pub const MAX_LOOKBACK_BLOCKS: u64 = 600;
 
 /// Dedup ring capacity, in log identities.

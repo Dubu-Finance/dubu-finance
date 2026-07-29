@@ -391,6 +391,14 @@ pub struct HedgePair {
     /// Cross regardless of the interval once drift reaches this, in the pool's base units. A risk
     /// choice rather than a derivation: it bounds what a burst builds before the interval elapses.
     pub max_drift_base: String,
+    /// Largest single order, in the pool's base units. Empty or `"0"` means no clip.
+    ///
+    /// An EXECUTION limit, not a risk filter -- see [`crate::hedge::Band::max_order`]. Every unit of
+    /// exposure gets hedged either way; this only decides how much goes out per order, which is what
+    /// keeps a pool converging on a long-standing position from paying to move the book against
+    /// itself on the first cycle.
+    #[serde(default)]
+    pub max_order_base: String,
     /// Don't send again within this many milliseconds. A crossing takes time to fill and to be
     /// reflected; firing again before then doubles the position instead of correcting it.
     #[serde(default = "d_hedge_cooloff_ms")]
