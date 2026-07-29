@@ -2104,7 +2104,6 @@ async fn run_cycle(
                         if base < 0 { -v } else { v }
                     })
                     .unwrap_or(0),
-                target_ppm: pair.target_base_share_ppm(),
             };
             let floor_cap = skew::min_price_cap_bps(f, meta.min_price, half_spread);
             let s = skew::compute(
@@ -2123,7 +2122,11 @@ block_work,
 
                 target: "skew", event = "skew", pair_id = pair.pair_id, symbol = %pair.symbol,
                 imbalance_ppm = s.imbalance_ppm,
-                target_ppm = inventory.target_ppm,
+                // The skew now targets zero net exposure. `target_base_share_pct` is a funding
+                // number and no longer reaches this path; logged here so a reader can see they
+                // have separated rather than wonder where it went.
+                funding_target_ppm = pair.target_base_share_ppm(),
+                hedge_value = %inventory.hedge_value,
                 base_value = %inventory.base_value, quote_share = %inventory.quote_share,
                 sigma_millibps = s.sigma_millibps,
                 sigma_horizon_secs = rt.cfg.skew.vol_horizon_secs,

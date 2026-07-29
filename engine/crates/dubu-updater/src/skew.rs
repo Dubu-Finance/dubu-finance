@@ -330,21 +330,43 @@ pub struct Inventory {
     pub hedge_value: i128,
     /// This pair's share of the shared quote balance, in quote units.
     pub quote_share: u128,
-    /// Target base share of the book, in parts per million. Configuration, never a constant.
-    pub target_ppm: u32,
 }
 
 impl Inventory {
-    /// The signed imbalance `q`, in parts per million.
+    /// The signed imbalance `q`, in parts per million: net exposure as a share of the book.
     ///
-    /// `+1_000_000` is "the whole book is base and the target was zero"; `-target_ppm` is "no base
-    /// at all". Zero book yields zero imbalance rather than a division by zero — a pool holding
-    /// nothing has no inventory to skew against.
+    /// `+1_000_000` is "the whole book is base and none of it is hedged"; negative is a net short.
+    /// Zero book yields zero rather than a division by zero — a pool holding nothing has no
+    /// inventory to skew against.
+    ///
+    /// # The target is zero, and it used to be `target_base_share_pct`
+    ///
+    /// That subtraction put two different questions in one expression. The numerator answers a RISK
+    /// question -- how much does the pool lose if the price moves -- and it is measured after the
+    /// hedge. `target_base_share_pct` answers a FUNDING question -- how much base must be on hand to
+    /// settle a fill -- and a perp short supplies none of it. Both are shares of the book, so the
+    /// subtraction compiled and the tests passed; the quantities were never comparable.
+    ///
+    /// It failed in the worst direction: the better the hedge, the further the numerator fell toward
+    /// zero while the target stayed at 50%, so a fully hedged pair read as maximally SHORT and the
+    /// skew lifted the book to buy base it already had $9M of.
+    ///
+    /// Measured live on 2026-07-29, ten fills against the ETH pair with the pool at its band:
+    ///
+    /// ```text
+    /// pool sells base   +7.74 bp realised    <- book lifted 3.65 bp
+    /// pool buys  base   +0.44 bp realised    <- four of six fills NEGATIVE
+    /// ```
+    ///
+    /// Negative means the pool paid above its own reference to be sold ETH. Against a half-spread of
+    /// 2.13 bp the lift was 3.65 bp, so one side was free to take.
+    ///
+    /// Funding is now nobody's business here. It is a constraint on capacity -- a pair cannot pay out
+    /// base it does not hold -- and belongs wherever capacity is decided, not in the price.
     #[must_use]
     pub fn imbalance_ppm(&self) -> i64 {
-        // The book is what the pool OWNS -- that is the capital the target share is a share of, and
-        // a perp hedge adds none of it. What the hedge changes is the exposure, not the balance
-        // sheet, so it belongs in the numerator and nowhere else.
+        // The book is what the pool OWNS. A perp hedge adds none of it -- it changes the exposure,
+        // not the balance sheet -- so it belongs in the numerator and nowhere else.
         let book = self.base_value.saturating_add(self.quote_share);
         if book == 0 {
             return 0;
@@ -356,8 +378,7 @@ impl Inventory {
         // impossible, and the skew should price to unwind it, so the signed path is kept rather
         // than clamped at zero.
         let book_i = i128::try_from(book).unwrap_or(i128::MAX).max(1);
-        let current = net.saturating_mul(1_000_000) / book_i;
-        i64::try_from(current).unwrap_or(1_000_000) - i64::from(self.target_ppm)
+        i64::try_from(net.saturating_mul(1_000_000) / book_i).unwrap_or(1_000_000)
     }
 }
 
@@ -553,59 +574,68 @@ pub fn compute(
 
 #[cfg(test)]
 mod tests {
-    /// The regression this field exists for: a fully hedged pool must quote symmetrically.
+    /// A fully hedged pool has no exposure and must quote symmetrically.
     ///
-    /// Before it, skew read the pool's balance alone. Hold 3,506 ETH against a 3,506 short and the
-    /// net exposure is zero -- but the balance says "too much base", so the pool priced to sell what
-    /// it had already sold. The hedge flattened, the skew rebuilt, and the two ran against each
-    /// other indefinitely.
+    /// Two bugs live here, and the second was created by fixing the first. Originally the skew read
+    /// the pool's BALANCE: hold 3,506 ETH against a 3,506 short and the balance still says "too much
+    /// base", so the pool priced to sell what it had already sold -- the hedge flattened, the skew
+    /// rebuilt, and the two ran against each other indefinitely. `hedge_value` fixed that.
+    ///
+    /// It then read net exposure against a 50% BASE-SHARE target, which is a funding number, so a
+    /// fully hedged pair came out at -500_000 -- maximally short -- and the skew lifted the book to
+    /// buy base it already held. Measured live: four of six pool-buys filled ABOVE the pool's own
+    /// reference. Both quantities are shares of the book, so nothing failed to compile.
     #[test]
     fn a_fully_hedged_pool_has_no_imbalance_to_skew_against() {
-        let unhedged = Inventory {
+        let flat = Inventory {
             base_value: 6_000_000,
             quote_share: 6_000_000,
+            hedge_value: -6_000_000,
+        };
+        assert_eq!(
+            flat.imbalance_ppm(),
+            0,
+            "every unit of base is hedged; nothing to price against"
+        );
+
+        // The same pool with no hedge is long its entire base holding, and says so.
+        let unhedged = Inventory {
             hedge_value: 0,
-            target_ppm: 500_000,
+            ..flat
         };
         assert_eq!(
             unhedged.imbalance_ppm(),
-            0,
-            "50/50 and flat is the baseline"
-        );
-
-        // A swap is an exchange: the pool receives 2,000,000 of base and pays the same in quote, so
-        // the book is the size it was and only its composition moved.
-        let taken = Inventory {
-            base_value: 8_000_000,
-            quote_share: 4_000_000,
-            ..unhedged
-        };
-        assert_eq!(taken.imbalance_ppm(), 166_666, "long base, price it down");
-
-        // Hedged, the same holding carries no exposure and the quote goes back to symmetric.
-        let hedged = Inventory {
-            hedge_value: -2_000_000,
-            ..taken
-        };
-        assert_eq!(
-            hedged.imbalance_ppm(),
-            0,
-            "the hedge cancels the holding, so the skew is what it was before the fill"
+            500_000,
+            "half the book is base and none of it is hedged"
         );
     }
 
-    /// Over-hedging is a net short, not an impossibility, and the skew has to price to unwind it.
+    /// The funding target is gone from this path, and the test that proves it is the one that used
+    /// to pass for the wrong reason: a 50/50 pool with no hedge is NOT flat.
+    #[test]
+    fn a_balanced_balance_sheet_is_not_a_flat_position() {
+        let half = Inventory {
+            base_value: 5_000_000,
+            quote_share: 5_000_000,
+            hedge_value: 0,
+        };
+        assert_eq!(
+            half.imbalance_ppm(),
+            500_000,
+            "50% of the book in base is 50% of the book exposed, whatever the funding target says"
+        );
+    }
+
     #[test]
     fn an_over_hedged_pool_skews_the_other_way() {
         let over = Inventory {
             base_value: 4_000_000,
             quote_share: 6_000_000,
             hedge_value: -6_000_000,
-            target_ppm: 500_000,
         };
         assert!(
-            over.imbalance_ppm() < -500_000,
-            "net short past the target: {}",
+            over.imbalance_ppm() < 0,
+            "short more than it holds: {}",
             over.imbalance_ppm()
         );
     }
@@ -619,17 +649,15 @@ mod tests {
             base_value: 8_000_000,
             quote_share: 2_000_000,
             hedge_value: 0,
-            target_ppm: 500_000,
         };
         let b = Inventory {
             hedge_value: -3_000_000,
             ..a
         };
-        // base 8M of a 10M book is 800_000 ppm; net 5M of the same 10M book is 500_000.
-        assert_eq!(a.imbalance_ppm(), 300_000);
+        assert_eq!(a.imbalance_ppm(), 800_000, "base 8M of a 10M book");
         assert_eq!(
             b.imbalance_ppm(),
-            0,
+            500_000,
             "net 5M against a book that is still 10M"
         );
     }
@@ -655,13 +683,14 @@ mod tests {
         }
     }
 
-    /// A pool holding `base_pct` of its book in base, against a 50% target.
+    /// A pool holding `base_pct` of a fixed 100M book in base, with half the book hedged away, so
+    /// its NET exposure is `base_pct - 50` points. Keeps the symmetric long/short cases readable
+    /// now that an unhedged pool can never be short.
     fn inv(base_pct: u128) -> Inventory {
         Inventory {
             base_value: base_pct * 1_000_000,
             quote_share: (100 - base_pct) * 1_000_000,
-            hedge_value: 0,
-            target_ppm: 500_000,
+            hedge_value: -50_000_000,
         }
     }
 
@@ -875,13 +904,13 @@ mod tests {
 
     #[test]
     fn the_documented_worked_example_comes_out_where_the_docs_say() {
-        // 20% away from target, sigma 10 bps (the live ETHUSDT measurement), gamma 1000 -> 2 bp.
-        // This is the number the module docs quote to justify gamma's range, so it is pinned.
+        // 20% of the book left exposed, sigma 10 bps (the live ETHUSDT measurement), gamma 1000
+        // -> 2 bp. This is the number the module docs quote to justify gamma's range, so it is
+        // pinned. The pool holds 70% base and has hedged 50 points of it away.
         let i = Inventory {
             base_value: 700_000,
             quote_share: 300_000,
-            hedge_value: 0,
-            target_ppm: 500_000,
+            hedge_value: -500_000,
         };
         assert_eq!(i.imbalance_ppm(), 200_000);
         let live = SkewParams {
@@ -898,8 +927,7 @@ mod tests {
         let live_book = Inventory {
             base_value: 611_617,
             quote_share: 388_383,
-            hedge_value: 0,
-            target_ppm: 500_000,
+            hedge_value: -500_000,
         };
         assert_eq!(live_book.imbalance_ppm(), 111_617);
         let s = compute(&live_book, 81 * 1_000_000, 9_000, &live, 9_999);
@@ -1057,7 +1085,6 @@ mod tests {
             base_value: 0,
             quote_share: 0,
             hedge_value: 0,
-            target_ppm: 500_000,
         };
         assert_eq!(i.imbalance_ppm(), 0);
         assert_eq!(
@@ -1066,19 +1093,29 @@ mod tests {
         );
     }
 
+    /// The hedge is what moves the imbalance now, and it is the only thing that does.
+    ///
+    /// This replaces a test that varied `target_ppm` across the same balances. That knob was a
+    /// funding target and never belonged in the price -- see [`Inventory::imbalance_ppm`].
     #[test]
-    fn the_target_is_configuration_and_moving_it_moves_the_imbalance() {
-        // The knob is a share of the book, so the same balances read differently against
-        // different targets — which is the whole point of it not being a constant.
-        let holdings = |target| Inventory {
+    fn the_hedge_is_what_moves_the_imbalance() {
+        let holdings = |hedge| Inventory {
             base_value: 600,
             quote_share: 400,
-            hedge_value: 0,
-            target_ppm: target,
+            hedge_value: hedge,
         };
-        assert_eq!(holdings(500_000).imbalance_ppm(), 100_000);
-        assert_eq!(holdings(600_000).imbalance_ppm(), 0);
-        assert_eq!(holdings(800_000).imbalance_ppm(), -200_000);
+        assert_eq!(holdings(0).imbalance_ppm(), 600_000, "long the lot");
+        assert_eq!(
+            holdings(-300).imbalance_ppm(),
+            300_000,
+            "half of it covered"
+        );
+        assert_eq!(holdings(-600).imbalance_ppm(), 0, "flat");
+        assert_eq!(
+            holdings(-900).imbalance_ppm(),
+            -300_000,
+            "short past its holding"
+        );
     }
 
     #[test]
