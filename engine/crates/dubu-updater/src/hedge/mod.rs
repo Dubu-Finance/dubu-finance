@@ -83,11 +83,20 @@ pub struct Order {
 /// How a pair's band is configured.
 #[derive(Debug, Clone, Copy)]
 pub struct Band {
-    /// Don't cross more often than this. Derived -- see [`derive_hedge_interval`].
-    pub interval: Duration,
-    /// Cross regardless of the interval once drift reaches this, in base units. A risk choice, not
-    /// a derivation: it bounds what a burst can accumulate before the interval elapses.
-    pub max_drift: u128,
+    /// The no-trade half-width, in base units. Exposure inside `[-width, +width]` is carried, not
+    /// hedged. Zero disables the band and therefore the hedge.
+    ///
+    /// This replaced a timer, and the timer was wrong in a way worth recording. It fired at
+    /// `T* = (fee/sigma)^2` -- rehedge once the price has moved one fee -- which is Henrotte's
+    /// asset-tolerance rule, a known family but one that uses no risk measure at all. Two defects:
+    /// it contains no inventory term, so it hedged when nothing had accumulated and waited when a
+    /// lot had; and its scaling is wrong. Under proportional costs the optimal band goes as
+    /// `cost^(1/3)`, which implies a mean interval in `cost^(2/3)`, where the timer gave `cost^2`.
+    /// On plausible ETH numbers the timer fires every ~18s against a band-implied ~54 hours. That
+    /// is not a calibration gap; it is paying fees to chase noise.
+    ///
+    /// See [`derive_band`] for where the number comes from.
+    pub width: u128,
     /// The venue's minimum order size, in base units. A crossing below this is not sent — it would
     /// be rejected and the drift would be counted as hedged when it was not.
     pub min_qty: u128,
@@ -107,8 +116,7 @@ pub struct Band {
 impl Default for Band {
     fn default() -> Self {
         Self {
-            interval: Duration::from_secs(0),
-            max_drift: 0,
+            width: 0,
             min_qty: 0,
             cooloff: Duration::from_secs(2),
             max_order: 0,
@@ -148,8 +156,6 @@ pub struct Bands {
     /// Net exposure: what the pool holds plus what the venue is short. Positive means long overall,
     /// so the venue must sell. Zero is flat, which is the target.
     deviation: i128,
-    /// When the deviation last became actionable. See [`Bands::observe`].
-    since: Option<Instant>,
     last_sent: Option<Instant>,
     crossings: u64,
     suppressed_small: u64,
@@ -164,7 +170,6 @@ impl Bands {
             pair_id,
             band,
             deviation: 0,
-            since: None,
             last_sent: None,
             crossings: 0,
             suppressed_small: 0,
@@ -178,22 +183,17 @@ impl Bands {
     /// signed (negative when short). Neither is a delta and neither is remembered from last time --
     /// that is the point. No `eth_getLogs`, no cursor, no ledger of what was sent.
     ///
-    /// `now` starts the interval clock when the deviation first becomes worth acting on. Without it
-    /// "never sent" reads as "the interval has already elapsed", and the first trivial deviation
-    /// crosses immediately and pays a fee on nothing. The interval measures how long an exposure has
-    /// been *sitting*, so it begins when the exposure does. A deviation below `min_qty` is not
-    /// actionable, so it stops the clock rather than holding it open on a quantity that can never be
-    /// sent.
-    pub fn observe(&mut self, now: Instant, pool_base: i128, venue_base: i128) {
-        let next = pool_base.saturating_add(venue_base);
-        let was = self.deviation.unsigned_abs() >= self.band.min_qty && self.deviation != 0;
-        let is = next.unsigned_abs() >= self.band.min_qty && next != 0;
-        if is && !was {
-            self.since = Some(now);
-        } else if !is {
-            self.since = None;
-        }
-        self.deviation = next;
+    /// There is no clock. The band decides on position alone, so how long an exposure has been
+    /// sitting is not an input -- an exposure inside the band is one the pool has chosen to carry
+    /// for as long as it stays there.
+    pub const fn observe(&mut self, pool_base: i128, venue_base: i128) {
+        self.deviation = pool_base.saturating_add(venue_base);
+    }
+
+    /// The no-trade half-width this pair runs at, in base units.
+    #[must_use]
+    pub const fn width(&self) -> u128 {
+        self.band.width
     }
 
     /// Net exposure, from the pool's point of view. Positive is long.
@@ -227,30 +227,20 @@ impl Bands {
     /// that had already been deducted would leave the pool believing it was flat when it was not.
     #[must_use]
     pub fn evaluate(&mut self, now: Instant) -> Option<Order> {
-        // Both zero is how the hedge is switched off. Either alone still arms the other trigger.
-        if self.band.interval.is_zero() && self.band.max_drift == 0 {
+        // A zero band is how the hedge is switched off.
+        if self.band.width == 0 {
             return None;
         }
         let magnitude = self.deviation.unsigned_abs();
-        if magnitude == 0 {
-            return None;
-        }
+        // Inside the no-trade region. Not "too small to bother with" -- carried on purpose, because
+        // the fee to remove it exceeds the risk of holding it.
+        let excess = magnitude.checked_sub(self.band.width).filter(|e| *e > 0)?;
 
-        // Two triggers, and the cap is the one that does not wait. A burst can build a position
-        // worth clearing long before the fee-optimal interval elapses, and the interval exists to
-        // stop over-paying fees, not to hold risk through a move.
-        let capped = self.band.max_drift > 0 && magnitude >= self.band.max_drift;
-        // Measured from when this drift started accumulating, not from the last crossing. `None`
-        // here means no drift is outstanding, which the magnitude check above has already ruled
-        // out -- so a missing clock is a bug rather than a licence to cross.
-        let due = !self.band.interval.is_zero()
-            && self
-                .since
-                .is_some_and(|t| now.saturating_duration_since(t) >= self.band.interval);
-        if !capped && !due {
-            return None;
-        }
-
+        // Reflect to the boundary, never to flat. Trading all the way back to zero pays to remove
+        // exposure the band has already decided is worth carrying, and the next fill puts it
+        // straight back. This is what the theory prescribes (Kallsen-Muhle-Karbe: trade the minimal
+        // amount to stay inside) and what production hedgers offer as "just get within delta range".
+        let magnitude = excess;
         if magnitude < self.band.min_qty {
             self.suppressed_small = self.suppressed_small.saturating_add(1);
             return None;
@@ -296,350 +286,303 @@ impl Bands {
     }
 }
 
-/// The band width that balances fee against the volatility of holding the drift.
+/// The no-trade half-width, from a risk budget rather than a utility parameter.
 ///
-/// Both inputs are known without any flow data, which is what makes this the one tunable in the
-/// spread model that does not need markout:
+/// # Where the cube root comes from
 ///
-/// * `fee_bps_e2` — the venue's taker fee, from its rate card.
-/// * `sigma_millibps_per_sqrt_sec` — measured by [`crate::skew::Volatility`].
-/// * `seconds_between_hedges` — how long a crossing is expected to be apart from the next, which
-///   sets how long the drift sits exposed.
+/// Under proportional transaction costs the optimal policy is a no-trade region with reflection at
+/// the boundary, and its width scales as the CUBE ROOT of the cost. Kallsen and Muhle-Karbe (2015,
+/// *Mathematical Finance* 25(4)) give the general form, which subsumes Davis-Norman, Shreve-Soner
+/// and Whalley-Wilmott. Specialised to a market maker chasing a flat target, it reads
 ///
-/// Widening trades fee for exposure: cross half as often and pay half the fee, but sit on twice
-/// the position. The balance is where the marginal fee saved equals the marginal variance taken,
-/// which for a random walk is where the band equals `sqrt(fee / (sigma^2 * t))` in relative terms.
+/// ```text
+/// h = ( 3 * c * sigma_q^2 / (2 * p * sigma^2 * S) )^(1/3)
+/// ```
 ///
-/// Returned in base units against `epoch_base`, so the caller gets something it can compare to a
-/// drift directly rather than a ratio it has to re-scale.
+/// with `c` the one-way cost, `sigma_q` the volatility of net inventory, `sigma` the asset's
+/// volatility, `S` the price and `p` absolute risk aversion. `sigma_q` sits exactly where an option
+/// hedger's gamma sits: it is the rate at which the thing you are chasing moves.
+///
+/// # Why this function does not use that formula
+///
+/// Two of its inputs are unavailable and one is unfalsifiable. `sigma_q` is measured from your own
+/// fill log, and this pool has never been traded against, so it is not merely unknown but
+/// undefined. `p` is a utility parameter nobody can state honestly.
+///
+/// At the optimum, though, the stationary inventory is uniform on `[-h, h]`, so
+///
+/// ```text
+/// h = sqrt(3) * RMS(inventory carried)
+/// ```
+///
+/// which turns the question into one an operator can actually answer: how much exposure are you
+/// willing to carry? That is a risk budget, not a measurement, and it is what this takes.
+///
+/// The cube root makes the choice forgiving in a way worth stating: an input wrong by 8x moves the
+/// band by 2x. Setting the budget roughly lands near optimal.
+///
+/// `carried` is the RMS exposure the pool accepts, in base units.
 #[must_use]
-pub fn derive_hedge_interval(fee_bps_e2: u32, sigma_millibps_per_sqrt_sec: u64) -> Duration {
-    if sigma_millibps_per_sqrt_sec == 0 || fee_bps_e2 == 0 {
-        return Duration::ZERO;
+pub fn derive_band(carried: u128) -> u128 {
+    // sqrt(3), in integer arithmetic so the result is reproducible across platforms.
+    carried.saturating_mul(1_732_050_808) / 1_000_000_000
+}
+
+/// The diagnostic that needs no risk-aversion parameter either.
+///
+/// At the optimal band, fees spent on hedging come to exactly **twice** the risk penalty rate.
+/// Spending materially more than that means the band is too tight -- the pool is buying certainty
+/// it did not want at a price it did not agree to. Returns the ratio scaled by 100, so `200` is on
+/// target; there is no need for floating point and no meaning in more precision than that.
+///
+/// Both arguments are rates over the same window, in the same currency.
+#[must_use]
+pub const fn fee_to_risk_ratio(fees_spent: u128, risk_penalty: u128) -> Option<u128> {
+    if risk_penalty == 0 {
+        return None;
     }
-    let fee = f64::from(fee_bps_e2) / 1_000_000.0;
-    let sigma = sigma_millibps_per_sqrt_sec as f64 / 10_000_000.0;
-    let secs = (fee / sigma).powi(2);
-    // An hour is already far past the point where the interval is the binding constraint; beyond
-    // it the drift cap is doing all the work and a larger number only hides that.
-    Duration::from_secs_f64(secs.clamp(0.0, 3600.0))
+    Some(fees_spent.saturating_mul(100) / risk_penalty)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn band(max_drift: u128) -> Band {
+    fn band(width: u128) -> Band {
         Band {
-            interval: Duration::from_secs(45),
-            max_drift,
+            width,
             min_qty: 1,
             cooloff: Duration::ZERO,
             max_order: 0,
         }
     }
 
-    /// Flat is `pool + venue == 0`, not `pool == 0`. A market maker holding 1,000 base against a
-    /// 1,000 short carries no price risk and must not trade.
+    /// Flat is `pool + venue == 0`, not `pool == 0`. A maker holding 1,000 base against a 1,000
+    /// short carries no price risk.
     #[test]
     fn holding_inventory_against_an_equal_short_is_flat() {
         let mut b = Bands::new(1, band(100));
-        let t0 = Instant::now();
-        b.observe(t0, 1_000, -1_000);
+        b.observe(1_000, -1_000);
         assert_eq!(b.deviation(), 0);
-        assert_eq!(b.evaluate(t0 + Duration::from_secs(600)), None);
+        assert_eq!(b.evaluate(Instant::now()), None);
     }
 
-    /// Small fills that cancel must not cross. This is the entire reason for a band: paying the
-    /// taker fee on a buy and a sell that net to nothing is pure loss.
+    /// Exposure inside the band is CARRIED, not tolerated. This is the no-trade region: removing it
+    /// costs more in fees than holding it costs in risk, so a hedger that clears it is losing money
+    /// on purpose.
     #[test]
-    fn offsetting_fills_never_reach_the_venue() {
+    fn exposure_inside_the_band_is_carried_however_long_it_sits() {
         let mut b = Bands::new(1, band(100));
         let t0 = Instant::now();
-        for _ in 0..20 {
-            b.observe(t0, 1_030, -1_000);
-            assert_eq!(
-                b.evaluate(t0),
-                None,
-                "30 is under the cap and inside the interval"
-            );
-            b.observe(t0, 1_000, -1_000);
-            assert_eq!(b.evaluate(t0), None);
-        }
-        assert_eq!(b.deviation(), 0);
+        b.observe(1_099, -1_000);
+        assert_eq!(b.deviation(), 99);
+        assert_eq!(b.evaluate(t0), None);
+        assert_eq!(
+            b.evaluate(t0 + Duration::from_secs(86_400)),
+            None,
+            "a day later it is still inside the band; there is no clock"
+        );
         assert_eq!(b.crossings(), 0);
     }
 
-    /// One-directional flow past the cap must cross, in the opposite direction to the pool's fill.
+    /// Past the edge, trade back TO THE EDGE. Flattening would pay to remove exposure the band has
+    /// already decided is worth carrying, and the next fill puts it straight back.
     #[test]
-    fn one_sided_flow_crosses_the_other_way() {
+    fn crossing_reflects_to_the_boundary_rather_than_to_flat() {
         let mut b = Bands::new(1, band(100));
         let t0 = Instant::now();
-        b.observe(t0, 1_060, -1_000);
-        assert_eq!(
-            b.evaluate(t0),
-            None,
-            "under the cap and inside the interval"
-        );
-        b.observe(t0, 1_120, -1_000);
+        b.observe(1_150, -1_000);
         assert_eq!(
             b.evaluate(t0),
             Some(Order {
                 pair_id: 1,
                 side: Side::Sell,
-                qty: 120
+                qty: 50
             }),
-            "the pool bought base, so the venue sells"
+            "150 of exposure against a band of 100 sends 50, not 150"
         );
     }
 
-    /// A pool that has held a position since before the hedge existed is exposed by exactly that
-    /// position, and the incremental model could not see it: nothing had *changed*, so drift read
-    /// zero while 3,507 ETH sat unhedged. This is the regression that motivated the rewrite.
+    /// Both directions. A short past the edge buys back to the edge.
     #[test]
-    fn a_standing_position_is_exposure_even_though_nothing_moved() {
+    fn the_band_is_symmetric() {
         let mut b = Bands::new(1, band(100));
-        let t0 = Instant::now();
-        b.observe(t0, 3_507, 0);
-        assert_eq!(b.deviation(), 3_507);
+        b.observe(1_000, -1_150);
         assert_eq!(
-            b.evaluate(t0).map(|o| (o.side, o.qty)),
-            Some((Side::Sell, 3_507)),
-            "never traded, never hedged, fully exposed"
+            b.evaluate(Instant::now()),
+            Some(Order {
+                pair_id: 1,
+                side: Side::Buy,
+                qty: 50
+            })
         );
     }
 
-    /// A deposit is exposure. Receiving a token makes the pool long it, and where the length came
-    /// from is a question the risk does not ask -- so this must hedge, not filter.
+    /// A position held since before the hedge existed is exposure, and it converges to the band --
+    /// not to zero. The incremental model could not see it at all: nothing had CHANGED, so drift
+    /// read zero while 3,487 ETH sat unhedged.
     #[test]
-    fn a_deposit_is_hedged_like_any_other_length() {
-        let mut b = Bands::new(1, band(100));
-        let t0 = Instant::now();
-        b.observe(t0, 1_000, -1_000);
-        assert_eq!(b.evaluate(t0), None, "flat");
-
-        b.observe(t0, 2_000, -1_000);
-        assert_eq!(
-            b.evaluate(t0).map(|o| (o.side, o.qty)),
-            Some((Side::Sell, 1_000)),
-            "1,000 arrived; 1,000 of price risk arrived with it"
-        );
-    }
-
-    /// The interval fires on its own, without the cap. This is the fee-optimal path: a deviation too
-    /// small to be urgent still gets cleared once holding it stops being cheaper than the fee.
-    #[test]
-    fn the_interval_clears_a_deviation_the_cap_would_never_reach() {
-        let mut b = Bands::new(1, band(10_000));
-        let t0 = Instant::now();
-        b.observe(t0, 1_005, -1_000);
-        assert_eq!(
-            b.evaluate(t0),
-            None,
-            "the clock starts here, so nothing is due yet"
-        );
-        assert!(
-            b.evaluate(t0 + Duration::from_secs(46)).is_some(),
-            "and it is due once the deviation has sat for the interval"
-        );
-
-        // The venue took it, so the next reading is flat -- and the clock stops on its own.
-        let t1 = t0 + Duration::from_secs(46);
-        b.settle(t1, Side::Sell, 5);
-        b.observe(t1, 1_005, -1_005);
-        assert_eq!(b.deviation(), 0);
-        assert_eq!(
-            b.evaluate(t0 + Duration::from_secs(200)),
-            None,
-            "nothing to cross"
-        );
-    }
-
-    /// The cap does not wait for the interval. A burst is exactly the case where holding for
-    /// fee-efficiency is the wrong trade.
-    #[test]
-    fn the_cap_overrides_the_interval() {
-        let mut b = Bands::new(1, band(100));
-        let t0 = Instant::now();
-        b.observe(t0, 1_020, -1_000);
-        assert_eq!(b.evaluate(t0), None, "small and fresh");
-        b.observe(t0, 1_520, -1_000);
-        assert!(
-            b.evaluate(t0 + Duration::from_millis(1)).is_some(),
-            "past the cap, so the interval does not hold it"
-        );
-    }
-
-    /// A partial fill leaves its remainder exposed, and nothing has to remember that. The venue
-    /// moved by what filled, so the next reading simply shows what is left.
-    ///
-    /// Under the incremental model this was the dangerous case: `settle` had to subtract exactly
-    /// what filled, and subtracting what was *requested* instead left the pool believing it was flat
-    /// while still carrying the difference.
-    #[test]
-    fn a_partial_fill_leaves_the_remainder_behind() {
-        let mut b = Bands::new(1, band(100));
-        let t0 = Instant::now();
-        b.observe(t0, 1_150, -1_000);
-        assert_eq!(b.evaluate(t0).expect("past the cap").qty, 150);
-
-        b.settle(t0, Side::Sell, 90);
-        b.observe(t0, 1_150, -1_090);
-        assert_eq!(
-            b.deviation(),
-            60,
-            "60 still unhedged, read rather than remembered"
-        );
-    }
-
-    /// The reading is the truth, so a hedge sent twice by mistake corrects itself on the next cycle
-    /// instead of poisoning a running total forever. This is the 0.04-ETH-hedged-twice incident.
-    #[test]
-    fn an_over_hedge_is_corrected_rather_than_accumulated() {
-        let mut b = Bands::new(1, band(1));
-        let t0 = Instant::now();
-        b.observe(t0, 1_040, -1_000);
-        assert_eq!(b.evaluate(t0).expect("past the cap").qty, 40);
-
-        // Sent twice: the venue is now 80 short against 40 of length.
-        b.observe(t0, 1_040, -1_080);
-        assert_eq!(b.deviation(), -40, "over-hedged, and visibly so");
-        assert_eq!(
-            b.evaluate(t0 + Duration::from_secs(46)).map(|o| o.side),
-            Some(Side::Buy),
-            "the correction is just the next crossing, in the other direction"
-        );
-    }
-
-    /// The clip bounds the order, never the exposure. What is left over is still owed and comes out
-    /// on the following crossings.
-    #[test]
-    fn a_large_position_converges_in_clipped_orders() {
+    fn a_standing_position_converges_to_the_band_edge() {
         let mut b = Bands::new(
             1,
             Band {
-                interval: Duration::from_secs(45),
-                max_drift: 100,
+                width: 100,
                 min_qty: 1,
                 cooloff: Duration::ZERO,
                 max_order: 1_000,
             },
         );
         let t0 = Instant::now();
-        let pool: i128 = 3_507;
+        let pool: i128 = 3_487;
         let mut venue: i128 = 0;
         let mut sent = 0u32;
         for _ in 0..10 {
-            b.observe(t0, pool, venue);
+            b.observe(pool, venue);
             let Some(o) = b.evaluate(t0) else { break };
-            assert!(o.qty <= 1_000, "no order may exceed the clip");
+            assert!(o.qty <= 1_000, "no order exceeds the clip");
             venue -= i128::try_from(o.qty).unwrap();
             b.settle(t0, o.side, o.qty);
             sent += 1;
         }
-        assert_eq!(sent, 4, "3,507 in clips of 1,000");
-        assert_eq!(pool + venue, 0, "and it lands exactly flat");
+        assert_eq!(sent, 4, "3,387 of excess in clips of 1,000");
+        assert_eq!(pool + venue, 100, "parked on the band, not flattened");
+        assert_eq!(b.evaluate(t0), None, "and it stops there");
     }
 
-    /// The cool-off stops a second crossing before the first is reflected. Without it a slow venue
-    /// turns one deviation into two positions in the same direction.
+    /// A deposit is exposure. Receiving a token makes the pool long it, and where the length came
+    /// from is a question the risk does not ask.
+    #[test]
+    fn a_deposit_is_hedged_like_any_other_length() {
+        let mut b = Bands::new(1, band(100));
+        let t0 = Instant::now();
+        b.observe(1_000, -1_000);
+        assert_eq!(b.evaluate(t0), None, "flat");
+        b.observe(2_000, -1_000);
+        assert_eq!(
+            b.evaluate(t0).map(|o| (o.side, o.qty)),
+            Some((Side::Sell, 900)),
+            "1,000 arrived; 900 of it is past the band"
+        );
+    }
+
+    /// The reading is the truth, so a hedge sent twice corrects itself on the next cycle instead of
+    /// poisoning a running total forever. This is the 0.04-ETH-hedged-twice incident.
+    #[test]
+    fn an_over_hedge_is_corrected_rather_than_accumulated() {
+        let mut b = Bands::new(1, band(10));
+        let t0 = Instant::now();
+        b.observe(1_040, -1_000);
+        assert_eq!(b.evaluate(t0).expect("past the band").qty, 30);
+
+        // Sent twice: the venue is now 80 short against 40 of length.
+        b.observe(1_040, -1_080);
+        assert_eq!(b.deviation(), -40, "over-hedged, and visibly so");
+        assert_eq!(
+            b.evaluate(t0).map(|o| (o.side, o.qty)),
+            Some((Side::Buy, 30)),
+            "the correction is the next crossing, in the other direction"
+        );
+    }
+
+    /// A partial fill leaves its remainder exposed, and nothing has to remember that.
+    #[test]
+    fn a_partial_fill_leaves_the_remainder_behind() {
+        let mut b = Bands::new(1, band(10));
+        let t0 = Instant::now();
+        b.observe(1_150, -1_000);
+        assert_eq!(b.evaluate(t0).expect("past the band").qty, 140);
+
+        b.settle(t0, Side::Sell, 90);
+        b.observe(1_150, -1_090);
+        assert_eq!(b.deviation(), 60, "read rather than remembered");
+        assert_eq!(b.evaluate(t0).expect("still past").qty, 50);
+    }
+
+    /// The cool-off stops a second crossing before the first is reflected in the venue position.
     #[test]
     fn the_cooloff_stops_doubling_the_position() {
         let mut b = Bands::new(
             1,
             Band {
-                interval: Duration::from_secs(45),
-                max_drift: 100,
+                width: 10,
                 min_qty: 1,
                 cooloff: Duration::from_secs(5),
                 max_order: 0,
             },
         );
         let t0 = Instant::now();
-        b.observe(t0, 1_150, -1_000);
-        assert!(b.evaluate(t0).is_some(), "past the cap");
-        b.settle(t0, Side::Sell, 150);
+        b.observe(1_150, -1_000);
+        assert!(b.evaluate(t0).is_some(), "past the band");
+        b.settle(t0, Side::Sell, 140);
 
-        // The venue has not reflected the fill yet, so the deviation still reads un-hedged.
-        b.observe(t0, 1_150, -1_000);
+        b.observe(1_150, -1_000);
         assert_eq!(b.evaluate(t0), None, "inside the cool-off");
         assert_eq!(b.suppressed_cooloff(), 1);
         assert!(
             b.evaluate(t0 + Duration::from_secs(6)).is_some(),
-            "and free once it lapses"
+            "free once it lapses"
         );
     }
 
-    /// Below the venue's minimum the order would be rejected. Sending it anyway and settling on
-    /// the request would silently discard real inventory.
+    /// Below the venue's minimum the order would be rejected outright.
     #[test]
     fn a_crossing_under_the_venue_minimum_is_held_rather_than_sent() {
         let mut b = Bands::new(
             1,
             Band {
-                interval: Duration::from_secs(45),
-                max_drift: 10,
+                width: 10,
                 min_qty: 500,
                 cooloff: Duration::ZERO,
                 max_order: 0,
             },
         );
-        let t0 = Instant::now();
-        b.observe(t0, 1_050, -1_000);
+        b.observe(1_050, -1_000);
         assert_eq!(
-            b.evaluate(t0),
+            b.evaluate(Instant::now()),
             None,
-            "past the cap, but under the venue minimum"
+            "past the band, under the minimum"
         );
         assert_eq!(b.suppressed_small(), 1);
         assert_eq!(b.deviation(), 50, "still owed");
     }
 
-    /// Both triggers off is how the hedge is disabled.
+    /// A zero band is how the hedge is switched off.
     #[test]
-    fn a_band_with_neither_trigger_sends_nothing() {
-        let mut b = Bands::new(
-            1,
-            Band {
-                interval: Duration::ZERO,
-                max_drift: 0,
-                min_qty: 1,
-                cooloff: Duration::ZERO,
-                max_order: 0,
-            },
-        );
-        b.observe(Instant::now(), 1_000_000, 0);
+    fn a_band_of_zero_sends_nothing() {
+        let mut b = Bands::new(1, Band::default());
+        b.observe(1_000_000, 0);
         assert_eq!(b.evaluate(Instant::now()), None);
     }
 
-    /// The derived interval is the one number here that needs no flow data, and it has to move the
-    /// right way in both inputs or it is decoration.
-    ///
-    /// At ETHUSDT's measured 0.594 bp per root-second against a 4 bp taker fee it lands near 45
-    /// seconds: below that, clearing costs more in fees than the exposure was worth.
+    /// `h = sqrt(3) * carry`, and the point of the cube root is that being wrong is cheap.
     #[test]
-    fn the_derived_interval_trades_fee_against_volatility() {
-        let base = derive_hedge_interval(400, 594);
-        assert!(
-            base.as_secs() >= 40 && base.as_secs() <= 50,
-            "expected ~45s, got {base:?}"
-        );
+    fn the_band_is_root_three_times_the_carry_and_forgiving_with_it() {
+        assert_eq!(derive_band(0), 0, "no budget, no band, no hedge");
+        assert_eq!(derive_band(1_000), 1_732);
+        assert_eq!(derive_band(69_740), 120_793, "ETH at a 2% budget");
 
-        let dearer = derive_hedge_interval(800, 594);
-        assert!(dearer > base, "a costlier fee is worth waiting longer for");
+        // The band is linear in the budget, but the budget itself enters the underlying formula
+        // under a cube root -- so an operator wrong by 8x on the inputs behind it is wrong by 2x
+        // on the band. That is the property that makes setting it by judgement defensible.
+        let eightfold = f64::from(8u8).cbrt();
+        assert!((eightfold - 2.0).abs() < 1e-9);
+    }
 
-        let wilder = derive_hedge_interval(400, 1_200);
-        assert!(wilder < base, "a wilder market is worth crossing sooner");
-
+    /// At the optimum, fees spent come to exactly twice the risk penalty. Far above that means the
+    /// band is too tight -- the pool is buying certainty it never agreed to pay for.
+    #[test]
+    fn the_fee_to_risk_ratio_says_when_the_band_is_too_tight() {
+        assert_eq!(fee_to_risk_ratio(200, 100), Some(200), "on target");
+        assert_eq!(fee_to_risk_ratio(900, 100), Some(900), "band far too tight");
         assert_eq!(
-            derive_hedge_interval(400, 0),
-            Duration::ZERO,
-            "no sigma, no interval"
+            fee_to_risk_ratio(50, 100),
+            Some(50),
+            "band wide, carrying risk cheaply"
         );
         assert_eq!(
-            derive_hedge_interval(0, 594),
-            Duration::ZERO,
-            "no fee, no interval"
+            fee_to_risk_ratio(10, 0),
+            None,
+            "no risk penalty, no ratio to report"
         );
     }
 }

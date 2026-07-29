@@ -1166,9 +1166,16 @@ base_url = "https://testnet.binancefuture.com"
 key_env = "BINANCE_TESTNET_API_KEY"
 secret_env = "BINANCE_TESTNET_API_SECRET"
 
-# Binance USD-M taker, standard tier: 4 bp. Not a VIP figure -- those need volume we do not have,
-# and assuming them would derive an interval we are not entitled to.
-taker_fee_bps_e2 = 400
+# Binance USD-M futures taker at the standard tier: 5.0 bp, read off the official fee page
+# 2026-07-29. It was 4 bp here on a guess, which was optimistic by a quarter.
+#
+# NOT a VIP figure. Those need volume we do not have, and there is no version of this that reaches
+# zero: the lowest published taker anywhere is 1.44 bp (Hyperliquid at the top tier with a 40%
+# staking discount), 1.5 bp on OKX, 1.53 bp on Binance VIP 9 paying BNB. Maker rebates DO go
+# negative -- OKX pays -0.5 bp, Bitstamp -7.5 bp at MM3 -- but Binance's own liquidity-provider
+# programme discounts the MAKER leg only, so being a recognised market maker does not make a
+# crossing cheaper. Every hedge that crosses pays, and this is the floor it pays from.
+taker_fee_bps_e2 = 500
 
 timeout_ms = 5000
 
@@ -1220,7 +1227,10 @@ qty_decimals = 3
 min_qty_base = "10000000000000000"
 # 25 ETH. A RISK CHOICE, not a derivation: it bounds what a burst can build up before the derived
 # interval elapses. The interval is what makes the hedge cheap; this is what stops it being slow.
-max_drift_base = "25000000000000000000"
+# 2% of the 3,487 ETH the pool holds, as an RMS exposure it accepts unhedged.
+# The band is sqrt(3) x this = 120.8 ETH; inside it nothing is sent,
+# because removing the exposure costs more in fees than carrying it costs in risk.
+carry_base = "69740000000000000000"
 # One order at a time, 25 ETH. An EXECUTION limit -- the rest of the exposure is
 # still owed and comes out on the next crossings. See `hedge::Band::max_order`.
 max_order_base = "25000000000000000000"
@@ -1232,7 +1242,10 @@ symbol = "BNBUSDT"
 venue = "binance_paper"
 qty_decimals = 2
 min_qty_base = "10000000000000000"
-max_drift_base = "50000000000000000000"
+# 2% of the 11,111 BNB the pool holds, as an RMS exposure it accepts unhedged.
+# The band is sqrt(3) x this = 384.9 BNB; inside it nothing is sent,
+# because removing the exposure costs more in fees than carrying it costs in risk.
+carry_base = "222220000000000000000"
 # One order at a time, 30 BNB. An EXECUTION limit -- the rest of the exposure is
 # still owed and comes out on the next crossings. See `hedge::Band::max_order`.
 max_order_base = "30000000000000000000"
@@ -1244,7 +1257,10 @@ symbol = "XRPUSDT"
 venue = "binance_paper"
 qty_decimals = 1
 min_qty_base = "1000000"
-max_drift_base = "20000000000"
+# 2% of the 20,000,000 XRP the pool holds, as an RMS exposure it accepts unhedged.
+# The band is sqrt(3) x this = 692,820.3 XRP; inside it nothing is sent,
+# because removing the exposure costs more in fees than carrying it costs in risk.
+carry_base = "400000000000"
 # One order at a time, 20,000 XRP. An EXECUTION limit -- the rest of the exposure is
 # still owed and comes out on the next crossings. See `hedge::Band::max_order`.
 max_order_base = "20000000000"
@@ -1256,7 +1272,10 @@ symbol = "SOLUSDT"
 venue = "binance_paper"
 qty_decimals = 2
 min_qty_base = "10000000"
-max_drift_base = "250000000000"
+# 2% of the 136,500 SOL the pool holds, as an RMS exposure it accepts unhedged.
+# The band is sqrt(3) x this = 4,728.5 SOL; inside it nothing is sent,
+# because removing the exposure costs more in fees than carrying it costs in risk.
+carry_base = "2730000000000"
 # One order at a time, 100 SOL. An EXECUTION limit -- the rest of the exposure is
 # still owed and comes out on the next crossings. See `hedge::Band::max_order`.
 max_order_base = "100000000000"
@@ -1269,7 +1288,10 @@ venue = "hyperliquid_paper"
 dex = "xyz"
 qty_decimals = 2
 min_qty_base = "1000000"
-max_drift_base = "10000000000"
+# 2% of the 29,498 AAPL the pool holds, as an RMS exposure it accepts unhedged.
+# The band is sqrt(3) x this = 1,021.8 AAPL; inside it nothing is sent,
+# because removing the exposure costs more in fees than carrying it costs in risk.
+carry_base = "58996000000"
 # One order at a time, 2,000 shares. An EXECUTION limit -- the rest of the exposure is
 # still owed and comes out on the next crossings. See `hedge::Band::max_order`.
 max_order_base = "200000000000"
@@ -1282,7 +1304,10 @@ venue = "hyperliquid_paper"
 dex = "xyz"
 qty_decimals = 2
 min_qty_base = "1000000"
-max_drift_base = "10000000000"
+# 2% of the 32,573 TSLA the pool holds, as an RMS exposure it accepts unhedged.
+# The band is sqrt(3) x this = 1,128.4 TSLA; inside it nothing is sent,
+# because removing the exposure costs more in fees than carrying it costs in risk.
+carry_base = "65146000000"
 # One order at a time, 2,000 shares. An EXECUTION limit -- the rest of the exposure is
 # still owed and comes out on the next crossings. See `hedge::Band::max_order`.
 max_order_base = "200000000000"
@@ -1295,7 +1320,10 @@ venue = "hyperliquid_paper"
 dex = "xyz"
 qty_decimals = 2
 min_qty_base = "1000000"
-max_drift_base = "10000000000"
+# 2% of the 75,188 SKHY the pool holds, as an RMS exposure it accepts unhedged.
+# The band is sqrt(3) x this = 2,604.6 SKHY; inside it nothing is sent,
+# because removing the exposure costs more in fees than carrying it costs in risk.
+carry_base = "150376000000"
 # One order at a time, 5,000 shares. An EXECUTION limit -- the rest of the exposure is
 # still owed and comes out on the next crossings. See `hedge::Band::max_order`.
 max_order_base = "500000000000"
@@ -1308,7 +1336,10 @@ venue = "hyperliquid_paper"
 dex = "xyz"
 qty_decimals = 2
 min_qty_base = "1000000"
-max_drift_base = "10000000000"
+# 2% of the 86,956 SPCX the pool holds, as an RMS exposure it accepts unhedged.
+# The band is sqrt(3) x this = 3,012.2 SPCX; inside it nothing is sent,
+# because removing the exposure costs more in fees than carrying it costs in risk.
+carry_base = "173912000000"
 # One order at a time, 5,000 shares. An EXECUTION limit -- the rest of the exposure is
 # still owed and comes out on the next crossings. See `hedge::Band::max_order`.
 max_order_base = "500000000000"
@@ -1322,7 +1353,10 @@ qty_decimals = 3
 # 0.001 BTC (8 decimals).
 min_qty_base = "100000"
 # 1 BTC.
-max_drift_base = "100000000"
+# 2% of the 100 BTC the pool holds, as an RMS exposure it accepts unhedged.
+# The band is sqrt(3) x this = 3.5 BTC; inside it nothing is sent,
+# because removing the exposure costs more in fees than carrying it costs in risk.
+carry_base = "200000000"
 # One order at a time, 0.5 BTC. An EXECUTION limit -- the rest of the exposure is
 # still owed and comes out on the next crossings. See `hedge::Band::max_order`.
 max_order_base = "50000000"

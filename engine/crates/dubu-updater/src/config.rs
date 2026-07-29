@@ -399,9 +399,13 @@ pub struct HedgePair {
     pub qty_decimals: u32,
     /// The venue's minimum order size, in the pool's base units.
     pub min_qty_base: String,
-    /// Cross regardless of the interval once drift reaches this, in the pool's base units. A risk
-    /// choice rather than a derivation: it bounds what a burst builds before the interval elapses.
-    pub max_drift_base: String,
+    /// RMS net exposure this pair is willing to carry unhedged, in the pool's base units.
+    ///
+    /// A RISK BUDGET, not a measurement, and the only input the band needs -- see
+    /// [`crate::hedge::derive_band`] for why the theoretically correct formula is unusable here and
+    /// why `h = sqrt(3) * carry` is the honest substitute. Exposure inside the band is carried on
+    /// purpose: removing it costs more in fees than holding it costs in risk.
+    pub carry_base: String,
     /// Largest single order, in the pool's base units. Empty or `"0"` means no clip.
     ///
     /// An EXECUTION limit, not a risk filter -- see [`crate::hedge::Band::max_order`]. Every unit of

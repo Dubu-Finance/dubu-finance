@@ -1294,7 +1294,6 @@ fn start_hedge(cfg: &Config, sigma_millibps_per_sqrt_sec: u64) -> Option<HedgeLe
 
     // The interval is derived, not configured. See `hedge::derive_hedge_interval`: below
     // `(fee/sigma)^2` a crossing spends more on fees than the exposure it clears was worth.
-    let interval = hedge::derive_hedge_interval(hc.taker_fee_bps_e2, sigma_millibps_per_sqrt_sec);
 
     let mut bands = BTreeMap::new();
     let mut symbols = BTreeMap::new();
@@ -1315,8 +1314,7 @@ fn start_hedge(cfg: &Config, sigma_millibps_per_sqrt_sec: u64) -> Option<HedgeLe
             hedge::Bands::new(
                 hp.pair_id,
                 hedge::Band {
-                    interval,
-                    max_drift: parse(&hp.max_drift_base),
+                    width: hedge::derive_band(parse(&hp.carry_base)),
                     min_qty: parse(&hp.min_qty_base),
                     cooloff: Duration::from_millis(hp.cooloff_ms),
                     max_order: parse(&hp.max_order_base),
@@ -1343,8 +1341,9 @@ fn start_hedge(cfg: &Config, sigma_millibps_per_sqrt_sec: u64) -> Option<HedgeLe
     info!(
         target: "hedge", event = "enabled", base_url = %hc.base_url,
         pairs = bands.len(), taker_fee_bps_e2 = hc.taker_fee_bps_e2,
-        sigma_millibps_per_sqrt_sec, interval_secs = interval.as_secs(),
-        "hedge leg configured; the crossing interval is derived from fee and sigma, not chosen"
+        sigma_millibps_per_sqrt_sec,
+        bands_bps = bands.values().map(|b| b.width().to_string()).collect::<Vec<_>>().join(","),
+        "hedge leg configured; each pair carries exposure inside its band and reflects at the edge"
     );
     // Built only if some pair asks for it, so a crypto-only config makes no Hyperliquid requests.
     let paper = if dexs.is_empty() {
@@ -1412,11 +1411,7 @@ async fn run_hedge(rt: &mut Runtime, view: &ChainView) {
             continue;
         };
         let venue_base = leg.positions.get(pair_id).copied().unwrap_or(0);
-        band.observe(
-            now,
-            i128::try_from(pool_base).unwrap_or(i128::MAX),
-            venue_base,
-        );
+        band.observe(i128::try_from(pool_base).unwrap_or(i128::MAX), venue_base);
     }
 
     // A drifting host clock breaks every signed call at once, with an error that names the
