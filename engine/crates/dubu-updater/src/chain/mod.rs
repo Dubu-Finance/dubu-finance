@@ -257,6 +257,18 @@ pub enum RpcError {
 }
 
 impl RpcError {
+    /// True when the request provably never left this process.
+    ///
+    /// Both variants are refused by the local limiter before a socket is opened, so nothing the
+    /// caller was about to do has happened yet. The transmit path needs this: a send that failed
+    /// *after* going out may have consumed a nonce, and a send that never went out cannot have.
+    /// Treating the two the same is what made the sender re-read its nonce thousands of times for
+    /// transactions it had not sent.
+    #[must_use]
+    pub const fn never_sent(&self) -> bool {
+        matches!(self, Self::BackingOff { .. } | Self::BudgetExhausted { .. })
+    }
+
     /// True when the failure is the *endpoint's*, so another endpoint is worth trying.
     ///
     /// [`Self::Node`] is deliberately excluded. A JSON-RPC error means this node parsed the

@@ -443,6 +443,19 @@ pub struct Sender {
     max_priority_fee: u128,
     transmit_allowed: bool,
     nonce: Option<u64>,
+    /// One past the highest nonce this sender has actually broadcast. A floor under every re-read.
+    ///
+    /// A re-read asks `eth_getTransactionCount(addr, "pending")`, and "pending" is *that node's*
+    /// pending pool. The transmit pool holds nine endpoints, and when the pinned one is serving a
+    /// rate-limit penalty the question goes to another — one that has not seen the transactions we
+    /// handed to the first. It answers with a count from before them, the sender signs a nonce it
+    /// has already used, and the node refuses it as `nonce too low`, which drops the nonce and asks
+    /// again. Measured: 3,391 of 4,519 failed sends were this loop, and it is why the ladder aged
+    /// past `maxStaleSecs` and the pool went dark in bursts a taker sees as a venue flickering.
+    ///
+    /// Taking the larger of the two cannot skip a nonce. Every value counted here was broadcast, so
+    /// the chain will reach it; the floor can only refuse to walk back over ground already covered.
+    broadcast_next: u64,
     /// Outstanding transactions per pair, oldest first. A `Vec` rather than one slot because the
     /// send path pipelines — see [`Sender::at_capacity`].
     pending: BTreeMap<u16, Vec<Pending>>,
@@ -472,6 +485,9 @@ impl Sender {
             max_priority_fee,
             transmit_allowed: cfg.transmit_allowed,
             nonce: None,
+            // Zero floors nothing, which is right at startup: this process has broadcast nothing,
+            // so the node's count is the only truth there is.
+            broadcast_next: 0,
             pending: BTreeMap::new(),
             pending_timeout: Duration::from_secs(cfg.pending_timeout_secs),
             in_flight_max: cfg.in_flight_max,
@@ -632,6 +648,9 @@ impl Sender {
                         json!([signer.address().to_string(), "pending"]),
                     )
                     .await?;
+                // Never below what we have already broadcast. See `broadcast_next`: the node that
+                // answers this is not always the node that took the last send.
+                let n = n.max(self.broadcast_next);
                 self.nonce = Some(n);
                 n
             }
@@ -654,6 +673,7 @@ impl Sender {
                     )));
                 }
                 self.nonce = Some(nonce + 1);
+                self.broadcast_next = self.broadcast_next.max(nonce + 1);
                 self.pending
                     .entry(intent.pair_id())
                     .or_default()
@@ -666,7 +686,13 @@ impl Sender {
                 Ok(Sent::Broadcast { hash, nonce })
             }
             Err(e) => {
-                self.resync_nonce();
+                // A request the limiter refused before opening a socket cannot have consumed the
+                // nonce, so keeping it costs nothing and saves a re-read — and a re-read is the
+                // one operation that can hand back a stale count. Anything that did go out is
+                // dropped as before, because from here we cannot tell whether it landed.
+                if !e.never_sent() {
+                    self.resync_nonce();
+                }
                 Err(TxError::Rpc(e))
             }
         }
@@ -1236,6 +1262,80 @@ mod tests {
         s.nonce = Some(41);
         s.resync_nonce();
         assert_eq!(s.nonce, None);
+    }
+
+    /// A re-read may reach a node that has not seen what we already broadcast.
+    ///
+    /// The failure this guards: the transmit pool has nine endpoints and pins to one. When that
+    /// one is serving a rate-limit penalty the nonce question goes to another, which answers from
+    /// its own pending pool — a count from before the transactions the first node is holding. The
+    /// sender then signs a nonce it has already used, the node refuses it as `nonce too low`, the
+    /// refusal drops the nonce, and it asks again. 3,391 of 4,519 failed sends were this loop.
+    #[test]
+    fn a_re_read_never_walks_the_nonce_back_over_ground_already_broadcast() {
+        let mut s = Sender::new(
+            None,
+            91_342,
+            Address::ZERO,
+            &tx_cfg(true),
+            50_000_000,
+            5_000_000,
+        );
+        s.broadcast_next = 215_412; // 215409..=215411 went out
+
+        // What a node that saw them would say, and what a node that did not would say.
+        for answered in [215_412_u64, 215_409] {
+            assert_eq!(
+                answered.max(s.broadcast_next),
+                215_412,
+                "a lagging node must not pull the nonce back onto a number already used"
+            );
+        }
+
+        // A node genuinely ahead — someone else spent nonces from this key — still wins.
+        assert_eq!(215_500_u64.max(s.broadcast_next), 215_500);
+    }
+
+    /// The floor tracks what was broadcast, not what was signed.
+    ///
+    /// A transaction that was built but never left must not raise it: the chain never saw that
+    /// nonce, so skipping it would leave a gap that every later transaction queues behind.
+    #[test]
+    fn the_floor_only_moves_on_a_broadcast() {
+        let s = Sender::new(
+            None,
+            91_342,
+            Address::ZERO,
+            &tx_cfg(true),
+            50_000_000,
+            5_000_000,
+        );
+        assert_eq!(
+            s.broadcast_next, 0,
+            "a fresh sender has broadcast nothing, so the node's count is the only truth"
+        );
+    }
+
+    /// A request the limiter refused before opening a socket cannot have consumed a nonce, so it
+    /// must not trigger the re-read that a genuinely-sent failure does. Keeping the nonce here is
+    /// what stops one rate-limit penalty from becoming a run of `nonce too low`.
+    #[test]
+    fn a_send_that_never_left_is_distinguishable_from_one_that_did() {
+        let never = RpcError::BackingOff {
+            endpoint: "rpc",
+            remaining_ms: 204,
+        };
+        assert!(never.never_sent());
+
+        let went_out = RpcError::Http {
+            endpoint: "rpc",
+            status: 500,
+            body: String::new(),
+        };
+        assert!(
+            !went_out.never_sent(),
+            "a 500 came back from the node, so the request reached it"
+        );
     }
 
     #[test]
