@@ -115,6 +115,19 @@ const MSPCX: Address = getAddress('0x38EfEf195b347B9EcEf07185C716C9A93E232B9a');
  * `baseDecimals` was read from each token's `decimals()` rather than assumed. They are not uniform
  * — mSOL is 9, mXRP is 6, the equities are 8 — and a wrong one misprices by orders of magnitude
  * without failing anything.
+ *
+ * # Adding a market has an on-chain prerequisite, and nothing here checks it
+ *
+ * The prop leg works the moment a row is added: the pool already quotes the pair. The RFQ leg does
+ * not, and fails quietly. `PmmSettle` custodies nothing and settles by `transferFrom` against the
+ * maker's own balance, so the maker must have approved it for the base token — and the seven pairs
+ * added after the first two had an allowance of zero while holding plenty of inventory. The engine
+ * answered `insufficient-inventory`, the aggregator surfaced `refused`, and `refused` reads as the
+ * maker declining a price rather than as a missing approval.
+ *
+ * So when adding a market: check `allowance(maker, PmmSettle)` for the base token, not just the
+ * maker's balance. A zero there is the whole difference between the RFQ leg quoting and silently
+ * never quoting.
  */
 export const MARKETS: Market[] = [
   { pairId: 1, symbol: 'mWETH/mUSDC', base: MWETH, quote: MUSDC, baseDecimals: 18, quoteDecimals: 6 },
