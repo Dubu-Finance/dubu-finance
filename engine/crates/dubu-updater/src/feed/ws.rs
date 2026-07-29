@@ -1,11 +1,11 @@
 //! The websocket driver every venue shares.
 //!
-//! Four venues, four wire formats, and exactly one reconnect loop. The loop is the part that is
-//! easy to get subtly wrong — backoff that resets at the wrong moment, a read timeout that fires
-//! during a quiet period, a disconnect that leaves the last price readable — and four copies of
-//! it would drift apart in ways nobody notices until one venue is quietly dead. So the venues
-//! implement [`MarketFeed`], which is a parser and a subscribe frame, and this module owns
-//! everything else.
+//! Several venues, several wire formats, and exactly one reconnect loop. The loop is the part
+//! that is easy to get subtly wrong — backoff that resets at the wrong moment, a read timeout
+//! that fires during a quiet period, a disconnect that leaves the last price readable — and one
+//! copy per venue would drift apart in ways nobody notices until one venue is quietly dead. So
+//! the venues implement [`MarketFeed`], which is a parser and a subscribe frame, and this module
+//! owns everything else.
 //!
 //! # Liveness, three mechanisms, because they fail differently
 //!
@@ -13,11 +13,9 @@
 //!   socket that produces no frame at all for `read_timeout_ms` is dead regardless of what TCP
 //!   believes. Forces a reconnect.
 //! * **Keepalive.** OKX closes an idle connection after 30s and wants a literal `ping` text
-//!   frame; [`MarketFeed::keepalive`] is how a venue asks for one. Venues that need nothing say
-//!   nothing.
+//!   frame; [`MarketFeed::keepalive`] is how a venue asks for one.
 //! * **Staleness.** Owned by [`FeedShared`], not here: the socket being up says nothing about a
-//!   particular symbol still ticking, and that distinction is what
-//!   [`super::VenueStatus::Stale`] exists to express.
+//!   particular symbol still ticking, which is what [`super::VenueStatus::Stale`] expresses.
 //!
 //! # Text and binary
 //!
@@ -94,11 +92,29 @@ pub trait MarketFeed: Send {
     fn parse(&mut self, text: &str) -> Result<Option<Update>, String>;
 }
 
+/// The socket type every venue connects over.
+type Socket =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+/// One outcome of `timeout(read_timeout, socket.next())`.
+type ReadOutcome = Result<
+    Option<Result<Message, tokio_tungstenite::tungstenite::Error>>,
+    tokio::time::error::Elapsed,
+>;
+
+/// A ceiling no venue's keepalive will ever reach, so the keepalive `select!` arm can be
+/// unconditional rather than duplicated across two loops.
+const NO_KEEPALIVE: Duration = Duration::from_secs(3_600);
+
 /// Run one venue's feed until `shutdown` flips, reconnecting on every failure.
 ///
 /// Never returns an error: a venue that cannot connect is a *state* the rest of the system reads
 /// off [`FeedShared`], not a failure that should take the process down. The process still has to
 /// withdraw quotes on the way out, and it cannot do that if a feed task panics it first.
+///
+/// # Panics
+/// If `cfg` violates the bounds [`FeedConfig`] validates at load. Those bounds are what keep the
+/// backoff monotone and the read timeout from firing instantly.
 pub async fn run(
     cfg: FeedConfig,
     base_url: String,
@@ -106,8 +122,14 @@ pub async fn run(
     shared: Arc<FeedShared>,
     mut shutdown: watch::Receiver<bool>,
 ) {
+    assert!(!base_url.is_empty(), "a venue needs an endpoint");
+    assert!(cfg.reconnect_initial_ms > 0, "a zero backoff hot-loops");
+    assert!(cfg.reconnect_max_ms >= cfg.reconnect_initial_ms);
+    assert!(cfg.read_timeout_ms > 0, "a zero read timeout never reads");
+
     let venue = client.venue();
     let url = client.url(&base_url);
+    assert!(!url.is_empty());
     let mut delay = Duration::from_millis(cfg.reconnect_initial_ms);
     let delay_max = Duration::from_millis(cfg.reconnect_max_ms);
     let read_timeout = Duration::from_millis(cfg.read_timeout_ms);
@@ -117,6 +139,10 @@ pub async fn run(
         if *shutdown.borrow() {
             return;
         }
+        assert!(
+            delay <= delay_max,
+            "the backoff must stay under its ceiling"
+        );
 
         let connect = tokio_tungstenite::connect_async(&url);
         let outcome = tokio::select! {
@@ -128,17 +154,7 @@ pub async fn run(
         match outcome {
             Ok(Ok((mut socket, _resp))) => {
                 client.on_connect();
-                let mut subscribe_failed = false;
-                for frame in client.subscribe_frames() {
-                    if socket.send(Message::Text(frame)).await.is_err() {
-                        warn!(target: "feed", event = "subscribe_failed", venue = %venue,
-                              "could not send the subscribe frame");
-                        subscribe_failed = true;
-                        break;
-                    }
-                }
-
-                if !subscribe_failed {
+                if subscribe(client.as_mut(), &mut socket, venue).await {
                     info!(target: "feed", event = "connected", venue = %venue,
                           "market data venue connected");
                     shared.on_connected(first);
@@ -152,12 +168,13 @@ pub async fn run(
                         &mut shutdown,
                     )
                     .await;
-                }
-                shared.on_disconnected();
-                if subscribe_failed {
+                    shared.on_disconnected();
+                    if *shutdown.borrow() {
+                        return;
+                    }
+                } else {
                     // Fall through to the backoff rather than hot-looping on a broken endpoint.
-                } else if *shutdown.borrow() {
-                    return;
+                    shared.on_disconnected();
                 }
             }
             Ok(Err(e)) => {
@@ -177,28 +194,100 @@ pub async fn run(
             _ = shutdown.changed() => return,
             () = tokio::time::sleep(delay) => {}
         }
-        delay = (delay * 2).min(delay_max);
+        delay = backoff(delay, delay_max);
+    }
+}
+
+/// Double the retry delay, up to the ceiling.
+fn backoff(delay: Duration, max: Duration) -> Duration {
+    assert!(!delay.is_zero(), "a zero backoff never grows");
+    assert!(delay <= max);
+    let next = (delay * 2).min(max);
+    assert!(
+        next >= delay,
+        "backoff must never shrink on a repeated failure"
+    );
+    assert!(next <= max);
+    next
+}
+
+/// Send every subscribe frame the venue asked for. `false` if the socket died mid-list.
+async fn subscribe(client: &mut dyn MarketFeed, socket: &mut Socket, venue: VenueId) -> bool {
+    for frame in client.subscribe_frames() {
+        assert!(
+            !frame.is_empty(),
+            "an empty subscribe frame subscribes to nothing"
+        );
+        if socket.send(Message::Text(frame)).await.is_err() {
+            warn!(target: "feed", event = "subscribe_failed", venue = %venue,
+                  "could not send the subscribe frame");
+            return false;
+        }
+    }
+    true
+}
+
+/// Classify one read outcome, logging the reason the connection is finished.
+///
+/// `None` means "stop reading and reconnect"; the caller does not distinguish the four causes
+/// beyond what is logged here.
+fn frame(next: ReadOutcome, venue: VenueId, read_timeout: Duration) -> Option<Message> {
+    match next {
+        Err(_) => {
+            warn!(target: "feed", event = "read_timeout", venue = %venue,
+                  timeout_ms = read_timeout.as_millis(),
+                  "no frame within the read timeout; reconnecting");
+            None
+        }
+        Ok(None) => {
+            warn!(target: "feed", event = "stream_ended", venue = %venue, "socket closed by peer");
+            None
+        }
+        Ok(Some(Err(e))) => {
+            warn!(target: "feed", event = "read_error", venue = %venue, error = %e,
+                  "websocket read failed");
+            None
+        }
+        Ok(Some(Ok(m))) => Some(m),
+    }
+}
+
+/// Parse one payload and hand any book update to the shared state.
+fn on_frame(client: &mut Box<dyn MarketFeed>, shared: &FeedShared, venue: VenueId, text: &str) {
+    match client.parse(text) {
+        Ok(Some(update)) => {
+            debug_assert!(!update.symbol.is_empty(), "a tick must name a symbol");
+            let now = Instant::now();
+            if update.reset {
+                shared.record_reset(&update.symbol, update.tick, now);
+            } else if let Err(rej) = shared.record(&update.symbol, update.tick, now) {
+                debug!(target: "feed", event = "tick_rejected", venue = %venue,
+                       symbol = %update.symbol, reason = ?rej, "dropped a book tick");
+            }
+        }
+        Ok(None) => {}
+        Err(e) => warn!(target: "feed", event = "parse_error", venue = %venue, error = %e,
+                        "unparseable frame; dropped"),
     }
 }
 
 /// Read frames until something goes wrong. Returns so the caller can reconnect.
 async fn read_loop(
     client: &mut Box<dyn MarketFeed>,
-    socket: &mut tokio_tungstenite::WebSocketStream<
-        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-    >,
+    socket: &mut Socket,
     shared: &Arc<FeedShared>,
     read_timeout: Duration,
     shutdown: &mut watch::Receiver<bool>,
 ) {
+    assert!(!read_timeout.is_zero(), "a zero read timeout never reads");
     let venue = client.venue();
     let keepalive = client.keepalive();
-    // A period no venue will ever reach, so the `select!` arm below can be unconditional.
-    let mut ticker = tokio::time::interval(
-        keepalive
-            .as_ref()
-            .map_or(Duration::from_secs(3_600), |k| k.0),
-    );
+    let period = keepalive.as_ref().map_or(NO_KEEPALIVE, |k| k.0);
+    assert!(!period.is_zero(), "a zero-period ticker spins the select");
+    if keepalive.is_none() {
+        assert_eq!(period, NO_KEEPALIVE);
+    }
+    let mut ticker = tokio::time::interval(period);
     ticker.tick().await; // `interval` fires immediately; the connection is fresh.
 
     loop {
@@ -209,8 +298,8 @@ async fn read_loop(
                 return;
             }
             _ = ticker.tick() => {
-                if let Some((_, frame)) = &keepalive {
-                    if socket.send(Message::Text(frame.clone())).await.is_err() {
+                if let Some((_, keepalive_frame)) = &keepalive {
+                    if socket.send(Message::Text(keepalive_frame.clone())).await.is_err() {
                         warn!(target: "feed", event = "keepalive_failed", venue = %venue,
                               "could not send the keepalive frame");
                         return;
@@ -221,23 +310,8 @@ async fn read_loop(
             r = tokio::time::timeout(read_timeout, socket.next()) => r,
         };
 
-        let msg = match next {
-            Err(_) => {
-                warn!(target: "feed", event = "read_timeout", venue = %venue,
-                      timeout_ms = read_timeout.as_millis(),
-                      "no frame within the read timeout; reconnecting");
-                return;
-            }
-            Ok(None) => {
-                warn!(target: "feed", event = "stream_ended", venue = %venue, "socket closed by peer");
-                return;
-            }
-            Ok(Some(Err(e))) => {
-                warn!(target: "feed", event = "read_error", venue = %venue, error = %e,
-                      "websocket read failed");
-                return;
-            }
-            Ok(Some(Ok(m))) => m,
+        let Some(msg) = frame(next, venue, read_timeout) else {
+            return;
         };
 
         // Text and binary both carry payloads; see the module docs on why the opcode is not the
@@ -261,20 +335,6 @@ async fn read_loop(
             _ => None,
         };
         let Some(text) = payload else { continue };
-
-        match client.parse(&text) {
-            Ok(Some(update)) => {
-                let now = Instant::now();
-                if update.reset {
-                    shared.record_reset(&update.symbol, update.tick, now);
-                } else if let Err(rej) = shared.record(&update.symbol, update.tick, now) {
-                    debug!(target: "feed", event = "tick_rejected", venue = %venue,
-                           symbol = %update.symbol, reason = ?rej, "dropped a book tick");
-                }
-            }
-            Ok(None) => {}
-            Err(e) => warn!(target: "feed", event = "parse_error", venue = %venue, error = %e,
-                            "unparseable frame; dropped"),
-        }
+        on_frame(client, shared, venue, &text);
     }
 }

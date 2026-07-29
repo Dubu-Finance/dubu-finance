@@ -15,11 +15,11 @@
 //!
 //! Bybit is the only venue here whose top-of-book stream is **incremental**. A `delta` frame
 //! carries only the side that changed: an empty `b` means "the bid is unchanged", and a level
-//! whose size is `"0"` means that level was **deleted** — which, at depth 1, means there is no
-//! best bid at all until the next frame. A client that read an empty `b` as "no bid" would
-//! throw away half the updates, and one that read `["1969.52","0"]` as a 1969.52 bid would price
-//! against a level that no longer exists. So this module keeps the last top of book per symbol
-//! and merges deltas into it, and drops the tick outright whenever a side ends up empty.
+//! whose size is `"0"` means that level was **deleted** — at depth 1, that there is no best bid
+//! at all until the next frame. Reading an empty `b` as "no bid" throws away half the updates;
+//! reading `["1969.52","0"]` as a 1969.52 bid prices against a level that no longer exists. So
+//! this module keeps the last top of book per symbol, merges deltas into it, and drops the tick
+//! whenever a side ends up empty.
 //!
 //! That state is per connection and [`MarketFeed::on_connect`] clears it. Merging a post-reconnect
 //! delta into a pre-outage book is the obvious way to produce a confident, wrong price.
@@ -32,9 +32,8 @@
 //!
 //! # Keepalive
 //!
-//! `{"op":"ping"}` every 20s. `orderbook.1` on a liquid spot pair pushes every few milliseconds,
-//! so this only matters if the market genuinely stops — which is exactly when a silent
-//! disconnect would be most confusing.
+//! `{"op":"ping"}` every 20s, inside Bybit's idle timeout. `orderbook.1` on a liquid spot pair
+//! pushes every few milliseconds, so this only matters if the market genuinely stops.
 
 use std::collections::BTreeMap;
 
@@ -85,12 +84,30 @@ pub struct Client {
 
 impl Client {
     /// Build from `(venue symbol, canonical symbol)` pairs.
+    ///
+    /// # Panics
+    /// If any symbol is empty. A client built from a blank symbol subscribes to nothing and
+    /// reads as a healthy silent venue.
     #[must_use]
     pub fn new(symbols: &[(String, String)]) -> Self {
-        Self {
+        for (venue, canonical) in symbols {
+            assert!(!venue.is_empty(), "a bybit symbol must not be blank");
+            assert!(
+                !canonical.is_empty(),
+                "a canonical symbol must not be blank"
+            );
+        }
+        let client = Self {
             symbols: symbols.iter().cloned().collect(),
             tops: BTreeMap::new(),
-        }
+        };
+        assert!(client.tops.is_empty(), "no book exists before a connect");
+        debug_assert_eq!(
+            client.symbols.len(),
+            symbols.len(),
+            "two pairs claim the same bybit symbol, so one of them is silently unsubscribed"
+        );
+        client
     }
 }
 
@@ -99,9 +116,39 @@ fn level(side: &str, l: &[String; 2]) -> Result<(u128, u128), String> {
     let px = units::parse_fixed(&l[0], FEED_SCALE).map_err(|e| format!("{side}[0]: {e}"))?;
     let sz = units::parse_fixed(&l[1], FEED_SCALE).map_err(|e| format!("{side}[1]: {e}"))?;
     if sz == 0 {
+        // A deletion clears the price with the size. Returning `(px, 0)` would leave a price on a
+        // level that no longer exists, and the emptiness check downstream reads the price.
         return Ok((0, 0));
     }
+    assert!(
+        sz > 0,
+        "the deletion branch above is the only zero-size exit"
+    );
     Ok((px, sz))
+}
+
+/// Fold one side of a frame into the stored top of book.
+///
+/// The whole difference between the two frame kinds lives here: an absent side on a `delta` means
+/// "unchanged", and on a `snapshot` means the side really is empty.
+fn merge_side(
+    side: &str,
+    current: (u128, u128),
+    incoming: Option<&[String; 2]>,
+    snapshot: bool,
+) -> Result<(u128, u128), String> {
+    let merged = match incoming {
+        Some(l) => level(side, l)?,
+        None if snapshot => (0, 0),
+        None => current,
+    };
+    if incoming.is_none() && !snapshot {
+        assert_eq!(
+            merged, current,
+            "a delta that says nothing must change nothing"
+        );
+    }
+    Ok(merged)
 }
 
 impl MarketFeed for Client {
@@ -110,26 +157,33 @@ impl MarketFeed for Client {
     }
 
     fn subscribe_frames(&self) -> Vec<String> {
+        assert!(
+            !self.symbols.is_empty(),
+            "a subscribe frame with no args never delivers a book"
+        );
         let args: Vec<String> = self
             .symbols
             .keys()
             .map(|s| format!(r#""orderbook.1.{s}""#))
             .collect();
-        vec![format!(
-            r#"{{"op":"subscribe","args":[{}]}}"#,
-            args.join(",")
-        )]
+        assert_eq!(args.len(), self.symbols.len());
+        let frame = format!(r#"{{"op":"subscribe","args":[{}]}}"#, args.join(","));
+        debug_assert!(serde_json::from_str::<serde_json::Value>(&frame).is_ok());
+        vec![frame]
     }
 
     fn keepalive(&self) -> Option<(std::time::Duration, String)> {
-        Some((
-            std::time::Duration::from_secs(KEEPALIVE_SECS),
-            r#"{"op":"ping"}"#.to_string(),
-        ))
+        let period = std::time::Duration::from_secs(KEEPALIVE_SECS);
+        assert!(period.as_secs() > 0, "a zero-period keepalive spins");
+        Some((period, r#"{"op":"ping"}"#.to_string()))
     }
 
     fn on_connect(&mut self) {
         self.tops.clear();
+        assert!(
+            self.tops.is_empty(),
+            "a surviving book would merge new deltas into a pre-outage top"
+        );
     }
 
     fn parse(&mut self, text: &str) -> Result<Option<Update>, String> {
@@ -143,6 +197,7 @@ impl MarketFeed for Client {
         let Some(symbol) = self.symbols.get(&frame.data.s).cloned() else {
             return Ok(None);
         };
+        debug_assert!(!symbol.is_empty(), "`new` rejects a blank canonical symbol");
 
         let snapshot = frame.kind == "snapshot";
         // A delta before any snapshot has nothing to merge into.
@@ -154,31 +209,34 @@ impl MarketFeed for Client {
                 None => return Ok(None),
             }
         };
+        if snapshot {
+            assert_eq!(top, Top::default(), "a snapshot replaces the book");
+        }
 
-        if let Some(b) = frame.data.b.first() {
-            let (px, sz) = level("b", b)?;
-            top.bid = px;
-            top.bid_qty = sz;
-        } else if snapshot {
-            // A snapshot with no bid side really is an empty bid side.
-            top.bid = 0;
-            top.bid_qty = 0;
-        }
-        if let Some(a) = frame.data.a.first() {
-            let (px, sz) = level("a", a)?;
-            top.ask = px;
-            top.ask_qty = sz;
-        } else if snapshot {
-            top.ask = 0;
-            top.ask_qty = 0;
-        }
+        let (bid, bid_qty) =
+            merge_side("b", (top.bid, top.bid_qty), frame.data.b.first(), snapshot)?;
+        let (ask, ask_qty) =
+            merge_side("a", (top.ask, top.ask_qty), frame.data.a.first(), snapshot)?;
+        top = Top {
+            bid,
+            bid_qty,
+            ask,
+            ask_qty,
+        };
 
         self.tops.insert(symbol.clone(), top);
+        debug_assert_eq!(self.tops.get(&symbol), Some(&top));
         if top.bid == 0 || top.ask == 0 {
             // One side is empty. The merge state is kept — the next delta may refill it — but
             // there is no top of book to price from right now.
             return Ok(None);
         }
+        // Both sides survived the emptiness check, so neither price nor either size is the zero a
+        // deletion leaves behind. This is the one place in the parsers where that holds.
+        assert!(top.bid > 0);
+        assert!(top.ask > 0);
+        assert!(top.bid_qty > 0);
+        assert!(top.ask_qty > 0);
 
         let tick = BookTick {
             update_id: frame.data.u,

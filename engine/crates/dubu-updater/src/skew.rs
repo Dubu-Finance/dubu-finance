@@ -1,95 +1,82 @@
 //! Inventory skew: the Avellaneda–Stoikov reservation price, and the volatility estimate it
 //! needs.
 //!
-//! # Why there is a skew at all
-//!
-//! The bot used to quote symmetrically around the reference regardless of what the pool held, so
-//! sustained one-way flow accumulated inventory and nothing pushed it back. There is no hedge
-//! venue — a Korean corporate real-name exchange account is not available, so there is no account
-//! to hedge into — which means this is not one inventory control among several. It is the only
-//! one there is.
-//!
-//! # The model, and only the linear term
-//!
 //! ```text
 //! r = s - q * gamma * sigma^2
 //! ```
 //!
-//! `s` is the reference price, `q` the signed inventory imbalance against target, `gamma` the
-//! risk aversion, `sigma` the volatility over a stated horizon. The reservation price `r` is what
-//! the book is centred on instead of `s`, so a pool that is long quotes lower on **both** sides
-//! and gets hit on its ask sooner than on its bid.
+//! `s` is the reference price, `q` the signed inventory imbalance, `gamma` the risk aversion,
+//! `sigma` the volatility over a stated horizon. The book is centred on the reservation price `r`
+//! instead of on `s`, so a pool that is long quotes lower on **both** sides and gets hit on its ask
+//! sooner than on its bid.
 //!
-//! The load-bearing detail — and the reason to reach for A–S rather than a hand-rolled constant
-//! `kappa * q` — is that the coefficient scales with **`sigma^2`, not with a constant**. The same
-//! imbalance is far more dangerous in a fast market than in a calm one, and a fixed `kappa` is
-//! wrong in both directions at once: too timid when volatility triples, too aggressive when the
-//! market goes quiet and the position could have been worked off at no cost.
+//! # Why there is a skew at all
 //!
-//! **The derivative and integral terms are deliberately absent.** Turning this into a PID would
-//! need three coefficients, and three coefficients can only be tuned against replay data that
-//! does not exist here — so they would be three numbers picked by feel, which archi_v2 §5.4 is
-//! explicit about not doing. The linear term is one coefficient and it is provably optimal under
-//! the model's own assumptions. What would justify adding the others: a derivative term earns its
-//! place once fill data shows the imbalance *oscillating* around target rather than converging
-//! (skew overshooting, flow reversing, skew overshooting back), and an integral term once it
-//! shows a persistent steady-state offset the proportional term never closes. Both are
-//! measurable from the `skew` log line below plus fills, and neither should be added before they
-//! have been measured.
+//! The bot used to quote symmetrically regardless of what the pool held, so sustained one-way flow
+//! accumulated inventory and nothing pushed it back. This was written when there was no venue to
+//! hedge into at all — a Korean corporate real-name exchange account is not available — which made
+//! the skew the only inventory control there was; [`Inventory::hedge_value`] is now netted into `q`
+//! so the two do not fight.
+//!
+//! # Why A–S and not a hand-rolled `kappa * q`
+//!
+//! Because the coefficient scales with **`sigma^2`, not with a constant**. The same imbalance is
+//! far more dangerous in a fast market than in a calm one, and a fixed `kappa` is wrong in both
+//! directions at once: too timid when volatility triples, too aggressive when the market goes quiet
+//! and the position could have been worked off at no cost.
+//!
+//! **The derivative and integral terms are deliberately absent.** A PID needs three coefficients,
+//! and three coefficients can only be tuned against replay data that does not exist here — so they
+//! would be three numbers picked by feel, which archi_v2 §5.4 is explicit about not doing. What
+//! would justify adding them: a derivative term earns its place once fill data shows the imbalance
+//! *oscillating* around target rather than converging (skew overshooting, flow reversing, skew
+//! overshooting back), and an integral term once it shows a persistent steady-state offset the
+//! proportional term never closes. Both are measurable from the `skew` log line plus fills.
 //!
 //! # Units, so that gamma is a number a human can reason about
 //!
-//! Everything here is dimensionless and expressed in basis points, which is the only way `gamma`
-//! ends up in a tunable range:
-//!
 //! ```text
-//! q      = base share of the book - target share       in [-1, 1], carried as ppm
+//! q      = net exposure as a share of the book         in [-1, 1], carried as ppm
 //! sigma  = relative volatility over `horizon_secs`     carried as bps, and squared as bps^2
 //! skew   = gamma * q * sigma^2 / 10_000                in bps of the reference
 //! ```
 //!
-//! The `/ 10_000` is what converts `sigma^2` from "bps squared" back into bps. Measured on the
-//! live feed on 2026-07-27, ETHUSDT's `sigma` over the 300s horizon runs about **10 bps** and
-//! BTCUSDT's about **3 bps**, so `sigma^2 / 10_000` is 0.01 bp for ETH. A pool 20% away from its
-//! target inventory with `gamma = 1000` therefore skews by 2 bp against a 5 bp half-spread —
-//! visible, and not dominant. That is the range `gamma` is meant to live in, and it is worth
-//! noting how far off a guess can be: this was first written assuming 30 bps, and since the skew
-//! is quadratic in `sigma`, that guess was wrong by a factor of nine. `gamma` is a number to
-//! back-solve from the `skew` log line, never to pick by feel.
+//! The `/ 10_000` converts `sigma^2` from "bps squared" back into bps. Measured on the live feed on
+//! 2026-07-27, ETHUSDT's `sigma` over the 300s horizon runs about **10 bps** and BTCUSDT's about
+//! **3 bps**, so `sigma^2 / 10_000` is 0.01 bp for ETH: a pool 20% away from target with
+//! `gamma = 1000` skews by 2 bp against a 5 bp half-spread — visible, and not dominant. That is the
+//! range `gamma` is meant to live in, and it is worth noting how far off a guess can be. This was
+//! first written assuming 30 bps, and since the skew is quadratic in `sigma` that guess was wrong
+//! by a factor of nine. `gamma` is a number to back-solve from the `skew` log line, never to pick
+//! by feel.
 //!
-//! Both pairs share one `gamma`, and BTCUSDT's skew comes out near zero — its imbalance is 1%
-//! rather than 11% and its volatility is a third of ETH's. That is the model working, not a
-//! misconfiguration: `q * sigma^2` is small for that pair right now, so there is little risk to
-//! push back against.
+//! Both pairs share one `gamma` and BTCUSDT's skew comes out near zero — its imbalance is 1% rather
+//! than 11% and its volatility a third of ETH's. That is the model working, not a misconfiguration.
 //!
 //! # Warm-up
 //!
 //! The EWMA is seeded at zero, so `sigma` — and with it the skew — climbs from nothing over the
-//! first few `tau` after a start or a feed outage. That is deliberately the conservative
-//! direction: an unknown volatility produces no skew rather than an invented one. `vol_samples`
-//! is in every log line so the warm-up is visible rather than looking like a dead feature.
+//! first few `tau` after a start or a feed outage. That is deliberately the conservative direction:
+//! an unknown volatility produces no skew rather than an invented one. `vol_samples` is in every
+//! log line so the warm-up is visible rather than looking like a dead feature.
 //!
 //! # The sign
 //!
-//! `q > 0` means the pool holds **more** base than it wants, so it wants to sell, so the book
-//! must move **down**. `dubu-core`'s convention is that a positive `skew_bps` shifts the book
-//! down, so the signs line up and no negation is needed anywhere. A–S agrees: long inventory
-//! lowers the reservation price.
+//! `q > 0` means the pool holds **more** base than it wants, so it wants to sell, so the book must
+//! move **down**. `dubu-core`'s convention is that a positive `skew_bps` shifts the book down, so
+//! the signs line up and no negation is needed anywhere. A–S agrees: long inventory lowers the
+//! reservation price.
 //!
 //! # The skew can never cross the book
 //!
-//! Worth stating because it is the first thing to worry about. The skew moves the **mid**, and
-//! both targets are derived from the skewed mid with the same half-spread — `bid = mid(1-hs)`,
+//! The first thing to worry about, and it is structural. The skew moves the **mid**, and both
+//! targets are derived from the skewed mid with the same half-spread — `bid = mid(1-hs)`,
 //! `ask = mid(1+hs)` — so they move together and the spread between them is preserved exactly.
-//! With `half_spread_bps` non-zero (which the config validator enforces) `bid < ask` for every
-//! skew in range. `minBid` past `minAsk` is not a failure mode of this design; a test pins it
-//! across the whole clamp range.
 //!
-//! The floor is the real constraint, and it is handled by [`price_cap_bps_min`] rather than left
-//! to be discovered downstream: a large positive skew can push the bid target under the pair's
-//! `minPrice`, at which point `ladder::build` correctly refuses the row — but a refused row is a
-//! quoting outage, and clamping the skew to the largest value that still clears the floor keeps
-//! the pool quoting a slightly-less-skewed book instead.
+//! The floor is the real constraint, and [`price_cap_bps_min`] handles it rather than leaving it to
+//! be discovered downstream: a large positive skew can push the bid target under the pair's
+//! `minPrice`, at which point `ladder::build` correctly refuses the row — and a refused row is a
+//! quoting outage, where a slightly-less-skewed book is not.
 
 use std::time::Instant;
 
@@ -98,6 +85,14 @@ use dubu_core::math::{mul_div_ceil, mul_div_floor};
 
 /// Relative returns are carried as parts per `10^8`, matching [`crate::units::FEED_SCALE`].
 const REL: u128 = 100_000_000;
+
+/// The two are the same scale by construction, not by coincidence: a return is a ratio of two feed
+/// prices, so carrying it at any other precision would either truncate the ratio or invent digits.
+const _: () = assert!(REL == 10u128.pow(crate::units::FEED_SCALE as u32));
+
+/// [`price_cap_bps_min`] divides by `BPS - hs` with `hs` clamped to `BPS_MAX`, so a `BPS_MAX` that
+/// reached `BPS` would be a division by zero on the path that keeps the pool quoting.
+const _: () = assert!(BPS_MAX < BPS);
 
 // ---------------------------------------------------------------------------
 // Volatility
@@ -122,35 +117,32 @@ pub struct VolConfig {
 ///
 /// # The horizon, and why 300 seconds
 ///
-/// `sigma` only means something with a horizon attached, and the choice sets the numeric range
-/// `gamma` has to live in, so it is worth stating rather than defaulting.
-///
-/// The default is **300 seconds, the same window as `risk.bleed_window_secs`**. That is not a
-/// coincidence and it is the whole argument: the bleed killswitch already defines the horizon
-/// over which an adverse move against the inventory is treated as a real loss rather than as
-/// noise. The skew exists to push inventory back before that switch has anything to measure, so
-/// it should be sized against the volatility over exactly that window. Any other horizon would
-/// mean two parts of the same risk system disagreeing about what "soon" means.
+/// The default is **300 seconds, the same window as `risk.bleed_window_secs`**, and that is the
+/// whole argument: the bleed killswitch already defines the horizon over which an adverse move
+/// against the inventory counts as a real loss rather than as noise. The skew exists to push
+/// inventory back before that switch has anything to measure, so it should be sized against the
+/// volatility over exactly that window. Any other horizon means two parts of the same risk system
+/// disagreeing about what "soon" means.
 ///
 /// Two horizons that look tempting and are not:
 ///
-/// * *One second*, the cycle cadence — the position the skew is working off survives orders of
-///   magnitude longer than one block, so per-second volatility understates the risk being carried
-///   by a factor of ~17 and `gamma` would have to absorb it.
-/// * *One hour*, the pool's `maxStaleSecs` — that is the staleness backstop, not a holding
-///   horizon, and at that scale `sigma^2` moves so slowly that the skew becomes a constant,
-///   which is precisely what A–S was chosen over.
+/// * *One second*, the cycle cadence — the position survives orders of magnitude longer than one
+///   block, so per-second volatility understates the risk carried by ~17x and `gamma` would have to
+///   absorb it.
+/// * *One hour*, the pool's `maxStaleSecs` — a staleness backstop, not a holding horizon, and at
+///   that scale `sigma^2` moves so slowly the skew becomes a constant, which is what A–S was
+///   chosen over.
 ///
 /// # The estimator
 ///
-/// Returns are sampled once per quote cycle, which the `newHeads` subscription puts at about 1 Hz.
-/// Each sample contributes `r^2 / dt` to a per-second variance, so jitter in the cycle cadence —
-/// a fallback-timer cycle at 2s, a missed head — does not bias the level. Scaling to the horizon
-/// is the usual square-root-of-time: `sigma(T)^2 = var_per_sec * T`.
+/// Returns are sampled once per quote cycle, about 1 Hz. Each sample contributes `r^2 / dt` to a
+/// per-second variance, so jitter in the cycle cadence — a fallback-timer cycle at 2s, a missed
+/// head — does not bias the level. Scaling to the horizon is square-root-of-time:
+/// `sigma(T)^2 = var_per_sec * T`.
 ///
-/// The EWMA weight is the standard discretisation `w = 1 - exp(-dt/tau)`, taken to first order as
-/// `dt/tau`. At the default `tau` of 60s and `dt` of 1s the two differ by under 1%, and the
-/// approximation is what keeps the whole update in integers.
+/// The EWMA weight is the standard `w = 1 - exp(-dt/tau)` taken to first order as `dt/tau`. At the
+/// default `tau` of 60s and `dt` of 1s the two differ by under 1%, and the approximation is what
+/// keeps the whole update in integers.
 #[derive(Debug, Clone)]
 pub struct Volatility {
     cfg: VolConfig,
@@ -162,8 +154,24 @@ pub struct Volatility {
 
 impl Volatility {
     /// A fresh estimator with no history.
+    ///
+    /// # Panics
+    ///
+    /// If the configuration can never produce a non-zero `sigma`. Each of these leaves the skew
+    /// permanently at zero AND the volatility half-spread permanently at `s0`, which is a silently
+    /// under-priced quote rather than a visible failure. [`crate::config`] refuses all three at
+    /// startup; this is the second belt, and the cheapest place to catch a hand-built config.
     #[must_use]
     pub const fn new(cfg: VolConfig) -> Self {
+        // A zero tau makes the EWMA weight zero, so the variance never leaves its seed.
+        assert!(cfg.tau_ms > 0, "vol tau of zero freezes the estimator");
+        // A zero horizon makes `sigma_sq_bps_e6` zero whatever the variance is.
+        assert!(cfg.horizon_secs > 0, "vol horizon of zero erases sigma");
+        // Inverted bounds mean every sample is either skipped or read as an outage.
+        assert!(
+            cfg.sample_ms_min < cfg.sample_ms_max,
+            "vol sample bounds are inverted; no observation could ever be folded in"
+        );
         Self {
             cfg,
             var_per_sec: 0,
@@ -179,14 +187,18 @@ impl Volatility {
         self.samples
     }
 
-    /// Forget the history.
+    /// Forget the anchor, keeping the variance.
     ///
-    /// Called when the reference price is unavailable, so that the first sample after an outage
-    /// is not a "return" spanning the whole gap. Without it, a two-minute feed outage during
-    /// which the market moved 1% would enter the estimator as a single enormous one-second
-    /// return and the skew would be sized off it for the next several minutes.
+    /// Called when the reference price is unavailable, so that the first sample after an outage is
+    /// not a "return" spanning the whole gap: a two-minute outage across a 1% move would otherwise
+    /// enter as a single enormous one-second return and size the skew off it for minutes.
     pub fn reset(&mut self) {
+        let var_before = self.var_per_sec;
         self.last = None;
+        assert!(self.last.is_none(), "the anchor must be gone");
+        // Only the anchor. Dropping the variance too would restart the warm-up on every brief feed
+        // hiccup and quote a market it had already measured as if it had never seen it.
+        assert_eq!(self.var_per_sec, var_before, "reset must keep the variance");
     }
 
     /// Fold in one observation of the reference price.
@@ -195,17 +207,24 @@ impl Volatility {
             self.last = Some((price, now));
             return;
         };
+        let samples_before = self.samples;
         let dt_ms =
             u64::try_from(now.saturating_duration_since(t0).as_millis()).unwrap_or(u64::MAX);
         if dt_ms < self.cfg.sample_ms_min {
             // Too close together to divide by. Keep the old anchor so the next sample spans a
             // sensible interval rather than starting over.
+            assert!(self.last.is_some(), "a skipped sample must keep its anchor");
             return;
         }
         if dt_ms > self.cfg.sample_ms_max || prev == 0 {
             self.last = Some((price, now));
+            assert_eq!(self.samples, samples_before, "an outage is not a return");
             return;
         }
+        // Both guards are behind us, so the divisors below are real.
+        assert!(prev > 0, "a zero anchor is an outage, not a return");
+        assert!(dt_ms >= self.cfg.sample_ms_min, "dt below the sample floor");
+        assert!(dt_ms > 0, "a zero interval would divide the contribution");
 
         // |r| in parts per REL. The sign is irrelevant: it is squared immediately.
         let r = mul_div_floor(price.abs_diff(prev), REL, prev).unwrap_or(REL);
@@ -213,57 +232,89 @@ impl Volatility {
             .checked_mul(r)
             .and_then(|sq| sq.checked_mul(1_000))
             .map_or(u128::MAX, |x| x / u128::from(dt_ms));
+        if price == prev {
+            assert_eq!(contrib, 0, "an unmoved reference has no variance in it");
+        }
 
         let w_num = u128::from(dt_ms.min(self.cfg.tau_ms));
         let w_den = u128::from(self.cfg.tau_ms.max(1));
+        // A weight above one overshoots the target instead of approaching it, which turns the EWMA
+        // into an oscillator and prices every quote off the swing.
+        assert!(w_num <= w_den, "EWMA weight above 1: {w_num}/{w_den}");
+        assert!(w_den > 0, "EWMA weight divides by zero");
         self.var_per_sec = if contrib >= self.var_per_sec {
             let step = mul_div_floor(contrib - self.var_per_sec, w_num, w_den).unwrap_or(0);
-            self.var_per_sec.saturating_add(step)
+            let out = self.var_per_sec.saturating_add(step);
+            // An EWMA step never overshoots the sample it is moving toward.
+            assert!(out <= contrib, "the estimate stepped past the observation");
+            out
         } else {
             let step = mul_div_floor(self.var_per_sec - contrib, w_num, w_den).unwrap_or(0);
-            self.var_per_sec.saturating_sub(step)
+            let out = self.var_per_sec.saturating_sub(step);
+            assert!(out >= contrib, "the estimate stepped past the observation");
+            out
         };
 
         self.last = Some((price, now));
         self.samples = self.samples.saturating_add(1);
+        assert!(self.samples > samples_before, "a folded return must count");
     }
 
     /// `sigma^2` over the configured horizon, in **bps squared scaled by `10^6`**.
     ///
-    /// This is the number the skew actually multiplies, and it is deliberately the one with no
-    /// square root in it: A–S needs `sigma^2`, so taking a root here only to square it again
-    /// would throw away precision for nothing. [`Volatility::sigma_millibps`] exists for the log
-    /// line and for humans.
+    /// The number the skew actually multiplies, and deliberately the one with no square root in it:
+    /// A–S needs `sigma^2`, so taking a root here only to square it again would throw away
+    /// precision for nothing. [`Volatility::sigma_millibps`] exists for the log line and for humans.
     #[must_use]
     pub const fn sigma_sq_bps_e6(&self) -> u128 {
         // sigma_rel^2 over the horizon is `var_per_sec * horizon` in (1/REL)^2 units. In bps^2
         // that is `* REL^2 / 10^8`, i.e. `* 10^-8`; scaled by 10^6 it is `/ 100`.
-        (self
+        let out = (self
             .var_per_sec
             .saturating_mul(self.cfg.horizon_secs as u128))
-            / 100
+            / 100;
+        // The warm-up contract, both ways: an unmeasured market must produce no skew, and a
+        // measured one must not have its variance rounded away by the horizon scaling.
+        if self.var_per_sec == 0 {
+            assert!(out == 0, "variance of zero cannot produce a sigma");
+        }
+        if out > 0 {
+            assert!(
+                self.var_per_sec > 0,
+                "sigma out of a market that never moved"
+            );
+        }
+        out
     }
 
     /// `sigma` over the configured horizon, in thousandths of a basis point.
     ///
-    /// Milli-bps rather than bps because a calm five-minute window on ETHUSDT is tens of bps and
-    /// a quiet one is single digits; integer bps would round the interesting range to nothing.
+    /// Milli-bps rather than bps because a calm five-minute window on ETHUSDT is tens of bps and a
+    /// quiet one is single digits; integer bps would round the interesting range to nothing.
     #[must_use]
     pub fn sigma_millibps(&self) -> u64 {
-        u64::try_from(isqrt(self.sigma_sq_bps_e6())).unwrap_or(u64::MAX)
+        let sq = self.sigma_sq_bps_e6();
+        let out = u64::try_from(isqrt(sq)).unwrap_or(u64::MAX);
+        if sq == 0 {
+            assert_eq!(out, 0, "a flat market reports a flat sigma");
+        }
+        if out > 0 {
+            assert!(sq > 0, "a sigma out of a zero variance");
+        }
+        out
     }
 
     /// `sigma` over an **arbitrary** interval, in hundredths of a basis point.
     ///
-    /// The horizon above is a property of the skew — it is the window over which an adverse move
-    /// against inventory counts as a real loss. [`crate::jump`] asks a different question, about a
-    /// single observation, and needs the same estimate scaled to that observation's own interval
-    /// instead. This is the *only* way to get it: adding a second, faster estimator would be two
-    /// numbers to keep consistent and two ways to be wrong about how volatile the market is.
+    /// The horizon above is a property of the skew — the window over which an adverse move against
+    /// inventory counts as a real loss. [`crate::jump`] asks a different question, about a single
+    /// observation, and needs the same estimate scaled to that observation's own interval. This is
+    /// the *only* way to get it: a second, faster estimator would be two numbers to keep consistent
+    /// and two ways to be wrong about how volatile the market is.
     ///
-    /// The same square-root-of-time scaling as [`Volatility::sigma_sq_bps_e6`], so a fast-lane
-    /// scan at 200 ms and a cycle scan at 1 s are compared against thresholds that differ by
-    /// exactly `sqrt(5)`, which is what makes the two sampling rates interchangeable.
+    /// The same square-root-of-time scaling as [`Volatility::sigma_sq_bps_e6`], so a fast-lane scan
+    /// at 200 ms and a cycle scan at 1 s are compared against thresholds that differ by exactly
+    /// `sqrt(5)` — which is what makes the two sampling rates interchangeable.
     ///
     /// ```text
     /// sigma_bps(dt)^2 = var_per_sec * dt_ms / (1000 * 10^8)
@@ -272,11 +323,24 @@ impl Volatility {
     #[must_use]
     pub fn sigma_bps_e2_over_ms(&self, dt_ms: u64) -> u32 {
         let v = self.var_per_sec.saturating_mul(u128::from(dt_ms)) / 10_000_000;
-        u32::try_from(isqrt(v)).unwrap_or(u32::MAX)
+        let out = u32::try_from(isqrt(v)).unwrap_or(u32::MAX);
+        // A zero interval is a zero move; a dead market is a zero sigma over any interval. Both
+        // reach `jump`'s threshold clamp, where a wrong sigma is a missed jump.
+        if dt_ms == 0 {
+            assert_eq!(out, 0, "no interval, no move to be surprised by");
+        }
+        if self.var_per_sec == 0 {
+            assert_eq!(out, 0, "a dead market is flat over every interval");
+        }
+        if out > 0 {
+            assert!(dt_ms > 0, "a move over no time at all");
+            assert!(self.var_per_sec > 0, "a move in a market that never moved");
+        }
+        out
     }
 }
 
-/// Integer square root, by Newton's method. Used only for the human-readable `sigma`.
+/// Integer square root, by Newton's method.
 fn isqrt(n: u128) -> u128 {
     if n < 2 {
         return n;
@@ -287,6 +351,14 @@ fn isqrt(n: u128) -> u128 {
         x = y;
         y = (x + n / x) / 2;
     }
+    // Both halves of the definition. Newton's method converges from above, so an off-by-one here
+    // would bias every reported sigma in the same direction rather than cancelling out.
+    assert!(x <= n, "isqrt above its own input: {x} for {n}");
+    assert!(x * x <= n, "isqrt overshot: {x}^2 > {n}");
+    // `(x+1)^2` past `u128` is past `n` too, so the upper half holds trivially there.
+    if let Some(next_sq) = (x + 1).checked_mul(x + 1) {
+        assert!(next_sq > n, "isqrt undershot: ({x}+1)^2 <= {n}");
+    }
     x
 }
 
@@ -294,12 +366,12 @@ fn isqrt(n: u128) -> u128 {
 // Inventory
 // ---------------------------------------------------------------------------
 
-/// One pair's inventory position, in quote units, against its configured target.
+/// One pair's inventory position, in quote units.
 ///
 /// # What "the book" is, for a pool with a shared quote token
 ///
-/// The target is a **share of the book**, not an absolute amount, so it stays meaningful as the
-/// pool grows or shrinks. The book for one pair is
+/// A share of the book rather than an absolute amount, so it stays meaningful as the pool grows or
+/// shrinks:
 ///
 /// ```text
 /// book_i = value(base_i) + quote_balance / pairs
@@ -307,10 +379,10 @@ fn isqrt(n: u128) -> u128 {
 ///
 /// The even split of the shared quote token is a simplification and is named as one: both pairs
 /// draw their bids from the same mUSDC, and nothing yet caps the sum of their bid liabilities
-/// against it. That is archi_v2 §5.4's cross-asset clamp, which the README lists as not built.
-/// This makes exactly the same assumption that gap already makes, in exactly the same place, so
-/// it adds no new error — but a reader should know that `q` for one pair is not independent of
-/// the other's inventory, and that closing the cross-asset clamp is what would make it so.
+/// against it. That is archi_v2 §5.4's cross-asset clamp, which the README lists as not built. This
+/// makes the same assumption that gap already makes, in the same place, so it adds no new error —
+/// but `q` for one pair is not independent of the other's inventory, and closing the cross-asset
+/// clamp is what would make it so.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Inventory {
     /// Base holdings valued at the reference, in quote units.
@@ -318,15 +390,14 @@ pub struct Inventory {
     /// The hedge position, valued at the same reference and **signed**: negative when the venue is
     /// short, which is what a hedge against inventory looks like.
     ///
-    /// Without this the skew reads the pool's balance alone and fights the hedge. The pool holds
-    /// 3,506 ETH and the venue is short 3,506; net exposure is zero and the right quote is
-    /// symmetric. Reading the pool alone says "3,506 ETH, too much, price it down" -- so the hedge
-    /// flattens the position and the skew immediately prices to rebuild it. Two controls, opposite
-    /// directions, both convinced they are correcting.
+    /// Without this the skew reads the pool's balance alone and fights the hedge: hold 3,506 ETH
+    /// against a 3,506 short and net exposure is zero, but the balance alone says "too much base,
+    /// price it down", so the hedge flattens and the skew immediately prices to rebuild. Two
+    /// controls, opposite directions, both convinced they are correcting.
     ///
-    /// Includes what is in flight. A hedge that has been sent but not filled has already committed
-    /// the exposure; counting only what has settled double-counts it for as long as the venue takes
-    /// to answer, which this afternoon was long enough to turn one 0.04 ETH fill into a 0.08 short.
+    /// Includes what is in flight. A hedge sent but not filled has already committed the exposure;
+    /// counting only what has settled double-counts it for as long as the venue takes to answer,
+    /// which one afternoon was long enough to turn one 0.04 ETH fill into a 0.08 short.
     pub hedge_value: i128,
     /// This pair's share of the shared quote balance, in quote units.
     pub quote_share: u128,
@@ -342,27 +413,26 @@ impl Inventory {
     /// # The target is zero, and it used to be `target_base_share_pct`
     ///
     /// That subtraction put two different questions in one expression. The numerator answers a RISK
-    /// question -- how much does the pool lose if the price moves -- and it is measured after the
-    /// hedge. `target_base_share_pct` answers a FUNDING question -- how much base must be on hand to
-    /// settle a fill -- and a perp short supplies none of it. Both are shares of the book, so the
+    /// question -- how much does the pool lose if the price moves -- and is measured after the
+    /// hedge. `target_base_share_pct` answered a FUNDING question -- how much base must be on hand
+    /// to settle a fill -- which a perp short supplies none of. Both are shares of the book, so the
     /// subtraction compiled and the tests passed; the quantities were never comparable.
     ///
-    /// It failed in the worst direction: the better the hedge, the further the numerator fell toward
-    /// zero while the target stayed at 50%, so a fully hedged pair read as maximally SHORT and the
-    /// skew lifted the book to buy base it already had $9M of.
-    ///
-    /// Measured live on 2026-07-29, ten fills against the ETH pair with the pool at its band:
+    /// It failed in the worst direction: the better the hedge, the further the numerator fell
+    /// toward zero while the target stayed at 50%, so a fully hedged pair read as maximally SHORT
+    /// and the skew lifted the book to buy base it already had $9M of. Measured live on 2026-07-29,
+    /// ten fills against the ETH pair with the pool at its band:
     ///
     /// ```text
     /// pool sells base   +7.74 bp realised    <- book lifted 3.65 bp
     /// pool buys  base   +0.44 bp realised    <- four of six fills NEGATIVE
     /// ```
     ///
-    /// Negative means the pool paid above its own reference to be sold ETH. Against a half-spread of
-    /// 2.13 bp the lift was 3.65 bp, so one side was free to take.
+    /// Negative means the pool paid above its own reference to be sold ETH. Against a half-spread
+    /// of 2.13 bp the lift was 3.65 bp, so one side was free to take.
     ///
-    /// Funding is now nobody's business here. It is a constraint on capacity -- a pair cannot pay out
-    /// base it does not hold -- and belongs wherever capacity is decided, not in the price.
+    /// Funding is now nobody's business here. It is a constraint on capacity -- a pair cannot pay
+    /// out base it does not hold -- and belongs wherever capacity is decided, not in the price.
     #[must_use]
     pub fn imbalance_ppm(&self) -> i64 {
         // The book is what the pool OWNS. A perp hedge adds none of it -- it changes the exposure,
@@ -371,14 +441,32 @@ impl Inventory {
         if book == 0 {
             return 0;
         }
+        assert!(book > 0, "an empty book returns above, never divides");
         let net = i128::try_from(self.base_value)
             .unwrap_or(i128::MAX)
             .saturating_add(self.hedge_value);
+        if self.hedge_value == 0 {
+            assert!(net >= 0, "an unhedged pool cannot be short: {net}");
+        }
         // A hedge larger than the holding leaves a net short. That is over-hedged rather than
         // impossible, and the skew should price to unwind it, so the signed path is kept rather
         // than clamped at zero.
         let book_i = i128::try_from(book).unwrap_or(i128::MAX).max(1);
-        i64::try_from(net.saturating_mul(1_000_000) / book_i).unwrap_or(1_000_000)
+        assert!(book_i > 0, "a non-positive book would flip every sign");
+        let q = i64::try_from(net.saturating_mul(1_000_000) / book_i).unwrap_or(1_000_000);
+        // The sign convention the whole module hangs on: `q > 0` prices the book DOWN. Getting it
+        // backwards is the failure this field was rewritten for -- a fully hedged pair reading as
+        // maximally short and the skew lifting the bid to buy base it already held.
+        if net > 0 {
+            assert!(q >= 0, "a net long read as short: net {net} -> q {q}");
+        }
+        if net < 0 {
+            assert!(q <= 0, "a net short read as long: net {net} -> q {q}");
+        }
+        if net == 0 {
+            assert_eq!(q, 0, "a flat position has nothing to skew against");
+        }
+        q
     }
 }
 
@@ -428,7 +516,15 @@ impl Clamp {
     /// Whether a bound actually bit.
     #[must_use]
     pub const fn bound(self) -> bool {
-        !matches!(self, Self::Unbound)
+        let out = !matches!(self, Self::Unbound);
+        // Both directions, because the log line reads `clamp` and `bound` as one claim: a `true`
+        // here with `Unbound` next to it would say the model and the clamp both decided.
+        if matches!(self, Self::Unbound) {
+            assert!(!out, "the unbound case is the one where nothing bit");
+        } else {
+            assert!(out, "every other case is a bound that bit");
+        }
+        out
     }
 }
 
@@ -458,19 +554,21 @@ pub struct Skew {
 /// The largest positive skew that still leaves the bid target above the pair's `minPrice`.
 ///
 /// A positive skew moves the whole book down, and the bid target is the lowest thing derived from
-/// the mid, so it hits the pool's absolute floor first. Past that point `ladder::build` refuses
-/// the row — correctly, because `minPrice` is an oracle-independent backstop and quoting through
-/// it is exactly what the floor forbids — but a refused row means the pool quotes nothing until
-/// the market moves back. Clamping here trades a little skew for staying in the market, which is
-/// the right way round: the skew is a preference and quoting is the job.
+/// the mid, so it hits the pool's absolute floor first. Past that point `ladder::build` refuses the
+/// row — correctly, because `minPrice` is an oracle-independent backstop — but a refused row means
+/// the pool quotes nothing until the market moves back. Clamping here trades a little skew for
+/// staying in the market, which is the right way round: the skew is a preference and quoting is the
+/// job.
 ///
 /// Derivation. `ladder::build` computes `mid = floor(fair * (BPS - skew) / BPS)` and then
 /// `bid = floor(mid * (BPS - hs) / BPS)`, and needs `bid >= min_price`. It is sufficient that
-/// `mid >= ceil(min_price * BPS / (BPS - hs)) + 1`, where the `+ 1` absorbs the floor in the
-/// second step. Solving for the skew and rounding conservatively gives the value returned here.
+/// `mid >= ceil(min_price * BPS / (BPS - hs)) + 1`, where the `+ 1` absorbs the floor in the second
+/// step. Solving for the skew and rounding conservatively gives the value returned here.
 #[must_use]
 pub fn price_cap_bps_min(fair: u128, min_price: u128, half_spread_bps: u16) -> u16 {
     let hs = u128::from(half_spread_bps).min(BPS_MAX);
+    assert!(hs <= BPS_MAX, "half-spread outside the ladder's domain");
+    assert!(BPS > hs, "the divisor below would be zero or wrap");
     if fair == 0 {
         return 0;
     }
@@ -481,12 +579,23 @@ pub fn price_cap_bps_min(fair: u128, min_price: u128, half_spread_bps: u16) -> u
     if fair <= mid_min {
         return 0;
     }
+    assert!(
+        fair > mid_min,
+        "a fair value at the floor has no room to skew"
+    );
     // skew <= BPS - ceil(mid_min * BPS / fair)
     let Some(needed) = mul_div_ceil(mid_min, BPS, fair) else {
         return 0;
     };
     let cap = BPS.saturating_sub(needed);
-    u16::try_from(cap.min(BPS_MAX)).unwrap_or(0)
+    let out = u16::try_from(cap.min(BPS_MAX)).unwrap_or(0);
+    // A cap past `BPS_MAX` would let the skew invert the price rather than merely floor it, and
+    // `ladder::build` would refuse the row this exists to keep quoting.
+    assert!(
+        u128::from(out) <= BPS_MAX,
+        "floor cap outside the domain: {out}"
+    );
+    out
 }
 
 /// Compute the Avellaneda–Stoikov linear skew for one row.
@@ -497,25 +606,22 @@ pub fn price_cap_bps_min(fair: u128, min_price: u128, half_spread_bps: u16) -> u
 /// direction writes a free option.
 ///
 /// A **positive** skew moves the book down. The pool is long, wants to sell, and both its bid and
-/// its ask fall. The bid falling is defensive — it widens the gap between what the pool pays and
-/// what the market says the asset is worth — and the ask falling is the point, because a cheaper
-/// ask is what actually works the position off. Neither side of that is a gift to a taker. The
-/// bound that matters in this direction is structural rather than economic, and it is the
-/// `minPrice` floor, which is why [`price_cap_bps_min`] is folded in here rather than left to
-/// downstream refusal.
+/// its ask fall. The bid falling is defensive, and the ask falling is the point, because a cheaper
+/// ask is what actually works the position off. Neither side is a gift to a taker. The bound that
+/// matters here is structural rather than economic — the `minPrice` floor, which is why
+/// [`price_cap_bps_min`] is folded in rather than left to downstream refusal.
 ///
 /// A **negative** skew moves the book up. The pool is short base, wants to buy, and its **bid**
-/// rises toward and eventually past the reference. A bid above fair value is a free option
-/// written to whoever notices first — precisely the adverse-selection direction the whole
-/// `adverse_drift_bps` asymmetry in `policy` exists to defend against — and unlike the positive
-/// direction there is no structural floor to stop it. So it is capped tighter, and the tighter
-/// cap is the *economic* one. The cost of the asymmetry is that a short book is worked off more
-/// slowly than a long one; that is the correct trade for a book that cannot hedge, because a
-/// slow recovery costs volume and a picked-off bid costs money.
+/// rises toward and eventually past the reference. A bid above fair value is a free option written
+/// to whoever notices first — the adverse-selection direction the whole `adverse_drift_bps`
+/// asymmetry in `policy` exists to defend against — and there is no structural floor to stop it. So
+/// it is capped tighter, and that tighter cap is the *economic* one. The cost is that a short book
+/// is worked off more slowly than a long one: the correct trade, because a slow recovery costs
+/// volume and a picked-off bid costs money.
 ///
 /// Both caps also stop a single wild `sigma` print from inverting the strategy. `sigma^2` is
-/// quadratic, so a volatility estimate that is 10x too high produces a skew 100x too large, and
-/// the cap is what keeps that from becoming a 300 bp quote before anyone reads a log.
+/// quadratic, so a volatility estimate 10x too high produces a skew 100x too large, and the cap is
+/// what keeps that from becoming a 300 bp quote before anyone reads a log.
 #[must_use]
 pub fn compute(
     inventory: &Inventory,
@@ -525,17 +631,7 @@ pub fn compute(
     floor_cap_bps: u16,
 ) -> Skew {
     let q = inventory.imbalance_ppm();
-
-    // skew_decibps = 10 * gamma * q * sigma^2 / 10_000, in two steps so no intermediate is
-    // larger than it has to be. `step` is `gamma * sigma^2 * 1_000`.
-    let step =
-        mul_div_floor(sigma_sq_bps_e6, u128::from(params.gamma_e2), 100_000).unwrap_or(u128::MAX);
-    let magnitude = mul_div_floor(step, u128::from(q.unsigned_abs()), 1_000_000_000_000)
-        .unwrap_or(u128::from(u32::MAX));
-    let magnitude = i64::try_from(magnitude).unwrap_or(i64::from(i32::MAX));
-    let raw_decibps_i64 = if q < 0 { -magnitude } else { magnitude };
-    let raw_decibps =
-        i32::try_from(raw_decibps_i64).unwrap_or(if q < 0 { i32::MIN } else { i32::MAX });
+    let raw_decibps = compute_raw_decibps(q, sigma_sq_bps_e6, params);
 
     // Round half away from zero, so a 0.5 bp skew becomes 1 bp rather than 0. `dubu-core` takes
     // whole bps; sub-bp resolution would mean a second implementation of the skew here, which is
@@ -546,9 +642,23 @@ pub fn compute(
     } else {
         raw_decibps.saturating_sub(5) / 10
     };
+    if raw_decibps > 0 {
+        assert!(
+            rounded >= 0,
+            "rounding flipped a long book short: {rounded}"
+        );
+    }
+    if raw_decibps < 0 {
+        assert!(
+            rounded <= 0,
+            "rounding flipped a short book long: {rounded}"
+        );
+    }
 
     let positive_cap = i32::from(params.positive_bps_max.min(floor_cap_bps));
     let negative_cap = -i32::from(params.negative_bps_max);
+    assert!(positive_cap >= 0, "the book-lowering cap cannot lift it");
+    assert!(negative_cap <= 0, "the book-lifting cap cannot lower it");
     let (applied, clamp) = if rounded > positive_cap {
         let by = if i32::from(floor_cap_bps) < i32::from(params.positive_bps_max) {
             Clamp::MinPriceFloor
@@ -561,6 +671,21 @@ pub fn compute(
     } else {
         (rounded, Clamp::Unbound)
     };
+    assert!(applied <= positive_cap, "skew past its own positive cap");
+    assert!(applied >= negative_cap, "skew past its own negative cap");
+    // `clamp` is what the operator reads to tell the model's decision from the cap's, so it has to
+    // agree with `applied` in both directions rather than merely most of the time.
+    if clamp == Clamp::Unbound {
+        assert_eq!(
+            applied, rounded,
+            "an unbound skew is the model's own number"
+        );
+    } else {
+        assert_ne!(
+            applied, rounded,
+            "a bound that changed nothing is not a bound"
+        );
+    }
 
     Skew {
         applied_bps: i16::try_from(applied).unwrap_or(0),
@@ -570,6 +695,39 @@ pub fn compute(
         floor_cap_bps,
         clamp,
     }
+}
+
+/// The model's own number, in deci-bps, before any clamp: `10 * gamma * q * sigma^2 / 10_000`.
+///
+/// In two steps so no intermediate is larger than it has to be; `step` is `gamma * sigma^2 * 1000`.
+fn compute_raw_decibps(q: i64, sigma_sq_bps_e6: u128, params: &SkewParams) -> i32 {
+    let step =
+        mul_div_floor(sigma_sq_bps_e6, u128::from(params.gamma_e2), 100_000).unwrap_or(u128::MAX);
+    let magnitude = mul_div_floor(step, u128::from(q.unsigned_abs()), 1_000_000_000_000)
+        .unwrap_or(u128::from(u32::MAX));
+    let magnitude = i64::try_from(magnitude).unwrap_or(i64::from(i32::MAX));
+    assert!(magnitude >= 0, "a magnitude carries no sign: {magnitude}");
+    let raw_decibps_i64 = if q < 0 { -magnitude } else { magnitude };
+    let out = i32::try_from(raw_decibps_i64).unwrap_or(if q < 0 { i32::MIN } else { i32::MAX });
+    // The sign comes from the inventory and from nothing else. A skew that disagreed with `q` would
+    // quote to acquire exactly the exposure the pool is trying to shed.
+    if q > 0 {
+        assert!(out >= 0, "a long book skewed the book up: q {q} -> {out}");
+    }
+    if q < 0 {
+        assert!(
+            out <= 0,
+            "a short book skewed the book down: q {q} -> {out}"
+        );
+    }
+    if q == 0 {
+        assert_eq!(out, 0, "a flat book has nothing to skew against");
+    }
+    // The saturation floor and ceiling both exist; neither may be crossed.
+    if sigma_sq_bps_e6 == 0 {
+        assert_eq!(out, 0, "no volatility means no risk to skew against");
+    }
+    out
 }
 
 #[cfg(test)]

@@ -1,10 +1,8 @@
 //! Binance spot `bookTicker`.
 //!
 //! Read-only public market data. **No credentials, no account endpoints, no order entry**, and
-//! nothing in this file can be extended into any of those without adding a signing step that
-//! does not exist. `bookTicker` needs no API key precisely because it is public observation
-//! rather than participation — which is also why it is available to a desk that has no exchange
-//! account, and this desk has none.
+//! nothing here can be extended into any of those without adding a signing step that does not
+//! exist.
 //!
 //! # Wire format
 //!
@@ -17,7 +15,7 @@
 //! ```
 //!
 //! `u` is the order-book update id, `b`/`B` the best bid and its size, `a`/`A` the best ask and
-//! its size. All five numeric fields are decimal strings and are parsed as exact fixed-point at
+//! its size. All five numeric fields are decimal strings parsed as exact fixed-point at
 //! [`crate::units::FEED_SCALE`]; see that module for why there is no `f64` on this path.
 //!
 //! `u` is monotone but **not contiguous**, so a dropped message is undetectable here; see the
@@ -67,14 +65,31 @@ pub struct Client {
 
 impl Client {
     /// Build from `(venue symbol, canonical symbol)` pairs.
+    ///
+    /// # Panics
+    /// If any symbol is empty. Config load is where that is meant to be caught; a client built
+    /// from a blank symbol subscribes to nothing and reads as a healthy silent venue.
     #[must_use]
     pub fn new(symbols: &[(String, String)]) -> Self {
-        Self {
+        for (venue, canonical) in symbols {
+            assert!(!venue.is_empty(), "a binance symbol must not be blank");
+            assert!(
+                !canonical.is_empty(),
+                "a canonical symbol must not be blank"
+            );
+        }
+        let client = Self {
             symbols: symbols
                 .iter()
                 .map(|(v, c)| (v.to_uppercase(), c.clone()))
                 .collect(),
-        }
+        };
+        debug_assert_eq!(
+            client.symbols.len(),
+            symbols.len(),
+            "two pairs claim the same binance symbol, so one of them is silently unsubscribed"
+        );
+        client
     }
 }
 
@@ -84,16 +99,25 @@ impl MarketFeed for Client {
     }
 
     fn url(&self, base: &str) -> String {
+        assert!(!base.is_empty(), "the binance endpoint must be configured");
+        assert!(
+            !self.symbols.is_empty(),
+            "a combined stream with no streams never delivers a frame"
+        );
         let streams: Vec<String> = self
             .symbols
             .keys()
             .map(|s| format!("{}@bookTicker", s.to_lowercase()))
             .collect();
-        format!(
+        assert_eq!(streams.len(), self.symbols.len());
+        let url = format!(
             "{}?streams={}",
             base.trim_end_matches('/'),
             streams.join("/")
-        )
+        );
+        assert!(url.contains("?streams="));
+        assert!(!url.ends_with("?streams="));
+        url
     }
 
     fn subscribe_frames(&self) -> Vec<String> {
@@ -101,7 +125,6 @@ impl MarketFeed for Client {
     }
 
     fn parse(&mut self, text: &str) -> Result<Option<Update>, String> {
-        // Try the combined-stream envelope first, then the raw single-stream shape, then give up.
         let data: BookTickerData = match serde_json::from_str::<Envelope>(text) {
             Ok(e) => e.data,
             Err(_) => match serde_json::from_str::<BookTickerData>(text) {
@@ -112,6 +135,7 @@ impl MarketFeed for Client {
         let Some(symbol) = self.symbols.get(&data.s.to_uppercase()) else {
             return Ok(None);
         };
+        debug_assert!(!symbol.is_empty(), "`new` rejects a blank canonical symbol");
 
         let f = |field: &str, v: &str| -> Result<u128, String> {
             units::parse_fixed(v, FEED_SCALE).map_err(|e| format!("{field}: {e}"))
@@ -123,6 +147,8 @@ impl MarketFeed for Client {
             ask: f("a", &data.a)?,
             ask_qty: f("A", &data.ask_qty)?,
         };
+        // Every field decoded, so none of the four is a silent zero standing in for a parse that
+        // failed. Whether the *book* is sane is `fair_value`'s question, not this parser's.
         Ok(Some(Update {
             symbol: symbol.clone(),
             tick,

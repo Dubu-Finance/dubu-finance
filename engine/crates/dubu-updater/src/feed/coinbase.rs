@@ -28,12 +28,11 @@
 //! * The `-USD` books are deep and continuous, and the entire 9 bp gap is the **USDT/USD basis**.
 //!   The pool's pairs track `ETHUSDT` and `BTCUSDT`, so a USD-quoted venue is not a second
 //!   observation of the same price — it is a different price, and averaging it in would bias the
-//!   reference by roughly `9 / n` bps against a 5 bp half-spread. That is a units error wearing
-//!   the costume of redundancy.
+//!   reference by roughly `9 / n` bps against a 5 bp half-spread.
 //! * The `-USDT` books are the right *unit* but thin (~500 ETH a day), and the `ticker` channel
 //!   fires on **trades**, not on book changes, so it sits outside `stale_after_ms` most of the
-//!   time. It would count toward the venue list and contribute nothing, which is worse than being
-//!   absent because it makes quorum look healthier than it is.
+//!   time. It would count toward the venue list and contribute nothing, making quorum look
+//!   healthier than it is.
 //!
 //! So the client exists, is parsed against a captured live frame in the tests, and is left out of
 //! `updater.toml`. A pair whose base genuinely trades against USD would enable it by naming a
@@ -67,11 +66,28 @@ pub struct Client {
 
 impl Client {
     /// Build from `(venue product, canonical symbol)` pairs.
+    ///
+    /// # Panics
+    /// If any symbol is empty. A client built from a blank product subscribes to nothing and
+    /// reads as a healthy silent venue.
     #[must_use]
     pub fn new(symbols: &[(String, String)]) -> Self {
-        Self {
-            symbols: symbols.iter().cloned().collect(),
+        for (product, canonical) in symbols {
+            assert!(!product.is_empty(), "a coinbase product must not be blank");
+            assert!(
+                !canonical.is_empty(),
+                "a canonical symbol must not be blank"
+            );
         }
+        let client = Self {
+            symbols: symbols.iter().cloned().collect(),
+        };
+        debug_assert_eq!(
+            client.symbols.len(),
+            symbols.len(),
+            "two pairs claim the same coinbase product, so one is silently unsubscribed"
+        );
+        client
     }
 }
 
@@ -81,11 +97,18 @@ impl MarketFeed for Client {
     }
 
     fn subscribe_frames(&self) -> Vec<String> {
+        assert!(
+            !self.symbols.is_empty(),
+            "a subscription naming no product never delivers a ticker"
+        );
         let products: Vec<String> = self.symbols.keys().map(|s| format!("\"{s}\"")).collect();
-        vec![format!(
+        assert_eq!(products.len(), self.symbols.len());
+        let frame = format!(
             r#"{{"type":"subscribe","product_ids":[{}],"channels":["ticker"]}}"#,
             products.join(",")
-        )]
+        );
+        debug_assert!(serde_json::from_str::<serde_json::Value>(&frame).is_ok());
+        vec![frame]
     }
 
     fn parse(&mut self, text: &str) -> Result<Option<Update>, String> {
@@ -99,9 +122,11 @@ impl MarketFeed for Client {
         if t.kind != "ticker" {
             return Ok(None);
         }
+        assert_eq!(t.kind, "ticker", "every other frame kind exited above");
         let Some(symbol) = self.symbols.get(&t.product_id) else {
             return Ok(None);
         };
+        debug_assert!(!symbol.is_empty(), "`new` rejects a blank canonical symbol");
 
         let f = |field: &str, v: &str| -> Result<u128, String> {
             units::parse_fixed(v, FEED_SCALE).map_err(|e| format!("{field}: {e}"))

@@ -9,21 +9,20 @@
 //! That is enforced by the type rather than by discipline. [`FeedSnapshot::live`] returns
 //! `Some` only while that venue is connected *and* the last accepted tick is inside
 //! `stale_after_ms`; every other case is `None`, whatever is still sitting in memory. The last
-//! tick is reachable through [`FeedSnapshot::last_seen`], whose name and doc comment say it is
-//! for logging, and which no pricing path calls.
+//! tick is reachable through [`FeedSnapshot::last_seen`], which no pricing path calls.
 //!
-//! This matters more than it sounds. The failure it prevents is the quiet one: the socket dies
-//! during a fast move, the bot keeps quoting a two-minute-old price against a market that has
-//! moved 80 bp, and every taker who notices gets a free option until `maxStaleSecs` expires.
+//! The failure it prevents is the quiet one: the socket dies during a fast move, the bot keeps
+//! quoting a two-minute-old price against a market that has moved 80 bp, and every taker who
+//! notices gets a free option until `maxStaleSecs` expires.
 //!
 //! # Why more than one venue
 //!
-//! One exchange makes the on-chain price bound vacuous in exactly the way a single-source oracle
-//! is: the ladder and its own sanity limits are derived from the same number, so a feed that is
-//! *confidently wrong* — a bad parse, a socket that stays open and serves stale data, an exchange
-//! printing garbage mid-outage — produces a ladder nothing downstream can catch. Several
-//! independent venues give the combiner in [`crate::fair_value`] a cross-section to reject
-//! against, which is the only defence available until the on-chain Pyth deviation bound exists.
+//! One exchange makes the on-chain price bound vacuous in the way a single-source oracle is: the
+//! ladder and its own sanity limits derive from the same number, so a feed that is *confidently
+//! wrong* — a bad parse, a socket that stays open and serves stale data, an exchange printing
+//! garbage mid-outage — produces a ladder nothing downstream can catch. Several independent
+//! venues give the combiner in [`crate::fair_value`] a cross-section to reject against, which is
+//! the only defence available until the on-chain Pyth deviation bound exists.
 //!
 //! Each venue is its own socket, its own reconnect loop and its own [`FeedShared`]. Nothing is
 //! shared between them but the clock, so one venue failing cannot take another down.
@@ -31,7 +30,7 @@
 //! # Two statuses, deliberately
 //!
 //! [`VenueStatus`] is what one venue is doing with one symbol. [`FeedStatus`] is what the *system*
-//! is allowed to conclude about that symbol once every venue has been read and combined — and the
+//! may conclude about that symbol once every venue has been read and combined — and the
 //! interesting states there are not about sockets at all, they are `NoQuorum` and `Dispersed`.
 //! [`crate::policy`] gates on the second, never the first: a single venue's status is never on its
 //! own a reason to quote or not to quote.
@@ -41,11 +40,11 @@
 //! Every venue here carries some monotone update id, and none of them is contiguous, so a
 //! *dropped* message is not detectable and this module does not claim to detect one. What **is**
 //! detectable, and is treated as a gap, is a **regression**: an id at or below the last accepted
-//! value for that symbol on that venue. That means a duplicate, a reordering, or a server-side
-//! book reset, and in all three cases the tick is dropped rather than applied over newer state.
-//! The one exception is a frame whose protocol explicitly says "reset your local book" — Bybit's
-//! `snapshot` — which is applied through [`FeedShared::record_reset`] with the check bypassed,
-//! because refusing it would be refusing the venue's own resynchronisation.
+//! value for that symbol on that venue — a duplicate, a reordering, or a server-side book reset,
+//! and in all three cases the tick is dropped rather than applied over newer state. The one
+//! exception is a frame whose protocol explicitly says "reset your local book" — Bybit's
+//! `snapshot` — applied through [`FeedShared::record_reset`] with the check bypassed, because
+//! refusing it would be refusing the venue's own resynchronisation.
 
 pub mod binance;
 pub mod bybit;
@@ -241,13 +240,21 @@ impl FeedSnapshot {
     /// The tick, **only** if it may be priced from.
     ///
     /// `None` whenever this venue is not [`VenueStatus::Live`]. This is the only accessor any
-    /// pricing path may call.
+    /// pricing path may call, and the assertions below are the module's one invariant written
+    /// where it is relied on.
     #[must_use]
     pub fn live(&self) -> Option<&BookTick> {
-        match self.status {
+        let tick = match self.status {
             VenueStatus::Live => self.tick.as_ref(),
             _ => None,
+        };
+        if tick.is_some() {
+            assert!(self.status.is_live(), "a price escaped a non-live venue");
         }
+        if !self.status.is_live() {
+            assert!(tick.is_none());
+        }
+        tick
     }
 
     /// The last tick regardless of status — **for logging and diagnostics only**.
@@ -260,10 +267,8 @@ impl FeedSnapshot {
     }
 }
 
-/// Why a tick was not accepted.
-///
-/// One variant, because one thing is detectable on these streams. See the module docs on what a
-/// venue's update id can and cannot tell you.
+/// Why a tick was not accepted. One variant, because one thing is detectable on these streams;
+/// see the module docs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Rejected {
     /// An id at or below the last accepted one for this symbol: a duplicate, a reordering, or a
@@ -297,11 +302,21 @@ pub struct FeedShared {
 
 impl FeedShared {
     /// Create the shared state for one venue. Symbols appear as their first tick arrives.
+    ///
+    /// # Panics
+    /// If `stale_after` is zero, which would make every tick stale on arrival and every venue
+    /// permanently unusable.
     #[must_use]
     pub fn new(venue: VenueId, stale_after: Duration) -> Self {
+        assert!(
+            !stale_after.is_zero(),
+            "every tick would be stale on arrival"
+        );
         Self {
             venue,
             inner: Mutex::new(Inner {
+                // Down until the socket task says otherwise: a venue that has never connected
+                // must not read as connected-with-no-data.
                 link: Link::Down,
                 symbols: HashMap::new(),
                 reconnects: 0,
@@ -325,6 +340,7 @@ impl FeedShared {
     /// # Errors
     /// [`Rejected::SequenceRegression`].
     pub fn record(&self, symbol: &str, tick: BookTick, now: Instant) -> Result<(), Rejected> {
+        assert!(!symbol.is_empty(), "a tick must name a symbol");
         let mut g = self.lock();
         let have = g.symbols.get(symbol).map(|s| s.tick.update_id);
         if let Some(have) = have {
@@ -335,23 +351,35 @@ impl FeedShared {
                     have,
                 });
             }
+            // The whole point of the check: what gets stored is strictly newer than what was
+            // there, so newer data can never be overwritten by older data.
+            assert!(tick.update_id > have);
         }
         g.symbols
             .insert(symbol.to_string(), SymbolState { tick, at: now });
+        debug_assert_eq!(
+            g.symbols.get(symbol).map(|s| s.tick.update_id),
+            Some(tick.update_id)
+        );
         Ok(())
     }
 
     /// Apply a tick **unconditionally**, for a frame whose protocol says the book was reset.
     ///
-    /// Only Bybit needs this: its `orderbook.1` stream stamps a frame `snapshot` when the
-    /// service restarts and the update id goes back to 1. Refusing that as a regression would be
-    /// refusing the venue's own resynchronisation and would present as a permanently dead symbol.
-    /// Every other caller uses [`FeedShared::record`], because bypassing the check is exactly the
-    /// hole the check exists to close.
+    /// Only Bybit needs this: its `orderbook.1` stream stamps a frame `snapshot` when the service
+    /// restarts and the update id goes back to 1. Refusing that as a regression would present as a
+    /// permanently dead symbol. Every other caller uses [`FeedShared::record`], because bypassing
+    /// the check is the hole the check exists to close.
     pub fn record_reset(&self, symbol: &str, tick: BookTick, now: Instant) {
+        assert!(!symbol.is_empty(), "a tick must name a symbol");
         let mut g = self.lock();
         g.symbols
             .insert(symbol.to_string(), SymbolState { tick, at: now });
+        debug_assert_eq!(
+            g.symbols.get(symbol).map(|s| s.tick.update_id),
+            Some(tick.update_id),
+            "a reset applies unconditionally, whatever the id was"
+        );
     }
 
     /// The socket came up.
@@ -363,21 +391,30 @@ impl FeedShared {
     /// than a resurrected pre-outage price.
     pub fn on_connected(&self, first: bool) {
         let mut g = self.lock();
+        let before = g.reconnects;
         g.link = Link::Up;
         g.symbols.clear();
         if !first {
             g.reconnects += 1;
         }
+        assert!(g.symbols.is_empty(), "a pre-outage price must not survive");
+        assert_eq!(g.link, Link::Up);
+        if first {
+            assert_eq!(g.reconnects, before, "the first connect is not a reconnect");
+        }
     }
 
     /// The socket went down.
     pub fn on_disconnected(&self) {
-        self.lock().link = Link::Down;
+        let mut g = self.lock();
+        g.link = Link::Down;
+        assert_eq!(g.link, Link::Down);
     }
 
     /// Read one symbol.
     #[must_use]
     pub fn snapshot(&self, symbol: &str, now: Instant) -> FeedSnapshot {
+        assert!(!symbol.is_empty(), "a snapshot must name a symbol");
         let g = self.lock();
         let entry = g.symbols.get(symbol);
         let age = entry.map(|s| now.saturating_duration_since(s.at));
@@ -390,6 +427,17 @@ impl FeedShared {
                 age_ms: age_ms.unwrap_or(u64::MAX),
             },
         };
+        // The link and the tick each independently veto `Live`; neither alone grants it.
+        if status.is_live() {
+            assert_eq!(g.link, Link::Up);
+            assert!(entry.is_some());
+        }
+        if g.link == Link::Down {
+            assert!(!status.is_live());
+        }
+        if entry.is_none() {
+            assert!(age_ms.is_none());
+        }
         FeedSnapshot {
             status,
             age_ms,
@@ -427,10 +475,10 @@ pub struct VenueFeeds {
     ///
     /// Without this, [`Self::snapshots`] asks every venue about every symbol and a venue that was
     /// never asked answers [`VenueStatus::NoData`] -- indistinguishable from one that was asked and
-    /// has not printed. `VenueWatch` then reports it as a venue LOST. Adding the equity pairs made
+    /// has not printed, so `VenueWatch` reports it as a venue LOST. Adding the equity pairs made
     /// that concrete: Binance, OKX and Bybit list no shares, so a boot logged twelve "VENUE LOST"
-    /// warnings for venues that had never carried those symbols, which is exactly how a real venue
-    /// outage stops being noticed.
+    /// warnings for venues that had never carried those symbols, which is how a real venue outage
+    /// stops being noticed.
     carries: BTreeMap<VenueId, BTreeSet<String>>,
 }
 
@@ -440,9 +488,17 @@ impl VenueFeeds {
     /// The coverage is required rather than optional: a venue with no symbols carries nothing and
     /// is absent from every cross-section, which is a legitimate state and must not be confused
     /// with "not configured, so let everything through".
+    ///
+    /// # Panics
+    /// If a venue appears twice in `coverage`, which would silently drop one of the two symbol
+    /// lists and leave those symbols quoted by nothing.
     #[must_use]
     pub fn new(coverage: &[(VenueId, Vec<String>)], stale_after: Duration) -> Self {
-        Self {
+        assert!(
+            !stale_after.is_zero(),
+            "every tick would be stale on arrival"
+        );
+        let feeds = Self {
             carries: coverage
                 .iter()
                 .map(|(v, syms)| (*v, syms.iter().cloned().collect()))
@@ -451,18 +507,30 @@ impl VenueFeeds {
                 .iter()
                 .map(|&(v, _)| (v, std::sync::Arc::new(FeedShared::new(v, stale_after))))
                 .collect(),
-        }
+        };
+        assert_eq!(
+            feeds.feeds.len(),
+            coverage.len(),
+            "a venue was listed twice"
+        );
+        assert_eq!(feeds.carries.len(), feeds.feeds.len());
+        feeds
     }
 
     /// The shared state for one venue, for handing to its socket task.
     #[must_use]
     pub fn venue(&self, v: VenueId) -> Option<std::sync::Arc<FeedShared>> {
-        self.feeds.get(&v).cloned()
+        let shared = self.feeds.get(&v).cloned();
+        if let Some(ref s) = shared {
+            assert_eq!(s.venue(), v, "a venue was handed another venue's state");
+        }
+        shared
     }
 
     /// How many venues are configured.
     #[must_use]
     pub fn len(&self) -> usize {
+        debug_assert_eq!(self.feeds.len(), self.carries.len());
         self.feeds.len()
     }
 
@@ -477,18 +545,28 @@ impl VenueFeeds {
         self.feeds.keys().copied()
     }
 
-    /// Read one symbol on every venue that quotes it, in a stable order.
+    /// Read one symbol on every venue that carries it, in a stable order.
     ///
-    /// A venue that does not carry this symbol at all still appears, as
-    /// [`VenueStatus::NoData`] — the caller wants to see that a venue is configured and silent,
-    /// which is precisely the state an absence would hide.
+    /// A venue that carries the symbol and is silent still appears, as [`VenueStatus::NoData`] —
+    /// that is the state an absence would hide. A venue that does not carry it is absent, which
+    /// is what stops a venue that was never asked from being reported as lost.
     #[must_use]
     pub fn snapshots(&self, symbol: &str, now: Instant) -> Vec<(VenueId, FeedSnapshot)> {
-        self.feeds
+        assert!(!symbol.is_empty(), "a cross-section must name a symbol");
+        let snaps: Vec<(VenueId, FeedSnapshot)> = self
+            .feeds
             .iter()
             .filter(|(v, _)| self.carries.get(v).is_some_and(|c| c.contains(symbol)))
             .map(|(&v, f)| (v, f.snapshot(symbol, now)))
-            .collect()
+            .collect();
+        assert!(snaps.len() <= self.feeds.len());
+        debug_assert!(
+            snaps
+                .iter()
+                .all(|(v, _)| self.carries.get(v).is_some_and(|c| c.contains(symbol))),
+            "a venue that does not carry this symbol reached the cross-section"
+        );
+        snaps
     }
 }
 
@@ -541,6 +619,7 @@ impl VenueWatch {
     /// [`VenueStatus::NoData`], so a venue that never connects at all announces itself once
     /// rather than never.
     pub fn diff(&mut self, symbol: &str, snaps: &[(VenueId, FeedSnapshot)]) -> Vec<Transition> {
+        assert!(!symbol.is_empty(), "a transition must name a symbol");
         let mut out = Vec::new();
         for (venue, snap) in snaps {
             let key = (*venue, symbol.to_string());
@@ -564,6 +643,14 @@ impl VenueWatch {
                 }),
             }
         }
+        assert!(
+            out.len() <= snaps.len(),
+            "one venue may report one transition"
+        );
+        debug_assert!(
+            out.iter().all(|t| t.from.label() != t.to.label()),
+            "a transition that changes nothing is exactly what the label compare suppresses"
+        );
         out
     }
 }

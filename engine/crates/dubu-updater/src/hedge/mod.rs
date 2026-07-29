@@ -1,48 +1,24 @@
 //! Neutralising the inventory a fill leaves behind, on a venue that will actually take the other
 //! side.
 //!
-//! # Why this exists, in one number
+//! Unhedged, holding costs `gamma * sigma^2 * holding_time` with `holding_time` *unbounded*, so the
+//! schedule is priced defensively: the pool quotes a 25 bp slope where the measured cost of
+//! unwinding 1,000 ETH on Binance is **3.8 bp**. The whole 6x gap pays for a risk a hedge removes.
+//! Not per fill, though -- that pays the taker fee each time and small fills mostly cancel, so this
+//! tracks *net* exposure and crosses only when it leaves a band.
 //!
-//! Without it the pool's price schedule has to pay for holding whatever it buys until somebody
-//! happens to sell it back. That cost is `gamma * sigma^2 * holding_time`, and `holding_time` with
-//! no hedge is *unbounded* — so the schedule is priced defensively and the pool quotes a 25 bp
-//! slope where the measured cost of actually unwinding 1,000 ETH on Binance is **3.8 bp**. Six
-//! times too steep, and the whole gap is compensation for a risk that a hedge removes.
+//! The band *width* is not derivable: the optimum is `sigma_flow * sqrt(fee / risk_cost)`, and
+//! `sigma_flow` is a property of order flow, which is exactly what there is no data for. The
+//! **interval** is. Holding a drift for `T` seconds risks `sigma * sqrt(T)` of it and clearing it
+//! costs `fee`, so crossing more often than `T* = (fee / sigma_per_sqrt_sec)^2` spends more on fees
+//! than the exposure was worth. Both inputs are known -- fee is a rate card, sigma is measured --
+//! and at a 4 bp taker fee against ETHUSDT's 0.594 bp per root-second that is about **45 seconds**,
+//! so the width adapts to flow without anyone knowing what the flow is. The hard cap on drift on
+//! top is a risk choice, not a derivation: it bounds what a burst builds up before that elapses.
 //!
-//! # Not every fill
-//!
-//! Hedging each fill separately pays the taker fee each time, and small fills mostly cancel: one
-//! taker sells, the next buys, and the net inventory never moved. So this tracks the *net* drift
-//! since the last hedge and only crosses when it leaves a band.
-//!
-//! # What is derivable, and what is not
-//!
-//! The obvious thing to derive is the band *width*, and it cannot be done: the optimal width is
-//! `sigma_flow * sqrt(fee / risk_cost)`, and `sigma_flow` -- how fast inventory drifts -- is a
-//! property of order flow, which is exactly what there is no data for.
-//!
-//! What is derivable is the **interval**. Holding a drift for `T` seconds risks `sigma * sqrt(T)`
-//! of it; clearing it costs `fee`. Crossing more often than the point where those are equal spends
-//! more on fees than the exposure was worth, so:
-//!
-//! ```text
-//!   T* = (fee / sigma_per_sqrt_sec)^2
-//! ```
-//!
-//! Both inputs are known -- fee is a rate card, sigma is measured -- and at a 4 bp taker fee
-//! against ETHUSDT's 0.594 bp per root-second that is about **45 seconds**. Whatever drift
-//! accumulates in that window is the band, which means the width adapts to flow without anyone
-//! having to know what the flow is.
-//!
-//! A hard cap on drift sits on top, and that one is a risk choice rather than a derivation: it
-//! bounds what a burst can build up before the interval elapses.
-//!
-//! # What a hedge does not fix
-//!
-//! It removes *variance*, not *expected loss to someone who knew more*. A taker who hits a stale
-//! quote costs the pool `reference_move` whether the position is held or crossed out immediately —
-//! hedging only decides when that loss is realised. Adverse selection is answered by re-quoting
-//! faster, not by hedging faster, and the two are separate levers on separate terms.
+//! A hedge removes *variance*, not expected loss to someone who knew more: a taker hitting a stale
+//! quote costs `reference_move` whether the position is held or crossed out at once. Adverse
+//! selection is answered by re-quoting faster, and the two are separate levers.
 
 use std::time::{Duration, Instant};
 
@@ -62,10 +38,14 @@ impl Side {
     /// Binance's spelling.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
-        match self {
+        let spelling = match self {
             Self::Sell => "SELL",
             Self::Buy => "BUY",
-        }
+        };
+        // The venue matches this verbatim; a malformed side is a rejected order, not a wrong one.
+        assert!(!spelling.is_empty());
+        assert!(spelling.len() <= 4);
+        spelling
     }
 }
 
@@ -84,18 +64,12 @@ pub struct Order {
 #[derive(Debug, Clone, Copy)]
 pub struct Band {
     /// The no-trade half-width, in base units. Exposure inside `[-width, +width]` is carried, not
-    /// hedged. Zero disables the band and therefore the hedge.
+    /// hedged. Zero disables the band and therefore the hedge. See [`derive_band`].
     ///
-    /// This replaced a timer, and the timer was wrong in a way worth recording. It fired at
-    /// `T* = (fee/sigma)^2` -- rehedge once the price has moved one fee -- which is Henrotte's
-    /// asset-tolerance rule, a known family but one that uses no risk measure at all. Two defects:
-    /// it contains no inventory term, so it hedged when nothing had accumulated and waited when a
-    /// lot had; and its scaling is wrong. Under proportional costs the optimal band goes as
-    /// `cost^(1/3)`, which implies a mean interval in `cost^(2/3)`, where the timer gave `cost^2`.
-    /// On plausible ETH numbers the timer fires every ~18s against a band-implied ~54 hours. That
-    /// is not a calibration gap; it is paying fees to chase noise.
-    ///
-    /// See [`derive_band`] for where the number comes from.
+    /// It replaced a timer at `T* = (fee/sigma)^2` -- Henrotte's asset-tolerance rule -- which had
+    /// no inventory term and the wrong scaling: under proportional costs the optimal band goes as
+    /// `cost^(1/3)`, implying an interval in `cost^(2/3)` where the timer gave `cost^2`. On
+    /// plausible ETH numbers that fires every ~18s against a band-implied ~54 hours.
     pub width: u128,
     /// The venue's minimum order size, in base units. A crossing below this is not sent — it would
     /// be rejected and the drift would be counted as hedged when it was not.
@@ -105,50 +79,41 @@ pub struct Band {
     pub cooloff: Duration,
     /// Largest single order, in base units. Zero means no clip.
     ///
-    /// This is an EXECUTION limit, not a risk filter. Every unit of deviation is real exposure and
-    /// deserves a hedge; what this bounds is how much of it may go to the venue in one order. A pool
-    /// holding 3,507 ETH that has never hedged needs 3,507 ETH of hedge -- but sending it as one
-    /// market order would pay for the privilege of moving the book against itself. Clipping
-    /// converges over several crossings instead, one `cooloff` apart.
+    /// An EXECUTION limit, not a risk filter: every unit of deviation gets hedged. A pool holding
+    /// 3,507 ETH that has never hedged needs 3,507 ETH of hedge, but sending that as one market
+    /// order pays to move the book against itself. Clipping converges over several crossings
+    /// instead, one `cooloff` apart.
     pub order_max: u128,
 }
 
 impl Default for Band {
     fn default() -> Self {
-        Self {
+        let band = Self {
             width: 0,
             qty_min: 0,
             cooloff: Duration::from_secs(2),
             order_max: 0,
-        }
+        };
+        // The default is the hedge switched OFF: a default that crossed would trade an unconfigured
+        // pair, which is the wrong direction to be wrong in.
+        assert!(band.width == 0);
+        assert!(!band.cooloff.is_zero());
+        band
     }
 }
 
 /// How far a pair's net exposure sits from flat, and the rule for acting on it.
 ///
-/// # Absolute, not incremental, and that is the whole design
+/// Recomputed from two absolutes every cycle -- what the pool holds and what the venue is short --
+/// rather than accumulated from deltas. Accumulating hid the standing position (3,507 ETH that had
+/// never been hedged read as drift zero, because nothing had changed *since the last crossing*),
+/// needed a special case for deposits (a pool that receives a token is long it, and where the
+/// exposure came from is a question the risk does not ask), and let error persist: one fill counted
+/// twice moved the running total forever, which is how 0.04 ETH became a 0.08 short nothing could
+/// unwind. Absolute is self-correcting instead, and needs no ledger of what was sent.
 ///
-/// This used to accumulate deltas: every observed fill was added to a running `drift` and every
-/// confirmed hedge was subtracted from it. Three separate defects came out of that one choice.
-///
-/// * **The standing position was invisible.** A pool holding 3,507 ETH that had never hedged read
-///   as drift zero, because nothing had changed *since the last crossing*. The exposure the hedge
-///   exists to neutralise was exactly the exposure it could not see.
-/// * **A deposit had to be special-cased.** Under an incremental model a balance that jumps looks
-///   like a giant fill, so the obvious reflex is to filter it out. That reflex is wrong: a pool
-///   that receives a token is long that token, and where the exposure came from is a question the
-///   risk does not ask.
-/// * **Error accumulated forever.** A missed observation, or a fill counted twice, moved the
-///   running total permanently -- there was no reading that could correct it. That is precisely
-///   how 0.04 ETH was once hedged twice into a 0.08 short that nothing could unwind.
-///
-/// So the deviation is now recomputed from two absolutes every cycle: what the pool holds, and what
-/// the venue is short. It is self-correcting by construction -- a cycle that observes nothing
-/// leaves the next cycle reading the truth rather than a stale sum -- and it needs no ledger of
-/// what was sent, which is the ledger that used to be wrong.
-///
-/// The skew still owns absolute inventory as a slow control on the quoting *centre*. This is a fast
-/// control on the venue *position*. They read the same balance and act on different things.
+/// The skew owns absolute inventory as a slow control on the quoting *centre*; this is a fast
+/// control on the venue *position*. Same balance, different things.
 #[derive(Debug)]
 pub struct Bands {
     pair_id: u16,
@@ -166,7 +131,7 @@ impl Bands {
     /// A pair with no drift recorded.
     #[must_use]
     pub const fn new(pair_id: u16, band: Band) -> Self {
-        Self {
+        let bands = Self {
             pair_id,
             band,
             deviation: 0,
@@ -174,20 +139,30 @@ impl Bands {
             crossings: 0,
             suppressed_small: 0,
             suppressed_cooloff: 0,
-        }
+        };
+        // A fresh pair is flat: the first `observe` sets the exposure, never construction.
+        assert!(bands.deviation == 0);
+        assert!(bands.crossings == 0);
+        assert!(bands.last_sent.is_none());
+        bands
     }
 
     /// Record where the pool and the venue actually stand.
     ///
-    /// `pool_base` is the pool's holding, read from the chain; `venue_base` is the venue position,
-    /// signed (negative when short). Neither is a delta and neither is remembered from last time --
-    /// that is the point. No `eth_getLogs`, no cursor, no ledger of what was sent.
-    ///
-    /// There is no clock. The band decides on position alone, so how long an exposure has been
-    /// sitting is not an input -- an exposure inside the band is one the pool has chosen to carry
-    /// for as long as it stays there.
+    /// `pool_base` is the pool's holding; `venue_base` is the venue position, signed (negative when
+    /// short). Neither is a delta and neither is remembered -- that is the point: no `eth_getLogs`,
+    /// no cursor, no ledger. There is no clock either, so an exposure inside the band is one the
+    /// pool carries for as long as it stays there.
     pub const fn observe(&mut self, pool_base: i128, venue_base: i128) {
         self.deviation = pool_base.saturating_add(venue_base);
+        // Saturating cannot wrap, and the sign is the part the venue side depends on: a deviation
+        // whose sign flipped would hedge the wrong way and double the exposure.
+        if pool_base >= 0 && venue_base >= 0 {
+            assert!(self.deviation >= 0);
+        }
+        if pool_base <= 0 && venue_base <= 0 {
+            assert!(self.deviation <= 0);
+        }
     }
 
     /// The no-trade half-width this pair runs at, in base units.
@@ -222,25 +197,26 @@ impl Bands {
 
     /// Decide whether the drift now warrants crossing.
     ///
-    /// Returns the order to send, or `None`. Nothing is deducted here: the caller confirms with
-    /// [`Self::settle`] once the venue has actually taken it, because a rejected or unfilled order
-    /// that had already been deducted would leave the pool believing it was flat when it was not.
+    /// Returns the order to send, or `None`. Nothing is deducted here: a rejected or unfilled order
+    /// already deducted would leave the pool believing it was flat when it was not.
     #[must_use]
     pub fn evaluate(&mut self, now: Instant) -> Option<Order> {
         // A zero band is how the hedge is switched off.
         if self.band.width == 0 {
             return None;
         }
-        let magnitude = self.deviation.unsigned_abs();
-        // Inside the no-trade region. Not "too small to bother with" -- carried on purpose, because
-        // the fee to remove it exceeds the risk of holding it.
-        let excess = magnitude.checked_sub(self.band.width).filter(|e| *e > 0)?;
+        let exposure = self.deviation.unsigned_abs();
+        // Inside the band is carried on purpose: the fee to remove it exceeds the risk of holding
+        // it. Past the edge, reflect TO the boundary rather than to flat -- trading back to zero
+        // pays to remove exposure the band already decided is worth carrying, and the next fill
+        // puts it straight back. Kallsen-Muhle-Karbe prescribe the minimal trade that stays inside;
+        // production hedgers sell the same thing as "just get within delta range".
+        let magnitude = exposure.checked_sub(self.band.width).filter(|e| *e > 0)?;
+        assert!(magnitude > 0);
+        assert!(magnitude <= exposure);
+        // Past the band in magnitude means off flat in sign, and the sign picks the venue side.
+        assert!(self.deviation != 0);
 
-        // Reflect to the boundary, never to flat. Trading all the way back to zero pays to remove
-        // exposure the band has already decided is worth carrying, and the next fill puts it
-        // straight back. This is what the theory prescribes (Kallsen-Muhle-Karbe: trade the minimal
-        // amount to stay inside) and what production hedgers offer as "just get within delta range".
-        let magnitude = excess;
         if magnitude < self.band.qty_min {
             self.suppressed_small = self.suppressed_small.saturating_add(1);
             return None;
@@ -252,13 +228,16 @@ impl Bands {
             self.suppressed_cooloff = self.suppressed_cooloff.saturating_add(1);
             return None;
         }
-        // Clipped, not skipped. The rest is still real exposure and the next crossing takes the
-        // next slice; what this avoids is one order large enough to move the book it is hedging in.
-        let qty = if self.band.order_max > 0 {
-            magnitude.min(self.band.order_max)
-        } else {
-            magnitude
-        };
+        let qty = clip(magnitude, self.band.order_max);
+        // The bound that matters, restated on the value that actually leaves: an order can never
+        // exceed the deviation that justified it.
+        assert!(qty > 0);
+        assert!(qty <= exposure);
+        // Guarded, because a clip below the venue minimum is a misconfiguration to be read in the
+        // rejection, not a reason to take the process down mid-cycle.
+        if self.band.order_max == 0 || self.band.order_max >= self.band.qty_min {
+            assert!(qty >= self.band.qty_min);
+        }
         Some(Order {
             pair_id: self.pair_id,
             side: if self.deviation > 0 {
@@ -272,60 +251,91 @@ impl Bands {
 
     /// Record that a crossing went out, and arm the cool-off.
     ///
-    /// Nothing is deducted here, and that is the change the absolute model buys. Under the
-    /// incremental one this had to subtract exactly what filled -- so a partial fill, a rejection,
-    /// or a reply that never arrived left the running total wrong with no way back. Now the next
-    /// [`Self::observe`] reads both sides and the deviation is simply correct again.
+    /// Nothing is deducted here, and that is what the absolute model buys: a partial fill, a
+    /// rejection, or a reply that never arrived all correct themselves on the next
+    /// [`Self::observe`], which reads both sides rather than adjusting a running total.
     ///
     /// What still matters is the cool-off. A hedge takes time to fill and longer to be reflected in
     /// the venue position, so between sending and seeing it the deviation still reads un-hedged.
     /// Firing again inside that window is how one exposure becomes two.
     pub fn settle(&mut self, now: Instant, _side: Side, _qty: u128) {
+        let before = self.crossings;
         self.last_sent = Some(now);
         self.crossings = self.crossings.saturating_add(1);
+        // `last_sent` arms the cool-off; unset, the next cycle crosses the same exposure again.
+        assert!(self.last_sent.is_some());
+        if before < u64::MAX {
+            assert!(self.crossings == before + 1);
+        }
     }
+}
+
+/// Bound one order to the venue's largest single order. Zero means no clip.
+///
+/// The remainder is not skipped: it is still real exposure and the next crossing takes the next
+/// slice. What this avoids is one order large enough to move the book it is hedging in.
+fn clip(magnitude: u128, order_max: u128) -> u128 {
+    assert!(magnitude > 0);
+    let qty = if order_max > 0 {
+        magnitude.min(order_max)
+    } else {
+        magnitude
+    };
+    assert!(qty > 0);
+    assert!(qty <= magnitude);
+    if order_max > 0 {
+        assert!(qty <= order_max);
+    }
+    qty
 }
 
 /// The no-trade half-width, from a risk budget rather than a utility parameter.
 ///
-/// # Where the cube root comes from
-///
 /// Under proportional transaction costs the optimal policy is a no-trade region with reflection at
 /// the boundary, and its width scales as the CUBE ROOT of the cost. Kallsen and Muhle-Karbe (2015,
-/// *Mathematical Finance* 25(4)) give the general form, which subsumes Davis-Norman, Shreve-Soner
-/// and Whalley-Wilmott. Specialised to a market maker chasing a flat target, it reads
+/// *Mathematical Finance* 25(4)) give the general form -- subsuming Davis-Norman, Shreve-Soner and
+/// Whalley-Wilmott -- which for a maker chasing a flat target reads
 ///
 /// ```text
 /// h = ( 3 * c * sigma_q^2 / (2 * p * sigma^2 * S) )^(1/3)
 /// ```
 ///
 /// with `c` the one-way cost, `sigma_q` the volatility of net inventory, `sigma` the asset's
-/// volatility, `S` the price and `p` absolute risk aversion. `sigma_q` sits exactly where an option
-/// hedger's gamma sits: it is the rate at which the thing you are chasing moves.
+/// volatility, `S` the price and `p` absolute risk aversion.
 ///
-/// # Why this function does not use that formula
-///
-/// Two of its inputs are unavailable and one is unfalsifiable. `sigma_q` is measured from your own
-/// fill log, and this pool has never been traded against, so it is not merely unknown but
-/// undefined. `p` is a utility parameter nobody can state honestly.
-///
-/// At the optimum, though, the stationary inventory is uniform on `[-h, h]`, so
+/// That formula is unusable here: `sigma_q` is measured from your own fill log and this pool has
+/// never been traded against, so it is undefined rather than unknown, and `p` is a utility
+/// parameter nobody can state honestly. At the optimum the stationary inventory is uniform on
+/// `[-h, h]`, so
 ///
 /// ```text
 /// h = sqrt(3) * RMS(inventory carried)
 /// ```
 ///
-/// which turns the question into one an operator can actually answer: how much exposure are you
-/// willing to carry? That is a risk budget, not a measurement, and it is what this takes.
-///
-/// The cube root makes the choice forgiving in a way worth stating: an input wrong by 8x moves the
-/// band by 2x. Setting the budget roughly lands near optimal.
-///
-/// `carried` is the RMS exposure the pool accepts, in base units.
+/// which asks instead how much exposure the operator is willing to carry -- a risk budget, and what
+/// `carried` is, in base units. The cube root makes that forgiving: an input wrong by 8x moves the
+/// band by 2x.
 #[must_use]
 pub fn derive_band(carried: u128) -> u128 {
-    // sqrt(3), in integer arithmetic so the result is reproducible across platforms.
-    carried.saturating_mul(1_732_050_808) / 1_000_000_000
+    // sqrt(3), in integer arithmetic so the result is reproducible across platforms. The bracket
+    // is checked at compile time, because the bounds asserted on `width` below rest on it.
+    const ROOT_3_E9: u128 = 1_732_050_808;
+    const ONE_E9: u128 = 1_000_000_000;
+    const _: () = assert!(ROOT_3_E9 > ONE_E9);
+    const _: () = assert!(ROOT_3_E9 < 2 * ONE_E9);
+
+    let width = carried.saturating_mul(ROOT_3_E9) / ONE_E9;
+    // No budget, no band, no hedge -- and a budget of any size must produce a band it brackets,
+    // because sqrt(3) lies between 1 and 2. Skipped where the multiply saturated, which is a
+    // budget no pool holds.
+    if carried == 0 {
+        assert!(width == 0);
+    }
+    if carried <= u128::MAX / ROOT_3_E9 {
+        assert!(width >= carried);
+        assert!(width <= carried.saturating_mul(2));
+    }
+    width
 }
 
 /// The diagnostic that needs no risk-aversion parameter either.
@@ -333,7 +343,7 @@ pub fn derive_band(carried: u128) -> u128 {
 /// At the optimal band, fees spent on hedging come to exactly **twice** the risk penalty rate.
 /// Spending materially more than that means the band is too tight -- the pool is buying certainty
 /// it did not want at a price it did not agree to. Returns the ratio scaled by 100, so `200` is on
-/// target; there is no need for floating point and no meaning in more precision than that.
+/// target; there is no meaning in more precision than that.
 ///
 /// Both arguments are rates over the same window, in the same currency.
 #[must_use]
@@ -341,7 +351,15 @@ pub const fn fee_to_risk_ratio(fees_spent: u128, risk_penalty: u128) -> Option<u
     if risk_penalty == 0 {
         return None;
     }
-    Some(fees_spent.saturating_mul(100) / risk_penalty)
+    // The zero case returned above, so the divisor below cannot be zero.
+    assert!(risk_penalty > 0);
+    let ratio = fees_spent.saturating_mul(100) / risk_penalty;
+    // Spending nothing must read as nothing, or an operator sees a band that looks too tight when
+    // the hedge has not crossed at all.
+    if fees_spent == 0 {
+        assert!(ratio == 0);
+    }
+    Some(ratio)
 }
 
 #[cfg(test)]

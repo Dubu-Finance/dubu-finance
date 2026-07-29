@@ -4,50 +4,31 @@
 //! half_spread = min(s0 + s1 * sigma, cap) + degraded_extra
 //! ```
 //!
-//! `s0` is the pair's configured `half_spread_bps`, `sigma` is the 300 s volatility from
-//! [`crate::skew::Volatility`] — the same estimate the Avellaneda–Stoikov skew uses, and the only
-//! one in this crate — and `s1` is a dimensionless coefficient in bps of half-spread per bp of
-//! sigma.
-//!
-//! # Why the constant had to go
-//!
-//! Adverse selection here is **entirely a jump phenomenon**. The simulator's pure-diffusion paths
-//! produced zero informed fills: at 1 bp/s with 2 s of quote latency the posted quote is never
-//! wrong by more than ~1.4 bp against a 5 bp half-spread, so there is nothing to arbitrage. Every
-//! dollar of the measured -$16,580 came from one 100 bp jump. Jumps cluster with volatility, so a
-//! half-spread that does not move with volatility is a constant premium against a hazard that is
-//! anything but constant — too wide most of the time and far too narrow when it matters.
+//! `s0` is the pair's configured `half_spread_bps`, `sigma` comes from
+//! [`crate::skew::Volatility`] — the only volatility estimate in this crate — and `s1` is
+//! dimensionless, in bps of half-spread per bp of sigma.
 //!
 //! # Deriving `s1` rather than picking it
 //!
-//! The sweep, against one 100 bp jump on the pool as configured (25 bp width, $2M epoch):
+//! Adverse selection here is **entirely a jump phenomenon**: the simulator's pure-diffusion paths
+//! produced zero informed fills, and every dollar of the measured -$16,580 came from one 100 bp
+//! jump. Jumps cluster with volatility, so a constant half-spread is a constant premium against a
+//! hazard that is anything but. The sweep, against one 100 bp jump on the pool as configured
+//! (25 bp width, $2M epoch):
 //!
 //! ```text
 //! half-spread   5 bp      15 bp      30 bp      60 bp
 //! result     -$15,695   -$8,697     +$566      +$378
 //! ```
 //!
-//! **30 bp is the smallest half-spread the sweep measures to be positive.** That is the anchor —
-//! a measured point, not a zero interpolated between two negative-and-positive neighbours, because
-//! the relationship is not linear (`e50` in the arrival hazard is itself tied to the half-spread).
-//! In absorption terms it is `30 + 25/2 = 42.5 bp` of absorption against a 100 bp jump.
+//! **30 bp is the smallest half-spread the sweep measures to be positive** — a measured point, not
+//! a zero interpolated between neighbours, because `e50` in the arrival hazard is itself tied to
+//! the half-spread. In absorption terms, `30 + 25/2 = 42.5 bp` against a 100 bp jump.
 //!
-//! The remaining question is *when* the pool should be paying 30 bp. Not always: a constant 30 bp
-//! is UniV2's fee, and a prop AMM that quotes UniV2's fee has no reason to exist. It should be
-//! paying it when a 100 bp jump is a live possibility, and the sweep's own conclusion says when
-//! that is — jumps cluster with volatility. At ETHUSDT's measured `sigma(300s)` of 10 bp, a 100 bp
-//! gap is a 10-sigma move and is not live. At **5x** that, `sigma(300s) = 50 bp`, it is a 2-sigma
-//! move and plainly is. So:
-//!
-//! ```text
-//! s0 + s1 * (5 * sigma_measured) = 30
-//! 5  + s1 * 50                   = 30
-//! s1                             = 25 / 50 = 0.5
-//! ```
-//!
-//! **`s1 = 0.5`** — half a basis point of half-spread per basis point of 300-second sigma.
-//!
-//! What it produces, on both pairs, at the measured sigma and multiples of it:
+//! The pool should pay that when a 100 bp jump is live, not always — a constant 30 bp is UniV2's
+//! fee, and a prop AMM quoting UniV2's fee has no reason to exist. At ETHUSDT's measured
+//! `sigma(300s)` of 10 bp a 100 bp gap is a 10-sigma move; at **5x** that it is 2-sigma and plainly
+//! live. So `5 + s1 * 50 = 30`, i.e. **`s1 = 0.5`**, and:
 //!
 //! ```text
 //!                 sigma(300s)   half-spread    absorption
@@ -59,65 +40,56 @@
 //!          5x        15 bp        15.5 bp        35.5 bp
 //! ```
 //!
-//! BTC widens far less, and should: it is a third as volatile, and its wider ladder already
-//! absorbs 20 bp before the spread contributes anything. One `s1` across both pairs is only
-//! possible *because* the term is proportional to each pair's own sigma.
+//! One `s1` across both pairs is only possible *because* the term is proportional to each pair's
+//! own sigma: BTC is a third as volatile and its wider ladder already absorbs 20 bp.
 //!
-//! **The honest cost.** ETH's ordinary-market half-spread doubles, 5 bp to 10 bp. The simulator
-//! cannot see what that costs, because it has no competing venue and therefore no uninformed
-//! arrival rate that responds to price — its own documentation says so, and says the spread sweep
-//! is biased in favour of wider for exactly that reason. So `s1` is chosen knowing the model
-//! flatters it, and it is the first number to back-solve once there is fill data. That is why
-//! every row logs `s0`, `sigma`, the sigma term, the result, and whether the cap bound: without
-//! those four the next correction would be another guess.
+//! **The honest cost.** ETH's ordinary-market half-spread doubles, 5 bp to 10 bp, and the simulator
+//! cannot price that: no competing venue means no uninformed arrival rate that responds to price,
+//! and its own documentation says the sweep is biased in favour of wider for that reason. `s1` is
+//! the first number to back-solve once there is fill data, which is why every row logs `s0`,
+//! `sigma`, the sigma term, the result, and whether the cap bound.
 //!
 //! # The cap is 30 bp, and past it the answer is not more spread
 //!
-//! An unbounded spread in a volatility spike is a quoting outage wearing a disguise, so the term
-//! is capped — at exactly the 30 bp anchor, which is exactly UniV2's fee. The rule that produces
-//! is worth stating plainly: **the pool never quotes worse than the constant-fee AMM it is trying
-//! to beat; it simply does not quote 30 bp in a calm market.** Above that point widening has
-//! stopped being a defence — the sweep's own 60 bp row earns *less* than the 30 bp row — and the
-//! defence that does work is [`crate::jump`], which stops quoting altogether.
+//! An unbounded spread in a volatility spike is a quoting outage in disguise, so the term is capped
+//! at the 30 bp anchor — exactly UniV2's fee. **The pool never quotes worse than the constant-fee
+//! AMM it is trying to beat; it simply does not quote 30 bp in a calm market.** Above that point
+//! widening has stopped being a defence — the sweep's 60 bp row earns *less* than its 30 bp row —
+//! and the defence that does work is [`crate::jump`], which stops quoting.
 //!
-//! The cap can never *narrow* a configured spread: if an operator sets `half_spread_bps` above the
-//! cap, `s0` wins and the volatility term contributes nothing. [`crate::config`] refuses that
-//! configuration at startup rather than silently honouring it.
+//! The cap can never *narrow* a configured spread: `s0` is the operator's floor and wins over a cap
+//! set below it. [`crate::config`] refuses that combination at startup rather than honouring it.
 //!
 //! # Staleness-scaled spread: considered, not implemented
 //!
-//! The chain's ladder is fixed between pushes, so widening in proportion to the expected time to
-//! the next push is a real idea. It is not implemented, for two reasons that are measurements
-//! rather than opinions.
+//! Widening in proportion to the expected time to the next push is a real idea, refused for two
+//! measured reasons. First, the exposure window is already priced explicitly — [`rescale_sigma`]
+//! scales `sigma` to it, and the loop pushes on a 0.5 bp adverse-drift trigger at a 1 s cadence, so
+//! realised staleness is one to two blocks; a ramp on top would double-count. Second, the one
+//! regime where staleness is genuinely long has its own explicit widening,
+//! `chain.degraded_extra_half_spread_bps` at 25 bp whenever the chain view cannot be refreshed — a
+//! step function instead of a ramp, aimed at the case that actually produces long staleness.
 //!
-//! First, **the horizon already pays for it, seventeen times over.** `sigma` is scaled to 300 s and
-//! the loop pushes on a 0.5 bp adverse-drift trigger at a 1 s cadence, so realised staleness is one
-//! to two blocks. `sigma(300s) = sqrt(300) * sigma(1s)`, so the 5 bp the volatility term already
-//! adds for ETH is covering 300 seconds of one-sigma diffusion against an exposure window of one.
-//! A staleness term on top of that would be double-counting by more than an order of magnitude.
-//!
-//! Second, **the one regime where staleness is genuinely long already has its own explicit
-//! widening**: `chain.degraded_extra_half_spread_bps`, 25 bp, applied whenever the chain view
-//! cannot be refreshed. That is a staleness-scaled spread with a step function instead of a ramp,
-//! and it is aimed at the case that actually produces long staleness.
-//!
-//! What would change the answer: the `quote_age_secs` field already in every `decision` log line
-//! showing a fat tail past a few seconds in ordinary operation. Then the exposure window would no
-//! longer be one block, the 300 s horizon would stop being generous, and a ramp would earn its
-//! place. Until that is measured, adding it would be a third coefficient chosen by feel.
+//! What would change the answer: `quote_age_secs`, already in every `decision` log line, showing a
+//! fat tail past a few seconds in ordinary operation. Measuring it is what produced
+//! [`rescale_sigma`].
 
 use dubu_core::ladder::BPS_E2_MAX;
+
+/// The half-spread domain has to fit the `u32` [`crate::ladder::build`] takes, because [`compute`]
+/// clamps to it with a `u32::try_from` that would otherwise fall back to a wider ceiling than the
+/// validator accepts.
+const _: () = assert!(BPS_E2_MAX < u32::MAX as u128);
 
 /// Rescale a sigma measured over one window to the window a quote is actually exposed for.
 ///
 /// # Why this exists
 ///
-/// The volatility estimator reports over `skew.vol_horizon_secs`, 300 s, because that is roughly
-/// how long INVENTORY is held -- the skew's exposure. The half-spread's exposure is something else
-/// entirely: how long a posted quote can be hit at a price the market has left behind. The module
-/// docs above argued the 300 s horizon "already pays for it, seventeen times over" and named the
-/// measurement that would change the answer -- `quote_age_secs` showing a fat tail past a few
-/// seconds. It was measured on 2026-07-29 over 360 decisions:
+/// The estimator reports over `skew.vol_horizon_secs`, 300 s, because that is roughly how long
+/// INVENTORY is held -- the skew's exposure. The half-spread's exposure is a different question:
+/// how long a posted quote can be hit at a price the market has left behind. The module docs named
+/// the measurement that would settle it -- `quote_age_secs` showing a fat tail past a few seconds.
+/// Measured 2026-07-29 over 360 decisions:
 ///
 /// ```text
 /// p50 0.00 s   p90 2.00 s   p99 3.00 s   p100 364.00 s
@@ -125,20 +97,31 @@ use dubu_core::ladder::BPS_E2_MAX;
 ///
 /// So the exposure window is two to three seconds, and sizing the spread off a five-minute move was
 /// covering it sqrt(300/3) = 10x over. On ETH that is the difference between 5.67 bp and 1.47 bp of
-/// half-spread -- the margin was not a rounding error, it was most of the price.
+/// half-spread -- not a rounding error, most of the price.
 ///
 /// The p100 is the honest caveat: one quote sat for six minutes, and for that quote the 300 s
-/// horizon was right. That case has its own explicit widening (`degraded_extra_half_spread_bps`),
-/// which is the mechanism meant to catch it; whether it actually fired there is not established.
+/// horizon was right. That case has its own explicit widening (`degraded_extra_half_spread_bps`);
+/// whether it actually fired there is not established.
 ///
-/// Sigma scales as the square root of time, so this is `sigma * sqrt(to / from)`. Returns the input
-/// unchanged when either window is zero -- there is no sensible rescaling of an unmeasured sigma.
+/// Sigma scales as the square root of time. Returns the input unchanged when either window is zero
+/// -- there is no sensible rescaling of an unmeasured sigma.
 #[must_use]
 pub fn rescale_sigma(sigma_millibps: u64, from_secs: u64, to_secs: u64) -> u64 {
     if from_secs == 0 || to_secs == 0 || sigma_millibps == 0 {
         return sigma_millibps;
     }
     let ratio = (to_secs as f64 / from_secs as f64).sqrt();
+    // A NaN or infinite ratio casts to zero and would silently erase the sigma that prices every
+    // quote, so the domain is checked rather than trusted to the `as` cast.
+    assert!(ratio.is_finite(), "sigma rescale ratio is not finite");
+    assert!(ratio > 0.0, "sigma rescale ratio must be positive: {ratio}");
+    // Both arms hold at equal windows, which is the exact `ratio == 1.0` case.
+    if to_secs >= from_secs {
+        assert!(ratio >= 1.0, "a longer window cannot shrink sigma: {ratio}");
+    }
+    if to_secs <= from_secs {
+        assert!(ratio <= 1.0, "a shorter window cannot grow sigma: {ratio}");
+    }
     (sigma_millibps as f64 * ratio) as u64
 }
 
@@ -154,7 +137,7 @@ pub struct SpreadParams {
     pub half_spread_bps_e2_max: u32,
 }
 
-/// Everything one half-spread computation produced. All of it is logged, every row, every cycle —
+/// Everything one half-spread computation produced. All of it is logged, every row, every cycle:
 /// this is the sample a back-solve for `s1` needs, and `vol_decibps` next to `capped` is what says
 /// whether the model or the ceiling has been doing the deciding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -183,29 +166,27 @@ impl Spread {
     /// off".
     #[must_use]
     pub const fn vol_e2(&self) -> u32 {
-        self.vol_scaled_e2.saturating_sub(self.s0_bps_e2)
+        let out = self.vol_scaled_e2.saturating_sub(self.s0_bps_e2);
+        assert!(out <= self.vol_scaled_e2, "the term is part of the spread");
+        // The negative space: a spread at `s0` is the term contributing nothing, never a wrap.
+        if self.s0_bps_e2 >= self.vol_scaled_e2 {
+            assert!(out == 0, "a spread at s0 has no volatility term in it");
+        }
+        out
     }
 }
 
 /// Compute one row's half-spread.
 ///
-/// # The order of operations, which is a decision and not an accident
+/// The degraded-chain widening is added **after** the cap, not inside it. The two defend against
+/// different failures — a market that is moving, a chain view that cannot be refreshed — and
+/// letting the cap swallow the widening would disable the second whenever the first was at its
+/// ceiling, which is precisely when both are needed.
 ///
-/// The cap is applied to `s0 + s1 * sigma` and the degraded-chain widening is added **after** it.
-/// The two defend against different failures — one against a market that is moving, the other
-/// against a chain view that cannot be refreshed — and letting the volatility cap swallow the
-/// degraded widening would silently disable the second whenever the first was already at its
-/// ceiling, which is precisely when both are needed. The final value is clamped to `dubu-core`'s
-/// `BPS_MAX` so it can never leave the domain [`crate::ladder::build`] validates in.
-///
-/// # Composition with the inventory skew
-///
-/// The result is the half-spread that [`crate::skew::price_cap_bps_min`] is asked about, so the
-/// skew's floor clamp is computed against the spread that will actually be posted. A wider spread
-/// pushes the bid target lower and therefore leaves *less* room to skew down; feeding the
-/// unwidened value in would let the skew push a row through the pair's `minPrice` floor and have
-/// it refused. Both then go into `dubu-core`'s `skewed_mid` and through `validateLadder`, so
-/// nothing reaches the chain unvalidated.
+/// The result is also what [`crate::skew::price_cap_bps_min`] is asked about, so the skew's floor
+/// clamp is computed against the spread that will actually be posted: a wider spread leaves *less*
+/// room to skew down, and the unwidened value would let the skew push a row through the pair's
+/// `minPrice` floor and have it refused.
 #[must_use]
 pub fn compute(
     s0_bps_e2: u32,
@@ -213,32 +194,39 @@ pub fn compute(
     degraded_extra_e2: u32,
     params: &SpreadParams,
 ) -> Spread {
-    // s1 * sigma, in HUNDREDTHS of a bp: (s1_e2 / 100) * (sigma_millibps / 1000) * 100.
-    //
-    // This used to round up to whole bps, because `dubu-core` took whole bps. It no longer does,
-    // and the rounding was not free: once sigma was scaled to the quote's real exposure window the
-    // volatility term came to 0.61 bp on ETH, which rounded to 1 -- a 64% overcharge on the term,
-    // and on a 1 bp `s0` that is a third of the whole price.
-    let vol_decibps =
-        u32::try_from(u64::from(params.vol_coefficient_e2).saturating_mul(sigma_millibps) / 10_000)
-            .unwrap_or(u32::MAX);
+    let vol_decibps = compute_vol_decibps(sigma_millibps, params);
     let vol_e2 = vol_decibps.saturating_mul(10);
+    assert!(vol_e2 >= vol_decibps, "deci-bps to hundredths only widens");
 
     let wanted = s0_bps_e2.saturating_add(vol_e2);
+    assert!(wanted >= s0_bps_e2, "the volatility term only ever widens");
     let cap = params.half_spread_bps_e2_max;
     // `.max(s0_bps_e2)`: a cap below the configured spread must never *narrow* it. `s0` is the
-    // operator's floor, not a suggestion — the volatility term simply contributes nothing there.
-    // `config` refuses that combination at startup, so this is the second belt.
+    // operator's floor; the volatility term simply contributes nothing there. `config` refuses
+    // that combination at startup, so this is the second belt.
     let (vol_scaled_e2, capped) = if wanted > cap {
         (cap.max(s0_bps_e2), true)
     } else {
         (wanted, false)
     };
+    assert!(
+        vol_scaled_e2 >= s0_bps_e2,
+        "the cap narrowed the configured spread"
+    );
+    assert!(
+        vol_scaled_e2 <= wanted,
+        "nothing here may widen past s0 + s1 * sigma"
+    );
+    if capped {
+        assert!(wanted > cap, "`capped` must mean the cap actually bound");
+    } else {
+        assert_eq!(
+            vol_scaled_e2, wanted,
+            "an unbound spread is the model's own number"
+        );
+    }
 
-    let half_spread_e2 = vol_scaled_e2
-        .saturating_add(degraded_extra_e2)
-        .min(u32::try_from(BPS_E2_MAX).unwrap_or(u32::MAX));
-
+    let half_spread_e2 = compute_half_spread_e2(vol_scaled_e2, degraded_extra_e2, s0_bps_e2);
     Spread {
         s0_bps_e2,
         sigma_millibps,
@@ -248,6 +236,52 @@ pub fn compute(
         degraded_extra_e2,
         half_spread_e2,
     }
+}
+
+/// `s1 * sigma` in DECI-bps: `(s1_e2 / 100) * (sigma_millibps / 1000) * 10`.
+///
+/// Deci-bps rather than the whole bps this used to round up to: once sigma was scaled to the
+/// quote's real exposure window the volatility term came to 0.61 bp on ETH, which rounded to 1 --
+/// a 64% overcharge on the term, and on a 1 bp `s0` a third of the whole price.
+fn compute_vol_decibps(sigma_millibps: u64, params: &SpreadParams) -> u32 {
+    let out =
+        u32::try_from(u64::from(params.vol_coefficient_e2).saturating_mul(sigma_millibps) / 10_000)
+            .unwrap_or(u32::MAX);
+    // The warm-up case: an unmeasured sigma must give the configured spread, not an invented one.
+    if sigma_millibps == 0 {
+        assert_eq!(out, 0, "a flat market has no volatility term");
+    }
+    if params.vol_coefficient_e2 == 0 {
+        assert_eq!(out, 0, "s1 = 0 must contribute nothing");
+    }
+    if out > 0 {
+        assert!(
+            sigma_millibps > 0,
+            "a term out of a market that never moved"
+        );
+        assert!(params.vol_coefficient_e2 > 0, "a term out of a disabled s1");
+    }
+    out
+}
+
+/// The degraded-chain widening on top of the capped spread, clamped into the domain
+/// [`crate::ladder::build`] validates in.
+fn compute_half_spread_e2(vol_scaled_e2: u32, degraded_extra_e2: u32, s0_bps_e2: u32) -> u32 {
+    let out = vol_scaled_e2
+        .saturating_add(degraded_extra_e2)
+        .min(u32::try_from(BPS_E2_MAX).unwrap_or(u32::MAX));
+    assert!(
+        u128::from(out) <= BPS_E2_MAX,
+        "half-spread outside the domain `ladder::build` validates in: {out}"
+    );
+    // The operator's floor survives everything above it.
+    if u128::from(s0_bps_e2) <= BPS_E2_MAX {
+        assert!(out >= s0_bps_e2, "the posted spread fell below s0");
+    }
+    if degraded_extra_e2 == 0 {
+        assert!(out <= vol_scaled_e2, "a healthy chain adds nothing");
+    }
+    out
 }
 
 #[cfg(test)]
@@ -270,11 +304,9 @@ mod tests {
 
     #[test]
     fn the_documented_table_is_what_the_code_produces() {
-        // The half-spread at 1x, 2x and 5x the MEASURED sigma on both pairs. These six numbers are
-        // the derivation's output and the thing a reader would check first, so they are pinned
-        // rather than left to be recomputed by hand.
-        // In hundredths of a bp now, and no longer rounded up to whole bps -- 9.5 bp is 950,
-        // where it used to be charged as 10.
+        // The derivation's own output at 1x, 2x and 5x the MEASURED sigma on both pairs, pinned
+        // rather than left to be recomputed by hand. Hundredths of a bp, no longer rounded up to
+        // whole bps -- 9.5 bp is 950, where it used to be charged as 10.
         let eth = |m: u64| compute(500, sigma(10 * m), 0, &params()).half_spread_e2;
         assert_eq!(
             eth(1),
@@ -289,8 +321,7 @@ mod tests {
         assert_eq!(btc(2), 1_100);
         assert_eq!(btc(5), 1_550, "8 + 0.5*15 = 15.5");
 
-        // And the absorption limits those imply, which is the number that actually decides the
-        // outcome: absorption = half_spread + width/2.
+        // The absorption limits those imply, which is what decides the outcome.
         assert_eq!(eth(1) + 2_500 / 2, 2_250, "10 bp half + 12.5 bp of width");
         assert_eq!(eth(5) + 2_500 / 2, 4_250);
         assert_eq!(btc(1) + 4_000 / 2, 2_950);
@@ -309,8 +340,7 @@ mod tests {
 
     #[test]
     fn the_term_is_linear_in_sigma_and_the_skew_is_quadratic() {
-        // Worth pinning together: the two consumers of the same sigma respond to it differently on
-        // purpose. Doubling sigma doubles the spread term and quadruples the skew.
+        // The two consumers of the same sigma respond to it differently on purpose.
         let one = compute(500, sigma(10), 0, &params()).vol_decibps;
         let two = compute(500, sigma(20), 0, &params()).vol_decibps;
         assert_eq!(two, 2 * one);
@@ -325,8 +355,7 @@ mod tests {
         assert!(s.capped, "without this flag, tuning s1 later is guesswork");
         assert_eq!(s.half_spread_e2, 3000);
 
-        // An absurd sigma cannot walk it any further. Past this point the defence is `jump`, not
-        // a wider quote.
+        // Past this point the defence is `jump`, not a wider quote.
         let s = compute(500, u64::MAX, 0, &params());
         assert_eq!(s.half_spread_e2, 3000);
         assert!(s.capped);
@@ -334,9 +363,8 @@ mod tests {
 
     #[test]
     fn the_degraded_widening_survives_the_cap() {
-        // The two defences are for different failures. A volatility spike that pins the cap must
-        // not silently disable the widening that exists for a chain view we cannot refresh —
-        // which is exactly when both are needed at once.
+        // A volatility spike that pins the cap must not silently disable the widening for a chain
+        // view we cannot refresh -- which is exactly when both are needed at once.
         let s = compute(500, sigma(100), 2_500, &params());
         assert_eq!(s.vol_scaled_e2, 3_000);
         assert!(s.capped);
@@ -346,8 +374,8 @@ mod tests {
 
     #[test]
     fn a_cap_below_the_configured_spread_never_narrows_it() {
-        // `s0` is the operator's floor, not a suggestion. `config::validate` refuses this
-        // combination at startup; this is the behaviour if it ever gets past.
+        // `config::validate` refuses this combination at startup; this is what happens if it
+        // ever gets past.
         let tight = SpreadParams {
             vol_coefficient_e2: 50,
             half_spread_bps_e2_max: 300,
@@ -370,9 +398,8 @@ mod tests {
 
     #[test]
     fn every_half_spread_this_can_produce_still_builds_a_row_the_chain_accepts() {
-        // The composition requirement: nothing here may produce a ladder `dubu-core`'s validator —
-        // which is the chain's own check — refuses. Swept across the whole reachable range of the
-        // volatility term, at the live pair shape, with the skew at both of its clamps.
+        // Nothing here may produce a ladder the chain's own validator refuses. Swept across the
+        // whole reachable range of the volatility term, with the skew at both of its clamps.
         const FAIR: u128 = 1_943_820_000_000_000;
         for m in [0u64, 1, 2, 5, 10, 50, 1_000] {
             let s = compute(500, sigma(10 * m), 0, &params());
@@ -421,9 +448,8 @@ mod tests {
 
     #[test]
     fn a_wider_spread_leaves_the_skew_less_room_before_the_floor_and_that_is_handled() {
-        // The composition failure this ordering prevents: computing the skew's floor clamp against
-        // the UNwidened spread would let it push a row under the pair's minPrice and have it
-        // refused outright, which is a quoting outage rather than a slightly-less-skewed book.
+        // Computing the skew's floor clamp against the UNwidened spread would let it push a row
+        // under the pair's minPrice: a quoting outage rather than a slightly-less-skewed book.
         let min_price = 1_000_000_000_000_000u128;
         let fair = 1_010_000_000_000_000u128;
         let narrow = crate::skew::price_cap_bps_min(fair, min_price, 5);
@@ -457,8 +483,7 @@ mod tests {
         );
     }
 
-    /// An unmeasured sigma has no rescaling, and neither does a zero window. Returning the input
-    /// keeps the caller's behaviour identical to before the horizon was split out.
+    /// An unmeasured sigma has no rescaling, and neither does a zero window.
     #[test]
     fn a_zero_anything_passes_through() {
         assert_eq!(rescale_sigma(0, 300, 3), 0);

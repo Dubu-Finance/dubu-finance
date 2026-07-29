@@ -1,14 +1,11 @@
 //! Fixed-point decimal parsing, and the one conversion between the exchange's price scale and
 //! the pool's.
 //!
-//! Everything the bot reads from outside itself arrives as a decimal string: Binance sends
-//! `"1943.82000000"`, the config file says `capacity = "1000"`. Both have to become integers
-//! before any of the pricing math runs, and both have to become integers *exactly* — a float
-//! round trip through `f64` is fine for a display value and wrong for a number that ends up in
-//! a `uint56` the chain will settle against.
-//!
-//! So there is no `f64` anywhere in this crate's pricing path. This module is the only place a
-//! decimal string becomes a number.
+//! Everything the bot reads from outside itself arrives as a decimal string — Binance sends
+//! `"1943.82000000"`, the config file says `capacity = "1000"` — and both have to become integers
+//! *exactly*. A float round trip through `f64` is fine for a display value and wrong for a number
+//! the chain will settle a `uint56` against, so there is no `f64` in this crate's pricing path and
+//! this module is the only place a decimal string becomes a number.
 //!
 //! # Scales
 //!
@@ -24,6 +21,10 @@
 //! parse is lossless, and because the micro-price forms `bid * askQty + ask * bidQty`: at scale 8
 //! that product peaks around `10^27` for a six-figure asset with a large book, six orders of
 //! magnitude inside `u128`. At scale 18 the same product overflows.
+//!
+//! Assertions here are `debug_assert!`: this runs once per feed tick, and a panic in the parser
+//! stops the bot quoting altogether, which is worse than the malformed input it would be
+//! reporting.
 
 use dubu_core::math::{mul_div_floor, pow10};
 
@@ -84,8 +85,11 @@ pub fn parse_fixed(s: &str, scale: u8) -> Result<u128, UnitsError> {
             scale,
         });
     }
+    debug_assert!(frac_part.len() <= usize::from(scale));
+    debug_assert!(!int_part.is_empty() || !frac_part.is_empty());
 
     let unit = pow10(scale).ok_or_else(|| UnitsError::Overflow(s.to_string()))?;
+    debug_assert!(unit >= 1);
     let whole: u128 = if int_part.is_empty() {
         0
     } else {
@@ -104,11 +108,22 @@ pub fn parse_fixed(s: &str, scale: u8) -> Result<u128, UnitsError> {
             .map_err(|_| UnitsError::Overflow(s.to_string()))?
             * pad
     };
+    // The fraction is strictly inside one whole unit, which is what makes the sum below a
+    // faithful fixed-point value rather than a carry the caller has to notice.
+    debug_assert!(frac < unit);
 
-    whole
+    let v = whole
         .checked_mul(unit)
         .and_then(|w| w.checked_add(frac))
-        .ok_or_else(|| UnitsError::Overflow(s.to_string()))
+        .ok_or_else(|| UnitsError::Overflow(s.to_string()))?;
+    debug_assert_eq!(v / unit, whole, "the integer part survives the scaling");
+    debug_assert_eq!(v % unit, frac);
+    // The negative space: a non-empty, non-zero string must not scale to nothing. Truncation to
+    // zero is the failure `TooPrecise` exists to make impossible, so it must not sneak back in.
+    if v == 0 {
+        debug_assert!(t.bytes().all(|b| !b.is_ascii_digit() || b == b'0'));
+    }
+    Ok(v)
 }
 
 /// Render a scaled integer back to a decimal string, for logs and error messages.
@@ -123,12 +138,21 @@ pub fn format_fixed(v: u128, scale: u8) -> String {
     if unit == 1 {
         return v.to_string();
     }
-    format!(
+    debug_assert!(v % unit < unit);
+    let out = format!(
         "{}.{:0width$}",
         v / unit,
         v % unit,
         width = usize::from(scale)
-    )
+    );
+    // The scale has to be visible in the output; that is the entire point of keeping the
+    // trailing zeros, and a short fraction would read as a different scale.
+    debug_assert!(out.contains('.'));
+    debug_assert_eq!(
+        out.split_once('.').map(|(_, f)| f.len()),
+        Some(usize::from(scale))
+    );
+    out
 }
 
 /// The decimal shift between a human price and the pool's `uint56` price for one pair.
@@ -146,7 +170,15 @@ pub fn format_fixed(v: u128, scale: u8) -> String {
 /// [`to_pool_price`] handles both directions rather than assuming the pairs we happen to run.
 #[must_use]
 pub fn price_shift(price_scale_exp: u8, base_decimals: u8, quote_decimals: u8) -> i32 {
-    i32::from(price_scale_exp) + i32::from(quote_decimals) - i32::from(base_decimals)
+    let shift = i32::from(price_scale_exp) + i32::from(quote_decimals) - i32::from(base_decimals);
+    // Three `u8`s widened to `i32` cannot leave the range, which is what makes the sign the only
+    // interesting thing about the result.
+    assert!(shift >= -255);
+    assert!(shift <= 510);
+    if base_decimals == quote_decimals {
+        assert_eq!(shift, i32::from(price_scale_exp));
+    }
+    shift
 }
 
 /// Convert a feed price (scale [`FEED_SCALE`]) into the pool's `uint56` price scale.
@@ -167,9 +199,17 @@ pub fn to_pool_price(feed_price: u128, shift: i32) -> Option<u128> {
     } else {
         (0, i32::from(FEED_SCALE) - shift)
     };
+    debug_assert!(num_exp >= 0);
+    debug_assert!(den_exp >= 0);
+    debug_assert!(num_exp == 0 || den_exp == 0, "only one direction at a time");
+
     let num = pow10(u8::try_from(num_exp).ok()?)?;
     let den = pow10(u8::try_from(den_exp).ok()?)?;
-    mul_div_floor(feed_price, num, den)
+    debug_assert!(num >= 1);
+    debug_assert!(den >= 1);
+    let p = mul_div_floor(feed_price, num, den)?;
+    debug_assert!(feed_price != 0 || p == 0, "zero in, zero out");
+    Some(p)
 }
 
 /// Inverse of [`to_pool_price`], for logging a pool price back in human terms.
@@ -180,9 +220,19 @@ pub fn from_pool_price(pool_price: u128, shift: i32) -> Option<u128> {
     } else {
         (i32::from(FEED_SCALE) - shift, 0)
     };
+    debug_assert!(num_exp >= 0);
+    debug_assert!(den_exp >= 0);
+    debug_assert!(num_exp == 0 || den_exp == 0);
+
     let num = pow10(u8::try_from(num_exp).ok()?)?;
     let den = pow10(u8::try_from(den_exp).ok()?)?;
-    mul_div_floor(pool_price, num, den)
+    // The exponents are exactly [`to_pool_price`]'s, swapped: this is its inverse and not a
+    // second, independently derived conversion.
+    debug_assert!(num >= 1);
+    debug_assert!(den >= 1);
+    let p = mul_div_floor(pool_price, num, den)?;
+    debug_assert!(pool_price != 0 || p == 0);
+    Some(p)
 }
 
 #[cfg(test)]

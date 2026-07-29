@@ -16,18 +16,18 @@
 //! ```
 //!
 //! Each level is `[price, size, liquidatedOrders, orderCount]` and `bbo-tbt` publishes exactly
-//! one level a side, which is the whole point of the channel — it is the top of book tick by
-//! tick, rather than a depth stream we would have to fold down.
+//! one level a side, which is the point of the channel: top of book tick by tick, rather than a
+//! depth stream we would have to fold down.
 //!
-//! `seqId` is the sequence, and it is monotone per instrument but not contiguous, so it detects
-//! a regression and nothing more.
+//! `seqId` is monotone per instrument but not contiguous, so it detects a regression and nothing
+//! more.
 //!
 //! # Keepalive
 //!
-//! OKX closes a connection that has been idle for 30 seconds and expects the **literal string**
-//! `ping` — not a JSON object, and not a websocket ping frame — answered with `pong`. A liquid
-//! `bbo-tbt` subscription pushes far more often than that, so this only matters when a market
-//! genuinely stops, which is exactly when a silent disconnect would be most confusing.
+//! OKX closes a connection idle for 30 seconds and expects the **literal string** `ping` — not a
+//! JSON object, and not a websocket ping frame — answered with `pong`. A liquid `bbo-tbt`
+//! subscription pushes far more often than that, so this only matters when a market genuinely
+//! stops, which is exactly when a silent disconnect would be most confusing.
 
 use std::collections::BTreeMap;
 
@@ -71,11 +71,28 @@ pub struct Client {
 
 impl Client {
     /// Build from `(venue symbol, canonical symbol)` pairs.
+    ///
+    /// # Panics
+    /// If any symbol is empty. A client built from a blank symbol subscribes to nothing and
+    /// reads as a healthy silent venue.
     #[must_use]
     pub fn new(symbols: &[(String, String)]) -> Self {
-        Self {
-            symbols: symbols.iter().cloned().collect(),
+        for (venue, canonical) in symbols {
+            assert!(!venue.is_empty(), "an okx instId must not be blank");
+            assert!(
+                !canonical.is_empty(),
+                "a canonical symbol must not be blank"
+            );
         }
+        let client = Self {
+            symbols: symbols.iter().cloned().collect(),
+        };
+        debug_assert_eq!(
+            client.symbols.len(),
+            symbols.len(),
+            "two pairs claim the same okx instId, so one of them is silently unsubscribed"
+        );
+        client
     }
 }
 
@@ -85,28 +102,34 @@ impl MarketFeed for Client {
     }
 
     fn subscribe_frames(&self) -> Vec<String> {
+        assert!(
+            !self.symbols.is_empty(),
+            "a subscribe frame with no args never delivers a book"
+        );
         let args: Vec<String> = self
             .symbols
             .keys()
             .map(|s| format!(r#"{{"channel":"bbo-tbt","instId":"{s}"}}"#))
             .collect();
-        vec![format!(
-            r#"{{"op":"subscribe","args":[{}]}}"#,
-            args.join(",")
-        )]
+        assert_eq!(args.len(), self.symbols.len());
+        let frame = format!(r#"{{"op":"subscribe","args":[{}]}}"#, args.join(","));
+        // A malformed frame is answered with a close, so the interpolation is checked rather than
+        // trusted.
+        debug_assert!(serde_json::from_str::<serde_json::Value>(&frame).is_ok());
+        vec![frame]
     }
 
     fn keepalive(&self) -> Option<(std::time::Duration, String)> {
-        Some((
-            std::time::Duration::from_secs(KEEPALIVE_SECS),
-            "ping".to_string(),
-        ))
+        let period = std::time::Duration::from_secs(KEEPALIVE_SECS);
+        assert!(
+            period < std::time::Duration::from_secs(30),
+            "the keepalive must fire inside okx's 30s idle timeout"
+        );
+        Some((period, "ping".to_string()))
     }
 
     fn parse(&mut self, text: &str) -> Result<Option<Update>, String> {
-        // `pong`, and the `{"event":"subscribe"|"error"}` control replies, are not book updates.
-        // An `event: error` is worth surfacing, because a rejected subscription otherwise looks
-        // exactly like a venue that has nothing to say.
+        // A rejected subscription otherwise looks exactly like a venue with nothing to say.
         if text == "pong" {
             return Ok(None);
         }
@@ -122,6 +145,7 @@ impl MarketFeed for Client {
         let Some(symbol) = self.symbols.get(&frame.arg.inst_id) else {
             return Ok(None);
         };
+        debug_assert!(!symbol.is_empty(), "`new` rejects a blank canonical symbol");
         let Some(bbo) = frame.data.first() else {
             return Ok(None);
         };
@@ -134,11 +158,14 @@ impl MarketFeed for Client {
         if bid.len() < 2 || ask.len() < 2 {
             return Err("a level carried fewer than [price, size]".to_string());
         }
+        // The bound for the indexing below, restated where it is relied on rather than left to a
+        // reader to re-derive from the guard above.
+        assert!(bid.len() >= 2);
+        assert!(ask.len() >= 2);
+
         let f = |field: &str, v: &str| -> Result<u128, String> {
             units::parse_fixed(v, FEED_SCALE).map_err(|e| format!("{field}: {e}"))
         };
-        // Both levels were length-checked four lines up; a venue that sends a short level is
-        // rejected there with a message rather than indexed into here.
         #[allow(clippy::indexing_slicing)]
         let tick = BookTick {
             update_id: bbo.seq_id,

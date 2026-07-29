@@ -4,11 +4,10 @@
 //!
 //! The plain mid `(bid + ask) / 2` ignores the sizes resting on each side, and the sizes are
 //! where the short-horizon information is. If there are 200 ETH bid and 2 ETH offered, the next
-//! trade is far more likely to lift the offer than to hit the bid, and the mid says the fair
-//! value is halfway between. Quoting a two-sided book around that mid means the side that gets
-//! filled is systematically the wrong one: you buy just before the price rises and sell just
-//! before it falls. The loss is small per fill and it is *biased*, so it does not average out —
-//! it accumulates at the rate you trade.
+//! trade is far more likely to lift the offer than to hit the bid. Quoting around that mid means
+//! the side that gets filled is systematically the wrong one: you buy just before the price rises
+//! and sell just before it falls. The loss is small per fill and it is *biased*, so it does not
+//! average out — it accumulates at the rate you trade.
 //!
 //! The size-weighted micro-price
 //!
@@ -37,11 +36,10 @@
 //! # Outlier rejection is cross-sectional and MAD-based, not a fixed band
 //!
 //! The previous design compared each tick to that venue's own previous tick against a fixed
-//! `max_jump_bps`. That has two problems and the second is worse than the first. A fixed band is
-//! wrong in both directions at once — too wide in a calm market to catch anything, and firing
-//! constantly in a fast one — and it had to concede after a few consecutive rejections or a
-//! genuine fast move became a permanent outage, which meant every real move cost several ticks of
-//! staleness at exactly the moment staleness is most expensive.
+//! `max_jump_bps`. A fixed band is wrong in both directions at once — too wide in a calm market
+//! to catch anything, and firing constantly in a fast one — and it had to concede after a few
+//! consecutive rejections or a genuine fast move became a permanent outage, so every real move
+//! cost several ticks of staleness at exactly the moment staleness is most expensive.
 //!
 //! With several venues the comparison can be made *across* them instead of across time, which
 //! removes both problems. At one instant:
@@ -58,14 +56,13 @@
 //! `mad` **is** the market's current disagreement, so the band widens by itself when the market
 //! is fast and tightens when it is calm. A venue printing garbage is far from a median three
 //! other venues agree on, whatever the regime; a genuine fast move takes every venue with it, so
-//! the median moves and nothing is rejected and nothing has to be conceded a few ticks later.
+//! the median moves, nothing is rejected, and nothing has to be conceded a few ticks later.
 //!
 //! The `floor` is not a fixed band smuggled back in — it is what stops the filter from eating
-//! itself. When every venue agrees to within a tick, `mad` collapses to zero, the threshold
-//! collapses with it, and every venue that is not exactly the median gets rejected. Measured on
-//! live ETHUSDT and BTCUSDT across Binance, OKX and Bybit, `mad` runs 0.1-1.0 bps and the largest
-//! single-venue deviation seen was 1.6 bps, so a floor of 2 bps is above ordinary disagreement
-//! and only a genuinely broken venue clears it.
+//! itself. When every venue agrees to within a tick, `mad` collapses to zero and every venue that
+//! is not exactly the median gets rejected. Measured on live ETHUSDT and BTCUSDT across Binance,
+//! OKX and Bybit, `mad` runs 0.1-1.0 bps and the largest single-venue deviation seen was 1.6 bps,
+//! so a floor of 2 bps is above ordinary disagreement and only a broken venue clears it.
 //!
 //! # Degrading is explicit, and there are two different ways to fail
 //!
@@ -74,13 +71,12 @@
 //! * [`ReferenceError::Dispersed`] — enough venues, and they **disagree**. There is no single
 //!   price to know.
 //!
-//! The second is the one that matters and it is why the dispersion gate is on `mad` rather than
-//! on the count of rejections. One venue disagreeing is an outlier and `mad` barely moves. Half
-//! the venues disagreeing is a regime change, and `mad` jumps to roughly half the gap between the
-//! two camps — so the gate fires and the bot stops quoting instead of averaging a price that no
-//! venue is showing. A rejection count could never distinguish those two: by construction at
-//! least half the cross-section always survives a MAD filter, so "a majority was rejected" is not
-//! a state that can occur.
+//! The second is why the dispersion gate is on `mad` rather than on the count of rejections. One
+//! venue disagreeing is an outlier and `mad` barely moves. Half the venues disagreeing is a
+//! regime change, and `mad` jumps to roughly half the gap between the two camps, so the gate
+//! fires and the bot stops quoting instead of averaging a price no venue is showing. A rejection
+//! count could never distinguish those two: by construction at least half the cross-section
+//! always survives a MAD filter, so "a majority was rejected" cannot occur.
 //!
 //! # What this still cannot catch
 //!
@@ -92,10 +88,9 @@
 //! # Arithmetic
 //!
 //! Exact integers throughout, at [`crate::units::FEED_SCALE`], via [`dubu_core::math`]. The
-//! micro-price numerator is bounded by `2 * maxPrice * maxQty`, which for a six-figure asset
-//! against a deep book is around `10^27` — inside `u128` in practice, but the 256-bit
-//! intermediate costs nothing here and removes the need to reason about a book we have not seen
-//! yet.
+//! micro-price numerator is bounded by `2 * maxPrice * maxQty`, around `10^27` for a six-figure
+//! asset against a deep book — inside `u128` in practice, but the 256-bit intermediate costs
+//! nothing and removes the need to reason about a book we have not seen yet.
 
 use dubu_core::math::{div_floor_u256, mul_div_floor, U256};
 
@@ -144,12 +139,36 @@ pub fn micro_price(t: &BookTick) -> Result<u128, Reject> {
     if t.bid_qty == 0 || t.ask_qty == 0 {
         return Err(Reject::ZeroDepth);
     }
+    // The three guards above are the only place an untrusted book is judged. Everything below
+    // may assume a well-formed one, so it is stated here rather than re-derived by a reader.
+    assert!(t.bid > 0);
+    assert!(t.ask > 0);
+    assert!(t.bid < t.ask);
+    assert!(t.bid_qty > 0);
+    assert!(t.ask_qty > 0);
+
     // Note the crossing: bid weighted by ASK size, ask weighted by BID size.
     let num = U256::mul_u128(t.bid, t.ask_qty)
         .checked_add(U256::mul_u128(t.ask, t.bid_qty))
         .ok_or(Reject::Domain)?;
     let den = t.bid_qty.checked_add(t.ask_qty).ok_or(Reject::Domain)?;
-    div_floor_u256(num, U256::from_u128(den)).ok_or(Reject::Domain)
+    assert!(den > 0, "both sides carry size, so the sum cannot be zero");
+    let micro = div_floor_u256(num, U256::from_u128(den)).ok_or(Reject::Domain)?;
+
+    // The postcondition that catches the sign error: a weighted average of two prices lies
+    // between them, so a micro-price outside the book means the weighting is wrong, not that the
+    // market is unusual. Floor division can only pull it down, never out of the interval.
+    assert!(
+        micro >= t.bid,
+        "micro-price below the bid: {micro} < {}",
+        t.bid
+    );
+    assert!(
+        micro < t.ask,
+        "micro-price at or above the ask: {micro} >= {}",
+        t.ask
+    );
+    Ok(micro)
 }
 
 /// Top-of-book spread in bps of the mid.
@@ -159,7 +178,12 @@ pub fn book_spread_bps(bid: u128, ask: u128) -> u128 {
     if mid == 0 {
         return 0;
     }
-    mul_div_floor(ask.saturating_sub(bid), 10_000, mid).unwrap_or(0)
+    assert!(mid > 0);
+    let bps = mul_div_floor(ask.saturating_sub(bid), 10_000, mid).unwrap_or(0);
+    if bid >= ask {
+        assert_eq!(bps, 0, "a crossed or locked book has no positive spread");
+    }
+    bps
 }
 
 /// One venue's contribution to the cross-section.
@@ -186,14 +210,20 @@ impl VenueQuote {
     /// # Errors
     /// [`Reject`], for a structurally broken book.
     pub fn new(venue: VenueId, tick: &BookTick, age_ms: u64) -> Result<Self, Reject> {
-        Ok(Self {
+        let quote = Self {
             venue,
             micro: micro_price(tick)?,
             bid: tick.bid,
             ask: tick.ask,
             book_spread_bps: book_spread_bps(tick.bid, tick.ask),
             age_ms,
-        })
+        };
+        // `micro_price` returning `Ok` is what makes all of this true; restated because everything
+        // downstream reads these fields rather than re-deriving them from the tick.
+        assert!(quote.bid < quote.ask);
+        assert!(quote.micro >= quote.bid);
+        assert!(quote.micro < quote.ask);
+        Ok(quote)
     }
 }
 
@@ -379,15 +409,32 @@ fn median_sorted(xs: &[u128]) -> Option<u128> {
     if n == 0 {
         return None;
     }
-    if n % 2 == 1 {
+    assert!(n > 0);
+    // `slice::is_sorted` is stable since 1.82 and this crate's MSRV is 1.75.
+    debug_assert!(
+        xs.windows(2).all(|w| w.first() <= w.last()),
+        "median_sorted was handed an unsorted slice"
+    );
+    let median = if n % 2 == 1 {
         xs.get(n / 2).copied()
     } else {
         let lo = *xs.get(n / 2 - 1)?;
         let hi = *xs.get(n / 2)?;
+        assert!(
+            lo <= hi,
+            "the slice is sorted, so the lower middle is the lower"
+        );
         // Halve each before adding: the values are feed-scale prices, so this cannot overflow,
         // but the habit is the one the rest of the crate keeps.
         Some(lo / 2 + hi / 2 + (lo % 2 + hi % 2) / 2)
+    };
+    // A median lies inside the sample. Outside means the halving carried wrong or the slice was
+    // not sorted after all.
+    if let (Some(m), Some(lo), Some(hi)) = (median, xs.first(), xs.last()) {
+        assert!(m >= *lo);
+        assert!(m <= *hi);
     }
+    median
 }
 
 /// Signed deviation from a reference, in deci-bps of it.
@@ -397,11 +444,83 @@ fn deviation_decibps(x: u128, from: u128) -> i64 {
     }
     let mag = mul_div_floor(x.abs_diff(from), DECIBPS, from).unwrap_or(u128::from(u32::MAX));
     let mag = i64::try_from(mag).unwrap_or(i64::MAX);
-    if x < from {
-        -mag
-    } else {
-        mag
+    assert!(
+        mag >= 0,
+        "a magnitude is unsigned before the sign is applied"
+    );
+    let signed = if x < from { -mag } else { mag };
+    if x == from {
+        assert_eq!(signed, 0, "no distance means no deviation");
     }
+    if x < from {
+        assert!(signed <= 0, "below the reference must read negative");
+    }
+    if x > from {
+        assert!(signed >= 0, "above the reference must read positive");
+    }
+    signed
+}
+
+/// Each venue's signed distance from the median, in deci-bps.
+fn deviations(quotes: &[VenueQuote], median: u128) -> Vec<Deviation> {
+    assert!(
+        median > 0,
+        "a zero median names no reference to deviate from"
+    );
+    let devs: Vec<Deviation> = quotes
+        .iter()
+        .map(|q| Deviation {
+            venue: q.venue,
+            micro: q.micro,
+            decibps: deviation_decibps(q.micro, median),
+        })
+        .collect();
+    assert_eq!(devs.len(), quotes.len(), "every venue keeps its place");
+    devs
+}
+
+/// Median absolute deviation across the whole cross-section, in deci-bps of the median.
+///
+/// This **is** the market's current disagreement, which is what makes the band adaptive.
+fn mad_decibps(devs: &[Deviation]) -> u128 {
+    assert!(!devs.is_empty(), "an empty cross-section has no scale");
+    let mut mags: Vec<u128> = devs
+        .iter()
+        .map(|d| u128::from(d.decibps.unsigned_abs()))
+        .collect();
+    mags.sort_unstable();
+    let mad = median_sorted(&mags).unwrap_or(0);
+    debug_assert!(mags.last().is_some_and(|worst| mad <= *worst));
+    mad
+}
+
+/// The rejection threshold, and which bound produced it.
+///
+/// With fewer than three venues an outlier cannot be attributed. Two venues that disagree are
+/// symmetric — each is exactly one MAD from the median of the pair — so any threshold rejects
+/// both or neither, and there is no information saying which one is wrong. The dispersion gate is
+/// the entire defence in that case, and rejecting the "worse" one would be inventing an answer.
+fn threshold(venues: usize, mad: u128, p: &MadParams) -> (u32, ThresholdBound) {
+    if venues < 3 {
+        return (p.dispersion_decibps_max, ThresholdBound::Unattributable);
+    }
+    assert!(venues >= 3, "the unattributable case returned above");
+    let scaled = u32::try_from(mad * u128::from(p.k_tenths) / 10).unwrap_or(u32::MAX);
+    let chosen = if scaled >= p.floor_decibps {
+        (scaled, ThresholdBound::Mad)
+    } else {
+        (p.floor_decibps, ThresholdBound::Floor)
+    };
+    // The floor is what stops the filter eating itself when every venue agrees to a tick and the
+    // MAD collapses to zero.
+    assert!(
+        chosen.0 >= p.floor_decibps,
+        "the threshold may never fall under the floor"
+    );
+    if chosen.1 == ThresholdBound::Mad {
+        assert_eq!(chosen.0, scaled);
+    }
+    chosen
 }
 
 /// Combine one instant's per-venue micro-prices into a single reference.
@@ -435,6 +554,11 @@ pub fn combine(quotes: &[VenueQuote], p: &MadParams) -> Result<Reference, Refere
     if n < need {
         return Err(ReferenceError::NoQuorum { have: n, need });
     }
+    assert!(
+        n >= need,
+        "the quorum check is the only way past this point"
+    );
+    assert!(!quotes.is_empty() || need == 0);
 
     let mut sorted: Vec<u128> = quotes.iter().map(|q| q.micro).collect();
     sorted.sort_unstable();
@@ -444,22 +568,10 @@ pub fn combine(quotes: &[VenueQuote], p: &MadParams) -> Result<Reference, Refere
     if median == 0 {
         return Err(ReferenceError::NoQuorum { have: 0, need });
     }
+    assert!(median > 0);
 
-    let devs: Vec<Deviation> = quotes
-        .iter()
-        .map(|q| Deviation {
-            venue: q.venue,
-            micro: q.micro,
-            decibps: deviation_decibps(q.micro, median),
-        })
-        .collect();
-
-    let mut mags: Vec<u128> = devs
-        .iter()
-        .map(|d| u128::from(d.decibps.unsigned_abs()))
-        .collect();
-    mags.sort_unstable();
-    let mad = median_sorted(&mags).unwrap_or(0);
+    let devs = deviations(quotes, median);
+    let mad = mad_decibps(&devs);
     let dispersion = u32::try_from(mad).unwrap_or(u32::MAX);
 
     // The regime gate. One venue away from the pack barely moves the MAD; half the venues away
@@ -472,36 +584,59 @@ pub fn combine(quotes: &[VenueQuote], p: &MadParams) -> Result<Reference, Refere
             venues: n,
         });
     }
+    assert!(dispersion <= p.dispersion_decibps_max);
 
-    // With fewer than three venues an outlier cannot be attributed. Two venues that disagree are
-    // symmetric — each is exactly one MAD from the median of the pair — so any threshold either
-    // rejects both or neither, and there is no information saying which one is wrong. The
-    // dispersion gate above is the entire defence in that case, and pretending otherwise by
-    // rejecting the "worse" one would be inventing an answer.
-    let (threshold, bound) = if quotes.len() < 3 {
-        (p.dispersion_decibps_max, ThresholdBound::Unattributable)
-    } else {
-        let scaled = u32::try_from(mad * u128::from(p.k_tenths) / 10).unwrap_or(u32::MAX);
-        if scaled >= p.floor_decibps {
-            (scaled, ThresholdBound::Mad)
-        } else {
-            (p.floor_decibps, ThresholdBound::Floor)
-        }
-    };
+    let (threshold, bound) = threshold(quotes.len(), mad, p);
+    if quotes.len() < 3 {
+        assert_eq!(bound, ThresholdBound::Unattributable);
+    }
 
+    let devs_len = devs.len();
     let (used, rejected): (Vec<Deviation>, Vec<Deviation>) = devs
         .into_iter()
         .partition(|d| d.decibps.unsigned_abs() <= u64::from(threshold));
+    assert_eq!(
+        used.len() + rejected.len(),
+        devs_len,
+        "a venue was lost in the partition"
+    );
+    // By construction at least half the cross-section is within one MAD of the median, so a
+    // majority can never be rejected. This is why a rejection count could not distinguish an
+    // outlier from a regime change; see the module docs.
+    assert!(
+        rejected.len() <= devs_len,
+        "more venues rejected than existed"
+    );
 
     let survived = u8::try_from(used.len()).unwrap_or(u8::MAX);
     if survived < need {
         return Err(ReferenceError::QuorumLostToOutliers { survived, need });
     }
+    assert!(!used.is_empty() || need == 0);
 
-    // Equal weight. `used` is non-empty here, and the sum of a handful of feed-scale prices is
-    // nowhere near `u128`.
+    // Equal weight. The sum of a handful of feed-scale prices is nowhere near `u128`.
     let sum: u128 = used.iter().map(|d| d.micro).sum();
     let micro = sum / used.len() as u128;
+    // A mean lies inside its sample, and every survivor is within `threshold` of the median, so
+    // this is also the bound on how far losing one venue can move the reference.
+    if let (Some(lo), Some(hi)) = (
+        used.iter().map(|d| d.micro).min(),
+        used.iter().map(|d| d.micro).max(),
+    ) {
+        assert!(
+            micro >= lo,
+            "the reference sits below every venue it averaged"
+        );
+        assert!(
+            micro <= hi,
+            "the reference sits above every venue it averaged"
+        );
+    }
+    debug_assert!(
+        used.iter()
+            .all(|d| d.decibps.unsigned_abs() <= u64::from(threshold)),
+        "a rejected venue survived the partition"
+    );
 
     Ok(Reference {
         micro,

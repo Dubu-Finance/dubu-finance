@@ -4,11 +4,9 @@
 //!
 //! The other four are crypto spot exchanges. None of them lists a share, so the four equity pairs
 //! on the pool — AAPL, TSLA, SKHY and SPCX — had no reference at all and the config validator
-//! refused to start rather than run a market that could never quote. This is what gives them one.
-//!
-//! Hyperliquid carries them through HIP-3: builder-deployed perp markets settling on its shared
-//! order book. Measured live, `xyz:AAPL` quotes 338.92 / 338.94 — a 0.6 bp spread, on a real book
-//! with real depth.
+//! refused to start. Hyperliquid carries them through HIP-3: builder-deployed perp markets
+//! settling on its shared order book. Measured live, `xyz:AAPL` quotes 338.92 / 338.94 — a 0.6 bp
+//! spread, on a real book with real depth.
 //!
 //! # The dex is part of the symbol, and that is not cosmetic
 //!
@@ -19,19 +17,17 @@
 //!
 //! # One venue is below quorum, and that is the honest state
 //!
-//! `feed.venues_min` is 2. A pair fed only from here will sit below quorum and quote nothing, which
-//! is correct and not a limitation to work around: a single price source has nobody to disagree
-//! with it, and the whole cross-venue arrangement exists to stop one venue's malfunction being
-//! read as the truth. Quoting equities means a second equity source — another HIP-3 builder is the
-//! obvious one, and the disagreement above is exactly why it is worth having.
+//! `feed.venues_min` is 2, so a pair fed only from here sits below quorum and quotes nothing. That
+//! is correct rather than a limitation to work around: a single price source has nobody to
+//! disagree with it. Quoting equities means a second equity source — another HIP-3 builder is the
+//! obvious one, and the disagreement above is why it is worth having.
 //!
 //! # Perps, priced against spot
 //!
 //! These are perpetual futures and the pool's tokens are spot. A perp trades near its index but
 //! carries a funding basis, so the reference is a few bp off the underlying by construction. That
-//! is a real bias and it is not corrected here; correcting it needs the funding rate, which is a
-//! separate subscription and a separate decision about whether the pool wants to wear the basis or
-//! quote around it.
+//! bias is not corrected here; correcting it needs the funding rate, which is a separate
+//! subscription and a separate decision about whether the pool wears the basis or quotes around it.
 
 use std::collections::BTreeMap;
 
@@ -71,11 +67,28 @@ pub struct Client {
 
 impl Client {
     /// Build from `(venue symbol, canonical symbol)` pairs.
+    ///
+    /// # Panics
+    /// If any symbol is empty. A client built from a blank symbol subscribes to nothing and
+    /// reads as a healthy silent venue.
     #[must_use]
     pub fn new(symbols: &[(String, String)]) -> Self {
-        Self {
-            symbols: symbols.iter().cloned().collect(),
+        for (venue, canonical) in symbols {
+            assert!(!venue.is_empty(), "a hyperliquid coin must not be blank");
+            assert!(
+                !canonical.is_empty(),
+                "a canonical symbol must not be blank"
+            );
         }
+        let client = Self {
+            symbols: symbols.iter().cloned().collect(),
+        };
+        debug_assert_eq!(
+            client.symbols.len(),
+            symbols.len(),
+            "two pairs claim the same hyperliquid coin, so one is silently unsubscribed"
+        );
+        client
     }
 }
 
@@ -85,16 +98,26 @@ impl MarketFeed for Client {
     }
 
     fn subscribe_frames(&self) -> Vec<String> {
-        // One frame per market. The venue takes a single subscription per message, unlike OKX's
-        // batched `args` array, so a pool quoting four equities sends four frames.
-        self.symbols
+        assert!(
+            !self.symbols.is_empty(),
+            "subscribing to no market never delivers a book"
+        );
+        // One frame per market: the venue takes a single subscription per message, unlike OKX's
+        // batched `args` array.
+        let frames: Vec<String> = self
+            .symbols
             .keys()
             .map(|s| {
                 format!(
                     r#"{{"method":"subscribe","subscription":{{"type":"l2Book","coin":"{s}"}}}}"#
                 )
             })
-            .collect()
+            .collect();
+        assert_eq!(frames.len(), self.symbols.len());
+        debug_assert!(frames
+            .iter()
+            .all(|f| serde_json::from_str::<serde_json::Value>(f).is_ok()));
+        frames
     }
 
     fn parse(&mut self, text: &str) -> Result<Option<Update>, String> {
@@ -103,8 +126,8 @@ impl MarketFeed for Client {
         };
         match frame.channel.as_str() {
             "l2Book" => {}
-            // A rejected subscription is worth surfacing: it otherwise looks exactly like a market
-            // with nothing to say, and the pair silently sits below quorum forever.
+            // A rejected subscription otherwise looks exactly like a market with nothing to say,
+            // and the pair silently sits below quorum forever.
             "error" => return Err(format!("venue error: {}", frame.data)),
             // `subscriptionResponse`, `pong`, and anything else that is not a book.
             _ => return Ok(None),
@@ -116,14 +139,18 @@ impl MarketFeed for Client {
         let Some(symbol) = self.symbols.get(&book.coin) else {
             return Ok(None);
         };
+        debug_assert!(!symbol.is_empty(), "`new` rejects a blank canonical symbol");
         let (Some(bids), Some(asks)) = (book.levels.first(), book.levels.get(1)) else {
             return Err("levels was not [bids, asks]".to_string());
         };
+        assert!(book.levels.len() >= 2, "both sides were just indexed");
         let (Some(bid), Some(ask)) = (bids.first(), asks.first()) else {
             // A book with a side missing is not a top of book. Dropping it is right: the
             // micro-price would be meaningless and a zero would be worse.
             return Ok(None);
         };
+        assert!(!bids.is_empty());
+        assert!(!asks.is_empty());
 
         let f = |field: &str, v: &str| -> Result<u128, String> {
             units::parse_fixed(v, FEED_SCALE).map_err(|e| format!("{field}: {e}"))
@@ -132,10 +159,9 @@ impl MarketFeed for Client {
         Ok(Some(Update {
             symbol: symbol.clone(),
             tick: BookTick {
-                // The venue publishes no update id, so the frame's own millisecond timestamp is the
-                // sequence. It is monotone per market, which is all the gap check needs -- and a
-                // frame that arrives out of order carries an older time, so it is dropped exactly
-                // as a regressed id would be.
+                // No update id is published, so the frame's own millisecond timestamp is the
+                // sequence. It is monotone per market, and a frame that arrives out of order
+                // carries an older time, so it is dropped exactly as a regressed id would be.
                 update_id: book.time,
                 bid: f("bid px", &bid.px)?,
                 bid_qty: f("bid sz", &bid.sz)?,

@@ -1,42 +1,37 @@
 //! Ladder construction from strategy inputs.
 //!
-//! The other production path into the four prices. Where [`crate::inverse`] starts from a
-//! target execution price, this starts from the shape the strategy wants: a reference mid,
-//! a half-spread, a width, and an inventory skew — the same four numbers archi_v2 §4.3
-//! proposes compressing into 14 bytes of calldata.
+//! Where [`crate::inverse`] starts from a target execution price, this starts from the shape the
+//! strategy wants: a reference mid, a half-spread, a width, and an inventory skew — the four
+//! numbers archi_v2 §4.3 proposes compressing into 14 bytes of calldata.
 //!
-//! The contract this module signs up to is absolute: **whatever comes in, what comes out
-//! passes `PropCurve.validateLadder`.** The chain must never reject a row we produced. A
-//! rejected `updateQuote` is not a harmless no-op — it burns the block, leaves the previous
-//! quote in place to go stale, and is exactly the failure mode that turns an quoting outage
-//! into an adverse-selection event.
+//! The contract is absolute: **whatever comes in, what comes out passes
+//! `PropCurve.validateLadder`.** A rejected `updateQuote` is not a harmless no-op — it burns the
+//! block and leaves the previous quote to go stale, which is what turns a quoting outage into an
+//! adverse-selection event.
 //!
 //! # Clamping order
 //!
-//! Deterministic, and in this order. Each step's postcondition is what makes the next step's
-//! bounds provably well-formed (`lo <= hi` at every `clamp`).
+//! Deterministic, and in this order: each step's postcondition is what makes the next step's
+//! bounds well-formed (`lo <= hi` at every `clamp`).
 //!
-//! 1. **Sanitise the bps knobs.** `half_spread_bps` and `width_bps` are clamped to
-//!    `0..=9_999`; `skew_bps` to `-9_999..=9_999`. `u16`/`i16` admit values past 10 000, and
-//!    `10_000 - bps` must stay positive or the whole construction inverts.
-//! 2. **Skew the mid.** `m = mid * (10_000 - skew) / 10_000`, floored, then clamped to
-//!    `1..=PRICE_MAX`. Positive skew pushes the whole book *down* (the pool is long and wants
-//!    to sell); negative pushes it up. Clamping to `>= 1` keeps a zero reference from
+//! 1. **Sanitise the bps knobs.** `u16`/`i16` admit values past [`BPS_E2_MAX`], and
+//!    `BPS_E2 - bps` must stay positive or the whole construction inverts.
+//! 2. **Skew the mid**, floored, then clamped to `1..=PRICE_MAX`. Positive skew pushes the book
+//!    *down* (the pool is long and wants to sell). The `>= 1` keeps a zero reference from
 //!    collapsing the row into the all-zero ladder the validator rejects.
-//! 3. **Project the four prices**, bid side floored and ask side ceiled — both directions
-//!    are the pool's favour. This is the only asymmetry between the sides and it is
-//!    deliberate; §4.3's on-chain reconstruction floors both, and if that compressed path is
-//!    ever enabled the two will differ by one unit on the ask. See
+//! 3. **Project the four prices**, bid floored and ask ceiled — both in the pool's favour. This
+//!    is the only asymmetry between the sides: §4.3's on-chain reconstruction floors both, so if
+//!    that compressed path is ever enabled the two differ by one unit on the ask. See
 //!    [`LadderBuilder::round_ask_up`].
-//! 4. **Clamp into a monotone chain, bottom up**, each price bounded below by its
-//!    predecessor and above by `PRICE_MAX - 1` (`PRICE_MAX` for `max_ask`). This single sweep
-//!    subsumes the floor clamp, the ceiling clamp, and the ordering repair, and it is why no
-//!    later step can undo an earlier one.
-//! 5. **Open the book by one unit** if `max_ask == min_bid`, because `validateLadder`'s
-//!    `maxAsk > minBid` is strict. Step 4 reserves the room for this by capping the first
-//!    three prices at `PRICE_MAX - 1`.
-//! 6. **Assert.** Run the on-chain validator. A failure here is a bug in this module, and
-//!    the row is dropped rather than sent.
+//! 4. **Clamp into a monotone chain, bottom up**, each price bounded below by its predecessor
+//!    and above by `PRICE_MAX - 1` (`PRICE_MAX` for `max_ask`). One sweep subsumes the floor
+//!    clamp, the ceiling clamp and the ordering repair, which is why no later step can undo an
+//!    earlier one.
+//! 5. **Open the book by one unit** if `max_ask == min_bid`; `validateLadder`'s `maxAsk > minBid`
+//!    is strict. Step 4 reserves the room by capping the first three prices at `PRICE_MAX - 1`.
+//! 6. **Assert, then validate.** Both, deliberately: the invariants are checked where the row is
+//!    built and again by the port of the on-chain validator, so a construction bug cannot reach
+//!    the chain by way of a validator that agrees with it.
 
 use crate::curve::{validate_ladder, Ladder, PRICE_MAX};
 use crate::error::LadderError;
@@ -47,10 +42,9 @@ pub const BPS: u128 = 10_000;
 
 /// One in a hundredth of a basis point, the unit the ladder's spread and width are built in.
 ///
-/// Integer basis points were the original unit and they ran out of resolution. ETH's half-spread is
-/// `s0 + s1 * sigma` and, once sigma was scaled to the quote's real exposure window rather than the
-/// inventory's, the volatility term came to 0.6 bp against an `s0` of 1 -- so the floor is most of
-/// the price and a whole basis point is a coarse thing to set it in. Hundredths give 0.5 bp.
+/// Integer basis points ran out of resolution: once sigma was scaled to the quote's real exposure
+/// window rather than the inventory's, ETH's volatility term came to 0.6 bp against an `s0` of 1,
+/// so the floor is most of the price and a whole bp is a coarse thing to set it in.
 ///
 /// Nothing on chain changes. `PropPool` is handed four PRICES and `validate_ladder` checks their
 /// ordering; basis points never leave this crate.
@@ -63,6 +57,20 @@ pub const BPS_MAX: u128 = 9_999;
 /// [`BPS_MAX`] in hundredths of a basis point.
 pub const BPS_E2_MAX: u128 = 999_999;
 
+// Compile-time pins on the relationships every clamp below is derived from. A silent edit to one
+// constant without the others is the way this module stops being total.
+const _: () = assert!(BPS_E2 == BPS * 100);
+const _: () = assert!(BPS_E2_MAX == BPS_MAX * 100 + 99);
+// `BPS - skew` and `BPS_E2 - bps` stay strictly positive, so no projection can invert or zero out.
+const _: () = assert!(BPS_MAX < BPS);
+const _: () = assert!(BPS_E2_MAX < BPS_E2);
+// Step 5 needs one price unit of headroom under the ceiling for `max_ask > min_bid`.
+const _: () = assert!(PRICE_MAX >= 2);
+// The step-3 projections are `mul_div` over a 256-bit intermediate, but the widest factor
+// (`BPS_E2 + BPS_E2_MAX`) times `PRICE_MAX` must still be a sane u128 for the saturation in
+// [`round`] to mean "too big", not "wrapped".
+const _: () = assert!(PRICE_MAX < u128::MAX / (BPS_E2 + BPS_E2_MAX));
+
 /// Strategy inputs for one quote row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LadderBuilder {
@@ -70,9 +78,9 @@ pub struct LadderBuilder {
     pub reference_mid: u128,
     /// Half the bid/ask spread, in bps of the skewed mid.
     pub half_spread_bps_e2: u32,
-    /// Ladder width, in bps of the near price. This is the concentration knob; archi_v2 §5.2
-    /// notes production values in the sub-basis-point range (`0.20 bp`), so expect this to be
-    /// 0 for most pairs and the width to come from [`crate::inverse`] instead.
+    /// Ladder width, in bps of the near price. The concentration knob; archi_v2 §5.2 notes
+    /// production values in the sub-basis-point range (`0.20 bp`), so expect this to be 0 for
+    /// most pairs and the width to come from [`crate::inverse`] instead.
     pub width_bps_e2: u32,
     /// Inventory skew, in bps. Positive shifts the whole book down.
     pub skew_bps: i16,
@@ -107,10 +115,28 @@ impl LadderBuilder {
             return Err(LadderError::PriceOutOfRange);
         }
         let skew = i128::from(self.skew_bps).clamp(-(BPS_MAX as i128), BPS_MAX as i128);
-        // 10_000 - skew lands in 1..=19_999, always positive.
+        assert!(skew.unsigned_abs() <= BPS_MAX);
+        // `BPS - skew` lands in 1..=19_999, always positive.
         let factor = (BPS as i128 - skew) as u128;
+        assert!(factor >= BPS - BPS_MAX);
+        assert!(factor <= BPS + BPS_MAX);
+        assert!(factor != 0);
+
         let m = mul_div_floor(self.reference_mid, factor, BPS).unwrap_or(PRICE_MAX);
-        Ok(m.clamp(1, PRICE_MAX))
+        let m = m.clamp(1, PRICE_MAX);
+        assert!(
+            m >= 1,
+            "a zero mid collapses the row into the all-zero ladder"
+        );
+        assert!(m <= PRICE_MAX);
+        // Pair assertion on the sign convention: positive skew may only push the book down.
+        if self.skew_bps > 0 {
+            assert!(m <= self.reference_mid.max(1));
+        }
+        if self.skew_bps < 0 {
+            assert!(m >= self.reference_mid.min(PRICE_MAX));
+        }
+        Ok(m)
     }
 
     /// Build the row. Always produces something `PropCurve.validateLadder` accepts.
@@ -127,49 +153,124 @@ impl LadderBuilder {
             return Err(LadderError::InfeasibleBounds);
         }
         let m = self.skewed_mid()?;
+        assert!(m >= 1);
+        assert!(m <= PRICE_MAX);
 
         // Step 1. Both in hundredths of a bp -- see [`BPS_E2`].
         let hs = u128::from(self.half_spread_bps_e2).min(BPS_E2_MAX);
         let w = u128::from(self.width_bps_e2).min(BPS_E2_MAX);
 
-        // Step 3. Bid side down, ask side (by default) up.
-        let raw_max_bid = mul_div_floor(m, BPS_E2 - hs, BPS_E2).unwrap_or(0);
-        let raw_min_bid = mul_div_floor(raw_max_bid, BPS_E2 - w, BPS_E2).unwrap_or(0);
+        let raw = self.project(m, hs, w);
+        let ladder = clamp_chain(raw, self.min_price);
+
+        // Step 6. The construction-side invariants, then the port of the on-chain validator.
+        assert_chain(&ladder, self.min_price);
+        validate_ladder(
+            ladder.min_bid,
+            ladder.max_bid,
+            ladder.min_ask,
+            ladder.max_ask,
+            self.min_price,
+        )?;
+        Ok(ladder)
+    }
+
+    /// Step 3: the four unclamped prices. Bid side down, ask side (by default) up.
+    fn project(&self, m: u128, hs: u128, w: u128) -> Ladder {
+        assert!(m >= 1);
+        assert!(m <= PRICE_MAX);
+        assert!(hs <= BPS_E2_MAX);
+        assert!(w <= BPS_E2_MAX);
+        assert!(
+            BPS_E2 - hs >= 1,
+            "a full-width half-spread would zero the bid"
+        );
+        assert!(BPS_E2 - w >= 1);
+
+        let max_bid = mul_div_floor(m, BPS_E2 - hs, BPS_E2).unwrap_or(0);
+        let min_bid = mul_div_floor(max_bid, BPS_E2 - w, BPS_E2).unwrap_or(0);
         let up = self.round_ask_up;
-        let raw_min_ask = round(up, m, BPS_E2 + hs, BPS_E2);
-        let raw_max_ask = round(up, raw_min_ask, BPS_E2 + w, BPS_E2);
+        let min_ask = round(up, m, BPS_E2 + hs, BPS_E2);
+        let max_ask = round(up, min_ask, BPS_E2 + w, BPS_E2);
 
-        // Step 4. Monotone bottom-up sweep. `hi_body = PRICE_MAX - 1` is >= min_price by the
-        // guard above, so every clamp below has `lo <= hi`.
-        let hi_body = PRICE_MAX - 1;
-        let min_bid = raw_min_bid.clamp(self.min_price, hi_body);
-        let max_bid = raw_max_bid.clamp(min_bid, hi_body);
-        let min_ask = raw_min_ask.clamp(max_bid, hi_body);
-        // Step 5, folded into the lower bound: max_ask >= max(min_ask, min_bid + 1).
-        let max_ask = raw_max_ask.clamp(min_ask.max(min_bid + 1), PRICE_MAX);
-
-        let ladder = Ladder {
+        // Ordered before any clamping, which is what makes step 4's sweep a repair of the
+        // `min_price`/`PRICE_MAX` bounds rather than of the projection itself.
+        assert!(min_bid <= max_bid);
+        assert!(max_bid <= m);
+        assert!(min_ask >= m.min(PRICE_MAX));
+        assert!(min_ask <= max_ask);
+        Ladder {
             min_bid,
             max_bid,
             min_ask,
             max_ask,
-        };
-        // Step 6.
-        validate_ladder(min_bid, max_bid, min_ask, max_ask, self.min_price)?;
-        Ok(ladder)
+        }
     }
 }
 
+/// Step 4 and step 5: the monotone bottom-up sweep, each price bounded below by its predecessor.
+///
+/// `hi_body = PRICE_MAX - 1` leaves `max_ask` the one unit the strict `maxAsk > minBid` needs.
+fn clamp_chain(raw: Ladder, min_price: u128) -> Ladder {
+    assert!(
+        min_price < PRICE_MAX,
+        "no room for the strict maxAsk > minBid"
+    );
+    let hi_body = PRICE_MAX - 1;
+    assert!(min_price <= hi_body, "every clamp below needs lo <= hi");
+
+    let min_bid = raw.min_bid.clamp(min_price, hi_body);
+    let max_bid = raw.max_bid.clamp(min_bid, hi_body);
+    let min_ask = raw.min_ask.clamp(max_bid, hi_body);
+    // Step 5, folded into the lower bound: max_ask >= max(min_ask, min_bid + 1).
+    let max_ask = raw.max_ask.clamp(min_ask.max(min_bid + 1), PRICE_MAX);
+
+    assert!(min_bid <= hi_body);
+    assert!(max_bid <= hi_body);
+    assert!(min_ask <= hi_body);
+    assert!(max_ask <= PRICE_MAX);
+    Ladder {
+        min_bid,
+        max_bid,
+        min_ask,
+        max_ask,
+    }
+}
+
+/// The invariants `PropCurve.validateLadder` accepts, asserted at the point of construction.
+///
+/// Paired with [`validate_ladder`] on purpose. The validator is a port of someone else's check
+/// and could in principle drift from it; these are stated here, against the clamping order that
+/// produced them, so a row that is wrong in both places has to be wrong twice.
+fn assert_chain(l: &Ladder, min_price: u128) {
+    assert!(l.min_bid >= min_price);
+    assert!(l.min_bid <= l.max_bid);
+    assert!(l.max_bid <= l.min_ask);
+    assert!(l.min_ask <= l.max_ask);
+    assert!(l.max_ask <= PRICE_MAX);
+    // The negative space: `validateLadder`'s `maxAsk > minBid` is strict, so the flat row that
+    // passes every ordering check above is still rejected on chain.
+    assert!(l.max_ask > l.min_bid);
+    assert!(l.max_ask != 0);
+}
+
 /// `ceil(a*b/d)` when `up`, else `floor`. Saturates at [`PRICE_MAX`] rather than failing:
-/// step 4 clamps every price into range anyway, and a saturating projection keeps `build`
-/// total.
+/// step 4 clamps every price into range anyway, and a saturating projection keeps `build` total.
 fn round(up: bool, a: u128, b: u128, d: u128) -> u128 {
+    assert!(d != 0);
     let r = if up {
         mul_div_ceil(a, b, d)
     } else {
         mul_div_floor(a, b, d)
     };
-    r.unwrap_or(PRICE_MAX).min(PRICE_MAX)
+    let r = r.unwrap_or(PRICE_MAX).min(PRICE_MAX);
+    assert!(r <= PRICE_MAX);
+    // What step 3 relies on: a factor at or above one never moves a price down, and the
+    // saturation is the only thing that can cap it.
+    if b >= d {
+        assert!(r >= a.min(PRICE_MAX));
+    }
+    r
 }
 
 #[cfg(test)]

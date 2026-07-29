@@ -2,17 +2,14 @@
 //!
 //! # The decomposition, which is the whole design
 //!
-//! A market maker's NAV moves for two unrelated reasons, and conflating them makes both
-//! killswitches useless:
+//! NAV moves for two unrelated reasons, and conflating them makes both killswitches useless:
+//! **revaluation**, the market moving under the inventory -- for an *unhedged* book a genuine gain
+//! or loss, unbounded and symmetric, and unrelated to whether the quoting is any good -- and
+//! **trade PnL**, what the fills themselves added or destroyed, which is the number that says
+//! whether takers are picking us off.
 //!
-//! * **revaluation** — the market moved and the inventory is worth something different. For an
-//!   *unhedged* book this is a genuine gain or loss, not an accounting artefact. It is also
-//!   unbounded, symmetric, and has nothing to do with whether the quoting is any good.
-//! * **trade PnL** — value the fills themselves added or destroyed. This is the number that
-//!   says whether takers are picking us off.
-//!
-//! Between two observations they separate exactly, with no event decoding, because inventory
-//! only changes when a trade happens:
+//! Between two observations they separate exactly, with no event decoding, because inventory only
+//! changes when a trade happens:
 //!
 //! ```text
 //! NAV          = quoteBalance + SUM_i value(baseBalance_i, fair_i)
@@ -20,14 +17,13 @@
 //! tradePnl     = (NAV_now - NAV_prev) - revaluation
 //! ```
 //!
-//! The property that makes this trustworthy: **with no trades, `tradePnl` is exactly zero.**
-//! Not approximately — the balances are identical, so the two sums cancel term for term over
-//! the same integer valuation function. A quiet market and a quiet book accumulate nothing at
-//! all, which is what lets a cumulative gross budget run for days without drifting into a trip.
-//! That is also why there is no noise floor knob: there is no noise to floor.
+//! The property that makes this trustworthy: **with no trades, `tradePnl` is exactly zero.** Not
+//! approximately — the balances are identical, so the two sums cancel term for term over the same
+//! integer valuation. That is what lets a cumulative gross budget run for days without drifting
+//! into a trip, and why there is no noise floor knob: there is no noise to floor.
 //!
-//! `value` is [`amount_out_bid`] against a flat ladder at the fair value — the chain's own
-//! integer valuation, floored, rather than a division written here.
+//! `value` is [`amount_out_bid`] against a flat ladder at the fair value — the chain's own integer
+//! valuation, floored, rather than a division written here.
 //!
 //! # The two switches
 //!
@@ -42,16 +38,15 @@
 //!
 //! # Latching and restart
 //!
-//! Both latch. The latch is written to disk atomically — temp file, then rename — after every
-//! change, and it is read at startup: a halted book **stays down** across a restart. Restarting
-//! the process is the most natural thing an operator does when something looks wrong, and if it
-//! silently resumed quoting the killswitch would be decoration.
+//! Both latch, written atomically — temp file, then rename — after every change and read at
+//! startup, so a halted book **stays down** across a restart. Restarting is the most natural thing
+//! an operator does when something looks wrong, and a killswitch that silently resumed quoting
+//! would be decoration.
 //!
-//! What deliberately does **not** survive a restart is the previous-observation state: the last
-//! balances and fair values. Trades may have happened while the process was down, so attributing
-//! the balance change across that gap to trade PnL would be an invention. The first observation
-//! after a restart re-seeds and attributes nothing. The *cumulative* total and the latch persist,
-//! which is what matters.
+//! What deliberately does **not** survive is the previous-observation state: the last balances and
+//! fair values. Trades may have happened while the process was down, so attributing the balance
+//! change across that gap would be an invention — the first observation after a restart re-seeds
+//! and attributes nothing. The *cumulative* total and the latch persist, which is what matters.
 //!
 //! # Known gap
 //!
@@ -113,10 +108,9 @@ pub struct Position {
 /// Uses the chain's own quote path so the mark and a real fill agree on what the inventory is
 /// worth, rather than differing by whatever a hand-written division rounds differently.
 ///
-/// Public because [`crate::skew`] needs the *same* valuation to measure inventory imbalance
-/// against target. Two valuation functions that disagree by a rounding step would mean the
-/// killswitch and the skew arguing about how much the pool holds, which is the sort of
-/// discrepancy that is invisible until it matters.
+/// Public because [`crate::skew`] needs the *same* valuation to measure inventory imbalance against
+/// target: two that disagree by a rounding step would have the killswitch and the skew arguing
+/// about how much the pool holds, which is invisible until it matters.
 ///
 /// # Errors
 /// [`dubu_core::CurveError`] only from the shared domain.
@@ -128,6 +122,9 @@ pub fn value(
     if base_balance == 0 || fair == 0 {
         return Ok(0);
     }
+    // Both zero cases returned above, so what follows is a real balance at a real price.
+    assert!(base_balance > 0);
+    assert!(fair > 0);
     amount_out_bid(
         base_balance.min(AMOUNT_MAX),
         fair,
@@ -168,11 +165,14 @@ impl Halt {
     /// Short stable string for structured logs.
     #[must_use]
     pub const fn label(&self) -> &'static str {
-        match self {
+        let label = match self {
             Self::Bleed { .. } => "bleed",
             Self::LossBudget { .. } => "loss_budget",
             Self::Liveness { .. } => "liveness",
-        }
+        };
+        // Structured logs key on this; an empty label loses which switch fired.
+        assert!(!label.is_empty());
+        label
     }
 }
 
@@ -202,10 +202,9 @@ impl std::fmt::Display for Halt {
 
 /// Serialise a `u128` as a decimal string.
 ///
-/// JSON numbers are `f64` to most readers, and this file is meant to be readable by a human
-/// with `jq` during an incident. A quote-unit total past 2^53 silently becoming approximate in
-/// whatever they use to look at it is not acceptable in the file that records why the book is
-/// down.
+/// JSON numbers are `f64` to most readers, and this file is read with `jq` during an incident. A
+/// total past 2^53 silently becoming approximate is not acceptable in the file that records why
+/// the book is down.
 mod u128_string {
     use serde::{Deserialize, Deserializer, Serializer};
 
@@ -253,7 +252,7 @@ impl RiskState {
     /// A clean state.
     #[must_use]
     pub const fn fresh() -> Self {
-        Self {
+        let state = Self {
             version: 1,
             halted: false,
             halt_reason: None,
@@ -261,7 +260,13 @@ impl RiskState {
             cumulative_trade_loss: 0,
             cumulative_trade_gain: 0,
             observations: 0,
-        }
+        };
+        // A missing state file starts here, so a fresh state that read as halted would keep a
+        // healthy book down and one carrying loss would start it part-way through its budget.
+        assert!(!state.halted);
+        assert!(state.cumulative_trade_loss == 0);
+        assert!(state.observations == 0);
+        state
     }
 }
 
@@ -308,6 +313,11 @@ impl KillSwitch {
         bleed_limit: u128,
         loss_budget: u128,
     ) -> Result<Self, RiskError> {
+        // The config validator refuses all three; restated here because a zero window has no peak
+        // to draw down from and a zero limit or budget trips on the first observation.
+        assert!(bleed_window_secs > 0);
+        assert!(bleed_limit > 0);
+        assert!(loss_budget > 0);
         let state = match std::fs::read_to_string(path) {
             Ok(text) => serde_json::from_str(&text).map_err(|source| RiskError::Corrupt {
                 path: path.to_path_buf(),
@@ -321,7 +331,7 @@ impl KillSwitch {
                 })
             }
         };
-        Ok(Self {
+        let switch = Self {
             path: path.to_path_buf(),
             state,
             bleed_window_secs,
@@ -329,7 +339,12 @@ impl KillSwitch {
             loss_budget,
             prev: None,
             window: Vec::new(),
-        })
+        };
+        // What must NOT survive a restart, asserted where it is constructed: trades may have
+        // happened while the process was down, so the first observation has to re-seed.
+        assert!(switch.prev.is_none());
+        assert!(switch.window.is_empty());
+        Ok(switch)
     }
 
     /// Whether the latch is set.
@@ -363,13 +378,18 @@ impl KillSwitch {
         self.state.halted = true;
         self.state.halt_reason = Some(halt.to_string());
         self.state.halted_at = Some(now);
+        // All three or none: a latch an operator cannot read the reason for after a restart is one
+        // they will clear blind.
+        assert!(self.state.halted);
+        assert!(self.state.halt_reason.is_some());
+        assert!(self.state.halted_at == Some(now));
         self.persist()
     }
 
     /// Feed one mark through both switches.
     ///
     /// Returns the trip, if this observation caused one. A no-op once halted: the latch does not
-    /// need re-deciding and the numbers behind it should not keep moving after the fact.
+    /// need re-deciding and its numbers should not keep moving after the fact.
     ///
     /// # Errors
     /// [`RiskError::Mark`] if a balance cannot be valued, [`RiskError::Io`] if a trip cannot be
@@ -380,68 +400,43 @@ impl KillSwitch {
         positions: &[Position],
         now: u64,
     ) -> Result<(Observation, Option<Halt>), RiskError> {
+        // A NAV marked on nothing is not a NAV, and a drawdown measured against it is not a
+        // drawdown. The caller skips groups with no positions rather than marking an empty book.
+        assert!(!positions.is_empty());
         let by_pair: BTreeMap<u16, Position> = positions.iter().map(|p| (p.pair_id, *p)).collect();
+        // A repeated pair id would silently drop a position from every sum below.
+        assert_eq!(by_pair.len(), positions.len());
 
-        let mut nav = quote_balance;
-        for p in by_pair.values() {
-            nav = nav.saturating_add(
-                value(p.base_balance, p.fair, p.price_scale_exp).map_err(RiskError::Mark)?,
-            );
-        }
+        let nav = nav_of(quote_balance, &by_pair)?;
+        let drawdown = self.record_drawdown(now, nav);
 
-        // The window, and the peak-to-current drawdown inside it.
-        self.window.push(NavPoint { at: now, nav });
-        let cutoff = now.saturating_sub(self.bleed_window_secs);
-        self.window.retain(|p| p.at >= cutoff);
-        let peak = self.window.iter().map(|p| p.nav).max().unwrap_or(nav);
-        let drawdown = peak.saturating_sub(nav);
-
-        // The decomposition. Revaluation is computed on the PREVIOUS balances, so the residual
-        // is what the fills did.
+        // Revaluation is computed on the PREVIOUS balances, so the residual is what the fills did.
         let (revaluation, trade_pnl, seeded) = match &self.prev {
             None => (0i128, 0i128, true),
             Some((prev_quote, prev_positions)) => {
-                let mut reval = 0i128;
-                for (id, prev) in prev_positions {
-                    // A pair that vanished from the config between observations cannot be
-                    // revalued; treat its old fair as still current, which contributes zero.
-                    let fair_now = by_pair.get(id).map_or(prev.fair, |p| p.fair);
-                    let then = value(prev.base_balance, prev.fair, prev.price_scale_exp)
-                        .map_err(RiskError::Mark)?;
-                    let now_v = value(prev.base_balance, fair_now, prev.price_scale_exp)
-                        .map_err(RiskError::Mark)?;
-                    reval += i128::try_from(now_v).unwrap_or(i128::MAX)
-                        - i128::try_from(then).unwrap_or(i128::MAX);
-                }
-                let mut prev_nav = *prev_quote;
-                for p in prev_positions.values() {
-                    prev_nav = prev_nav.saturating_add(
-                        value(p.base_balance, p.fair, p.price_scale_exp)
-                            .map_err(RiskError::Mark)?,
-                    );
-                }
+                let reval = revaluation_of(prev_positions, &by_pair)?;
+                let prev_nav = nav_of(*prev_quote, prev_positions)?;
                 let delta = i128::try_from(nav).unwrap_or(i128::MAX)
                     - i128::try_from(prev_nav).unwrap_or(i128::MAX);
                 (reval, delta - reval, false)
             }
         };
+        // A seed attributes nothing: trades may have happened before it, and inventing an
+        // attribution across that gap is what would poison the cumulative budget.
+        if seeded {
+            assert!(revaluation == 0);
+            assert!(trade_pnl == 0);
+        }
 
         if !seeded && !self.state.halted {
-            if trade_pnl < 0 {
-                self.state.cumulative_trade_loss = self
-                    .state
-                    .cumulative_trade_loss
-                    .saturating_add(trade_pnl.unsigned_abs());
-            } else {
-                self.state.cumulative_trade_gain = self
-                    .state
-                    .cumulative_trade_gain
-                    .saturating_add(trade_pnl.unsigned_abs());
-            }
-            self.state.observations += 1;
+            self.accumulate(trade_pnl);
         }
 
         self.prev = Some((quote_balance, by_pair));
+        assert!(
+            self.prev.is_some(),
+            "the next observation has a baseline to attribute against"
+        );
 
         let obs = Observation {
             nav,
@@ -456,30 +451,76 @@ impl KillSwitch {
             return Ok((obs, None));
         }
 
-        // Bleed first: it is the faster-moving switch and the more urgent verdict.
-        let halt = if drawdown >= self.bleed_limit {
-            Some(Halt::Bleed {
-                drawdown,
-                limit: self.bleed_limit,
-                window_secs: self.bleed_window_secs,
-            })
-        } else if self.state.cumulative_trade_loss >= self.loss_budget {
-            Some(Halt::LossBudget {
-                cumulative: self.state.cumulative_trade_loss,
-                budget: self.loss_budget,
-            })
-        } else {
-            None
-        };
-
+        let halt = self.verdict(drawdown);
         if let Some(h) = &halt {
             self.halt(h, now)?;
+            assert!(self.state.halted, "a trip that did not latch is decoration");
         } else {
             // Persist the running totals even without a trip, or a restart hands back whatever
             // budget was consumed since the last one.
             self.persist()?;
         }
         Ok((obs, halt))
+    }
+
+    /// Push this NAV into the bleed window, drop what has aged out, and return the peak-to-current
+    /// drawdown inside it.
+    fn record_drawdown(&mut self, now: u64, nav: u128) -> u128 {
+        self.window.push(NavPoint { at: now, nav });
+        let cutoff = now.saturating_sub(self.bleed_window_secs);
+        self.window.retain(|p| p.at >= cutoff);
+        // The point just pushed is stamped `now` and the cutoff is at or before it, so it always
+        // survives its own retain -- which is what makes the peak below at least this NAV.
+        assert!(!self.window.is_empty());
+        let peak = self.window.iter().map(|p| p.nav).max().unwrap_or(nav);
+        assert!(peak >= nav);
+        peak.saturating_sub(nav)
+    }
+
+    /// Fold one attributed step into the running totals.
+    ///
+    /// Gross, per archi_v2 §5.4: every negative step is added and a later recovery does **not** hand
+    /// the budget back. A book that loses 1000 and makes 1000 has been picked off twice, not zero
+    /// times.
+    fn accumulate(&mut self, trade_pnl: i128) {
+        let before = self.state.cumulative_trade_loss;
+        if trade_pnl < 0 {
+            self.state.cumulative_trade_loss = self
+                .state
+                .cumulative_trade_loss
+                .saturating_add(trade_pnl.unsigned_abs());
+        } else {
+            self.state.cumulative_trade_gain = self
+                .state
+                .cumulative_trade_gain
+                .saturating_add(trade_pnl.unsigned_abs());
+        }
+        self.state.observations += 1;
+        assert!(self.state.cumulative_trade_loss >= before);
+        // Gross means gross: the only thing that may consume the budget is a loss.
+        if trade_pnl >= 0 {
+            assert!(self.state.cumulative_trade_loss == before);
+        }
+    }
+
+    /// Which switch, if either, this observation tripped.
+    ///
+    /// Bleed first: it is the faster-moving switch and the more urgent verdict.
+    fn verdict(&self, drawdown: u128) -> Option<Halt> {
+        if drawdown >= self.bleed_limit {
+            return Some(Halt::Bleed {
+                drawdown,
+                limit: self.bleed_limit,
+                window_secs: self.bleed_window_secs,
+            });
+        }
+        if self.state.cumulative_trade_loss >= self.loss_budget {
+            return Some(Halt::LossBudget {
+                cumulative: self.state.cumulative_trade_loss,
+                budget: self.loss_budget,
+            });
+        }
+        None
     }
 
     /// Write the state atomically: temp file in the same directory, then rename.
@@ -500,11 +541,62 @@ impl KillSwitch {
             path: self.path.clone(),
             source: std::io::Error::other(e),
         })?;
+        assert!(!text.is_empty());
         let tmp = self.path.with_extension("json.tmp");
+        // Writing the scratch file over the latch and then renaming it to itself would destroy the
+        // one file that must never be half-written.
+        assert!(tmp != self.path);
         std::fs::write(&tmp, text).map_err(io)?;
         std::fs::rename(&tmp, &self.path).map_err(io)?;
         Ok(())
     }
+}
+
+/// NAV: the quote balance plus every base balance marked at its own fair value.
+///
+/// # Errors
+/// [`RiskError::Mark`] if a balance cannot be valued.
+fn nav_of(quote_balance: u128, positions: &BTreeMap<u16, Position>) -> Result<u128, RiskError> {
+    let mut nav = quote_balance;
+    for p in positions.values() {
+        nav = nav.saturating_add(
+            value(p.base_balance, p.fair, p.price_scale_exp).map_err(RiskError::Mark)?,
+        );
+    }
+    // Inventory is only ever worth a non-negative amount, so marking it cannot shrink the NAV.
+    assert!(nav >= quote_balance);
+    Ok(nav)
+}
+
+/// Value change attributable to price moves on the balances held at the PREVIOUS observation.
+///
+/// Marking the old balances at both fair values is what leaves the residual as the fills' doing.
+///
+/// # Errors
+/// [`RiskError::Mark`] if a balance cannot be valued.
+fn revaluation_of(
+    prev_positions: &BTreeMap<u16, Position>,
+    now_positions: &BTreeMap<u16, Position>,
+) -> Result<i128, RiskError> {
+    let mut reval = 0i128;
+    for (id, prev) in prev_positions {
+        // A pair that vanished from the config between observations cannot be revalued; treat its
+        // old fair as still current, which contributes zero.
+        let fair_now = now_positions.get(id).map_or(prev.fair, |p| p.fair);
+        let then =
+            value(prev.base_balance, prev.fair, prev.price_scale_exp).map_err(RiskError::Mark)?;
+        let now_v =
+            value(prev.base_balance, fair_now, prev.price_scale_exp).map_err(RiskError::Mark)?;
+        // The property the whole decomposition rests on: the same balance at the same fair over
+        // the same integer valuation must cancel term for term, so a quiet market contributes
+        // nothing and `trade_pnl` is exactly zero rather than approximately.
+        if fair_now == prev.fair {
+            assert_eq!(now_v, then);
+        }
+        reval +=
+            i128::try_from(now_v).unwrap_or(i128::MAX) - i128::try_from(then).unwrap_or(i128::MAX);
+    }
+    Ok(reval)
 }
 
 #[cfg(test)]
