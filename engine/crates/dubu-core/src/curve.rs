@@ -207,7 +207,13 @@ impl Ladder {
     /// # Errors
     /// See [`validate_ladder`].
     pub fn validate(&self, min_price: u128) -> Result<(), CurveError> {
-        validate_ladder(self.min_bid, self.max_bid, self.min_ask, self.max_ask, min_price)
+        validate_ladder(
+            self.min_bid,
+            self.max_bid,
+            self.min_ask,
+            self.max_ask,
+            min_price,
+        )
     }
 }
 
@@ -246,29 +252,54 @@ fn check_exp(price_scale_exp: u8) -> Result<u128, CurveError> {
 ///
 /// Preconditions, all established by the callers: `C > 0`, `u + q <= C`, `maxBid >= minBid`.
 /// Together they make the subtraction underflow-free (`W <= maxBid` and `2u + q <= 2C`).
-fn bid_gross(q: u128, min_bid: u128, max_bid: u128, c: u128, u: u128, scale: u128) -> Result<U256, CurveError> {
-    let span = max_bid.checked_sub(min_bid).ok_or(CurveError::ArithmeticPanic)?;
+fn bid_gross(
+    q: u128,
+    min_bid: u128,
+    max_bid: u128,
+    c: u128,
+    u: u128,
+    scale: u128,
+) -> Result<U256, CurveError> {
+    let span = max_bid
+        .checked_sub(min_bid)
+        .ok_or(CurveError::ArithmeticPanic)?;
     let gross = U256::mul_u128(max_bid.checked_mul(2).ok_or(CurveError::DomainOverflow)?, c);
     let impact = U256::mul_u128(span, twice_plus(u, q)?);
-    let factor = gross.checked_sub(impact).ok_or(CurveError::ArithmeticPanic)?;
-    let num = factor.checked_mul_u128(q).ok_or(CurveError::ArithmeticPanic)?;
+    let factor = gross
+        .checked_sub(impact)
+        .ok_or(CurveError::ArithmeticPanic)?;
+    let num = factor
+        .checked_mul_u128(q)
+        .ok_or(CurveError::ArithmeticPanic)?;
     let den = denominator(c, scale)?;
     Ok(num.div_rem(den).ok_or(CurveError::ArithmeticPanic)?.0)
 }
 
 /// `ceil( q * (2*minAsk*C + W*(2u + q)) / (2*C*S) )`, uncapped.
-fn ask_cost(q: u128, min_ask: u128, max_ask: u128, c: u128, u: u128, scale: u128) -> Result<U256, CurveError> {
-    let span = max_ask.checked_sub(min_ask).ok_or(CurveError::ArithmeticPanic)?;
+fn ask_cost(
+    q: u128,
+    min_ask: u128,
+    max_ask: u128,
+    c: u128,
+    u: u128,
+    scale: u128,
+) -> Result<U256, CurveError> {
+    let span = max_ask
+        .checked_sub(min_ask)
+        .ok_or(CurveError::ArithmeticPanic)?;
     let base = U256::mul_u128(min_ask.checked_mul(2).ok_or(CurveError::DomainOverflow)?, c);
     let impact = U256::mul_u128(span, twice_plus(u, q)?);
     let factor = base.checked_add(impact).ok_or(CurveError::DomainOverflow)?;
-    let num = factor.checked_mul_u128(q).ok_or(CurveError::ArithmeticPanic)?;
+    let num = factor
+        .checked_mul_u128(q)
+        .ok_or(CurveError::ArithmeticPanic)?;
     let den = denominator(c, scale)?;
     let (quo, rem) = num.div_rem(den).ok_or(CurveError::ArithmeticPanic)?;
     if rem.is_zero() {
         Ok(quo)
     } else {
-        quo.checked_add(U256::from_u128(1)).ok_or(CurveError::ArithmeticPanic)
+        quo.checked_add(U256::from_u128(1))
+            .ok_or(CurveError::ArithmeticPanic)
     }
 }
 
@@ -283,7 +314,10 @@ fn twice_plus(u: u128, q: u128) -> Result<u128, CurveError> {
 /// `2*C*S`, always `>= 2` for a live pair, so no divider ever sees a zero denominator.
 #[inline]
 fn denominator(c: u128, scale: u128) -> Result<U256, CurveError> {
-    Ok(U256::mul_u128(c.checked_mul(2).ok_or(CurveError::DomainOverflow)?, scale))
+    Ok(U256::mul_u128(
+        c.checked_mul(2).ok_or(CurveError::DomainOverflow)?,
+        scale,
+    ))
 }
 
 /// `ceil(a * b / d)` clamped into `u128`, for the bisection bracket seeds only. Saturating
@@ -321,9 +355,18 @@ pub fn amount_out_bid(
     bid_used: u128,
     price_scale_exp: u8,
 ) -> Result<u128, CurveError> {
-    debug_assert!(in_amount_domain(amount_in), "amountIn outside uint96 domain");
-    debug_assert!(in_price_domain(min_bid) && in_price_domain(max_bid), "price outside uint56 domain");
-    debug_assert!(in_amount_domain(bid_capacity) && in_amount_domain(bid_used), "capacity outside uint96 domain");
+    debug_assert!(
+        in_amount_domain(amount_in),
+        "amountIn outside uint96 domain"
+    );
+    debug_assert!(
+        in_price_domain(min_bid) && in_price_domain(max_bid),
+        "price outside uint56 domain"
+    );
+    debug_assert!(
+        in_amount_domain(bid_capacity) && in_amount_domain(bid_used),
+        "capacity outside uint96 domain"
+    );
     let scale = check_exp(price_scale_exp)?;
 
     if amount_in == 0 {
@@ -336,7 +379,9 @@ pub fn amount_out_bid(
     // sum certainly exceeds `bid_capacity <= u128::MAX`, which is the same verdict. This check
     // is also what puts the bid parabola's vertex out of reach and keeps the numerator's
     // subtraction underflow-free.
-    let consumed = bid_used.checked_add(amount_in).ok_or(CurveError::AmountExceedsCapacity)?;
+    let consumed = bid_used
+        .checked_add(amount_in)
+        .ok_or(CurveError::AmountExceedsCapacity)?;
     if consumed > bid_capacity {
         return Err(CurveError::AmountExceedsCapacity);
     }
@@ -367,8 +412,14 @@ pub fn amount_in_bid(
     bid_used: u128,
     price_scale_exp: u8,
 ) -> Result<u128, CurveError> {
-    debug_assert!(in_price_domain(min_bid) && in_price_domain(max_bid), "price outside uint56 domain");
-    debug_assert!(in_amount_domain(bid_capacity) && in_amount_domain(bid_used), "capacity outside uint96 domain");
+    debug_assert!(
+        in_price_domain(min_bid) && in_price_domain(max_bid),
+        "price outside uint56 domain"
+    );
+    debug_assert!(
+        in_amount_domain(bid_capacity) && in_amount_domain(bid_used),
+        "capacity outside uint96 domain"
+    );
     let scale = check_exp(price_scale_exp)?;
 
     if amount_out == 0 {
@@ -414,14 +465,19 @@ pub fn amount_in_bid(
     // regardless of how well this converges — three rounds is a gas constant on chain, not a
     // correctness parameter, and this port must run the same number of them to stay bit-exact.
     let span = max_bid - min_bid; // checked above, inside `bid_gross`
-    let den = bid_capacity.checked_mul(2).ok_or(CurveError::DomainOverflow)?;
+    let den = bid_capacity
+        .checked_mul(2)
+        .ok_or(CurveError::DomainOverflow)?;
     for _ in 0..3 {
         if lo >= hi {
             break;
         }
         // ceil the price = floor the drift: `>= p(lo)`.
-        let drift = mul_div_floor(span, twice_plus(bid_used, lo)?, den).ok_or(CurveError::DomainOverflow)?;
-        let p = max_bid.checked_sub(drift).ok_or(CurveError::ArithmeticPanic)?;
+        let drift = mul_div_floor(span, twice_plus(bid_used, lo)?, den)
+            .ok_or(CurveError::DomainOverflow)?;
+        let p = max_bid
+            .checked_sub(drift)
+            .ok_or(CurveError::ArithmeticPanic)?;
         if p != 0 {
             let seed = seed_ceil(amount_out, scale, p).min(hi);
             if seed > lo {
@@ -429,8 +485,11 @@ pub fn amount_in_bid(
             }
         }
         // floor the price = ceil the drift: `<= p(hi)`.
-        let drift = mul_div_ceil(span, twice_plus(bid_used, hi)?, den).ok_or(CurveError::DomainOverflow)?;
-        let p = max_bid.checked_sub(drift).ok_or(CurveError::ArithmeticPanic)?;
+        let drift =
+            mul_div_ceil(span, twice_plus(bid_used, hi)?, den).ok_or(CurveError::DomainOverflow)?;
+        let p = max_bid
+            .checked_sub(drift)
+            .ok_or(CurveError::ArithmeticPanic)?;
         if p != 0 {
             let seed = seed_ceil(amount_out, scale, p);
             if seed < hi && seed >= lo {
@@ -475,9 +534,18 @@ pub fn amount_in_ask(
     ask_used: u128,
     price_scale_exp: u8,
 ) -> Result<u128, CurveError> {
-    debug_assert!(in_amount_domain(amount_out), "amountOut outside uint96 domain");
-    debug_assert!(in_price_domain(min_ask) && in_price_domain(max_ask), "price outside uint56 domain");
-    debug_assert!(in_amount_domain(ask_capacity) && in_amount_domain(ask_used), "capacity outside uint96 domain");
+    debug_assert!(
+        in_amount_domain(amount_out),
+        "amountOut outside uint96 domain"
+    );
+    debug_assert!(
+        in_price_domain(min_ask) && in_price_domain(max_ask),
+        "price outside uint56 domain"
+    );
+    debug_assert!(
+        in_amount_domain(ask_capacity) && in_amount_domain(ask_used),
+        "capacity outside uint96 domain"
+    );
     let scale = check_exp(price_scale_exp)?;
 
     if amount_out == 0 {
@@ -486,7 +554,9 @@ pub fn amount_in_ask(
     if ask_capacity == 0 {
         return Err(CurveError::ZeroCapacity);
     }
-    let consumed = ask_used.checked_add(amount_out).ok_or(CurveError::AmountExceedsCapacity)?;
+    let consumed = ask_used
+        .checked_add(amount_out)
+        .ok_or(CurveError::AmountExceedsCapacity)?;
     if consumed > ask_capacity {
         return Err(CurveError::AmountExceedsCapacity);
     }
@@ -532,8 +602,14 @@ pub fn amount_out_ask(
     ask_used: u128,
     price_scale_exp: u8,
 ) -> Result<u128, CurveError> {
-    debug_assert!(in_price_domain(min_ask) && in_price_domain(max_ask), "price outside uint56 domain");
-    debug_assert!(in_amount_domain(ask_capacity) && in_amount_domain(ask_used), "capacity outside uint96 domain");
+    debug_assert!(
+        in_price_domain(min_ask) && in_price_domain(max_ask),
+        "price outside uint56 domain"
+    );
+    debug_assert!(
+        in_amount_domain(ask_capacity) && in_amount_domain(ask_used),
+        "capacity outside uint96 domain"
+    );
     let scale = check_exp(price_scale_exp)?;
 
     if amount_in == 0 {
@@ -588,14 +664,19 @@ pub fn amount_out_ask(
     // ~53 iterations on a 20 bps ladder — about 40k gas on the primary ask swap path. Both ends
     // stay valid at every step, so exactness does not depend on convergence.
     let span = max_ask - min_ask; // checked above, inside `ask_cost`
-    let den = ask_capacity.checked_mul(2).ok_or(CurveError::DomainOverflow)?;
+    let den = ask_capacity
+        .checked_mul(2)
+        .ok_or(CurveError::DomainOverflow)?;
     for _ in 0..3 {
         if lo >= hi {
             break;
         }
         // floor the price: `<= p(lo)`, which makes `X*S / p` an upper bound on the answer.
-        let drift = mul_div_floor(span, twice_plus(ask_used, lo)?, den).ok_or(CurveError::DomainOverflow)?;
-        let p = min_ask.checked_add(drift).ok_or(CurveError::DomainOverflow)?;
+        let drift = mul_div_floor(span, twice_plus(ask_used, lo)?, den)
+            .ok_or(CurveError::DomainOverflow)?;
+        let p = min_ask
+            .checked_add(drift)
+            .ok_or(CurveError::DomainOverflow)?;
         if p != 0 {
             let seed = seed_floor(amount_in, scale, p);
             if seed < hi {
@@ -603,8 +684,11 @@ pub fn amount_out_ask(
             }
         }
         // ceil the price: `>= p(hi)`, which makes every `q <= X*S / p` affordable.
-        let drift = mul_div_ceil(span, twice_plus(ask_used, hi)?, den).ok_or(CurveError::DomainOverflow)?;
-        let p = min_ask.checked_add(drift).ok_or(CurveError::DomainOverflow)?;
+        let drift =
+            mul_div_ceil(span, twice_plus(ask_used, hi)?, den).ok_or(CurveError::DomainOverflow)?;
+        let p = min_ask
+            .checked_add(drift)
+            .ok_or(CurveError::DomainOverflow)?;
         if p != 0 {
             let seed = seed_floor(amount_in, scale, p).min(hi);
             if seed > lo {
@@ -647,14 +731,28 @@ pub fn amount_out_ask(
 /// # Errors
 /// [`CurveError::ZeroCapacity`] on zero capacity, [`CurveError::ArithmeticPanic`] if
 /// `maxBid < minBid` or the ladder is otherwise out of range.
-pub fn avg_bid_price(min_bid: u128, max_bid: u128, capacity: u128, used: u128, q: u128) -> Result<u128, CurveError> {
+pub fn avg_bid_price(
+    min_bid: u128,
+    max_bid: u128,
+    capacity: u128,
+    used: u128,
+    q: u128,
+) -> Result<u128, CurveError> {
     if capacity == 0 {
         return Err(CurveError::ZeroCapacity);
     }
-    let span = max_bid.checked_sub(min_bid).ok_or(CurveError::ArithmeticPanic)?;
-    let discount = mul_div_ceil(span, twice_plus(used, q)?, capacity.checked_mul(2).ok_or(CurveError::DomainOverflow)?)
-        .ok_or(CurveError::DomainOverflow)?;
-    max_bid.checked_sub(discount).ok_or(CurveError::ArithmeticPanic)
+    let span = max_bid
+        .checked_sub(min_bid)
+        .ok_or(CurveError::ArithmeticPanic)?;
+    let discount = mul_div_ceil(
+        span,
+        twice_plus(used, q)?,
+        capacity.checked_mul(2).ok_or(CurveError::DomainOverflow)?,
+    )
+    .ok_or(CurveError::DomainOverflow)?;
+    max_bid
+        .checked_sub(discount)
+        .ok_or(CurveError::ArithmeticPanic)
 }
 
 /// The average ask price over `[used, used + q]`, ceiled:
@@ -666,14 +764,28 @@ pub fn avg_bid_price(min_bid: u128, max_bid: u128, capacity: u128, used: u128, q
 /// # Errors
 /// [`CurveError::ZeroCapacity`] on zero capacity, [`CurveError::ArithmeticPanic`] if
 /// `maxAsk < minAsk`.
-pub fn avg_ask_price(min_ask: u128, max_ask: u128, capacity: u128, used: u128, q: u128) -> Result<u128, CurveError> {
+pub fn avg_ask_price(
+    min_ask: u128,
+    max_ask: u128,
+    capacity: u128,
+    used: u128,
+    q: u128,
+) -> Result<u128, CurveError> {
     if capacity == 0 {
         return Err(CurveError::ZeroCapacity);
     }
-    let span = max_ask.checked_sub(min_ask).ok_or(CurveError::ArithmeticPanic)?;
-    let premium = mul_div_ceil(span, twice_plus(used, q)?, capacity.checked_mul(2).ok_or(CurveError::DomainOverflow)?)
-        .ok_or(CurveError::DomainOverflow)?;
-    min_ask.checked_add(premium).ok_or(CurveError::DomainOverflow)
+    let span = max_ask
+        .checked_sub(min_ask)
+        .ok_or(CurveError::ArithmeticPanic)?;
+    let premium = mul_div_ceil(
+        span,
+        twice_plus(used, q)?,
+        capacity.checked_mul(2).ok_or(CurveError::DomainOverflow)?,
+    )
+    .ok_or(CurveError::DomainOverflow)?;
+    min_ask
+        .checked_add(premium)
+        .ok_or(CurveError::DomainOverflow)
 }
 
 // ---------------------------------------------------------------------------
@@ -739,9 +851,13 @@ pub fn executable_top_bid(
     if bid_used >= bid_capacity {
         return Ok(min_bid);
     }
-    let span = max_bid.checked_sub(min_bid).ok_or(CurveError::ArithmeticPanic)?;
+    let span = max_bid
+        .checked_sub(min_bid)
+        .ok_or(CurveError::ArithmeticPanic)?;
     let drift = mul_div_ceil(span, bid_used, bid_capacity).ok_or(CurveError::DomainOverflow)?;
-    max_bid.checked_sub(drift).ok_or(CurveError::ArithmeticPanic)
+    max_bid
+        .checked_sub(drift)
+        .ok_or(CurveError::ArithmeticPanic)
 }
 
 /// Port of `PropCurve.executableTopAsk`.
@@ -766,7 +882,9 @@ pub fn executable_top_ask(
     if ask_used >= ask_capacity {
         return Ok(max_ask);
     }
-    let span = max_ask.checked_sub(min_ask).ok_or(CurveError::ArithmeticPanic)?;
+    let span = max_ask
+        .checked_sub(min_ask)
+        .ok_or(CurveError::ArithmeticPanic)?;
     let drift = mul_div_ceil(span, ask_used, ask_capacity).ok_or(CurveError::DomainOverflow)?;
     min_ask.checked_add(drift).ok_or(CurveError::DomainOverflow)
 }
@@ -788,27 +906,51 @@ mod tests {
 
     #[test]
     fn zero_capacity_reverts_for_nonzero_amount() {
-        assert_eq!(amount_out_bid(1, 1, 2, 0, 0, E), Err(CurveError::ZeroCapacity));
-        assert_eq!(amount_in_bid(1, 1, 2, 0, 0, E), Err(CurveError::ZeroCapacity));
-        assert_eq!(amount_in_ask(1, 1, 2, 0, 0, E), Err(CurveError::ZeroCapacity));
-        assert_eq!(amount_out_ask(1, 1, 2, 0, 0, E), Err(CurveError::ZeroCapacity));
+        assert_eq!(
+            amount_out_bid(1, 1, 2, 0, 0, E),
+            Err(CurveError::ZeroCapacity)
+        );
+        assert_eq!(
+            amount_in_bid(1, 1, 2, 0, 0, E),
+            Err(CurveError::ZeroCapacity)
+        );
+        assert_eq!(
+            amount_in_ask(1, 1, 2, 0, 0, E),
+            Err(CurveError::ZeroCapacity)
+        );
+        assert_eq!(
+            amount_out_ask(1, 1, 2, 0, 0, E),
+            Err(CurveError::ZeroCapacity)
+        );
     }
 
     #[test]
     fn capacity_boundary_is_inclusive() {
         assert!(amount_out_bid(100, 1_000, 2_000, 100, 0, 0).is_ok());
-        assert_eq!(amount_out_bid(101, 1_000, 2_000, 100, 0, 0), Err(CurveError::AmountExceedsCapacity));
+        assert_eq!(
+            amount_out_bid(101, 1_000, 2_000, 100, 0, 0),
+            Err(CurveError::AmountExceedsCapacity)
+        );
         assert!(amount_out_bid(40, 1_000, 2_000, 100, 60, 0).is_ok());
-        assert_eq!(amount_out_bid(41, 1_000, 2_000, 100, 60, 0), Err(CurveError::AmountExceedsCapacity));
+        assert_eq!(
+            amount_out_bid(41, 1_000, 2_000, 100, 60, 0),
+            Err(CurveError::AmountExceedsCapacity)
+        );
         // The ask side's capacity axis is base too, so `amount_in_ask` checks the same way.
         assert!(amount_in_ask(100, 1_000, 2_000, 100, 0, 0).is_ok());
-        assert_eq!(amount_in_ask(101, 1_000, 2_000, 100, 0, 0), Err(CurveError::AmountExceedsCapacity));
+        assert_eq!(
+            amount_in_ask(101, 1_000, 2_000, 100, 0, 0),
+            Err(CurveError::AmountExceedsCapacity)
+        );
     }
 
     #[test]
     fn midpoint_pricing_is_the_average() {
         // Consuming the whole 100-unit ladder from 2_000 down to 1_000 must charge 1_500.
-        assert_eq!(amount_out_bid(100, 1_000, 2_000, 100, 0, 0), Ok(100 * 1_500));
+        assert_eq!(
+            amount_out_bid(100, 1_000, 2_000, 100, 0, 0),
+            Ok(100 * 1_500)
+        );
         // Consuming the first half charges the midpoint of the first half: 1_750.
         assert_eq!(amount_out_bid(50, 1_000, 2_000, 100, 0, 0), Ok(50 * 1_750));
         // ... and the second half charges 1_250. Halves sum to the whole exactly.
@@ -823,10 +965,16 @@ mod tests {
         assert_eq!(amount_in_ask(50, 1_000, 2_000, 100, 0, 0), Ok(50 * 1_250));
         assert_eq!(amount_in_ask(50, 1_000, 2_000, 100, 50, 0), Ok(50 * 1_750));
         // And the inversion recovers the size exactly when the budget is exact.
-        assert_eq!(amount_out_ask(100 * 1_500, 1_000, 2_000, 100, 0, 0), Ok(100));
+        assert_eq!(
+            amount_out_ask(100 * 1_500, 1_000, 2_000, 100, 0, 0),
+            Ok(100)
+        );
         assert_eq!(amount_out_ask(50 * 1_250, 1_000, 2_000, 100, 0, 0), Ok(50));
         // One quote unit short buys one base unit less at this ladder.
-        assert_eq!(amount_out_ask(50 * 1_250 - 1, 1_000, 2_000, 100, 0, 0), Ok(49));
+        assert_eq!(
+            amount_out_ask(50 * 1_250 - 1, 1_000, 2_000, 100, 0, 0),
+            Ok(49)
+        );
     }
 
     /// DEFECT 2's witness, reproduced in the units the Foundry test used. An 18/6 pair at price
@@ -865,7 +1013,11 @@ mod tests {
             }
             assert_eq!(used, cap);
             assert!(total >= whole, "{pieces} pieces paid {total} < {whole}");
-            assert!(total - whole < pieces, "residual {} exceeds one unit per piece", total - whole);
+            assert!(
+                total - whole < pieces,
+                "residual {} exceeds one unit per piece",
+                total - whole
+            );
         }
     }
 
@@ -873,8 +1025,14 @@ mod tests {
     fn zero_price_only_on_a_wholly_zero_ask_ladder() {
         // `maxAsk == 0` is the only shape, and it is unreachable through `validate_ladder`.
         assert_eq!(amount_in_ask(1, 0, 0, 10, 0, E), Err(CurveError::ZeroPrice));
-        assert_eq!(amount_out_ask(1, 0, 0, 10, 0, E), Err(CurveError::ZeroPrice));
-        assert_eq!(amount_in_ask(MAX_AMOUNT, 0, 0, MAX_AMOUNT, 0, E), Err(CurveError::ZeroPrice));
+        assert_eq!(
+            amount_out_ask(1, 0, 0, 10, 0, E),
+            Err(CurveError::ZeroPrice)
+        );
+        assert_eq!(
+            amount_in_ask(MAX_AMOUNT, 0, 0, MAX_AMOUNT, 0, E),
+            Err(CurveError::ZeroPrice)
+        );
         // One unit of span is enough to price the interval: ceil lifts any nonzero cost to 1.
         assert_eq!(amount_in_ask(1, 0, 1, 1_000_000, 0, E), Ok(1));
         assert_eq!(amount_in_ask(1, 0, MAX_PRICE, MAX_AMOUNT, 0, 0), Ok(1));
@@ -891,7 +1049,10 @@ mod tests {
             let q = amount_in_bid(want, 9, 11, 10_000, 0, 0).unwrap();
             assert!(amount_out_bid(q, 9, 11, 10_000, 0, 0).unwrap() >= want);
             if q > 1 {
-                assert!(amount_out_bid(q - 1, 9, 11, 10_000, 0, 0).unwrap() < want, "not minimal at {want}");
+                assert!(
+                    amount_out_bid(q - 1, 9, 11, 10_000, 0, 0).unwrap() < want,
+                    "not minimal at {want}"
+                );
             }
         }
     }
@@ -918,21 +1079,42 @@ mod tests {
         let (min_ask, max_ask, cap) = (1_000u128, 2_000u128, 100u128);
         let full = amount_in_ask(cap, min_ask, max_ask, cap, 0, 0).unwrap();
         assert_eq!(amount_out_ask(full, min_ask, max_ask, cap, 0, 0), Ok(cap));
-        assert_eq!(amount_out_ask(full + 1, min_ask, max_ask, cap, 0, 0), Err(CurveError::AmountExceedsCapacity));
+        assert_eq!(
+            amount_out_ask(full + 1, min_ask, max_ask, cap, 0, 0),
+            Err(CurveError::AmountExceedsCapacity)
+        );
     }
 
     #[test]
     fn validator_matches_solidity_ordering() {
         assert_eq!(validate_ladder(10, 20, 30, 40, 10), Ok(()));
-        assert_eq!(validate_ladder(9, 20, 30, 40, 10), Err(CurveError::BidBelowMinPrice));
-        assert_eq!(validate_ladder(10, 20, 30, 29, 10), Err(CurveError::CrossedBook));
-        assert_eq!(validate_ladder(10, 31, 30, 40, 10), Err(CurveError::CrossedBook));
-        assert_eq!(validate_ladder(21, 20, 30, 40, 10), Err(CurveError::CrossedBook));
+        assert_eq!(
+            validate_ladder(9, 20, 30, 40, 10),
+            Err(CurveError::BidBelowMinPrice)
+        );
+        assert_eq!(
+            validate_ladder(10, 20, 30, 29, 10),
+            Err(CurveError::CrossedBook)
+        );
+        assert_eq!(
+            validate_ladder(10, 31, 30, 40, 10),
+            Err(CurveError::CrossedBook)
+        );
+        assert_eq!(
+            validate_ladder(21, 20, 30, 40, 10),
+            Err(CurveError::CrossedBook)
+        );
         // Flat ladder: ordering passes, the strict maxAsk > minBid does not.
-        assert_eq!(validate_ladder(10, 10, 10, 10, 10), Err(CurveError::CrossedBook));
+        assert_eq!(
+            validate_ladder(10, 10, 10, 10, 10),
+            Err(CurveError::CrossedBook)
+        );
         assert_eq!(validate_ladder(10, 10, 10, 11, 10), Ok(()));
         // Floor check runs before the ordering check.
-        assert_eq!(validate_ladder(0, 0, 0, 0, 1), Err(CurveError::BidBelowMinPrice));
+        assert_eq!(
+            validate_ladder(0, 0, 0, 0, 1),
+            Err(CurveError::BidBelowMinPrice)
+        );
     }
 
     #[test]
@@ -951,34 +1133,65 @@ mod tests {
         assert_eq!(executable_top_ask(1_000, 1_001, 3, 1), Ok(1_001));
         assert_eq!(executable_top_bid(1_000, 1_001, 3, 1), Ok(1_000));
         // ... and each helper is exactly the zero-size limit of its average-price counterpart.
-        assert_eq!(executable_top_bid(1_000, 1_001, 3, 1), avg_bid_price(1_000, 1_001, 3, 1, 0));
-        assert_eq!(executable_top_ask(1_000, 1_001, 3, 1), avg_ask_price(1_000, 1_001, 3, 1, 0));
+        assert_eq!(
+            executable_top_bid(1_000, 1_001, 3, 1),
+            avg_bid_price(1_000, 1_001, 3, 1, 0)
+        );
+        assert_eq!(
+            executable_top_ask(1_000, 1_001, 3, 1),
+            avg_ask_price(1_000, 1_001, 3, 1, 0)
+        );
     }
 
     #[test]
     fn realistic_weth_usdc_18_6() {
         // priceScaleExp = 24: price = human * 10**(24 - 18 + 6) = human * 10**12.
         let px = 3_000 * 1_000_000_000_000u128;
-        let out = amount_out_bid(1_000_000_000_000_000_000, px, px, 10_000_000_000_000_000_000, 0, 24).unwrap();
+        let out = amount_out_bid(
+            1_000_000_000_000_000_000,
+            px,
+            px,
+            10_000_000_000_000_000_000,
+            0,
+            24,
+        )
+        .unwrap();
         assert_eq!(out, 3_000_000_000); // 3_000 USDC at 6dp
-        // The ask leg of the same flat ladder costs the same 3_000 USDC for 1 WETH.
-        let cost = amount_in_ask(1_000_000_000_000_000_000, px, px, 10_000_000_000_000_000_000, 0, 24).unwrap();
+                                        // The ask leg of the same flat ladder costs the same 3_000 USDC for 1 WETH.
+        let cost = amount_in_ask(
+            1_000_000_000_000_000_000,
+            px,
+            px,
+            10_000_000_000_000_000_000,
+            0,
+            24,
+        )
+        .unwrap();
         assert_eq!(cost, 3_000_000_000);
-        assert_eq!(amount_out_ask(cost, px, px, 10_000_000_000_000_000_000, 0, 24), Ok(1_000_000_000_000_000_000));
+        assert_eq!(
+            amount_out_ask(cost, px, px, 10_000_000_000_000_000_000, 0, 24),
+            Ok(1_000_000_000_000_000_000)
+        );
     }
 
     #[test]
     fn realistic_wbtc_usdc_8_6() {
         let px = 60_000 * 100_000_000_000u128;
         assert!(px <= MAX_PRICE);
-        assert_eq!(amount_out_bid(100_000_000, px, px, 1_000_000_000, 0, 13), Ok(60_000_000_000));
+        assert_eq!(
+            amount_out_bid(100_000_000, px, px, 1_000_000_000, 0, 13),
+            Ok(60_000_000_000)
+        );
     }
 
     #[test]
     fn realistic_usdc_weth_6_18() {
         let px = 33_333_333_333_333_300u128;
         assert!(px <= MAX_PRICE);
-        assert_eq!(amount_out_bid(1_000_000, px, px, 1_000_000_000_000, 0, 8), Ok(333_333_333_333_333));
+        assert_eq!(
+            amount_out_bid(1_000_000, px, px, 1_000_000_000_000, 0, 8),
+            Ok(333_333_333_333_333)
+        );
     }
 
     #[test]
@@ -993,17 +1206,35 @@ mod tests {
             Err(CurveError::AmountOutOfDomain)
         );
         // One unit under the boundary on the same shape: avgBid == 1, so out == q < 2^96.
-        assert_eq!(amount_out_bid(MAX_AMOUNT, 1, 1, MAX_AMOUNT, 0, 0), Ok(MAX_AMOUNT));
+        assert_eq!(
+            amount_out_bid(MAX_AMOUNT, 1, 1, MAX_AMOUNT, 0, 0),
+            Ok(MAX_AMOUNT)
+        );
         // exp above MAX_PRICE_SCALE_EXP: still port-only, and it is checked first.
-        assert_eq!(amount_out_bid(1, 1, 1, 1, 0, 39), Err(CurveError::DomainOverflow));
+        assert_eq!(
+            amount_out_bid(1, 1, 1, 1, 0, 39),
+            Err(CurveError::DomainOverflow)
+        );
     }
 
     #[test]
     fn arithmetic_panic_on_inverted_ladder() {
-        assert_eq!(amount_out_bid(1, 2_000, 1_000, 10, 0, 0), Err(CurveError::ArithmeticPanic));
-        assert_eq!(amount_in_ask(1, 2_000, 1_000, 10, 0, 0), Err(CurveError::ArithmeticPanic));
-        assert_eq!(amount_out_ask(1, 2_000, 1_000, 10, 0, 0), Err(CurveError::ArithmeticPanic));
-        assert_eq!(amount_in_bid(1, 2_000, 1_000, 10, 0, 0), Err(CurveError::ArithmeticPanic));
+        assert_eq!(
+            amount_out_bid(1, 2_000, 1_000, 10, 0, 0),
+            Err(CurveError::ArithmeticPanic)
+        );
+        assert_eq!(
+            amount_in_ask(1, 2_000, 1_000, 10, 0, 0),
+            Err(CurveError::ArithmeticPanic)
+        );
+        assert_eq!(
+            amount_out_ask(1, 2_000, 1_000, 10, 0, 0),
+            Err(CurveError::ArithmeticPanic)
+        );
+        assert_eq!(
+            amount_in_bid(1, 2_000, 1_000, 10, 0, 0),
+            Err(CurveError::ArithmeticPanic)
+        );
     }
 
     #[test]

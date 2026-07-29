@@ -100,7 +100,12 @@
 // Not enabled for `cfg(test)`: an assertion is a panic, and that is what a test is for.
 #![cfg_attr(
     not(test),
-    deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )
 )]
 
 pub mod curve;
@@ -113,11 +118,14 @@ pub mod rfq;
 pub mod vectors;
 
 pub use curve::{
-    amount_in_ask, amount_in_bid, amount_out_ask, amount_out_bid, avg_ask_price, avg_bid_price, executable_top_ask,
-    executable_top_bid, validate_ladder, Ladder, MAX_AMOUNT, MAX_AMOUNT_OUT, MAX_PRICE, MAX_PRICE_SCALE_EXP, NO_ASK,
+    amount_in_ask, amount_in_bid, amount_out_ask, amount_out_bid, avg_ask_price, avg_bid_price,
+    executable_top_ask, executable_top_bid, validate_ladder, Ladder, MAX_AMOUNT, MAX_AMOUNT_OUT,
+    MAX_PRICE, MAX_PRICE_SCALE_EXP, NO_ASK,
 };
 pub use error::{CurveError, LadderError, PackError};
-pub use inverse::{solve_ask, solve_bid, solve_two_sided, SolveInput, Solution, TwoSided, WidthBinding};
+pub use inverse::{
+    solve_ask, solve_bid, solve_two_sided, Solution, SolveInput, TwoSided, WidthBinding,
+};
 pub use ladder::LadderBuilder;
 pub use pack::QuoteWord;
 pub use rfq::{Domain as RfqDomain, Order as RfqOrder, ORDER_TYPEHASH, ORDER_TYPE_STRING};

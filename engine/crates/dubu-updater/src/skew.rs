@@ -1029,8 +1029,8 @@ mod tests {
             ladder::build(&crate::ladder::RowInputs {
                 pair_id: 1,
                 fair,
-                half_spread_bps: 5,
-                width_bps: 25,
+                half_spread_bps_e2: 500,
+                width_bps_e2: 2500,
                 skew_bps: skew,
                 capture: 20_000_000_000_000_000_000,
                 bid_capacity: 1_000_000_000_000_000_000_000,
@@ -1130,7 +1130,7 @@ mod tests {
             for hs in [1u16, 5, 8, 100] {
                 let b = LadderBuilder {
                     skew_bps: skew,
-                    half_spread_bps: hs,
+                    half_spread_bps_e2: u32::from(hs) * 100,
                     ..LadderBuilder::new(fair)
                 };
                 let mid = b.skewed_mid().unwrap();

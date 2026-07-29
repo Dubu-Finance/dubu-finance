@@ -91,7 +91,8 @@ pub const ORDER_TYPE_STRING: &str = concat!(
 );
 
 /// The EIP-712 domain type string. Four members, so the domain carries a `version`.
-pub const DOMAIN_TYPE_STRING: &str = "EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)";
+pub const DOMAIN_TYPE_STRING: &str =
+    "EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)";
 
 /// `PmmSettle`'s EIP-712 domain name.
 pub const DOMAIN_NAME: &str = "DuBu PmmSettle";
@@ -109,7 +110,8 @@ pub const DOMAIN_VERSION: &str = "1";
 /// Written as hex through [`hex32`] rather than as a byte-array literal so it can be diffed by
 /// eye against the `0x23e6...` in the Solidity, which is the only form in which a reviewer can
 /// actually check it.
-pub const ORDER_TYPEHASH: [u8; 32] = hex32("23e655e78a91115e92aff2d730688fc421a3773ea96b4afcd69c21acf9e8be56");
+pub const ORDER_TYPEHASH: [u8; 32] =
+    hex32("23e655e78a91115e92aff2d730688fc421a3773ea96b4afcd69c21acf9e8be56");
 
 /// Number of 32-byte words in an `Order`'s `encodeData`: the type hash plus eleven members.
 pub const ORDER_ENCODE_DATA_WORDS: usize = 12;
@@ -356,7 +358,9 @@ pub mod vectors {
                     min_fill_bps: 0,
                 },
                 domain: Domain::new(0, [0; 20]),
-                struct_hash: hex32("e4f4bdaa8c4f12a4f520a975132dc664c5289e80fab437a5ba98fd51dc2c7b29"),
+                struct_hash: hex32(
+                    "e4f4bdaa8c4f12a4f520a975132dc664c5289e80fab437a5ba98fd51dc2c7b29",
+                ),
                 digest: hex32("bcc0c92d5f4d665e0ad5acda83ccc00e485acfac544532beed93b3df0689d84f"),
             },
             Vector {
@@ -375,7 +379,9 @@ pub mod vectors {
                     min_fill_bps: 0,
                 },
                 domain: Domain::new(91_342, addr(0x11)),
-                struct_hash: hex32("9dc8b4546d5a28923f50a4374402e8b0774db53704d9d668aa1be1a75a30259e"),
+                struct_hash: hex32(
+                    "9dc8b4546d5a28923f50a4374402e8b0774db53704d9d668aa1be1a75a30259e",
+                ),
                 digest: hex32("fd8b2f15795e0412c2494fb162b8e8c84ae531843730ad9fd27e78dc6b5006dc"),
             },
             Vector {
@@ -394,7 +400,9 @@ pub mod vectors {
                     min_fill_bps: 10_000,
                 },
                 domain: Domain::new(1, addr(0xde)),
-                struct_hash: hex32("e5bafa60feed25b42a0e0ca9ef1230af79d5ecdafed4eb60cc93953256305b7b"),
+                struct_hash: hex32(
+                    "e5bafa60feed25b42a0e0ca9ef1230af79d5ecdafed4eb60cc93953256305b7b",
+                ),
                 digest: hex32("d076d897e2cef09edf1c915695a37b4ccb28d6ef230cb3e44c797cecda588415"),
             },
             Vector {
@@ -413,7 +421,9 @@ pub mod vectors {
                     min_fill_bps: u16::MAX,
                 },
                 domain: Domain::new(u64::MAX, addr(0xee)),
-                struct_hash: hex32("a754907b3a90f7c66922923dc858007d4e2235aaf44c56bec298937ad69134ac"),
+                struct_hash: hex32(
+                    "a754907b3a90f7c66922923dc858007d4e2235aaf44c56bec298937ad69134ac",
+                ),
                 digest: hex32("f4a14b260933d10c42a3e7f80909e898e396b8e92accc08c1c72466797bb581e"),
             },
             Vector {
@@ -434,12 +444,13 @@ pub mod vectors {
                     min_fill_bps: 1,
                 },
                 domain: Domain::new(91_342, addr(0x11)),
-                struct_hash: hex32("83fe65ecbd2f178813110780f7fea08b239bc0192296d6afa13218dd060bf5a7"),
+                struct_hash: hex32(
+                    "83fe65ecbd2f178813110780f7fea08b239bc0192296d6afa13218dd060bf5a7",
+                ),
                 digest: hex32("e332ed6b3fb00d5917406e37e578c2f22363b216ab21f4389ae463aeebbc2e64"),
             },
         ]
     }
-
 }
 
 #[cfg(test)]
@@ -528,7 +539,12 @@ mod tests {
     #[test]
     fn fixed_vectors_are_stable() {
         for v in vectors::all() {
-            assert_eq!(v.order.struct_hash(), v.struct_hash, "{} struct hash", v.name);
+            assert_eq!(
+                v.order.struct_hash(),
+                v.struct_hash,
+                "{} struct hash",
+                v.name
+            );
             assert_eq!(v.order.digest(&v.domain), v.digest, "{} digest", v.name);
         }
     }

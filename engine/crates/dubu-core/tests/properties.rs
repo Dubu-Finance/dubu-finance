@@ -16,8 +16,9 @@
 //!    `PropCurve.validateLadder` accepts, checked against an independent transliteration.
 
 use dubu_core::curve::{
-    amount_in_ask, amount_in_bid, amount_out_ask, amount_out_bid, avg_ask_price, avg_bid_price, executable_top_ask,
-    executable_top_bid, validate_ladder, MAX_AMOUNT, MAX_PRICE, MAX_PRICE_SCALE_EXP, NO_ASK,
+    amount_in_ask, amount_in_bid, amount_out_ask, amount_out_bid, avg_ask_price, avg_bid_price,
+    executable_top_ask, executable_top_bid, validate_ladder, MAX_AMOUNT, MAX_PRICE,
+    MAX_PRICE_SCALE_EXP, NO_ASK,
 };
 use dubu_core::error::{CurveError, LadderError};
 use dubu_core::inverse::{solve_ask, solve_bid, solve_two_sided, SolveInput, WidthBinding};
@@ -68,19 +69,25 @@ fn ladder_pair() -> impl Strategy<Value = (u128, u128)> {
 
 /// An ordered, in-domain ladder that `validateLadder` accepts against `min_price = 0`.
 fn valid_ladder() -> impl Strategy<Value = (u128, u128, u128, u128)> {
-    (0u128..=MAX_PRICE, 0u128..=MAX_PRICE, 0u128..=MAX_PRICE, 0u128..=MAX_PRICE).prop_map(|(a, b, c, d)| {
-        let mut v = [a, b, c, d];
-        v.sort_unstable();
-        // Guarantee the strict maxAsk > minBid the validator demands.
-        if v[3] == v[0] {
-            if v[3] < MAX_PRICE {
-                v[3] += 1;
-            } else {
-                v[0] -= 1;
+    (
+        0u128..=MAX_PRICE,
+        0u128..=MAX_PRICE,
+        0u128..=MAX_PRICE,
+        0u128..=MAX_PRICE,
+    )
+        .prop_map(|(a, b, c, d)| {
+            let mut v = [a, b, c, d];
+            v.sort_unstable();
+            // Guarantee the strict maxAsk > minBid the validator demands.
+            if v[3] == v[0] {
+                if v[3] < MAX_PRICE {
+                    v[3] += 1;
+                } else {
+                    v[0] -= 1;
+                }
             }
-        }
-        (v[0], v[1], v[2], v[3])
-    })
+            (v[0], v[1], v[2], v[3])
+        })
 }
 
 // ---------------------------------------------------------------------------
@@ -97,17 +104,37 @@ fn b(v: u128) -> BigUint {
 }
 
 /// `(numerator, denominator)` of the exact rational quote leg of the bid side.
-fn exact_bid(q: u128, min_bid: u128, max_bid: u128, capacity: u128, used: u128, exp: u8) -> (BigUint, BigUint) {
+fn exact_bid(
+    q: u128,
+    min_bid: u128,
+    max_bid: u128,
+    capacity: u128,
+    used: u128,
+    exp: u8,
+) -> (BigUint, BigUint) {
     let span = b(max_bid) - b(min_bid);
     let factor = b(2) * b(max_bid) * b(capacity) - span * (b(2) * b(used) + b(q));
-    (b(q) * factor, b(2) * b(capacity) * b(10).pow(u32::from(exp)))
+    (
+        b(q) * factor,
+        b(2) * b(capacity) * b(10).pow(u32::from(exp)),
+    )
 }
 
 /// `(numerator, denominator)` of the exact rational quote leg of the ask side.
-fn exact_ask(q: u128, min_ask: u128, max_ask: u128, capacity: u128, used: u128, exp: u8) -> (BigUint, BigUint) {
+fn exact_ask(
+    q: u128,
+    min_ask: u128,
+    max_ask: u128,
+    capacity: u128,
+    used: u128,
+    exp: u8,
+) -> (BigUint, BigUint) {
     let span = b(max_ask) - b(min_ask);
     let factor = b(2) * b(min_ask) * b(capacity) + span * (b(2) * b(used) + b(q));
-    (b(q) * factor, b(2) * b(capacity) * b(10).pow(u32::from(exp)))
+    (
+        b(q) * factor,
+        b(2) * b(capacity) * b(10).pow(u32::from(exp)),
+    )
 }
 
 fn floor_div(n: &BigUint, d: &BigUint) -> BigUint {
@@ -192,13 +219,13 @@ proptest! {
     #[test]
     fn ladder_builder_never_panics(
         mid in wild(),
-        half_spread_bps: u16,
-        width_bps: u16,
+        half_spread_bps_e2: u32,
+        width_bps_e2: u32,
         skew_bps: i16,
         min_price in price(),
     ) {
-        let bldr = LadderBuilder { reference_mid: mid, half_spread_bps, width_bps, skew_bps, min_price,
-                                   round_ask_up: true };
+        let bldr = LadderBuilder { reference_mid: mid, half_spread_bps_e2, width_bps_e2, skew_bps,
+                                   min_price, round_ask_up: true };
         match bldr.build() {
             Ok(l) => {
                 prop_assert_eq!(l.validate(min_price), Ok(()));
@@ -954,7 +981,11 @@ fn generated_vectors_are_self_consistent() {
     let all = vectors::generate();
     assert!(!all.is_empty());
     for v in &all {
-        assert!(vectors::verify(v), "vector `{}` does not reproduce its own output", v.name);
+        assert!(
+            vectors::verify(v),
+            "vector `{}` does not reproduce its own output",
+            v.name
+        );
         if !v.expectRevert.is_empty() {
             assert!(
                 vectors::SOLIDITY_ERRORS.contains(&v.expectRevert.as_str()),
@@ -989,5 +1020,10 @@ fn checked_in_vector_file_is_current() {
         return;
     };
     let expected = vectors::to_json(&vectors::generate()).unwrap();
-    assert_eq!(on_disk, expected, "{} is stale; re-run `cargo run --bin gen-vectors`", path.display());
+    assert_eq!(
+        on_disk,
+        expected,
+        "{} is stale; re-run `cargo run --bin gen-vectors`",
+        path.display()
+    );
 }

@@ -45,9 +45,23 @@ use crate::math::{mul_div_ceil, mul_div_floor};
 /// Basis-point denominator.
 pub const BPS: u128 = 10_000;
 
+/// One in a hundredth of a basis point, the unit the ladder's spread and width are built in.
+///
+/// Integer basis points were the original unit and they ran out of resolution. ETH's half-spread is
+/// `s0 + s1 * sigma` and, once sigma was scaled to the quote's real exposure window rather than the
+/// inventory's, the volatility term came to 0.6 bp against an `s0` of 1 -- so the floor is most of
+/// the price and a whole basis point is a coarse thing to set it in. Hundredths give 0.5 bp.
+///
+/// Nothing on chain changes. `PropPool` is handed four PRICES and `validate_ladder` checks their
+/// ordering; basis points never leave this crate.
+pub const BPS_E2: u128 = 1_000_000;
+
 /// Largest bps value any knob may take. `10_000` would zero out a price outright and
 /// anything above it would invert the sign of `10_000 - bps`.
 pub const MAX_BPS: u128 = 9_999;
+
+/// [`MAX_BPS`] in hundredths of a basis point.
+pub const MAX_BPS_E2: u128 = 999_999;
 
 /// Strategy inputs for one quote row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,11 +69,11 @@ pub struct LadderBuilder {
     /// Reference mid, in the pair's price scale (`quote = base * price / 10**priceScaleExp`).
     pub reference_mid: u128,
     /// Half the bid/ask spread, in bps of the skewed mid.
-    pub half_spread_bps: u16,
+    pub half_spread_bps_e2: u32,
     /// Ladder width, in bps of the near price. This is the concentration knob; archi_v2 §5.2
     /// notes production values in the sub-basis-point range (`0.20 bp`), so expect this to be
     /// 0 for most pairs and the width to come from [`crate::inverse`] instead.
-    pub width_bps: u16,
+    pub width_bps_e2: u32,
     /// Inventory skew, in bps. Positive shifts the whole book down.
     pub skew_bps: i16,
     /// The pair's absolute `minPrice` floor. Oracle-independent backstop; `minBid` is
@@ -76,8 +90,8 @@ impl LadderBuilder {
     pub const fn new(reference_mid: u128) -> Self {
         Self {
             reference_mid,
-            half_spread_bps: 0,
-            width_bps: 0,
+            half_spread_bps_e2: 0,
+            width_bps_e2: 0,
             skew_bps: 0,
             min_price: 0,
             round_ask_up: true,
@@ -114,16 +128,16 @@ impl LadderBuilder {
         }
         let m = self.skewed_mid()?;
 
-        // Step 1.
-        let hs = u128::from(self.half_spread_bps).min(MAX_BPS);
-        let w = u128::from(self.width_bps).min(MAX_BPS);
+        // Step 1. Both in hundredths of a bp -- see [`BPS_E2`].
+        let hs = u128::from(self.half_spread_bps_e2).min(MAX_BPS_E2);
+        let w = u128::from(self.width_bps_e2).min(MAX_BPS_E2);
 
         // Step 3. Bid side down, ask side (by default) up.
-        let raw_max_bid = mul_div_floor(m, BPS - hs, BPS).unwrap_or(0);
-        let raw_min_bid = mul_div_floor(raw_max_bid, BPS - w, BPS).unwrap_or(0);
+        let raw_max_bid = mul_div_floor(m, BPS_E2 - hs, BPS_E2).unwrap_or(0);
+        let raw_min_bid = mul_div_floor(raw_max_bid, BPS_E2 - w, BPS_E2).unwrap_or(0);
         let up = self.round_ask_up;
-        let raw_min_ask = round(up, m, BPS + hs, BPS);
-        let raw_max_ask = round(up, raw_min_ask, BPS + w, BPS);
+        let raw_min_ask = round(up, m, BPS_E2 + hs, BPS_E2);
+        let raw_max_ask = round(up, raw_min_ask, BPS_E2 + w, BPS_E2);
 
         // Step 4. Monotone bottom-up sweep. `hi_body = MAX_PRICE - 1` is >= min_price by the
         // guard above, so every clamp below has `lo <= hi`.
@@ -134,7 +148,12 @@ impl LadderBuilder {
         // Step 5, folded into the lower bound: max_ask >= max(min_ask, min_bid + 1).
         let max_ask = raw_max_ask.clamp(min_ask.max(min_bid + 1), MAX_PRICE);
 
-        let ladder = Ladder { min_bid, max_bid, min_ask, max_ask };
+        let ladder = Ladder {
+            min_bid,
+            max_bid,
+            min_ask,
+            max_ask,
+        };
         // Step 6.
         validate_ladder(min_bid, max_bid, min_ask, max_ask, self.min_price)?;
         Ok(ladder)
@@ -145,7 +164,11 @@ impl LadderBuilder {
 /// step 4 clamps every price into range anyway, and a saturating projection keeps `build`
 /// total.
 fn round(up: bool, a: u128, b: u128, d: u128) -> u128 {
-    let r = if up { mul_div_ceil(a, b, d) } else { mul_div_floor(a, b, d) };
+    let r = if up {
+        mul_div_ceil(a, b, d)
+    } else {
+        mul_div_floor(a, b, d)
+    };
     r.unwrap_or(MAX_PRICE).min(MAX_PRICE)
 }
 
@@ -156,8 +179,8 @@ mod tests {
     #[test]
     fn plain_spread_and_width() {
         let b = LadderBuilder {
-            half_spread_bps: 10, // 0.10%
-            width_bps: 100,      // 1%
+            half_spread_bps_e2: 1000, // 0.10%
+            width_bps_e2: 10000,      // 1%
             ..LadderBuilder::new(1_000_000)
         };
         let l = b.build().unwrap();
@@ -170,21 +193,30 @@ mod tests {
 
     #[test]
     fn positive_skew_pushes_the_book_down() {
-        let up = LadderBuilder { half_spread_bps: 10, skew_bps: 0, ..LadderBuilder::new(1_000_000) };
+        let up = LadderBuilder {
+            half_spread_bps_e2: 1000,
+            skew_bps: 0,
+            ..LadderBuilder::new(1_000_000)
+        };
         let down = LadderBuilder { skew_bps: 50, ..up };
         let (a, b) = (up.build().unwrap(), down.build().unwrap());
         assert!(b.max_bid < a.max_bid);
         assert!(b.min_ask < a.min_ask);
         // Negative skew is the mirror.
-        let lifted = LadderBuilder { skew_bps: -50, ..up }.build().unwrap();
+        let lifted = LadderBuilder {
+            skew_bps: -50,
+            ..up
+        }
+        .build()
+        .unwrap();
         assert!(lifted.max_bid > a.max_bid);
     }
 
     #[test]
     fn min_price_floor_wins_over_the_projection() {
         let b = LadderBuilder {
-            half_spread_bps: 500,
-            width_bps: 5_000,
+            half_spread_bps_e2: 50000,
+            width_bps_e2: 500_000,
             min_price: 999_000,
             ..LadderBuilder::new(1_000_000)
         };
@@ -208,7 +240,12 @@ mod tests {
         assert!(l.max_ask <= MAX_PRICE);
 
         // Floor pinned one unit below the ceiling: the tightest feasible row.
-        let l = LadderBuilder { min_price: MAX_PRICE - 1, ..LadderBuilder::new(MAX_PRICE) }.build().unwrap();
+        let l = LadderBuilder {
+            min_price: MAX_PRICE - 1,
+            ..LadderBuilder::new(MAX_PRICE)
+        }
+        .build()
+        .unwrap();
         assert_eq!(l.min_bid, MAX_PRICE - 1);
         assert_eq!(l.max_ask, MAX_PRICE);
         l.validate(MAX_PRICE - 1).unwrap();
@@ -216,9 +253,16 @@ mod tests {
 
     #[test]
     fn out_of_range_inputs_are_rejected() {
-        assert_eq!(LadderBuilder::new(MAX_PRICE + 1).build(), Err(LadderError::PriceOutOfRange));
         assert_eq!(
-            LadderBuilder { min_price: MAX_PRICE, ..LadderBuilder::new(MAX_PRICE) }.build(),
+            LadderBuilder::new(MAX_PRICE + 1).build(),
+            Err(LadderError::PriceOutOfRange)
+        );
+        assert_eq!(
+            LadderBuilder {
+                min_price: MAX_PRICE,
+                ..LadderBuilder::new(MAX_PRICE)
+            }
+            .build(),
             Err(LadderError::InfeasibleBounds)
         );
     }
@@ -227,8 +271,8 @@ mod tests {
     fn bps_knobs_saturate_instead_of_inverting() {
         // u16 admits 65_535; 10_000 - 65_535 would underflow.
         let l = LadderBuilder {
-            half_spread_bps: u16::MAX,
-            width_bps: u16::MAX,
+            half_spread_bps_e2: u32::from(u16::MAX),
+            width_bps_e2: u32::from(u16::MAX),
             skew_bps: i16::MIN,
             ..LadderBuilder::new(1_000_000)
         }
@@ -239,8 +283,14 @@ mod tests {
 
     #[test]
     fn ask_rounding_direction_is_selectable() {
-        let up = LadderBuilder { half_spread_bps: 1, ..LadderBuilder::new(999_999) };
-        let down = LadderBuilder { round_ask_up: false, ..up };
+        let up = LadderBuilder {
+            half_spread_bps_e2: 100,
+            ..LadderBuilder::new(999_999)
+        };
+        let down = LadderBuilder {
+            round_ask_up: false,
+            ..up
+        };
         let (a, b) = (up.build().unwrap(), down.build().unwrap());
         assert!(a.min_ask >= b.min_ask);
         assert_eq!(a.min_ask - b.min_ask, 1);

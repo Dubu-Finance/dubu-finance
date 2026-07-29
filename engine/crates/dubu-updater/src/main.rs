@@ -576,8 +576,9 @@ async fn run(args: &Args) -> Result<i32, Box<dyn std::error::Error>> {
             (
                 p.pair_id,
                 jump::Bounds::new(
-                    p.jump_floor_bps.unwrap_or(p.half_spread_bps),
-                    p.half_spread_bps,
+                    p.jump_floor_bps
+                        .unwrap_or_else(|| p.half_spread_bps.ceil() as u16),
+                    p.half_spread_bps.ceil() as u16,
                     p.width_bps,
                 ),
             )
@@ -2058,12 +2059,12 @@ async fn run_cycle(
             rt.cfg.skew.spread_horizon_secs,
         );
         let spread = spread::compute(
-            pair.half_spread_bps,
+            pair.half_spread_bps_e2(),
             spread_sigma,
-            degraded_extra,
+            u32::from(degraded_extra) * 100,
             &rt.cfg.spread.params(),
         );
-        let half_spread = spread.half_spread_bps;
+        let half_spread = spread.half_spread_e2;
         // Every row, every cycle. Without these five fields, back-solving `s1` from history later
         // is guesswork — `vol_decibps` next to `capped` is what says whether the model or the
         // ceiling has been doing the deciding.
@@ -2071,19 +2072,19 @@ async fn run_cycle(
         block_work,
 
                     target: "spread", event = "half_spread", pair_id = pair.pair_id, symbol = %pair.symbol,
-                    s0_bps = spread.s0_bps,
+                    s0_bps_e2 = spread.s0_bps_e2,
                     sigma_millibps = spread.sigma_millibps,
                     sigma_horizon_secs = rt.cfg.skew.vol_horizon_secs,
                     vol_samples,
                     s1 = rt.cfg.spread.vol_coefficient,
                     vol_decibps = spread.vol_decibps,
-                    vol_bps = spread.vol_bps(),
-                    vol_scaled_bps = spread.vol_scaled_bps,
+                    vol_e2 = spread.vol_e2(),
+                    vol_scaled_e2 = spread.vol_scaled_e2,
                     capped = spread.capped,
                     cap_bps = rt.cfg.spread.max_half_spread_bps,
-                    degraded_extra_bps = spread.degraded_extra_bps,
-                    half_spread_bps = spread.half_spread_bps,
-                    absorption_bps = u32::from(spread.half_spread_bps) + u32::from(pair.width_bps) / 2,
+                    degraded_extra_e2 = spread.degraded_extra_e2,
+                    half_spread_e2 = spread.half_spread_e2,
+                    absorption_e2 = spread.half_spread_e2 + u32::from(pair.width_bps) * 50,
                     "volatility-scaled half-spread"
                 );
 
@@ -2120,7 +2121,14 @@ async fn run_cycle(
                     })
                     .unwrap_or(0),
             };
-            let floor_cap = skew::min_price_cap_bps(f, meta.min_price, half_spread);
+            // The skew still works in whole bps. Rounded UP, which is the conservative
+            // direction: a larger half-spread leaves LESS room to skew down before the row hits
+            // the pair's `minPrice`, so ceiling here can only tighten the cap, never loosen it.
+            let floor_cap = skew::min_price_cap_bps(
+                f,
+                meta.min_price,
+                u16::try_from(half_spread.div_ceil(100)).unwrap_or(u16::MAX),
+            );
             let s = skew::compute(
                 &inventory,
                 sigma_sq,
@@ -2160,8 +2168,8 @@ block_work,
             match ladder::build(&RowInputs {
                 pair_id: pair.pair_id,
                 fair: f,
-                half_spread_bps: half_spread,
-                width_bps: pair.width_bps,
+                half_spread_bps_e2: half_spread,
+                width_bps_e2: u32::from(pair.width_bps) * 100,
                 skew_bps: skew.map_or(0, |s| s.applied_bps),
                 capture: pair.capture_units().unwrap_or(0),
                 bid_capacity: bid_cap,

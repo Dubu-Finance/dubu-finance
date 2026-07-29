@@ -27,11 +27,17 @@ fn default_path() -> PathBuf {
 }
 
 fn main() -> ExitCode {
-    let path = std::env::args_os().nth(1).map_or_else(default_path, PathBuf::from);
+    let path = std::env::args_os()
+        .nth(1)
+        .map_or_else(default_path, PathBuf::from);
 
     let all = vectors::generate();
     for v in &all {
-        assert!(vectors::verify(v), "vector `{}` does not reproduce its own output", v.name);
+        assert!(
+            vectors::verify(v),
+            "vector `{}` does not reproduce its own output",
+            v.name
+        );
     }
 
     let json = match vectors::to_json(&all) {
@@ -53,6 +59,11 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    println!("gen-vectors: wrote {} vectors ({} bytes) to {}", all.len(), json.len(), path.display());
+    println!(
+        "gen-vectors: wrote {} vectors ({} bytes) to {}",
+        all.len(),
+        json.len(),
+        path.display()
+    );
     ExitCode::SUCCESS
 }

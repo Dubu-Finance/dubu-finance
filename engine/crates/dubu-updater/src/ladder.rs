@@ -54,7 +54,7 @@ use dubu_core::curve::{
     amount_in_ask, amount_out_bid, avg_ask_price, avg_bid_price, Ladder, MAX_AMOUNT, MAX_PRICE,
 };
 use dubu_core::inverse::{solve_two_sided, Solution, SolveInput, WidthBinding};
-use dubu_core::ladder::{LadderBuilder, BPS};
+use dubu_core::ladder::{LadderBuilder, BPS_E2};
 use dubu_core::math::{mul_div_ceil, mul_div_floor};
 use dubu_core::pack::QuoteWord;
 use dubu_core::{CurveError, LadderError, PackError};
@@ -105,9 +105,9 @@ pub struct RowInputs {
     /// Fair value, already converted into this pair's pool price scale.
     pub fair: u128,
     /// Half-spread in bps, **including** any degraded-mode widening.
-    pub half_spread_bps: u16,
+    pub half_spread_bps_e2: u32,
     /// Ladder width in bps of the near price — an upper bound on the width, not a target.
-    pub width_bps: u16,
+    pub width_bps_e2: u32,
     /// Inventory skew in bps. Positive shifts the whole book down.
     pub skew_bps: i16,
     /// Size the average price is guaranteed over.
@@ -201,9 +201,11 @@ pub fn build(input: &RowInputs) -> Result<QuoteRow, BuildError> {
 
     // Step 2: the two targets. Floor the bid and ceil the ask — both away from the taker, the
     // same direction every rounding in `dubu-core` takes.
-    let hs = u128::from(input.half_spread_bps).min(dubu_core::ladder::MAX_BPS);
-    let bid_target = mul_div_floor(mid, BPS - hs, BPS).ok_or(BuildError::Price("bid target"))?;
-    let ask_target = mul_div_ceil(mid, BPS + hs, BPS).ok_or(BuildError::Price("ask target"))?;
+    let hs = u128::from(input.half_spread_bps_e2).min(dubu_core::ladder::MAX_BPS_E2);
+    let bid_target =
+        mul_div_floor(mid, BPS_E2 - hs, BPS_E2).ok_or(BuildError::Price("bid target"))?;
+    let ask_target =
+        mul_div_ceil(mid, BPS_E2 + hs, BPS_E2).ok_or(BuildError::Price("ask target"))?;
     if ask_target > MAX_PRICE {
         return Err(BuildError::Price("ask target above uint56"));
     }
@@ -214,9 +216,9 @@ pub fn build(input: &RowInputs) -> Result<QuoteRow, BuildError> {
     }
 
     // Step 3: the width bound, in price units, from bps of each near price.
-    let wb = u128::from(input.width_bps);
-    let bid_width = mul_div_floor(bid_target, wb, BPS).ok_or(BuildError::Price("bid width"))?;
-    let ask_width = mul_div_floor(ask_target, wb, BPS).ok_or(BuildError::Price("ask width"))?;
+    let wb = u128::from(input.width_bps_e2);
+    let bid_width = mul_div_floor(bid_target, wb, BPS_E2).ok_or(BuildError::Price("bid width"))?;
+    let ask_width = mul_div_floor(ask_target, wb, BPS_E2).ok_or(BuildError::Price("ask width"))?;
 
     // Step 4: bounds. The bid may not be lifted above the mid; the ask may not be pushed below
     // it. See the module docs for what this bound is and — more importantly — is not.
@@ -442,8 +444,8 @@ mod tests {
         RowInputs {
             pair_id: 1,
             fair,
-            half_spread_bps: 5,
-            width_bps: 25,
+            half_spread_bps_e2: 500,
+            width_bps_e2: 2500,
             skew_bps: 0,
             capture: 20_000_000_000_000_000_000, // 20 mWETH
             bid_capacity: 1_000_000_000_000_000_000_000, // 1000 mWETH
@@ -523,12 +525,12 @@ mod tests {
     #[test]
     fn width_bps_bounds_the_ladder_rather_than_setting_it() {
         let narrow = build(&RowInputs {
-            width_bps: 1,
+            width_bps_e2: 100,
             ..weth_inputs(FAIR)
         })
         .unwrap();
         let wide = build(&RowInputs {
-            width_bps: 1_000,
+            width_bps_e2: 100000,
             ..weth_inputs(FAIR)
         })
         .unwrap();
@@ -545,7 +547,7 @@ mod tests {
         assert!(wide.ladder.max_bid <= wide.mid);
         assert_eq!(
             build(&RowInputs {
-                width_bps: 500,
+                width_bps_e2: 50000,
                 ..weth_inputs(FAIR)
             })
             .unwrap()
@@ -631,8 +633,8 @@ mod tests {
         let row = build(&RowInputs {
             pair_id: 2,
             fair: 1_180_000_000_000_000,
-            half_spread_bps: 8,
-            width_bps: 40,
+            half_spread_bps_e2: 800,
+            width_bps_e2: 4000,
             skew_bps: 0,
             capture: 20_000_000,         // 0.2 mWBTC
             bid_capacity: 2_000_000_000, // 20 mWBTC

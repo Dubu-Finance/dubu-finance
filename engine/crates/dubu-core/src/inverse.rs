@@ -244,7 +244,10 @@ pub fn widest_width(
     requested: u128,
 ) -> (u128, WidthBinding) {
     debug_assert!(twice_capacity >= 2 && twice_capacity % 2 == 0);
-    debug_assert!(capture * 2 <= twice_capacity, "capture must be clamped to capacity");
+    debug_assert!(
+        capture * 2 <= twice_capacity,
+        "capture must be clamped to capacity"
+    );
 
     // W_boundary = floor((2C*(H_i + 1) - 1) / K), vacuous at K == 0.
     //
@@ -269,7 +272,8 @@ pub fn widest_width(
     // Lemma (A): the floored impact makes `span(W) = W - floor(W*K/2C)` collapse to the *ceiled*
     // `ceil(W*n/2C)`, and a ceiling is bounded by `H_e` exactly when the real quotient is, so
     // there is no `-1` correction to apply.
-    let endpoint = mul_div_floor(headroom_span, twice_capacity, twice_capacity - capture).unwrap_or(MAX_PRICE);
+    let endpoint =
+        mul_div_floor(headroom_span, twice_capacity, twice_capacity - capture).unwrap_or(MAX_PRICE);
 
     // Order matters only for the reported binding; ties report the earlier cause, which is the
     // one the operator can act on.
@@ -340,14 +344,22 @@ pub fn solve_bid(input: &SolveInput) -> Result<Solution, LadderError> {
     );
 
     // FLOOR — see §3. The realised average is `target - frac(W*K/2C)`, at or below the target.
-    let impact = mul_div_floor(width, effective_capture, twice_capacity).ok_or(LadderError::PriceOutOfRange)?;
+    let impact = mul_div_floor(width, effective_capture, twice_capacity)
+        .ok_or(LadderError::PriceOutOfRange)?;
     let high = input.target + impact; // <= max_price by the boundary bound
     let low = high - width; // >= min_price by the endpoint bound
 
     debug_assert!(high <= input.max_price);
     debug_assert!(low >= input.min_price);
 
-    Ok(Solution { low, high, width, effective_capture, impact, binding })
+    Ok(Solution {
+        low,
+        high,
+        width,
+        effective_capture,
+        impact,
+        binding,
+    })
 }
 
 /// Solve the ask side. Mirror of [`solve_bid`]; see §5 of the module docs. The realised average
@@ -369,14 +381,22 @@ pub fn solve_ask(input: &SolveInput) -> Result<Solution, LadderError> {
         input.requested_width,
     );
 
-    let impact = mul_div_floor(width, effective_capture, twice_capacity).ok_or(LadderError::PriceOutOfRange)?;
+    let impact = mul_div_floor(width, effective_capture, twice_capacity)
+        .ok_or(LadderError::PriceOutOfRange)?;
     let low = input.target - impact; // >= min_price by the boundary bound
     let high = low + width; // <= max_price by the endpoint bound
 
     debug_assert!(high <= input.max_price);
     debug_assert!(low >= input.min_price);
 
-    Ok(Solution { low, high, width, effective_capture, impact, binding })
+    Ok(Solution {
+        low,
+        high,
+        width,
+        effective_capture,
+        impact,
+        binding,
+    })
 }
 
 /// A two-sided row plus the per-side solutions it came from.
@@ -423,13 +443,20 @@ pub fn solve_two_sided(bid: &SolveInput, ask: &SolveInput) -> Result<TwoSided, L
         max_ask = min_ask;
     }
     if max_ask <= min_bid {
-        max_ask = min_bid.checked_add(1).ok_or(LadderError::InfeasibleBounds)?;
+        max_ask = min_bid
+            .checked_add(1)
+            .ok_or(LadderError::InfeasibleBounds)?;
     }
     if max_ask > MAX_PRICE || min_ask > MAX_PRICE {
         return Err(LadderError::InfeasibleBounds);
     }
 
-    let ladder = Ladder { min_bid, max_bid, min_ask, max_ask };
+    let ladder = Ladder {
+        min_bid,
+        max_bid,
+        min_ask,
+        max_ask,
+    };
     ladder.validate(bid.min_price)?;
     Ok(TwoSided {
         ladder,
@@ -448,10 +475,21 @@ pub fn solve_two_sided(bid: &SolveInput, ask: &SolveInput) -> Result<TwoSided, L
 ///
 /// # Errors
 /// Propagates whatever the on-chain mirror would have reverted with.
-pub fn verify_bid_round_trip(sol: &Solution, capacity: u128, price_scale_exp: u8) -> Result<u128, LadderError> {
+pub fn verify_bid_round_trip(
+    sol: &Solution,
+    capacity: u128,
+    price_scale_exp: u8,
+) -> Result<u128, LadderError> {
     let realised = avg_bid_price(sol.low, sol.high, capacity, 0, sol.effective_capture)?;
     // Also exercise the full quote path so a divergence in the scaling step cannot hide.
-    let _ = amount_out_bid(sol.effective_capture, sol.low, sol.high, capacity, 0, price_scale_exp)?;
+    let _ = amount_out_bid(
+        sol.effective_capture,
+        sol.low,
+        sol.high,
+        capacity,
+        0,
+        price_scale_exp,
+    )?;
     Ok(realised)
 }
 
@@ -461,25 +499,55 @@ mod tests {
     use crate::curve::{amount_in_ask, amount_out_bid, avg_ask_price};
 
     fn bid_input(target: u128, capture: u128, capacity: u128) -> SolveInput {
-        SolveInput { target, capture, capacity, requested_width: MAX_PRICE, min_price: 0, max_price: MAX_PRICE }
+        SolveInput {
+            target,
+            capture,
+            capacity,
+            requested_width: MAX_PRICE,
+            min_price: 0,
+            max_price: MAX_PRICE,
+        }
     }
 
     /// The realised average, as the chain's own arithmetic implies it, expressed exactly:
     /// `target` iff `2C | W*K`, else strictly between `target - 1` and `target`.
     fn bid_residual_is_exact(sol: &Solution, capacity: u128) -> bool {
-        mul_div_rem(sol.width, sol.effective_capture, capacity * 2).unwrap().1 == 0
+        mul_div_rem(sol.width, sol.effective_capture, capacity * 2)
+            .unwrap()
+            .1
+            == 0
     }
 
     #[test]
     fn round_trip_lands_on_the_pools_side_of_the_target() {
         let input = bid_input(3_000_000_000_000_000, 5_000_000, 10_000_000);
         let sol = solve_bid(&input).unwrap();
-        let realised = avg_bid_price(sol.low, sol.high, input.capacity, 0, sol.effective_capture).unwrap();
+        let realised =
+            avg_bid_price(sol.low, sol.high, input.capacity, 0, sol.effective_capture).unwrap();
         assert!(realised <= input.target && input.target - realised <= 1);
         // The quote path never pays a taker more than a flat ladder at the target would.
-        let solved = amount_out_bid(sol.effective_capture, sol.low, sol.high, input.capacity, 0, 18).unwrap();
-        let flat = amount_out_bid(sol.effective_capture, input.target, input.target, input.capacity, 0, 18).unwrap();
-        assert!(solved <= flat, "solved {solved} beat the flat target ladder {flat}");
+        let solved = amount_out_bid(
+            sol.effective_capture,
+            sol.low,
+            sol.high,
+            input.capacity,
+            0,
+            18,
+        )
+        .unwrap();
+        let flat = amount_out_bid(
+            sol.effective_capture,
+            input.target,
+            input.target,
+            input.capacity,
+            0,
+            18,
+        )
+        .unwrap();
+        assert!(
+            solved <= flat,
+            "solved {solved} beat the flat target ladder {flat}"
+        );
     }
 
     #[test]
@@ -492,11 +560,20 @@ mod tests {
         assert_eq!((sol.width, sol.impact), (7, 1));
         assert_eq!((sol.low, sol.high), (999_994, 1_000_001));
         assert!(!bid_residual_is_exact(&sol, input.capacity));
-        assert_eq!(avg_bid_price(sol.low, sol.high, input.capacity, 0, sol.effective_capture), Ok(999_999));
+        assert_eq!(
+            avg_bid_price(sol.low, sol.high, input.capacity, 0, sol.effective_capture),
+            Ok(999_999)
+        );
         // Ceiling the impact would have put the realised average at 1_000_000 + something, i.e.
         // above the target — the one direction that is not allowed.
         assert_eq!(
-            avg_bid_price(sol.low + 1, sol.high + 1, input.capacity, 0, sol.effective_capture),
+            avg_bid_price(
+                sol.low + 1,
+                sol.high + 1,
+                input.capacity,
+                0,
+                sol.effective_capture
+            ),
             Ok(1_000_000)
         );
     }
@@ -509,7 +586,10 @@ mod tests {
         let sol = solve_bid(&input).unwrap();
         assert_eq!((sol.width, sol.impact), (8, 4));
         assert!(bid_residual_is_exact(&sol, input.capacity));
-        assert_eq!(avg_bid_price(sol.low, sol.high, input.capacity, 0, sol.effective_capture), Ok(1_000_000));
+        assert_eq!(
+            avg_bid_price(sol.low, sol.high, input.capacity, 0, sol.effective_capture),
+            Ok(1_000_000)
+        );
     }
 
     #[test]
@@ -523,7 +603,10 @@ mod tests {
     fn zero_capture_puts_the_target_at_the_top() {
         let input = bid_input(1_000_000, 0, 1_000);
         let sol = solve_bid(&input).unwrap();
-        assert_eq!((sol.effective_capture, sol.impact, sol.high), (0, 0, 1_000_000));
+        assert_eq!(
+            (sol.effective_capture, sol.impact, sol.high),
+            (0, 0, 1_000_000)
+        );
     }
 
     #[test]
@@ -592,7 +675,10 @@ mod tests {
         assert_eq!(sol.impact, 3);
         assert_eq!((sol.low, sol.high), (999_996, 1_000_003));
         // 7*1_000 = 7_000 is not a multiple of 2_000, so the realised average is one unit under.
-        assert_eq!(avg_bid_price(sol.low, sol.high, input.capacity, 0, sol.effective_capture), Ok(999_999));
+        assert_eq!(
+            avg_bid_price(sol.low, sol.high, input.capacity, 0, sol.effective_capture),
+            Ok(999_999)
+        );
     }
 
     #[test]
@@ -627,12 +713,32 @@ mod tests {
         assert_eq!(sol.width, 15_499_999_999_999_999);
         assert_eq!(sol.impact, 3_099_999_999_999_999);
         assert_eq!((sol.low, sol.high), (1, 15_500_000_000_000_000));
-        let realised = avg_ask_price(sol.low, sol.high, input.capacity, 0, sol.effective_capture).unwrap();
+        let realised =
+            avg_ask_price(sol.low, sol.high, input.capacity, 0, sol.effective_capture).unwrap();
         assert!(realised >= input.target && realised - input.target <= 1);
         // In amount terms: the solved ladder charges at least what a flat ladder at T charges.
-        let solved = amount_in_ask(sol.effective_capture, sol.low, sol.high, input.capacity, 0, 18).unwrap();
-        let flat = amount_in_ask(sol.effective_capture, input.target, input.target, input.capacity, 0, 18).unwrap();
-        assert!(solved >= flat, "solved {solved} undercharged against the flat target ladder {flat}");
+        let solved = amount_in_ask(
+            sol.effective_capture,
+            sol.low,
+            sol.high,
+            input.capacity,
+            0,
+            18,
+        )
+        .unwrap();
+        let flat = amount_in_ask(
+            sol.effective_capture,
+            input.target,
+            input.target,
+            input.capacity,
+            0,
+            18,
+        )
+        .unwrap();
+        assert!(
+            solved >= flat,
+            "solved {solved} undercharged against the flat target ladder {flat}"
+        );
     }
 
     #[test]
@@ -665,7 +771,15 @@ mod tests {
 
         // The two sides overlap, so the ask is lifted.
         assert!(out.ask_repaired);
-        assert_eq!(ladder, Ladder { min_bid: 0, max_bid: 1_333_333, min_ask: 1_333_333, max_ask: 4_000_403 });
+        assert_eq!(
+            ladder,
+            Ladder {
+                min_bid: 0,
+                max_bid: 1_333_333,
+                min_ask: 1_333_333,
+                max_ask: 4_000_403
+            }
+        );
     }
 
     #[test]
@@ -681,12 +795,33 @@ mod tests {
         let ask = bid_input(900, 100, 100);
         let out = solve_two_sided(&bid, &ask).unwrap();
         assert!(out.ask_repaired);
-        assert_eq!((out.bid.width, out.bid.impact, out.bid.low, out.bid.high), (2_000, 1_000, 0, 2_000));
-        assert_eq!((out.ask.width, out.ask.impact, out.ask.low, out.ask.high), (1_801, 900, 0, 1_801));
-        assert_eq!(out.ladder, Ladder { min_bid: 0, max_bid: 2_000, min_ask: 2_000, max_ask: 2_000 });
+        assert_eq!(
+            (out.bid.width, out.bid.impact, out.bid.low, out.bid.high),
+            (2_000, 1_000, 0, 2_000)
+        );
+        assert_eq!(
+            (out.ask.width, out.ask.impact, out.ask.low, out.ask.high),
+            (1_801, 900, 0, 1_801)
+        );
+        assert_eq!(
+            out.ladder,
+            Ladder {
+                min_bid: 0,
+                max_bid: 2_000,
+                min_ask: 2_000,
+                max_ask: 2_000
+            }
+        );
         // The repair is pool-favourable: the realised ask is strictly worse for the taker than
         // the 900 that was requested, never better.
-        let realised = avg_ask_price(out.ladder.min_ask, out.ladder.max_ask, 100, 0, out.ask.effective_capture).unwrap();
+        let realised = avg_ask_price(
+            out.ladder.min_ask,
+            out.ladder.max_ask,
+            100,
+            0,
+            out.ask.effective_capture,
+        )
+        .unwrap();
         assert_eq!(realised, 2_000);
         assert!(realised >= ask.target);
         out.ladder.validate(0).unwrap();
@@ -694,7 +829,10 @@ mod tests {
 
     #[test]
     fn infeasible_inputs_are_rejected_not_clamped() {
-        assert_eq!(solve_bid(&bid_input(1, 1, 0)), Err(LadderError::ZeroCapacity));
+        assert_eq!(
+            solve_bid(&bid_input(1, 1, 0)),
+            Err(LadderError::ZeroCapacity)
+        );
         let mut i = bid_input(100, 1, 10);
         i.min_price = 200;
         assert_eq!(solve_bid(&i), Err(LadderError::TargetBelowFloor));

@@ -106,7 +106,7 @@
 //! longer be one block, the 300 s horizon would stop being generous, and a ramp would earn its
 //! place. Until that is measured, adding it would be a third coefficient chosen by feel.
 
-use dubu_core::ladder::MAX_BPS;
+use dubu_core::ladder::MAX_BPS_E2;
 
 /// Rescale a sigma measured over one window to the window a quote is actually exposed for.
 ///
@@ -151,7 +151,7 @@ pub struct SpreadParams {
     pub vol_coefficient_e2: u32,
     /// The ceiling on `s0 + s1 * sigma`, in bps. The degraded-chain widening is added *after* it;
     /// see [`compute`].
-    pub max_half_spread_bps: u16,
+    pub max_half_spread_bps_e2: u32,
 }
 
 /// Everything one half-spread computation produced. All of it is logged, every row, every cycle —
@@ -160,7 +160,7 @@ pub struct SpreadParams {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Spread {
     /// The pair's configured half-spread, `s0`.
-    pub s0_bps: u16,
+    pub s0_bps_e2: u32,
     /// `sigma` over the estimator's horizon, in thousandths of a bp, exactly as the skew logs it.
     pub sigma_millibps: u64,
     /// `s1 * sigma`, in deci-bps. Deci-bps because whole-bps rounding hides everything under
@@ -168,13 +168,13 @@ pub struct Spread {
     pub vol_decibps: u32,
     /// `min(s0 + s1 * sigma, cap)`, in bps. What the volatility path produced, before the
     /// degraded-chain widening.
-    pub vol_scaled_bps: u16,
+    pub vol_scaled_e2: u32,
     /// Whether [`SpreadParams::max_half_spread_bps`] bound it.
     pub capped: bool,
     /// The degraded-chain widening that was added on top.
-    pub degraded_extra_bps: u16,
+    pub degraded_extra_e2: u32,
     /// The half-spread that goes into [`crate::ladder::build`].
-    pub half_spread_bps: u16,
+    pub half_spread_e2: u32,
 }
 
 impl Spread {
@@ -182,8 +182,8 @@ impl Spread {
     /// line, so that "the term is on but rounding to nothing" is distinguishable from "the term is
     /// off".
     #[must_use]
-    pub const fn vol_bps(&self) -> u16 {
-        self.vol_scaled_bps.saturating_sub(self.s0_bps)
+    pub const fn vol_e2(&self) -> u32 {
+        self.vol_scaled_e2.saturating_sub(self.s0_bps_e2)
     }
 }
 
@@ -208,43 +208,45 @@ impl Spread {
 /// nothing reaches the chain unvalidated.
 #[must_use]
 pub fn compute(
-    s0_bps: u16,
+    s0_bps_e2: u32,
     sigma_millibps: u64,
-    degraded_extra_bps: u16,
+    degraded_extra_e2: u32,
     params: &SpreadParams,
 ) -> Spread {
-    // s1 * sigma, in deci-bps: (s1_e2 / 100) * (sigma_millibps / 1000) * 10.
+    // s1 * sigma, in HUNDREDTHS of a bp: (s1_e2 / 100) * (sigma_millibps / 1000) * 100.
+    //
+    // This used to round up to whole bps, because `dubu-core` took whole bps. It no longer does,
+    // and the rounding was not free: once sigma was scaled to the quote's real exposure window the
+    // volatility term came to 0.61 bp on ETH, which rounded to 1 -- a 64% overcharge on the term,
+    // and on a 1 bp `s0` that is a third of the whole price.
     let vol_decibps =
         u32::try_from(u64::from(params.vol_coefficient_e2).saturating_mul(sigma_millibps) / 10_000)
             .unwrap_or(u32::MAX);
-    // Round the term UP to whole bps. `dubu-core` takes whole bps, and every other rounding in
-    // this crate goes away from the taker; a half-spread rounded down is the one direction that
-    // gives an edge away.
-    let vol_bps = u16::try_from(vol_decibps.div_ceil(10)).unwrap_or(u16::MAX);
+    let vol_e2 = vol_decibps.saturating_mul(10);
 
-    let wanted = s0_bps.saturating_add(vol_bps);
-    let cap = params.max_half_spread_bps;
-    // `.max(s0_bps)`: a cap below the configured spread must never *narrow* it. `s0` is the
+    let wanted = s0_bps_e2.saturating_add(vol_e2);
+    let cap = params.max_half_spread_bps_e2;
+    // `.max(s0_bps_e2)`: a cap below the configured spread must never *narrow* it. `s0` is the
     // operator's floor, not a suggestion — the volatility term simply contributes nothing there.
     // `config` refuses that combination at startup, so this is the second belt.
-    let (vol_scaled_bps, capped) = if wanted > cap {
-        (cap.max(s0_bps), true)
+    let (vol_scaled_e2, capped) = if wanted > cap {
+        (cap.max(s0_bps_e2), true)
     } else {
         (wanted, false)
     };
 
-    let half_spread_bps = vol_scaled_bps
-        .saturating_add(degraded_extra_bps)
-        .min(u16::try_from(MAX_BPS).unwrap_or(u16::MAX));
+    let half_spread_e2 = vol_scaled_e2
+        .saturating_add(degraded_extra_e2)
+        .min(u32::try_from(MAX_BPS_E2).unwrap_or(u32::MAX));
 
     Spread {
-        s0_bps,
+        s0_bps_e2,
         sigma_millibps,
         vol_decibps,
-        vol_scaled_bps,
+        vol_scaled_e2,
         capped,
-        degraded_extra_bps,
-        half_spread_bps,
+        degraded_extra_e2,
+        half_spread_e2,
     }
 }
 
@@ -257,7 +259,7 @@ mod tests {
     fn params() -> SpreadParams {
         SpreadParams {
             vol_coefficient_e2: 50,
-            max_half_spread_bps: 30,
+            max_half_spread_bps_e2: 3000,
         }
     }
 
@@ -271,35 +273,37 @@ mod tests {
         // The half-spread at 1x, 2x and 5x the MEASURED sigma on both pairs. These six numbers are
         // the derivation's output and the thing a reader would check first, so they are pinned
         // rather than left to be recomputed by hand.
-        let eth = |m: u64| compute(5, sigma(10 * m), 0, &params()).half_spread_bps;
-        assert_eq!(eth(1), 10, "ETH at the measured sigma of 10 bp");
-        assert_eq!(eth(2), 15);
-        assert_eq!(eth(5), 30, "the measured-positive point in the sweep");
-
-        let btc = |m: u64| compute(8, sigma(3 * m), 0, &params()).half_spread_bps;
+        // In hundredths of a bp now, and no longer rounded up to whole bps -- 9.5 bp is 950,
+        // where it used to be charged as 10.
+        let eth = |m: u64| compute(500, sigma(10 * m), 0, &params()).half_spread_e2;
         assert_eq!(
-            btc(1),
-            10,
-            "8 + 0.5*3 = 9.5, rounded up away from the taker"
+            eth(1),
+            1_000,
+            "ETH at the measured sigma of 10 bp: 5 + 0.5*10"
         );
-        assert_eq!(btc(2), 11);
-        assert_eq!(btc(5), 16, "8 + 0.5*15 = 15.5, rounded up");
+        assert_eq!(eth(2), 1_500);
+        assert_eq!(eth(5), 3_000, "the measured-positive point in the sweep");
+
+        let btc = |m: u64| compute(800, sigma(3 * m), 0, &params()).half_spread_e2;
+        assert_eq!(btc(1), 950, "8 + 0.5*3 = 9.5, and 9.5 is now representable");
+        assert_eq!(btc(2), 1_100);
+        assert_eq!(btc(5), 1_550, "8 + 0.5*15 = 15.5");
 
         // And the absorption limits those imply, which is the number that actually decides the
         // outcome: absorption = half_spread + width/2.
-        assert_eq!(eth(1) + 25 / 2, 22);
-        assert_eq!(eth(5) + 25 / 2, 42);
-        assert_eq!(btc(1) + 40 / 2, 30);
+        assert_eq!(eth(1) + 2_500 / 2, 2_250, "10 bp half + 12.5 bp of width");
+        assert_eq!(eth(5) + 2_500 / 2, 4_250);
+        assert_eq!(btc(1) + 4_000 / 2, 2_950);
     }
 
     #[test]
     fn a_flat_market_leaves_the_configured_spread_exactly_where_it_was() {
         // Warm-up matters: the estimator seeds at zero, so the first cycles after a start or a
         // feed outage must produce the configured spread and not an invented one.
-        let s = compute(5, 0, 0, &params());
-        assert_eq!(s.half_spread_bps, 5);
+        let s = compute(500, 0, 0, &params());
+        assert_eq!(s.half_spread_e2, 500);
         assert_eq!(s.vol_decibps, 0);
-        assert_eq!(s.vol_bps(), 0);
+        assert_eq!(s.vol_e2(), 0);
         assert!(!s.capped);
     }
 
@@ -307,24 +311,24 @@ mod tests {
     fn the_term_is_linear_in_sigma_and_the_skew_is_quadratic() {
         // Worth pinning together: the two consumers of the same sigma respond to it differently on
         // purpose. Doubling sigma doubles the spread term and quadruples the skew.
-        let one = compute(5, sigma(10), 0, &params()).vol_decibps;
-        let two = compute(5, sigma(20), 0, &params()).vol_decibps;
+        let one = compute(500, sigma(10), 0, &params()).vol_decibps;
+        let two = compute(500, sigma(20), 0, &params()).vol_decibps;
         assert_eq!(two, 2 * one);
     }
 
     #[test]
     fn the_cap_binds_and_says_so() {
         // 10x the measured sigma wants 5 + 50 = 55 bp.
-        let s = compute(5, sigma(100), 0, &params());
+        let s = compute(500, sigma(100), 0, &params());
         assert_eq!(s.vol_decibps, 500);
-        assert_eq!(s.vol_scaled_bps, 30);
+        assert_eq!(s.vol_scaled_e2, 3000);
         assert!(s.capped, "without this flag, tuning s1 later is guesswork");
-        assert_eq!(s.half_spread_bps, 30);
+        assert_eq!(s.half_spread_e2, 3000);
 
         // An absurd sigma cannot walk it any further. Past this point the defence is `jump`, not
         // a wider quote.
-        let s = compute(5, u64::MAX, 0, &params());
-        assert_eq!(s.half_spread_bps, 30);
+        let s = compute(500, u64::MAX, 0, &params());
+        assert_eq!(s.half_spread_e2, 3000);
         assert!(s.capped);
     }
 
@@ -333,11 +337,11 @@ mod tests {
         // The two defences are for different failures. A volatility spike that pins the cap must
         // not silently disable the widening that exists for a chain view we cannot refresh —
         // which is exactly when both are needed at once.
-        let s = compute(5, sigma(100), 25, &params());
-        assert_eq!(s.vol_scaled_bps, 30);
+        let s = compute(500, sigma(100), 2_500, &params());
+        assert_eq!(s.vol_scaled_e2, 3_000);
         assert!(s.capped);
-        assert_eq!(s.degraded_extra_bps, 25);
-        assert_eq!(s.half_spread_bps, 55);
+        assert_eq!(s.degraded_extra_e2, 2_500);
+        assert_eq!(s.half_spread_e2, 5_500);
     }
 
     #[test]
@@ -346,15 +350,15 @@ mod tests {
         // combination at startup; this is the behaviour if it ever gets past.
         let tight = SpreadParams {
             vol_coefficient_e2: 50,
-            max_half_spread_bps: 3,
+            max_half_spread_bps_e2: 300,
         };
-        let s = compute(5, sigma(10), 0, &tight);
+        let s = compute(500, sigma(10), 0, &tight);
         assert_eq!(
-            s.half_spread_bps, 5,
+            s.half_spread_e2, 500,
             "the cap floors at s0, it never cuts below it"
         );
         assert_eq!(
-            s.vol_bps(),
+            s.vol_e2(),
             0,
             "and the volatility term contributes nothing there"
         );
@@ -371,13 +375,13 @@ mod tests {
         // volatility term, at the live pair shape, with the skew at both of its clamps.
         const FAIR: u128 = 1_943_820_000_000_000;
         for m in [0u64, 1, 2, 5, 10, 50, 1_000] {
-            let s = compute(5, sigma(10 * m), 0, &params());
+            let s = compute(500, sigma(10 * m), 0, &params());
             for skew_bps in [-10i16, 0, 30] {
                 let row = ladder::build(&RowInputs {
                     pair_id: 1,
                     fair: FAIR,
-                    half_spread_bps: s.half_spread_bps,
-                    width_bps: 25,
+                    half_spread_bps_e2: s.half_spread_e2,
+                    width_bps_e2: 2500,
                     skew_bps,
                     capture: 20_000_000_000_000_000_000,
                     bid_capacity: 1_000_000_000_000_000_000_000,
@@ -385,26 +389,26 @@ mod tests {
                     min_price: 1_000_000_000_000_000,
                     price_scale_exp: 24,
                 })
-                .unwrap_or_else(|e| panic!("hs {} skew {skew_bps} failed: {e}", s.half_spread_bps));
+                .unwrap_or_else(|e| panic!("hs {} skew {skew_bps} failed: {e}", s.half_spread_e2));
                 row.ladder
                     .validate(1_000_000_000_000_000)
                     .expect("every reachable half-spread must still pass the chain's validator");
                 // The spread really is what was asked for, and it really does widen with sigma.
                 assert_eq!(
                     row.bid_target,
-                    row.mid * (10_000 - u128::from(s.half_spread_bps)) / 10_000
+                    row.mid * (1_000_000 - u128::from(s.half_spread_e2)) / 1_000_000
                 );
             }
         }
 
         // And the degraded case on top of the cap, which is the widest thing reachable at all.
-        let s = compute(5, sigma(1_000), 25, &params());
-        assert_eq!(s.half_spread_bps, 55);
+        let s = compute(500, sigma(1_000), 2_500, &params());
+        assert_eq!(s.half_spread_e2, 5_500);
         assert!(ladder::build(&RowInputs {
             pair_id: 1,
             fair: FAIR,
-            half_spread_bps: s.half_spread_bps,
-            width_bps: 25,
+            half_spread_bps_e2: s.half_spread_e2,
+            width_bps_e2: 2500,
             skew_bps: 30,
             capture: 20_000_000_000_000_000_000,
             bid_capacity: 1_000_000_000_000_000_000_000,

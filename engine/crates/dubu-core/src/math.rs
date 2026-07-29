@@ -281,7 +281,10 @@ impl U256 {
     #[inline]
     #[must_use]
     const fn shl1(self) -> Self {
-        Self { hi: (self.hi << 1) | (self.lo >> 127), lo: self.lo << 1 }
+        Self {
+            hi: (self.hi << 1) | (self.lo >> 127),
+            lo: self.lo << 1,
+        }
     }
 
     /// `self * k` as 256 bits, or `None` on overflow.
@@ -321,7 +324,10 @@ impl U256 {
         }
         if self.hi == 0 {
             // Both fit `u128` (d <= self here), so the native path is exact.
-            return Some((Self::from_u128(self.lo / d.lo), Self::from_u128(self.lo % d.lo)));
+            return Some((
+                Self::from_u128(self.lo / d.lo),
+                Self::from_u128(self.lo % d.lo),
+            ));
         }
 
         let mut rem = Self::ZERO;
@@ -329,7 +335,11 @@ impl U256 {
         let mut i = 256;
         while i > 0 {
             i -= 1;
-            let bit = if i >= 128 { (self.hi >> (i - 128)) & 1 } else { (self.lo >> i) & 1 };
+            let bit = if i >= 128 {
+                (self.hi >> (i - 128)) & 1
+            } else {
+                (self.lo >> i) & 1
+            };
             let carry = rem.hi >> 127;
             rem = rem.shl1();
             rem.lo |= bit;
@@ -395,13 +405,21 @@ mod tests {
         let a = U256::mul_u128(2 * price, cap);
         let b = U256::mul_u128(price, 2 * cap);
         let factor = a.checked_add(b).expect("second factor fits 256 bits");
-        assert!(factor.hi < 1u128 << 27, "second factor should be under 2^155");
+        assert!(
+            factor.hi < 1u128 << 27,
+            "second factor should be under 2^155"
+        );
         // times q < 2^96 — the widest numerator in the library.
-        let num = factor.checked_mul_u128(cap).expect("q * factor fits 256 bits");
+        let num = factor
+            .checked_mul_u128(cap)
+            .expect("q * factor fits 256 bits");
         assert!(num.hi >> 123 == 0, "numerator should be under 2^251");
         // denominator 2*C*S < 2^224
         let den = U256::mul_u128(2 * cap, scale);
-        assert!(!den.is_zero() && den.hi >> 96 == 0, "denominator should be under 2^224");
+        assert!(
+            !den.is_zero() && den.hi >> 96 == 0,
+            "denominator should be under 2^224"
+        );
         // And it divides.
         assert!(div_floor_u256(num, den).is_some());
     }
@@ -411,7 +429,10 @@ mod tests {
         assert_eq!(pow10(0), Some(1));
         assert_eq!(pow10(1), Some(10));
         assert_eq!(pow10(18), Some(1_000_000_000_000_000_000));
-        assert_eq!(pow10(38), Some(100_000_000_000_000_000_000_000_000_000_000_000_000));
+        assert_eq!(
+            pow10(38),
+            Some(100_000_000_000_000_000_000_000_000_000_000_000_000)
+        );
         assert_eq!(pow10(39), None);
         assert_eq!(pow10(255), None);
         // The headroom claim in PropCurve's comment: 10**38 still fits 127 bits.
@@ -441,14 +462,20 @@ mod tests {
         // (2^128-1)^2 / 1 does not fit u128.
         assert_eq!(mul_div_floor(u128::MAX, u128::MAX, 1), None);
         // ... but /(2^128-1) does, exactly.
-        assert_eq!(mul_div_floor(u128::MAX, u128::MAX, u128::MAX), Some(u128::MAX));
+        assert_eq!(
+            mul_div_floor(u128::MAX, u128::MAX, u128::MAX),
+            Some(u128::MAX)
+        );
     }
 
     #[test]
     fn mul_div_ceil_saturation() {
         // q == u128::MAX with a nonzero remainder cannot be rounded up.
         assert_eq!(mul_div_ceil(u128::MAX, 2, 2), Some(u128::MAX));
-        assert_eq!(mul_div_ceil(u128::MAX, u128::MAX, u128::MAX), Some(u128::MAX));
+        assert_eq!(
+            mul_div_ceil(u128::MAX, u128::MAX, u128::MAX),
+            Some(u128::MAX)
+        );
     }
 
     #[test]
@@ -462,7 +489,10 @@ mod tests {
         // fit in u128 — here width * (cap/2) is ~2^151. Compute the reference with BigUint
         // rather than natively, which is what made this assertion overflow at compile time.
         let expected = (BigUint::from(width) * BigUint::from(cap / 2)) / BigUint::from(cap);
-        assert_eq!(mul_div_floor(width, cap / 2, cap), Some(u128::try_from(expected).unwrap()));
+        assert_eq!(
+            mul_div_floor(width, cap / 2, cap),
+            Some(u128::try_from(expected).unwrap())
+        );
     }
 
     proptest! {

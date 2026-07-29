@@ -648,7 +648,7 @@ base_decimals = 18
 quote_decimals = 6
 
 # 5 bp either side: a 10 bp round trip, matching the ladder measured in DEPLOYMENTS.md.
-half_spread_bps = 1
+half_spread_bps = 0.5
 
 # Concentration: the price decays at most this far across the WHOLE posted depth. An upper
 # bound, not a target — the solver narrows it whenever the fair-value ceiling on maxBid binds.
@@ -756,7 +756,7 @@ quote_decimals = 6
 # 2, not 1.6 -- the field is an integer. BTC keeps a wider floor than ETH for the same
 # reason its width is 40 against ETH's 25: it is the less liquid of the two references and
 # its own sigma carries it further anyway.
-half_spread_bps = 2
+half_spread_bps = 0.5
 width_bps = 9
 
 # Same as pair 1. BTC's reference is noisier, so its floor stays the wider of the two.
@@ -844,7 +844,7 @@ ask_capacity = "2200"
 
 capacity_divergence_pct = 30
 
-half_spread_bps = 2
+half_spread_bps = 0.5
 width_bps = 9
 jump_floor_bps = 5
 max_push_interval_ms = 330
@@ -886,7 +886,7 @@ ask_capacity = "1000000"
 
 capacity_divergence_pct = 30
 
-half_spread_bps = 3
+half_spread_bps = 0.5
 width_bps = 14
 jump_floor_bps = 8
 max_push_interval_ms = 330
@@ -928,7 +928,7 @@ ask_capacity = "10000"
 
 capacity_divergence_pct = 30
 
-half_spread_bps = 3
+half_spread_bps = 0.5
 width_bps = 18
 jump_floor_bps = 7
 max_push_interval_ms = 330

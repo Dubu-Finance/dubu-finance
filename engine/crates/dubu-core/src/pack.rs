@@ -99,7 +99,8 @@ impl QuoteWord {
         if (hi >> (OFF_UNUSED - 128)) != 0 {
             return Err(PackError::NonCanonical);
         }
-        let min_ask = ((lo >> OFF_MIN_ASK) & M_MIN_ASK_LOW) | ((hi & M_MIN_ASK_HIGH) << MIN_ASK_LOW_BITS);
+        let min_ask =
+            ((lo >> OFF_MIN_ASK) & M_MIN_ASK_LOW) | ((hi & M_MIN_ASK_HIGH) << MIN_ASK_LOW_BITS);
         let ladder = Ladder {
             min_bid: (lo >> OFF_MIN_BID) & M56,
             max_bid: (lo >> OFF_MAX_BID) & M56,
@@ -150,7 +151,15 @@ mod tests {
     use proptest::prelude::*;
 
     fn word(min_bid: u128, max_bid: u128, min_ask: u128, max_ask: u128, pair_id: u16) -> QuoteWord {
-        QuoteWord::new(pair_id, Ladder { min_bid, max_bid, min_ask, max_ask })
+        QuoteWord::new(
+            pair_id,
+            Ladder {
+                min_bid,
+                max_bid,
+                min_ask,
+                max_ask,
+            },
+        )
     }
 
     #[test]
@@ -165,7 +174,11 @@ mod tests {
         ];
         for (w, off) in cases {
             let (lo, hi) = w.pack_limbs().unwrap();
-            let bit = if off < 128 { lo >> off } else { hi >> (off - 128) };
+            let bit = if off < 128 {
+                lo >> off
+            } else {
+                hi >> (off - 128)
+            };
             assert_eq!(bit, 1, "field at offset {off} is misplaced");
             let other = if off < 128 { hi } else { lo };
             assert_eq!(other, 0, "field at offset {off} leaked into the other limb");
@@ -195,13 +208,22 @@ mod tests {
 
     #[test]
     fn out_of_range_price_is_refused() {
-        assert_eq!(word(MAX_PRICE + 1, 0, 0, 0, 0).pack(), Err(PackError::PriceOutOfRange));
-        assert_eq!(word(0, 0, 0, MAX_PRICE + 1, 0).pack(), Err(PackError::PriceOutOfRange));
+        assert_eq!(
+            word(MAX_PRICE + 1, 0, 0, 0, 0).pack(),
+            Err(PackError::PriceOutOfRange)
+        );
+        assert_eq!(
+            word(0, 0, 0, MAX_PRICE + 1, 0).pack(),
+            Err(PackError::PriceOutOfRange)
+        );
     }
 
     #[test]
     fn dirty_high_bits_are_refused() {
-        assert_eq!(QuoteWord::unpack_limbs(0, 1 << (OFF_UNUSED - 128)), Err(PackError::NonCanonical));
+        assert_eq!(
+            QuoteWord::unpack_limbs(0, 1 << (OFF_UNUSED - 128)),
+            Err(PackError::NonCanonical)
+        );
         let mut bytes = [0u8; 32];
         bytes[1] = 1;
         assert_eq!(QuoteWord::unpack(&bytes), Err(PackError::NonCanonical));

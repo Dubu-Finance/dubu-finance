@@ -150,14 +150,16 @@
 use serde::{Deserialize, Serialize};
 
 use crate::curve::{
-    amount_in_ask, amount_in_bid, amount_out_ask, amount_out_bid, executable_top_ask, executable_top_bid,
-    validate_ladder, MAX_AMOUNT, MAX_AMOUNT_OUT, MAX_PRICE, MAX_PRICE_SCALE_EXP, NO_ASK,
+    amount_in_ask, amount_in_bid, amount_out_ask, amount_out_bid, executable_top_ask,
+    executable_top_bid, validate_ladder, MAX_AMOUNT, MAX_AMOUNT_OUT, MAX_PRICE,
+    MAX_PRICE_SCALE_EXP, NO_ASK,
 };
 use crate::error::CurveError;
 
 /// `type(uint256).max`, the value `executableTopAsk` returns on zero capacity. See
 /// [`crate::curve::NO_ASK`].
-pub const UINT256_MAX_DEC: &str = "115792089237316195423570985008687907853269984665640564039457584007913129639935";
+pub const UINT256_MAX_DEC: &str =
+    "115792089237316195423570985008687907853269984665640564039457584007913129639935";
 
 /// Every value [`Vector::expectRevert`] may take, other than `""`.
 ///
@@ -276,10 +278,18 @@ impl Default for Inputs {
 /// way that cannot be expressed as a vector; see the module docs.
 fn record(name: &str, i: Inputs) -> Vector {
     let outcome: Result<u128, CurveError> = match i.kind {
-        Kind::AmountOutBid => amount_out_bid(i.amount_in, i.min_bid, i.max_bid, i.capacity, i.used, i.exp),
-        Kind::AmountInBid => amount_in_bid(i.amount_in, i.min_bid, i.max_bid, i.capacity, i.used, i.exp),
-        Kind::AmountInAsk => amount_in_ask(i.amount_in, i.min_ask, i.max_ask, i.capacity, i.used, i.exp),
-        Kind::AmountOutAsk => amount_out_ask(i.amount_in, i.min_ask, i.max_ask, i.capacity, i.used, i.exp),
+        Kind::AmountOutBid => {
+            amount_out_bid(i.amount_in, i.min_bid, i.max_bid, i.capacity, i.used, i.exp)
+        }
+        Kind::AmountInBid => {
+            amount_in_bid(i.amount_in, i.min_bid, i.max_bid, i.capacity, i.used, i.exp)
+        }
+        Kind::AmountInAsk => {
+            amount_in_ask(i.amount_in, i.min_ask, i.max_ask, i.capacity, i.used, i.exp)
+        }
+        Kind::AmountOutAsk => {
+            amount_out_ask(i.amount_in, i.min_ask, i.max_ask, i.capacity, i.used, i.exp)
+        }
         Kind::ValidateLadder => {
             validate_ladder(i.min_bid, i.max_bid, i.min_ask, i.max_ask, i.min_price).map(|()| 0u128)
         }
@@ -294,7 +304,9 @@ fn record(name: &str, i: Inputs) -> Vector {
         Ok(v) => (String::new(), v.to_string()),
         Err(e) => {
             let sig = e.solidity_signature().unwrap_or_else(|| {
-                panic!("vector `{name}` hits a non-Solidity divergence ({e}); it must not be emitted")
+                panic!(
+                    "vector `{name}` hits a non-Solidity divergence ({e}); it must not be emitted"
+                )
             });
             (sig.trim_end_matches("()").to_owned(), "0".to_owned())
         }
@@ -336,7 +348,9 @@ pub fn verify(v: &Vector) -> bool {
         "executableTopAsk" => Kind::ExecutableTopAsk,
         _ => return false,
     };
-    let Ok(exp) = v.priceScaleExp.parse::<u8>() else { return false };
+    let Ok(exp) = v.priceScaleExp.parse::<u8>() else {
+        return false;
+    };
     let inputs = Inputs {
         kind,
         amount_in: parse(&v.amountIn),
@@ -356,7 +370,12 @@ pub fn verify(v: &Vector) -> bool {
 /// price, one base unit)`. `price = human_price * 10**(exp - base_dec + quote_dec)`.
 const PAIRS: [(&str, u8, u128, u128); 3] = [
     // WETH/USDC 18/6, ETH at 3_000.
-    ("weth_usdc_18_6", 24, 3_000_000_000_000_000, 1_000_000_000_000_000_000),
+    (
+        "weth_usdc_18_6",
+        24,
+        3_000_000_000_000_000,
+        1_000_000_000_000_000_000,
+    ),
     // WBTC/USDC 8/6, BTC at 60_000.
     ("wbtc_usdc_8_6", 13, 6_000_000_000_000_000, 100_000_000),
     // USDC/WETH 6/18 — the inverted orientation, where uint56 binds hardest.
@@ -376,28 +395,69 @@ pub fn generate() -> Vec<Vector> {
     let (lo, hi) = (1_000_000_000_000u128, 1_001_000_000_000u128);
 
     // -- amountOutBid: control flow -----------------------------------------------------
-    let bid = |name: &str, i: Inputs| record(name, Inputs { kind: Kind::AmountOutBid, ..i });
+    let bid = |name: &str, i: Inputs| {
+        record(
+            name,
+            Inputs {
+                kind: Kind::AmountOutBid,
+                ..i
+            },
+        )
+    };
 
     v.push(bid("bid/zero_amount_zero_capacity", Inputs::default()));
     v.push(bid(
         "bid/zero_amount_live_pair",
-        Inputs { min_bid: lo, max_bid: hi, capacity: cap, exp: 18, ..Inputs::default() },
+        Inputs {
+            min_bid: lo,
+            max_bid: hi,
+            capacity: cap,
+            exp: 18,
+            ..Inputs::default()
+        },
     ));
     v.push(bid(
         "bid/zero_capacity_nonzero_amount",
-        Inputs { amount_in: 1, min_bid: lo, max_bid: hi, exp: 18, ..Inputs::default() },
+        Inputs {
+            amount_in: 1,
+            min_bid: lo,
+            max_bid: hi,
+            exp: 18,
+            ..Inputs::default()
+        },
     ));
     v.push(bid(
         "bid/one_wei",
-        Inputs { amount_in: 1, min_bid: lo, max_bid: hi, capacity: cap, exp: 18, ..Inputs::default() },
+        Inputs {
+            amount_in: 1,
+            min_bid: lo,
+            max_bid: hi,
+            capacity: cap,
+            exp: 18,
+            ..Inputs::default()
+        },
     ));
     v.push(bid(
         "bid/capacity_boundary_exact",
-        Inputs { amount_in: cap, min_bid: lo, max_bid: hi, capacity: cap, exp: 18, ..Inputs::default() },
+        Inputs {
+            amount_in: cap,
+            min_bid: lo,
+            max_bid: hi,
+            capacity: cap,
+            exp: 18,
+            ..Inputs::default()
+        },
     ));
     v.push(bid(
         "bid/capacity_boundary_plus_one",
-        Inputs { amount_in: cap + 1, min_bid: lo, max_bid: hi, capacity: cap, exp: 18, ..Inputs::default() },
+        Inputs {
+            amount_in: cap + 1,
+            min_bid: lo,
+            max_bid: hi,
+            capacity: cap,
+            exp: 18,
+            ..Inputs::default()
+        },
     ));
     v.push(bid(
         "bid/used_plus_amount_exactly_capacity",
@@ -425,15 +485,36 @@ pub fn generate() -> Vec<Vector> {
     ));
     v.push(bid(
         "bid/fully_used_epoch_zero_amount",
-        Inputs { min_bid: lo, max_bid: hi, capacity: cap, used: cap, exp: 18, ..Inputs::default() },
+        Inputs {
+            min_bid: lo,
+            max_bid: hi,
+            capacity: cap,
+            used: cap,
+            exp: 18,
+            ..Inputs::default()
+        },
     ));
     v.push(bid(
         "bid/capacity_one_amount_one",
-        Inputs { amount_in: 1, min_bid: lo, max_bid: hi, capacity: 1, exp: 18, ..Inputs::default() },
+        Inputs {
+            amount_in: 1,
+            min_bid: lo,
+            max_bid: hi,
+            capacity: 1,
+            exp: 18,
+            ..Inputs::default()
+        },
     ));
     v.push(bid(
         "bid/flat_ladder",
-        Inputs { amount_in: 12_345, min_bid: lo, max_bid: lo, capacity: cap, exp: 18, ..Inputs::default() },
+        Inputs {
+            amount_in: 12_345,
+            min_bid: lo,
+            max_bid: lo,
+            capacity: cap,
+            exp: 18,
+            ..Inputs::default()
+        },
     ));
     // `midUsage = used + (amountIn + 1) / 2` CEILS, so these two share a midpoint of 500_000
     // (the floored halving they were originally named for gave 499_999 and 500_000). The pair
@@ -441,11 +522,25 @@ pub fn generate() -> Vec<Vector> {
     // floor separates them.
     v.push(bid(
         "bid/odd_amount_ceils_the_halving",
-        Inputs { amount_in: 999_999, min_bid: lo, max_bid: hi, capacity: cap, exp: 18, ..Inputs::default() },
+        Inputs {
+            amount_in: 999_999,
+            min_bid: lo,
+            max_bid: hi,
+            capacity: cap,
+            exp: 18,
+            ..Inputs::default()
+        },
     ));
     v.push(bid(
         "bid/even_amount_shares_the_odd_midpoint",
-        Inputs { amount_in: 1_000_000, min_bid: lo, max_bid: hi, capacity: cap, exp: 18, ..Inputs::default() },
+        Inputs {
+            amount_in: 1_000_000,
+            min_bid: lo,
+            max_bid: hi,
+            capacity: cap,
+            exp: 18,
+            ..Inputs::default()
+        },
     ));
     v.push(bid(
         "bid/mid_epoch_usage",
@@ -461,7 +556,14 @@ pub fn generate() -> Vec<Vector> {
     ));
     v.push(bid(
         "bid/min_price_zero_ladder_bottom_zero",
-        Inputs { amount_in: cap, min_bid: 0, max_bid: hi, capacity: cap, exp: 18, ..Inputs::default() },
+        Inputs {
+            amount_in: cap,
+            min_bid: 0,
+            max_bid: hi,
+            capacity: cap,
+            exp: 18,
+            ..Inputs::default()
+        },
     ));
 
     // -- amountOutBid: every supported priceScaleExp -------------------------------------
@@ -589,12 +691,20 @@ pub fn generate() -> Vec<Vector> {
             .expect("realistic ask leg must quote");
         v.push(record(
             &format!("ask_out/{label}/one_unit_exact_cost"),
-            Inputs { kind: Kind::AmountOutAsk, amount_in: cost, ..ask },
+            Inputs {
+                kind: Kind::AmountOutAsk,
+                amount_in: cost,
+                ..ask
+            },
         ));
         // One quote unit short must buy strictly less base.
         v.push(record(
             &format!("ask_out/{label}/one_unit_cost_minus_one"),
-            Inputs { kind: Kind::AmountOutAsk, amount_in: cost - 1, ..ask },
+            Inputs {
+                kind: Kind::AmountOutAsk,
+                amount_in: cost - 1,
+                ..ask
+            },
         ));
     }
 
@@ -603,57 +713,143 @@ pub fn generate() -> Vec<Vector> {
     // Capacity is BASE units on both of these now. `amountInAsk` is the primitive (base out ->
     // quote cost, ceiled); `amountOutAsk` is its exact integer inversion (quote in -> base out,
     // floored to what the budget strictly pays for).
-    let ask_in = |name: &str, i: Inputs| record(name, Inputs { kind: Kind::AmountInAsk, ..i });
-    let ask_out = |name: &str, i: Inputs| record(name, Inputs { kind: Kind::AmountOutAsk, ..i });
+    let ask_in = |name: &str, i: Inputs| {
+        record(
+            name,
+            Inputs {
+                kind: Kind::AmountInAsk,
+                ..i
+            },
+        )
+    };
+    let ask_out = |name: &str, i: Inputs| {
+        record(
+            name,
+            Inputs {
+                kind: Kind::AmountOutAsk,
+                ..i
+            },
+        )
+    };
 
-    v.push(ask_in("ask_in/zero_amount_zero_capacity", Inputs::default()));
-    v.push(ask_out("ask_out/zero_amount_zero_capacity", Inputs::default()));
+    v.push(ask_in(
+        "ask_in/zero_amount_zero_capacity",
+        Inputs::default(),
+    ));
+    v.push(ask_out(
+        "ask_out/zero_amount_zero_capacity",
+        Inputs::default(),
+    ));
     v.push(ask_in(
         "ask_in/zero_capacity_nonzero_amount",
-        Inputs { amount_in: 1, min_ask: lo, max_ask: hi, exp: 18, ..Inputs::default() },
+        Inputs {
+            amount_in: 1,
+            min_ask: lo,
+            max_ask: hi,
+            exp: 18,
+            ..Inputs::default()
+        },
     ));
     v.push(ask_out(
         "ask_out/zero_capacity_nonzero_amount",
-        Inputs { amount_in: 1, min_ask: lo, max_ask: hi, exp: 18, ..Inputs::default() },
+        Inputs {
+            amount_in: 1,
+            min_ask: lo,
+            max_ask: hi,
+            exp: 18,
+            ..Inputs::default()
+        },
     ));
     // The ONLY shape that reverts with ZeroPrice: maxAsk == 0, i.e. a wholly zero ask ladder.
     // `validateLadder`'s strict `maxAsk > minBid` makes it unreachable through `PropPool`, but
     // both directions must agree on the guard, because without it the pool gives base away.
     v.push(ask_in(
         "ask_in/zero_price_flat_zero_ladder",
-        Inputs { amount_in: 1, capacity: cap, exp: 18, ..Inputs::default() },
+        Inputs {
+            amount_in: 1,
+            capacity: cap,
+            exp: 18,
+            ..Inputs::default()
+        },
     ));
     v.push(ask_out(
         "ask_out/zero_price_flat_zero_ladder",
-        Inputs { amount_in: 1, capacity: cap, exp: 18, ..Inputs::default() },
+        Inputs {
+            amount_in: 1,
+            capacity: cap,
+            exp: 18,
+            ..Inputs::default()
+        },
     ));
     // One unit of span over a million units of capacity: the single CEIL lifts the cost of one
     // base unit off zero, so the pool never sells base for nothing.
     v.push(ask_in(
         "ask_in/one_unit_span_costs_at_least_one_unit",
-        Inputs { amount_in: 1, min_ask: 0, max_ask: 1, capacity: cap, exp: 18, ..Inputs::default() },
+        Inputs {
+            amount_in: 1,
+            min_ask: 0,
+            max_ask: 1,
+            capacity: cap,
+            exp: 18,
+            ..Inputs::default()
+        },
     ));
     v.push(ask_in(
         "ask_in/one_base_unit",
-        Inputs { amount_in: 1, min_ask: lo, max_ask: hi, capacity: cap, exp: 18, ..Inputs::default() },
+        Inputs {
+            amount_in: 1,
+            min_ask: lo,
+            max_ask: hi,
+            capacity: cap,
+            exp: 18,
+            ..Inputs::default()
+        },
     ));
     v.push(ask_in(
         "ask_in/capacity_boundary_exact",
-        Inputs { amount_in: cap, min_ask: lo, max_ask: hi, capacity: cap, exp: 18, ..Inputs::default() },
+        Inputs {
+            amount_in: cap,
+            min_ask: lo,
+            max_ask: hi,
+            capacity: cap,
+            exp: 18,
+            ..Inputs::default()
+        },
     ));
     v.push(ask_in(
         "ask_in/capacity_boundary_plus_one",
-        Inputs { amount_in: cap + 1, min_ask: lo, max_ask: hi, capacity: cap, exp: 18, ..Inputs::default() },
+        Inputs {
+            amount_in: cap + 1,
+            min_ask: lo,
+            max_ask: hi,
+            capacity: cap,
+            exp: 18,
+            ..Inputs::default()
+        },
     ));
     // Odd and even sizes over the same interval. The doubled midpoint keeps both exact, so the
     // pair pins that no halving is rounded: the two costs differ by exactly the marginal unit.
     v.push(ask_in(
         "ask_in/odd_size",
-        Inputs { amount_in: 999_999, min_ask: lo, max_ask: hi, capacity: cap, exp: 18, ..Inputs::default() },
+        Inputs {
+            amount_in: 999_999,
+            min_ask: lo,
+            max_ask: hi,
+            capacity: cap,
+            exp: 18,
+            ..Inputs::default()
+        },
     ));
     v.push(ask_in(
         "ask_in/even_size",
-        Inputs { amount_in: 1_000_000, min_ask: lo, max_ask: hi, capacity: cap, exp: 18, ..Inputs::default() },
+        Inputs {
+            amount_in: 1_000_000,
+            min_ask: lo,
+            max_ask: hi,
+            capacity: cap,
+            exp: 18,
+            ..Inputs::default()
+        },
     ));
     v.push(ask_in(
         "ask_in/mid_epoch_usage",
@@ -706,7 +902,14 @@ pub fn generate() -> Vec<Vector> {
     // One unit under it on the same shape, so the pair brackets the boundary.
     v.push(ask_in(
         "ask_in/amount_in_just_inside_the_domain",
-        Inputs { amount_in: MAX_AMOUNT, min_ask: 1, max_ask: 1, capacity: MAX_AMOUNT, exp: 0, ..Inputs::default() },
+        Inputs {
+            amount_in: MAX_AMOUNT,
+            min_ask: 1,
+            max_ask: 1,
+            capacity: MAX_AMOUNT,
+            exp: 0,
+            ..Inputs::default()
+        },
     ));
 
     // The inversion's own control flow. `full` is the quote cost of the epoch's whole remaining
@@ -714,19 +917,47 @@ pub fn generate() -> Vec<Vector> {
     let full = amount_in_ask(cap, lo, hi, cap, 0, 18).expect("cost of the whole epoch");
     v.push(ask_out(
         "ask_out/budget_is_the_whole_epoch",
-        Inputs { amount_in: full, min_ask: lo, max_ask: hi, capacity: cap, exp: 18, ..Inputs::default() },
+        Inputs {
+            amount_in: full,
+            min_ask: lo,
+            max_ask: hi,
+            capacity: cap,
+            exp: 18,
+            ..Inputs::default()
+        },
     ));
     v.push(ask_out(
         "ask_out/budget_one_over_the_whole_epoch",
-        Inputs { amount_in: full + 1, min_ask: lo, max_ask: hi, capacity: cap, exp: 18, ..Inputs::default() },
+        Inputs {
+            amount_in: full + 1,
+            min_ask: lo,
+            max_ask: hi,
+            capacity: cap,
+            exp: 18,
+            ..Inputs::default()
+        },
     ));
     v.push(ask_out(
         "ask_out/budget_one_under_the_whole_epoch",
-        Inputs { amount_in: full - 1, min_ask: lo, max_ask: hi, capacity: cap, exp: 18, ..Inputs::default() },
+        Inputs {
+            amount_in: full - 1,
+            min_ask: lo,
+            max_ask: hi,
+            capacity: cap,
+            exp: 18,
+            ..Inputs::default()
+        },
     ));
     v.push(ask_out(
         "ask_out/budget_buys_nothing",
-        Inputs { amount_in: 1, min_ask: lo, max_ask: hi, capacity: cap, exp: 18, ..Inputs::default() },
+        Inputs {
+            amount_in: 1,
+            min_ask: lo,
+            max_ask: hi,
+            capacity: cap,
+            exp: 18,
+            ..Inputs::default()
+        },
     ));
     v.push(ask_out(
         "ask_out/mid_epoch_usage",
@@ -742,7 +973,15 @@ pub fn generate() -> Vec<Vector> {
     ));
     v.push(ask_out(
         "ask_out/fully_used_epoch",
-        Inputs { amount_in: 1, min_ask: lo, max_ask: hi, capacity: cap, used: cap, exp: 18, ..Inputs::default() },
+        Inputs {
+            amount_in: 1,
+            min_ask: lo,
+            max_ask: hi,
+            capacity: cap,
+            used: cap,
+            exp: 18,
+            ..Inputs::default()
+        },
     ));
     v.push(ask_out(
         "ask_out/max_u56_prices_full_span",
@@ -771,40 +1010,97 @@ pub fn generate() -> Vec<Vector> {
         v.push(ask_in(&format!("ask_in/price_scale_exp_{exp}"), shape));
         // Above MAX_AMOUNT_OUT the forward direction reverts, so there is no budget to invert;
         // the `ask_in` record above already asserts the shared revert.
-        if let Ok(cost) =
-            amount_in_ask(shape.amount_in, shape.min_ask, shape.max_ask, shape.capacity, shape.used, exp)
-        {
-            v.push(ask_out(&format!("ask_out/price_scale_exp_{exp}"), Inputs { amount_in: cost, ..shape }));
+        if let Ok(cost) = amount_in_ask(
+            shape.amount_in,
+            shape.min_ask,
+            shape.max_ask,
+            shape.capacity,
+            shape.used,
+            exp,
+        ) {
+            v.push(ask_out(
+                &format!("ask_out/price_scale_exp_{exp}"),
+                Inputs {
+                    amount_in: cost,
+                    ..shape
+                },
+            ));
         }
     }
 
     // -- amountInBid: the bid side's exact-output direction ---------------------------------
     //
     // `amountIn` carries the requested QUOTE output here; `expected` is the least base input.
-    let bid_in = |name: &str, i: Inputs| record(name, Inputs { kind: Kind::AmountInBid, ..i });
+    let bid_in = |name: &str, i: Inputs| {
+        record(
+            name,
+            Inputs {
+                kind: Kind::AmountInBid,
+                ..i
+            },
+        )
+    };
 
-    v.push(bid_in("bid_in/zero_amount_zero_capacity", Inputs::default()));
+    v.push(bid_in(
+        "bid_in/zero_amount_zero_capacity",
+        Inputs::default(),
+    ));
     v.push(bid_in(
         "bid_in/zero_capacity_nonzero_amount",
-        Inputs { amount_in: 1, min_bid: lo, max_bid: hi, exp: 18, ..Inputs::default() },
+        Inputs {
+            amount_in: 1,
+            min_bid: lo,
+            max_bid: hi,
+            exp: 18,
+            ..Inputs::default()
+        },
     ));
     v.push(bid_in(
         "bid_in/fully_used_epoch",
-        Inputs { amount_in: 1, min_bid: lo, max_bid: hi, capacity: cap, used: cap, exp: 18, ..Inputs::default() },
+        Inputs {
+            amount_in: 1,
+            min_bid: lo,
+            max_bid: hi,
+            capacity: cap,
+            used: cap,
+            exp: 18,
+            ..Inputs::default()
+        },
     ));
     // The whole epoch's output, and one unit more than it can deliver.
     let whole = amount_out_bid(cap, lo, hi, cap, 0, 18).expect("bid quote for the whole epoch");
     v.push(bid_in(
         "bid_in/whole_epoch_output",
-        Inputs { amount_in: whole, min_bid: lo, max_bid: hi, capacity: cap, exp: 18, ..Inputs::default() },
+        Inputs {
+            amount_in: whole,
+            min_bid: lo,
+            max_bid: hi,
+            capacity: cap,
+            exp: 18,
+            ..Inputs::default()
+        },
     ));
     v.push(bid_in(
         "bid_in/one_more_than_the_epoch_can_deliver",
-        Inputs { amount_in: whole + 1, min_bid: lo, max_bid: hi, capacity: cap, exp: 18, ..Inputs::default() },
+        Inputs {
+            amount_in: whole + 1,
+            min_bid: lo,
+            max_bid: hi,
+            capacity: cap,
+            exp: 18,
+            ..Inputs::default()
+        },
     ));
     v.push(bid_in(
         "bid_in/one_quote_unit",
-        Inputs { amount_in: 1, min_bid: lo, max_bid: hi, capacity: cap, exp: 18, ..Inputs::default() },
+        Inputs {
+            amount_in: 1,
+            min_bid: lo,
+            max_bid: hi,
+            capacity: cap,
+            exp: 18,
+            ..Inputs::default()
+        },
     ));
     v.push(bid_in(
         "bid_in/mid_epoch_usage",
@@ -820,11 +1116,25 @@ pub fn generate() -> Vec<Vector> {
     ));
     v.push(bid_in(
         "bid_in/flat_ladder_exact_multiple",
-        Inputs { amount_in: 1_000_000, min_bid: 1_000, max_bid: 1_000, capacity: cap, exp: 0, ..Inputs::default() },
+        Inputs {
+            amount_in: 1_000_000,
+            min_bid: 1_000,
+            max_bid: 1_000,
+            capacity: cap,
+            exp: 0,
+            ..Inputs::default()
+        },
     ));
     v.push(bid_in(
         "bid_in/flat_ladder_one_over_a_multiple",
-        Inputs { amount_in: 1_000_001, min_bid: 1_000, max_bid: 1_000, capacity: cap, exp: 0, ..Inputs::default() },
+        Inputs {
+            amount_in: 1_000_001,
+            min_bid: 1_000,
+            max_bid: 1_000,
+            capacity: cap,
+            exp: 0,
+            ..Inputs::default()
+        },
     ));
     v.push(bid_in(
         "bid_in/max_u56_prices_exp_8",
@@ -847,25 +1157,67 @@ pub fn generate() -> Vec<Vector> {
             exp,
             ..Inputs::default()
         };
-        let want = amount_out_bid(1_000_000, shape.min_bid, shape.max_bid, shape.capacity, shape.used, exp)
-            .expect("bid quote inside the domain");
-        v.push(bid_in(&format!("bid_in/price_scale_exp_{exp}"), Inputs { amount_in: want, ..shape }));
+        let want = amount_out_bid(
+            1_000_000,
+            shape.min_bid,
+            shape.max_bid,
+            shape.capacity,
+            shape.used,
+            exp,
+        )
+        .expect("bid quote inside the domain");
+        v.push(bid_in(
+            &format!("bid_in/price_scale_exp_{exp}"),
+            Inputs {
+                amount_in: want,
+                ..shape
+            },
+        ));
     }
 
     // -- validateLadder --------------------------------------------------------------------
-    let val = |name: &str, i: Inputs| record(name, Inputs { kind: Kind::ValidateLadder, ..i });
+    let val = |name: &str, i: Inputs| {
+        record(
+            name,
+            Inputs {
+                kind: Kind::ValidateLadder,
+                ..i
+            },
+        )
+    };
 
     v.push(val(
         "validate/ok_strictly_ordered",
-        Inputs { min_bid: 10, max_bid: 20, min_ask: 30, max_ask: 40, min_price: 10, ..Inputs::default() },
+        Inputs {
+            min_bid: 10,
+            max_bid: 20,
+            min_ask: 30,
+            max_ask: 40,
+            min_price: 10,
+            ..Inputs::default()
+        },
     ));
     v.push(val(
         "validate/ok_touching_book",
-        Inputs { min_bid: 10, max_bid: 20, min_ask: 20, max_ask: 40, min_price: 0, ..Inputs::default() },
+        Inputs {
+            min_bid: 10,
+            max_bid: 20,
+            min_ask: 20,
+            max_ask: 40,
+            min_price: 0,
+            ..Inputs::default()
+        },
     ));
     v.push(val(
         "validate/ok_one_unit_of_room",
-        Inputs { min_bid: 10, max_bid: 10, min_ask: 10, max_ask: 11, min_price: 10, ..Inputs::default() },
+        Inputs {
+            min_bid: 10,
+            max_bid: 10,
+            min_ask: 10,
+            max_ask: 11,
+            min_price: 10,
+            ..Inputs::default()
+        },
     ));
     v.push(val(
         "validate/ok_max_u56",
@@ -880,27 +1232,69 @@ pub fn generate() -> Vec<Vector> {
     ));
     v.push(val(
         "validate/reject_bid_below_min_price",
-        Inputs { min_bid: 9, max_bid: 20, min_ask: 30, max_ask: 40, min_price: 10, ..Inputs::default() },
+        Inputs {
+            min_bid: 9,
+            max_bid: 20,
+            min_ask: 30,
+            max_ask: 40,
+            min_price: 10,
+            ..Inputs::default()
+        },
     ));
     v.push(val(
         "validate/reject_min_price_beats_ordering_check",
-        Inputs { min_bid: 0, max_bid: 0, min_ask: 0, max_ask: 0, min_price: 1, ..Inputs::default() },
+        Inputs {
+            min_bid: 0,
+            max_bid: 0,
+            min_ask: 0,
+            max_ask: 0,
+            min_price: 1,
+            ..Inputs::default()
+        },
     ));
     v.push(val(
         "validate/reject_inverted_ask",
-        Inputs { min_bid: 10, max_bid: 20, min_ask: 30, max_ask: 29, min_price: 0, ..Inputs::default() },
+        Inputs {
+            min_bid: 10,
+            max_bid: 20,
+            min_ask: 30,
+            max_ask: 29,
+            min_price: 0,
+            ..Inputs::default()
+        },
     ));
     v.push(val(
         "validate/reject_crossed_book",
-        Inputs { min_bid: 10, max_bid: 31, min_ask: 30, max_ask: 40, min_price: 0, ..Inputs::default() },
+        Inputs {
+            min_bid: 10,
+            max_bid: 31,
+            min_ask: 30,
+            max_ask: 40,
+            min_price: 0,
+            ..Inputs::default()
+        },
     ));
     v.push(val(
         "validate/reject_inverted_bid",
-        Inputs { min_bid: 21, max_bid: 20, min_ask: 30, max_ask: 40, min_price: 0, ..Inputs::default() },
+        Inputs {
+            min_bid: 21,
+            max_bid: 20,
+            min_ask: 30,
+            max_ask: 40,
+            min_price: 0,
+            ..Inputs::default()
+        },
     ));
     v.push(val(
         "validate/reject_flat_ladder_strict_comparison",
-        Inputs { min_bid: 10, max_bid: 10, min_ask: 10, max_ask: 10, min_price: 10, ..Inputs::default() },
+        Inputs {
+            min_bid: 10,
+            max_bid: 10,
+            min_ask: 10,
+            max_ask: 10,
+            min_price: 10,
+            ..Inputs::default()
+        },
     ));
     v.push(val("validate/reject_all_zero", Inputs::default()));
     v.push(val(
@@ -916,55 +1310,149 @@ pub fn generate() -> Vec<Vector> {
     ));
 
     // -- executableTopBid / executableTopAsk -----------------------------------------------
-    let top_bid = |name: &str, i: Inputs| record(name, Inputs { kind: Kind::ExecutableTopBid, ..i });
-    let top_ask = |name: &str, i: Inputs| record(name, Inputs { kind: Kind::ExecutableTopAsk, ..i });
+    let top_bid = |name: &str, i: Inputs| {
+        record(
+            name,
+            Inputs {
+                kind: Kind::ExecutableTopBid,
+                ..i
+            },
+        )
+    };
+    let top_ask = |name: &str, i: Inputs| {
+        record(
+            name,
+            Inputs {
+                kind: Kind::ExecutableTopAsk,
+                ..i
+            },
+        )
+    };
 
-    v.push(top_bid("top_bid/zero_capacity", Inputs { min_bid: lo, max_bid: hi, ..Inputs::default() }));
+    v.push(top_bid(
+        "top_bid/zero_capacity",
+        Inputs {
+            min_bid: lo,
+            max_bid: hi,
+            ..Inputs::default()
+        },
+    ));
     v.push(top_bid(
         "top_bid/unused_epoch",
-        Inputs { min_bid: lo, max_bid: hi, capacity: cap, ..Inputs::default() },
+        Inputs {
+            min_bid: lo,
+            max_bid: hi,
+            capacity: cap,
+            ..Inputs::default()
+        },
     ));
     v.push(top_bid(
         "top_bid/half_used",
-        Inputs { min_bid: lo, max_bid: hi, capacity: cap, used: cap / 2, ..Inputs::default() },
+        Inputs {
+            min_bid: lo,
+            max_bid: hi,
+            capacity: cap,
+            used: cap / 2,
+            ..Inputs::default()
+        },
     ));
     v.push(top_bid(
         "top_bid/exactly_exhausted",
-        Inputs { min_bid: lo, max_bid: hi, capacity: cap, used: cap, ..Inputs::default() },
+        Inputs {
+            min_bid: lo,
+            max_bid: hi,
+            capacity: cap,
+            used: cap,
+            ..Inputs::default()
+        },
     ));
     v.push(top_bid(
         "top_bid/over_exhausted",
-        Inputs { min_bid: lo, max_bid: hi, capacity: cap, used: cap + 1, ..Inputs::default() },
+        Inputs {
+            min_bid: lo,
+            max_bid: hi,
+            capacity: cap,
+            used: cap + 1,
+            ..Inputs::default()
+        },
     ));
     v.push(top_bid(
         "top_bid/one_short_of_exhausted",
-        Inputs { min_bid: lo, max_bid: hi, capacity: cap, used: cap - 1, ..Inputs::default() },
+        Inputs {
+            min_bid: lo,
+            max_bid: hi,
+            capacity: cap,
+            used: cap - 1,
+            ..Inputs::default()
+        },
     ));
     v.push(top_bid(
         "top_bid/max_u56_span",
-        Inputs { min_bid: 0, max_bid: MAX_PRICE, capacity: MAX_AMOUNT, used: MAX_AMOUNT / 3, ..Inputs::default() },
+        Inputs {
+            min_bid: 0,
+            max_bid: MAX_PRICE,
+            capacity: MAX_AMOUNT,
+            used: MAX_AMOUNT / 3,
+            ..Inputs::default()
+        },
     ));
 
-    v.push(top_ask("top_ask/zero_capacity_is_uint256_max", Inputs { min_ask: lo, max_ask: hi, ..Inputs::default() }));
+    v.push(top_ask(
+        "top_ask/zero_capacity_is_uint256_max",
+        Inputs {
+            min_ask: lo,
+            max_ask: hi,
+            ..Inputs::default()
+        },
+    ));
     v.push(top_ask(
         "top_ask/unused_epoch",
-        Inputs { min_ask: lo, max_ask: hi, capacity: cap, ..Inputs::default() },
+        Inputs {
+            min_ask: lo,
+            max_ask: hi,
+            capacity: cap,
+            ..Inputs::default()
+        },
     ));
     v.push(top_ask(
         "top_ask/half_used",
-        Inputs { min_ask: lo, max_ask: hi, capacity: cap, used: cap / 2, ..Inputs::default() },
+        Inputs {
+            min_ask: lo,
+            max_ask: hi,
+            capacity: cap,
+            used: cap / 2,
+            ..Inputs::default()
+        },
     ));
     v.push(top_ask(
         "top_ask/exactly_exhausted",
-        Inputs { min_ask: lo, max_ask: hi, capacity: cap, used: cap, ..Inputs::default() },
+        Inputs {
+            min_ask: lo,
+            max_ask: hi,
+            capacity: cap,
+            used: cap,
+            ..Inputs::default()
+        },
     ));
     v.push(top_ask(
         "top_ask/over_exhausted",
-        Inputs { min_ask: lo, max_ask: hi, capacity: cap, used: cap + 1, ..Inputs::default() },
+        Inputs {
+            min_ask: lo,
+            max_ask: hi,
+            capacity: cap,
+            used: cap + 1,
+            ..Inputs::default()
+        },
     ));
     v.push(top_ask(
         "top_ask/max_u56_span",
-        Inputs { min_ask: 0, max_ask: MAX_PRICE, capacity: MAX_AMOUNT, used: MAX_AMOUNT / 3, ..Inputs::default() },
+        Inputs {
+            min_ask: 0,
+            max_ask: MAX_PRICE,
+            capacity: MAX_AMOUNT,
+            used: MAX_AMOUNT / 3,
+            ..Inputs::default()
+        },
     ));
 
     v
@@ -1030,28 +1518,34 @@ mod tests {
         for exp in 0..=MAX_PRICE_SCALE_EXP {
             let e = exp.to_string();
             assert!(
-                all.iter().any(|v| v.kind == "amountOutAsk" && v.priceScaleExp == e),
+                all.iter()
+                    .any(|v| v.kind == "amountOutAsk" && v.priceScaleExp == e),
                 "amountOutAsk misses priceScaleExp {exp}"
             );
         }
         // Every named Solidity revert is exercised — including AmountOutOfDomain, which the
         // MAX_AMOUNT_OUT amendment turned from a port-only refusal into a shared revert.
         for err in SOLIDITY_ERRORS {
-            assert!(all.iter().any(|v| v.expectRevert == err), "no vector reverts with {err}");
+            assert!(
+                all.iter().any(|v| v.expectRevert == err),
+                "no vector reverts with {err}"
+            );
         }
         // The two kinds that RETURN a quote amount must exercise the shared domain edge. The two
         // whose *argument* is quote-denominated cannot: `MAX_AMOUNT_OUT == u128::MAX`, so their
         // on-chain input bound is enforced by the argument's type here and emits no vector.
         for kind in ["amountOutBid", "amountInAsk"] {
             assert!(
-                all.iter().any(|v| v.kind == kind && v.expectRevert == "AmountOutOfDomain"),
+                all.iter()
+                    .any(|v| v.kind == kind && v.expectRevert == "AmountOutOfDomain"),
                 "{kind} never reaches MAX_AMOUNT_OUT"
             );
         }
         // The ask side's ZeroPrice guard is asserted in both directions.
         for kind in ["amountInAsk", "amountOutAsk"] {
             assert!(
-                all.iter().any(|v| v.kind == kind && v.expectRevert == "ZeroPrice"),
+                all.iter()
+                    .any(|v| v.kind == kind && v.expectRevert == "ZeroPrice"),
                 "{kind} never guards a zero ask ladder"
             );
         }
@@ -1114,7 +1608,10 @@ mod tests {
     fn field_order_is_byte_wise_sorted() {
         let mut sorted = FIELDS;
         sorted.sort_unstable();
-        assert_eq!(FIELDS, sorted, "the documented struct order is not byte-wise sorted");
+        assert_eq!(
+            FIELDS, sorted,
+            "the documented struct order is not byte-wise sorted"
+        );
         // The one pair where byte-wise and case-insensitive alphabetical disagree: 'R' < 'e'.
         // Swapping these two silently turns every revert case into a success case.
         let at = |k: &str| FIELDS.iter().position(|x| *x == k).expect("field listed");
@@ -1126,12 +1623,20 @@ mod tests {
             let found = json
                 .find(&format!("\"{f}\":"))
                 .unwrap_or_else(|| panic!("field `{f}` is missing from the emitted JSON"));
-            assert!(found >= previous, "field `{f}` is out of order in the emitted JSON");
+            assert!(
+                found >= previous,
+                "field `{f}` is out of order in the emitted JSON"
+            );
             previous = found;
         }
         // No field is present that the Solidity struct does not declare.
-        let decoded: serde_json::Map<String, serde_json::Value> = serde_json::from_str(&json).unwrap();
-        assert_eq!(decoded.len(), FIELDS.len(), "struct arity changed; update the Solidity struct");
+        let decoded: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            decoded.len(),
+            FIELDS.len(),
+            "struct arity changed; update the Solidity struct"
+        );
     }
 
     #[test]

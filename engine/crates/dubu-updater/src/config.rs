@@ -599,7 +599,7 @@ impl Config {
             // A cap below a pair's own half-spread would silently NARROW the configured spread —
             // `spread::compute` refuses to do that, so the config would quietly mean something
             // other than what it says. Caught here, naming both numbers.
-            if self.spread.max_half_spread_bps < p.half_spread_bps {
+            if f64::from(self.spread.max_half_spread_bps) < p.half_spread_bps {
                 return Err(invalid(format!(
                     "spread.max_half_spread_bps ({}) is below pairs[{}].half_spread_bps ({}); \
                      the cap bounds the VOLATILITY TERM and can never narrow the configured spread, \
@@ -1108,6 +1108,15 @@ fn decibps(v: f64) -> u32 {
     (v * 10.0).round().max(0.0) as u32
 }
 
+/// Decimal basis points to hundredths of a basis point.
+///
+/// The unit the ladder is built in. Whole bps ran out of resolution once sigma was scaled to the
+/// quote's real exposure window: ETH's volatility term came to 0.61 bp against an `s0` of 1, so the
+/// floor is most of the price and a whole bp is a coarse thing to set it in.
+fn bps_e2(v: f64) -> u32 {
+    (v * 100.0).round().max(0.0) as u32
+}
+
 impl FeedConfig {
     /// The MAD filter's knobs, converted out of the config's decimal-bps form.
     #[must_use]
@@ -1392,7 +1401,7 @@ impl SpreadConfig {
     pub fn params(&self) -> crate::spread::SpreadParams {
         crate::spread::SpreadParams {
             vol_coefficient_e2: (self.vol_coefficient * 100.0).round().max(0.0) as u32,
-            max_half_spread_bps: self.max_half_spread_bps,
+            max_half_spread_bps_e2: u32::from(self.max_half_spread_bps) * 100,
         }
     }
 
@@ -1404,10 +1413,10 @@ impl SpreadConfig {
             ));
         }
         if self.max_half_spread_bps == 0 {
-            return Err(invalid("spread.max_half_spread_bps: must be non-zero"));
+            return Err(invalid("spread.max_half_spread_bps_e2: must be non-zero"));
         }
         if u128::from(self.max_half_spread_bps) > dubu_core::ladder::MAX_BPS {
-            return Err(invalid("spread.max_half_spread_bps: must be <= 9999"));
+            return Err(invalid("spread.max_half_spread_bps_e2: must be <= 9999"));
         }
         Ok(())
     }
@@ -1931,8 +1940,12 @@ pub struct PairConfig {
     pub base_decimals: u8,
     /// Decimals of the quote token. Verified against the deployed ERC-20 at startup.
     pub quote_decimals: u8,
-    /// Half the bid/ask spread, in bps of the skewed fair value.
-    pub half_spread_bps: u16,
+    /// Half the bid/ask spread, in bps of the skewed fair value. Decimal: `0.5` is half a bp.
+    ///
+    /// `s0` in `half_spread = min(s0 + s1 * sigma, cap)`. It is the FLOOR -- what an arbitrarily
+    /// small trade pays -- and is now most of the price on the crypto pairs, because scaling sigma
+    /// to the quote's exposure window took the volatility term down to well under a bp.
+    pub half_spread_bps: f64,
     /// Ladder width, in bps of the near price. This is the concentration knob: the price decays
     /// this far across the whole posted depth. It is an *upper* bound — the inverse solver
     /// narrows it further whenever the price bounds bind.
@@ -2034,6 +2047,12 @@ impl PairConfig {
         (self.favourable_drift_bps * 10.0).round() as u32
     }
 
+    /// `half_spread_bps` in hundredths of a bp, the unit the ladder is built in.
+    #[must_use]
+    pub fn half_spread_bps_e2(&self) -> u32 {
+        bps_e2(self.half_spread_bps)
+    }
+
     fn validate(&self, min_venues: u8) -> Result<(), ConfigError> {
         let id = self.pair_id;
         if id == 0 {
@@ -2076,7 +2095,7 @@ impl PairConfig {
             )));
         }
         let max_bps = dubu_core::ladder::MAX_BPS;
-        if u128::from(self.half_spread_bps) > max_bps {
+        if u128::from(self.half_spread_bps_e2()) > dubu_core::ladder::MAX_BPS_E2 {
             return Err(invalid(format!(
                 "pairs[{id}].half_spread_bps: must be <= {max_bps}"
             )));
@@ -2096,7 +2115,7 @@ impl PairConfig {
         }
         // A zero half-spread quotes both sides at fair value and loses the spread to every
         // taker. It is never a configuration, only a typo.
-        if self.half_spread_bps == 0 {
+        if self.half_spread_bps_e2() == 0 {
             return Err(invalid(format!(
                 "pairs[{id}].half_spread_bps: must be non-zero; a zero spread quotes both sides at fair value"
             )));
@@ -2302,7 +2321,7 @@ capacity_divergence_pct = 30
         let cfg = parse(&s).unwrap();
         assert_eq!(cfg.spread.params().vol_coefficient_e2, 0);
         let sp = crate::spread::compute(5, 10_000, 0, &cfg.spread.params());
-        assert_eq!(sp.half_spread_bps, 5);
+        assert_eq!(sp.half_spread_e2, 5);
     }
 
     #[test]
