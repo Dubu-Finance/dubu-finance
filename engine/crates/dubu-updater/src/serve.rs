@@ -259,6 +259,21 @@ struct QuoteRequest {
 
 /// One signed order. Amounts are decimal strings — a `u128` does not survive JSON's number type,
 /// and a silently truncated amount is a signature over a trade nobody meant.
+///
+/// # These names are not ours to choose
+///
+/// Every key here is a member of the EIP-712 struct the signature covers, and the member *names*
+/// are hashed into the type hash. `PmmSettle.ORDER_TYPEHASH` fixes them; the taker rebuilds the
+/// digest from this JSON and recovers a signer, so a key that does not match the type string
+/// rebuilds a different digest and recovers a stranger. Renaming a field here is changing a
+/// cross-service contract, whatever the Rust field is called.
+///
+/// That is not hypothetical. `fill_bps_min` reads correctly under "qualifiers last", and renaming
+/// it carried straight through `rename_all` onto the wire as `fillBpsMin`. The maker went on
+/// signing the right order over `minFillBps`; the aggregator read `minFillBps` as absent, defaulted
+/// it to zero, recovered `0x3ca7c4...` instead of the maker, and rejected every quote as
+/// `bad-signature` — pointing at the key, which was fine. `wire_names_match_the_signed_type_string`
+/// is the guard.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct OrderJson {
@@ -272,6 +287,7 @@ struct OrderJson {
     decay_start: String,
     decay_per_sec: u32,
     decay_cap: u32,
+    #[serde(rename = "minFillBps")]
     fill_bps_min: u16,
 }
 
@@ -823,6 +839,30 @@ mod tests {
                 .expect("u128")
                 > 0
         );
+    }
+
+    /// Every key of the signed order must be a member of the type string the signature commits to.
+    ///
+    /// The regression this exists for: `min_fill_bps` was renamed to `fill_bps_min` to put the
+    /// qualifier last, `rename_all` carried that onto the wire, and the aggregator — which builds
+    /// the digest from these keys — read the member as absent, defaulted it to zero, and recovered
+    /// a stranger. Every RFQ quote came back `bad-signature` while the maker was signing correctly
+    /// the whole time. Nothing in the maker could have caught it: the order was right, the
+    /// signature was right, and only the envelope disagreed.
+    #[tokio::test]
+    async fn wire_names_match_the_signed_type_string() {
+        let (_, body) = post_quote(seeded(), buy_request("2000000000")).await;
+        let order = body["order"].as_object().expect("order object");
+        assert!(!order.is_empty(), "an order with no fields proves nothing");
+
+        for key in order.keys() {
+            assert!(
+                dubu_core::rfq::ORDER_TYPE_STRING.contains(&format!(" {key},"))
+                    || dubu_core::rfq::ORDER_TYPE_STRING.contains(&format!(" {key})")),
+                "`{key}` is not a member of the type hash the signature covers; the taker will \
+                 rebuild a different digest and recover a stranger"
+            );
+        }
     }
 
     /// The amounts are decimal strings, not JSON numbers. A `u128` past 2^53 loses precision as a

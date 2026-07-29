@@ -1165,19 +1165,34 @@ quote_decimals = 6
 # reorganised, and a taker who fills against one wants the order still valid if their transaction
 # is re-included a block later. Buying that costs about 0.2bp of premium over a 3s TTL, which is
 # a better trade than discovering the alternative in production.
-# 2 seconds. The TTL is an option the maker writes, priced by quoting::ttl_premium_e2 and growing
-# with sqrt(TTL), so shorter is cheaper -- 5s cost 0.58bp of spread at today's sigma, 2s costs 0.37.
+# 4 seconds. The TTL is an option the maker writes, priced by quoting::ttl_premium_e2 and growing
+# with sqrt(TTL), so shorter is cheaper -- 5s cost 0.58bp of spread at today's sigma, 2s costs 0.37,
+# and 4s costs about 0.52.
 #
-# The floor is the taker's round trip, measured rather than guessed:
+# The floor was set from the taker's round trip, measured rather than guessed:
 #   quote round trip   ~78ms   (edge)
 #   sign and submit    ~50ms
 #   inclusion         440ms median, 508ms max   (six transactions)
 #   ----------------------------------
 #                    ~640ms worst observed
-# 2s leaves 3.1x margin. 1s would leave 1.6x, which one slow sequencer moment turns into an order
-# that expires in flight -- and an expired order costs the taker gas for a revert, which is worse
-# than never quoting.
-ttl_secs = 2
+#
+# That budget was right and still missed, because latency is not the binding constraint. The
+# aggregator refuses an order with under MIN_EXPIRY_HEADROOM_SECS = 1s left, and the two ends read
+# two different clocks at one-second resolution:
+#
+#   expiry     = chain_now + ttl        stamped from the sealed head, deliberately -- see
+#                                       serve.rs, a host clock 2s slow expired every order once
+#   rejected if expiry <= wall_now + 1  the aggregator has no cheap chain clock per request
+#
+# Measured over three samples, chain time ran between -1s and +1s of wall time. At ttl = 2 with the
+# chain one second behind, expiry lands exactly on wall_now + 1 and the comparison is `<=`, so the
+# order is refused the instant it arrives. Not marginally: deterministically, for a whole second
+# out of every two. That is what `rfqRejected: expired` was, and no amount of latency work fixes
+# it -- the 640ms budget was never being exceeded.
+#
+# 4s covers the headroom (1s), the clock offset (1s) and the truncation either end can contribute
+# (1s), and still leaves the round trip its 3x margin.
+ttl_secs = 4
 fill_bps_min = 1000
 
 [rfq.serve]
