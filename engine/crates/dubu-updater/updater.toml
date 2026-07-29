@@ -785,7 +785,7 @@ ask_capacity = "20"
 #
 # Cost: 2 pairs x 12 pushes a minute x 0.00000012 ETH = 0.0041 ETH a day.
 heartbeat_secs = 2
-adverse_drift_bps = 0.5
+adverse_drift_bps = 0.3
 favourable_drift_bps = 5
 capacity_divergence_pct = 30
 
@@ -890,7 +890,7 @@ half_spread_bps = 0.5
 width_bps = 14
 jump_floor_bps = 8
 push_interval_ms_max = 330
-adverse_drift_bps = 0.5
+adverse_drift_bps = 0.3
 favourable_drift_bps = 5
 heartbeat_secs = 2
 
@@ -932,7 +932,7 @@ half_spread_bps = 0.5
 width_bps = 18
 jump_floor_bps = 7
 push_interval_ms_max = 330
-adverse_drift_bps = 0.4
+adverse_drift_bps = 0.3
 favourable_drift_bps = 5
 heartbeat_secs = 2
 

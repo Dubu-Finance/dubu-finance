@@ -647,9 +647,14 @@ impl VenueWatch {
             out.len() <= snaps.len(),
             "one venue may report one transition"
         );
+        // NOT `from.label() != to.label()` on every transition. The first observation of a venue
+        // reports `from: NoData`, and a venue that is genuinely `NoData` then has both sides equal
+        // -- announcing a venue that has never delivered is that branch's whole job. Only the
+        // repeat-observation branch is suppressed by the label compare.
         debug_assert!(
-            out.iter().all(|t| t.from.label() != t.to.label()),
-            "a transition that changes nothing is exactly what the label compare suppresses"
+            out.iter()
+                .all(|t| !t.to.is_live() || t.from.label() != t.to.label()),
+            "a venue that came back must have been away"
         );
         out
     }
