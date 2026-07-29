@@ -168,6 +168,10 @@ pub mod abi {
 
         function snapshot(uint16 pairId) external view returns (PairSnapshotAbi);
         function pairConfig(uint16 pairId) external view returns (PairConfigAbi);
+        function effectiveCapacity(uint16 pairId)
+            external
+            view
+            returns (uint96 bidCapacity, uint96 askCapacity, uint16 decaySecs);
         function pairCount() external view returns (uint16);
         function updater() external view returns (address);
 
@@ -911,6 +915,31 @@ impl ChainHealth {
 // Decoded state
 // ---------------------------------------------------------------------------
 
+/// Port of `PropPool._decayed`. The staleness ramp: `capacity` at age zero, falling linearly to
+/// zero at `decay_secs`, floored. `decay_secs == 0` disables it.
+///
+/// The pool applies this to `available`, and `_outFor` measures the epoch's remaining room against
+/// `available` rather than `capacity` — so a size priced on the nominal number is a size the chain
+/// will refuse once the ramp has run. `PropPool.sol` is authoritative; its `_decayed` doc comment
+/// records that both ends are exact on purpose and that this port is expected to exist.
+#[must_use]
+pub const fn decayed(capacity: u128, age_secs: u64, decay_secs: u16) -> u128 {
+    debug_assert!(
+        capacity <= dubu_core::curve::AMOUNT_MAX,
+        "capacity outside uint96; the product below assumes that bound"
+    );
+    if decay_secs == 0 {
+        return capacity;
+    }
+    let window = decay_secs as u64;
+    if age_secs >= window {
+        return 0;
+    }
+    let out = (capacity * (window - age_secs) as u128) / window as u128;
+    debug_assert!(out <= capacity, "the ramp may only take depth away");
+    out
+}
+
 /// One pair's on-chain state, converted out of the ABI types.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Snap {
@@ -970,6 +999,21 @@ impl Snap {
         } else {
             0
         }
+    }
+
+    /// Bid depth the pool will still expose at `age_secs`, after the staleness ramp.
+    ///
+    /// Pair with [`Snap::bid_used`], not with [`Snap::bid_capacity`]: the room left is
+    /// `available - used`, and `used` is *not* scaled by the ramp.
+    #[must_use]
+    pub const fn available_bid(&self, age_secs: u64, decay_secs: u16) -> u128 {
+        decayed(self.bid_capacity, age_secs, decay_secs)
+    }
+
+    /// Ask depth the pool will still expose at `age_secs`. See [`Snap::available_bid`].
+    #[must_use]
+    pub const fn available_ask(&self, age_secs: u64, decay_secs: u16) -> u128 {
+        decayed(self.ask_capacity, age_secs, decay_secs)
     }
 
     /// Whether this pair is paused.
@@ -1032,6 +1076,13 @@ pub struct PairMeta {
     pub price_scale_exp: u8,
     /// Freshness window the pool enforces.
     pub stale_secs_max: u32,
+    /// Age at which the staleness ramp reaches zero. Zero disables it. Feeds [`decayed`].
+    ///
+    /// Read here rather than in the per-poll batch because it is manager-set and updater-invisible:
+    /// unlike capacity and used, nothing this process does moves it, and nothing that moves it
+    /// happens on a 330ms timescale. Polling it would buy one extra call per pair per poll for a
+    /// value that changes when a human changes it.
+    pub decay_secs: u16,
     /// Absolute floor on `minBid`, oracle-independent.
     pub min_price: u128,
     /// Base-token reserve floor.
@@ -1445,7 +1496,8 @@ pub async fn verify_against_chain(
     multicall: Address,
     cfg: &crate::config::Config,
 ) -> Result<ChainFacts, RpcError> {
-    // Round one: pairCount, updater, and every pairConfig.
+    // Round one: pairCount, updater, every pairConfig, then every effectiveCapacity. The last
+    // group is only here for its `decaySecs`, which `pairConfig` does not carry.
     let mut calls = vec![
         abi::Call3 {
             target: pool,
@@ -1467,6 +1519,15 @@ pub async fn verify_against_chain(
                 .into(),
         });
     }
+    for p in &cfg.pairs {
+        calls.push(abi::Call3 {
+            target: pool,
+            allowFailure: false,
+            callData: abi::effectiveCapacityCall { pairId: p.pair_id }
+                .abi_encode()
+                .into(),
+        });
+    }
     let raw = rpc
         .eth_call(
             multicall,
@@ -1474,7 +1535,7 @@ pub async fn verify_against_chain(
             "latest",
         )
         .await?;
-    let res = decode_batch(&raw, 2 + cfg.pairs.len())?;
+    let res = decode_batch(&raw, 2 + 2 * cfg.pairs.len())?;
 
     let pair_count = abi::pairCountCall::abi_decode_returns(&res[0].returnData)
         .map_err(|e| decode_err("pairCount", e))?;
@@ -1482,6 +1543,7 @@ pub async fn verify_against_chain(
         .map_err(|e| decode_err("updater", e))?;
 
     let mut configs = BTreeMap::new();
+    let mut decays = BTreeMap::new();
     for (i, p) in cfg.pairs.iter().enumerate() {
         if p.pair_id > pair_count {
             return Err(decode_err(
@@ -1500,7 +1562,12 @@ pub async fn verify_against_chain(
                 format!("pair {} does not exist on chain", p.pair_id),
             ));
         }
+        let e = abi::effectiveCapacityCall::abi_decode_returns(
+            &res[2 + cfg.pairs.len() + i].returnData,
+        )
+        .map_err(|e| decode_err("effectiveCapacity", e))?;
         configs.insert(p.pair_id, c);
+        decays.insert(p.pair_id, e.decaySecs);
     }
 
     // Round two: decimals() for every distinct token.
@@ -1576,6 +1643,7 @@ pub async fn verify_against_chain(
                 quote: c.quote,
                 price_scale_exp: c.priceScaleExp,
                 stale_secs_max: c.maxStaleSecs,
+                decay_secs: decays[&p.pair_id],
                 min_price: c.minPrice.to::<u128>(),
                 min_base_reserve: c.minBaseReserve.to::<u128>(),
                 min_quote_reserve: c.minQuoteReserve.to::<u128>(),
@@ -1643,6 +1711,51 @@ mod tests {
 
         let current = snap(14, 14, 0, 499_438_326_634_891_408_781);
         assert_eq!(current.ask_used(), 499_438_326_634_891_408_781);
+    }
+
+    /// The two ends of the ramp are exact by construction on chain, so they are exact here.
+    /// `PropPool._decayed`'s own doc comment says this is worth checking rather than assuming.
+    #[test]
+    fn the_ramp_is_exact_at_both_of_its_ends() {
+        let cap = 1_000_000_000_000_000_000_000;
+        assert_eq!(decayed(cap, 0, 30), cap, "age zero loses nothing at all");
+        assert_eq!(decayed(cap, 30, 30), 0, "the cliff is `>=`, not `>`");
+        assert_eq!(decayed(cap, 31, 30), 0);
+        assert_eq!(decayed(cap, u64::MAX, 30), 0);
+        // One second short of the cliff is still dust, not zero.
+        assert_eq!(decayed(100, 29, 30), 3);
+    }
+
+    #[test]
+    fn a_zero_window_disables_the_ramp_entirely() {
+        // Live pair 3's shape: no ramp, so age must not touch capacity at any age.
+        let cap = 1_000_000_000_000_000_000_000;
+        assert_eq!(decayed(cap, 0, 0), cap);
+        assert_eq!(decayed(cap, 86_400, 0), cap);
+        assert_eq!(decayed(cap, u64::MAX, 0), cap);
+    }
+
+    #[test]
+    fn the_ramp_floors_rather_than_rounds() {
+        // 100 * 23 / 30 = 76.66..., and the pool keeps the 0.66.
+        assert_eq!(decayed(100, 7, 30), 76);
+        // Same shape at the live pair's capacity: 1000e18 * 23 / 30.
+        assert_eq!(
+            decayed(1_000_000_000_000_000_000_000, 7, 30),
+            766_666_666_666_666_666_666
+        );
+    }
+
+    #[test]
+    fn available_applies_the_ramp_to_each_side_separately() {
+        let mut s = snap(1, 1, 0, 0);
+        s.ask_capacity = 500_000_000_000_000_000_000;
+        assert_eq!(s.available_bid(0, 30), s.bid_capacity);
+        assert_eq!(s.available_ask(0, 30), s.ask_capacity);
+        assert_eq!(s.available_bid(15, 30), 500_000_000_000_000_000_000);
+        assert_eq!(s.available_ask(15, 30), 250_000_000_000_000_000_000);
+        assert_eq!(s.available_bid(30, 30), 0);
+        assert_eq!(s.available_ask(30, 30), 0);
     }
 
     #[test]

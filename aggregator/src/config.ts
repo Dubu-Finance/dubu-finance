@@ -20,6 +20,8 @@ export interface Env {
   UNIV2_ROUTER02?: string;
   PMM_SETTLE?: string;
   PMM_ADAPTER?: string;
+  /** The full URL of the engine's prop-quote endpoint, path included. Unset means UniV2-only. */
+  PROP_QUOTE_URL?: string;
   /** Where to ask for a signed RFQ quote. Unset means AMM-only routing. */
   RFQ_MAKER_URL?: string;
   /** The address every RFQ order must recover to. Unset means RFQ is refused outright. */
@@ -48,6 +50,19 @@ export interface Config {
   univ2Router: Address;
   pmmSettle: Address | null;
   pmmAdapter: Address | null;
+  /**
+   * Where the prop pool is priced, now that it is priced over HTTP rather than by `eth_call`.
+   *
+   * A **full endpoint URL**, POSTed to verbatim — `https://<host>/prop/amounts`, not `https://<host>`.
+   * Nothing appends a path, so a base URL answers 404 and the leg reads as the engine having no
+   * market for the pair. `RFQ_MAKER_URL` cost a debugging session to exactly that mistake, which is
+   * why `quote.ts` logs a bare 404 and a declining engine as different things.
+   *
+   * `null` means the prop venue is not configured and every quote is UniV2-only. There is no
+   * on-chain fallback by design: an unreachable engine shows as prop being unavailable, not as a
+   * second and differently-wrong price.
+   */
+  propQuoteUrl: string | null;
   rfqMakerUrl: string | null;
   rfqMakerAddress: Address | null;
   partnerId: bigint;
@@ -66,6 +81,12 @@ export const MULTICALL3: Address = '0xcA11bde05977b3631167028862bE2a173976CA11';
 // Preconfirmed state is not final, which is the honest cost: a quote read here can be reordered
 // before sealing. That is what `minAmountOut` is for, and it is a far smaller error than quoting a
 // price the maker has already moved off.
+//
+// The quote path no longer reads `pending`, and that is the history rather than a contradiction:
+// serving preconfirmed state and a preconfirmed timestamp inconsistently is what made `PropPool`
+// call every quote stale, and it is why the pool is now priced over HTTP instead (see quote.ts).
+// The UniV2 multicall reads sealed `latest` by choice. What still wants this endpoint is
+// `makerCanDeliver`, which reads a balance and an allowance the maker may have moved this second.
 export const DEFAULT_RPC = 'https://sepolia-rpc-flashblocks.giwa.io';
 
 const MUSDC: Address = getAddress('0xd28596C6750D87C53EA146134AfAB53de86C5155');
@@ -97,6 +118,10 @@ function optional(env: Env, key: keyof Env): Address | null {
  * The RFQ leg is all-or-nothing: a maker URL without a maker address would mean accepting orders
  * from whoever answers that URL, so the two are checked together and the leg is disabled unless
  * both are present. Disabled means AMM-only routing, which is a worse quote and a working service.
+ *
+ * The prop leg needs no such pairing, and that is worth stating rather than leaving to be inferred:
+ * `PROP_QUOTE_URL` is its only knob. The pool and adapter addresses it routes through are
+ * `required` with defaults, so there is no half-configured prop leg to null out wholesale.
  */
 export function loadConfig(env: Env): Config {
   const pmmSettle = optional(env, 'PMM_SETTLE');
@@ -123,6 +148,7 @@ export function loadConfig(env: Env): Config {
     univ2Router: required(env, 'UNIV2_ROUTER02', '0x98E2aa881cEFe66E394C8261d1D1BdE25D4BffA6'),
     pmmSettle: rfqReady ? pmmSettle : null,
     pmmAdapter: rfqReady ? pmmAdapter : null,
+    propQuoteUrl: env.PROP_QUOTE_URL ?? null,
     rfqMakerUrl: rfqReady ? rfqMakerUrl : null,
     rfqMakerAddress: rfqReady ? rfqMakerAddress : null,
     partnerId: BigInt(env.PARTNER_ID ?? '0'),

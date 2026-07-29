@@ -36,11 +36,59 @@ use axum::extract::State;
 use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use dubu_core::curve::Ladder;
+use dubu_core::pool::{self, Side};
 use serde::{Deserialize, Serialize};
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use crate::maker::MakerKey;
 use crate::quoting::{Book, MakerParams, MarketState, Refusal};
+
+/// Most grid points one request may price. The aggregator sends eleven.
+const AMOUNTS_MAX: usize = 32;
+
+/// The pool state one pair quotes from, as the cycle last observed it on chain.
+///
+/// Copied out of the chain snapshot rather than re-read per request, which is the point: the
+/// aggregator's own `getAmountOut` had to be a preconfirmed `eth_call`, and GIWA serves pending
+/// state and pending timestamp from different moments — the pool then computed an age that never
+/// existed and refused every quote as stale. See [`dubu_core::pool`].
+#[derive(Debug, Clone, Copy)]
+pub struct PropState {
+    /// Which market.
+    pub pair_id: u16,
+    /// Base token.
+    pub base: Address,
+    /// Quote token.
+    pub quote: Address,
+    /// The four prices currently stored on chain.
+    pub ladder: Ladder,
+    /// The epoch, undecayed. This is what prices the ladder; see [`dubu_core::pool`].
+    pub bid_capacity: u128,
+    /// The ask side of the same.
+    pub ask_capacity: u128,
+    /// Base the bid epoch has already traded.
+    pub bid_used: u128,
+    /// Base the ask epoch has already traded.
+    pub ask_used: u128,
+    /// Chain seconds the stored ladder was stamped at.
+    pub updated_at: u64,
+    /// The pair's staleness window.
+    pub stale_secs_max: u32,
+    /// The pair's capacity ramp, zero when disabled.
+    pub decay_secs: u16,
+    /// The pair's decimal alignment.
+    pub price_scale_exp: u8,
+    /// Global halt or the pair's own flag.
+    pub paused: bool,
+    /// When the cycle observed this.
+    ///
+    /// An `Instant`, and reported to the caller as an elapsed age rather than a wall-clock stamp,
+    /// for the reason recorded on [`Inner::chain_clock`]: nothing synchronises this host's clock
+    /// with the aggregator's, and the last thing that crossed the wire as an absolute timestamp
+    /// silently expired every order this maker signed.
+    pub observed_at: Instant,
+}
 
 /// Where and whether to listen.
 #[derive(Debug, Clone, Deserialize)]
@@ -89,6 +137,10 @@ struct Inner {
     /// entirely.
     chain_clock: Option<(u64, Instant)>,
     markets: BTreeMap<u16, MarketState>,
+    /// The prop pool's own quotes, keyed the same way. Separate from `markets` because the two
+    /// answer different questions — `markets` is what this maker will sign for, `props` is what the
+    /// pool contract will pay — and a pair can be quotable on one and not the other.
+    props: BTreeMap<u16, PropState>,
     book: Book,
     /// Set once the cycle has published anything at all. Before that every request is refused —
     /// a maker that quotes from an empty snapshot is quoting from zero.
@@ -131,6 +183,21 @@ impl Shared {
         if let Ok(mut g) = self.inner.lock() {
             g.markets.insert(state.pair_id, state);
             g.seeded = true;
+        }
+    }
+
+    /// Replaces the prop pool's state for one pair. Called by the cycle, once per pair per cycle.
+    pub fn publish_prop(&self, state: PropState) {
+        if let Ok(mut g) = self.inner.lock() {
+            g.props.insert(state.pair_id, state);
+            g.seeded = true;
+        }
+    }
+
+    /// Withdraws a pair from prop quoting, leaving the RFQ market alone.
+    pub fn retire_prop(&self, pair_id: u16) {
+        if let Ok(mut g) = self.inner.lock() {
+            g.props.remove(&pair_id);
         }
     }
 
@@ -223,11 +290,36 @@ struct ErrorResponse {
     detail: String,
 }
 
+/// A grid of sizes to price against the prop pool. Field names match `aggregator/src/quote.ts`.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AmountsRequest {
+    token_in: Address,
+    token_out: Address,
+    /// Decimal strings, in `token_in`'s own units.
+    amounts_in: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AmountsResponse {
+    pair_id: u16,
+    side: &'static str,
+    /// Same length and order as the request. A zero is a refusal of that size, not a free leg.
+    amounts_out: Vec<String>,
+    /// How long ago the cycle observed the chain state this was priced from. Elapsed, not
+    /// absolute — see [`PropState::observed_at`].
+    observed_age_ms: u64,
+    /// Chain age of the stored ladder, which is what the staleness window is measured against.
+    quote_age_secs: u64,
+}
+
 /// Builds the router. Separated from [`run`] so a test can drive it without a socket.
 fn router(ctx: Ctx) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/quote", post(quote))
+        .route("/prop/amounts", post(prop_amounts))
         .with_state(ctx)
 }
 
@@ -363,6 +455,144 @@ async fn quote(
         signature: format!("0x{}", alloy_primitives::hex::encode(signed.signature)),
         digest: format!("{:#x}", signed.digest),
     }))
+}
+
+/// Prices a grid of sizes against the prop pool, the way `getAmountOut` would.
+///
+/// A zero for one size is a refusal of that size — exhausted epoch, past the decayed room, out of
+/// domain — which is the same signal the aggregator already reads from a failed `eth_call`, so the
+/// router needs no new case. A pair the pool will not quote at all is a 404 instead, because a grid
+/// of zeros and a missing venue want different logs.
+async fn prop_amounts(
+    State(ctx): State<Ctx>,
+    Json(req): Json<AmountsRequest>,
+) -> Result<Json<AmountsResponse>, (StatusCode, Json<ErrorResponse>)> {
+    if req.amounts_in.is_empty() || req.amounts_in.len() > AMOUNTS_MAX {
+        return Err(bad(
+            StatusCode::BAD_REQUEST,
+            "bad-request",
+            format!(
+                "amountsIn carries 1..={AMOUNTS_MAX} entries, not {}",
+                req.amounts_in.len()
+            ),
+        ));
+    }
+    let amounts_in = req
+        .amounts_in
+        .iter()
+        .map(|s| s.parse::<u128>())
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| {
+            bad(
+                StatusCode::BAD_REQUEST,
+                "bad-amount",
+                "every amountsIn entry must be a decimal integer".into(),
+            )
+        })?;
+
+    // Chain time, never this host's wall clock — the staleness window below is the pool's, and
+    // measuring it against a skewed clock is how the on-chain read failed in the first place.
+    let now_secs = ctx.shared.chain_now().unwrap_or_else(crate::now_unix);
+    let (state, side) = {
+        let g = ctx.shared.inner.lock().map_err(|_| {
+            bad(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "poisoned",
+                "shared state is poisoned".into(),
+            )
+        })?;
+        if !g.seeded {
+            return Err(bad(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "not-ready",
+                "the quote cycle has not published a reference yet".into(),
+            ));
+        }
+        g.props
+            .values()
+            .find_map(|p| {
+                if p.base == req.token_in && p.quote == req.token_out {
+                    Some((*p, Side::Bid))
+                } else if p.quote == req.token_in && p.base == req.token_out {
+                    Some((*p, Side::Ask))
+                } else {
+                    None
+                }
+            })
+            .ok_or_else(|| {
+                bad(
+                    StatusCode::NOT_FOUND,
+                    "no-market",
+                    "no prop market for that pair right now".into(),
+                )
+            })?
+    };
+
+    if let Some(why) = pool::refusal(
+        state.paused,
+        state.updated_at,
+        now_secs,
+        state.stale_secs_max,
+    ) {
+        return Err(bad(
+            StatusCode::NOT_FOUND,
+            "no-market",
+            format!("the pool is not quoting this pair: {why:?}"),
+        ));
+    }
+
+    let age = now_secs.saturating_sub(state.updated_at);
+    Ok(Json(price_grid(&state, side, age, &amounts_in)))
+}
+
+/// Applies the pool's own arithmetic to every grid point.
+fn price_grid(state: &PropState, side: Side, age: u64, amounts_in: &[u128]) -> AmountsResponse {
+    debug_assert!(!amounts_in.is_empty(), "the handler rejects an empty grid");
+
+    let (capacity, used) = match side {
+        Side::Bid => (state.bid_capacity, state.bid_used),
+        Side::Ask => (state.ask_capacity, state.ask_used),
+    };
+    let available = crate::chain::decayed(capacity, age, state.decay_secs);
+    debug_assert!(available <= capacity, "the ramp only ever removes depth");
+
+    let amounts_out = amounts_in
+        .iter()
+        .map(|&amount_in| {
+            pool::amount_out(
+                amount_in,
+                &state.ladder,
+                side,
+                capacity,
+                available,
+                used,
+                state.price_scale_exp,
+            )
+            .unwrap_or_else(|e| {
+                error!(
+                    target: "prop", event = "quote_failed", pair_id = state.pair_id,
+                    amount_in = %amount_in, error = ?e,
+                    "the off-chain port refused a size its own gates admitted"
+                );
+                0
+            })
+            .to_string()
+        })
+        .collect();
+
+    AmountsResponse {
+        pair_id: state.pair_id,
+        side: match side {
+            Side::Bid => "bid",
+            Side::Ask => "ask",
+        },
+        amounts_out,
+        observed_age_ms: Instant::now()
+            .saturating_duration_since(state.observed_at)
+            .as_millis()
+            .min(u128::from(u64::MAX)) as u64,
+        quote_age_secs: age,
+    }
 }
 
 fn refusal(r: Refusal) -> (StatusCode, Json<ErrorResponse>) {
@@ -684,6 +914,231 @@ mod tests {
             "the base leg must be visible as reserved"
         );
         assert_eq!(shared.open_orders(), 1);
+    }
+
+    // --- the prop pool's own quote ---------------------------------------------------------
+
+    /// Chain second the prop tests pin their clock to.
+    const CHAIN_NOW: u64 = 1_000_000;
+
+    fn prop_state(updated_at: u64) -> PropState {
+        PropState {
+            pair_id: 1,
+            base: BASE,
+            quote: QUOTE,
+            ladder: Ladder {
+                min_bid: 1_990_000_000_000_000,
+                max_bid: 2_000_000_000_000_000,
+                min_ask: 2_000_100_000_000_000,
+                max_ask: 2_010_000_000_000_000,
+            },
+            bid_capacity: 1_000 * ONE_ETH,
+            ask_capacity: 1_000 * ONE_ETH,
+            bid_used: 0,
+            ask_used: 0,
+            updated_at,
+            stale_secs_max: 5,
+            decay_secs: 30,
+            price_scale_exp: 24,
+            paused: false,
+            observed_at: Instant::now(),
+        }
+    }
+
+    /// A shared state whose chain clock is pinned, so staleness is a property of the fixture
+    /// rather than of how long the test took to run.
+    fn prop_seeded(state: PropState) -> Arc<Shared> {
+        let s = Arc::new(Shared::new());
+        s.publish_clock(CHAIN_NOW, Instant::now());
+        s.publish_prop(state);
+        s
+    }
+
+    async fn post_amounts(
+        shared: Arc<Shared>,
+        body: serde_json::Value,
+    ) -> (StatusCode, serde_json::Value) {
+        let res = app(shared)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/prop/amounts")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        let status = res.status();
+        let bytes = axum::body::to_bytes(res.into_body(), 1 << 20)
+            .await
+            .expect("body");
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null),
+        )
+    }
+
+    fn grid(token_in: Address, token_out: Address, amounts: &[&str]) -> serde_json::Value {
+        serde_json::json!({
+            "tokenIn": token_in.to_string(),
+            "tokenOut": token_out.to_string(),
+            "amountsIn": amounts,
+        })
+    }
+
+    #[tokio::test]
+    async fn a_grid_comes_back_priced_in_the_order_it_was_sent() {
+        let shared = prop_seeded(prop_state(CHAIN_NOW - 1));
+        let (status, body) = post_amounts(
+            shared,
+            grid(BASE, QUOTE, &["0", "1000000000000000000", "2000000000000000000"]),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["side"], "bid", "base in, quote out is the pool buying");
+        let out = body["amountsOut"].as_array().expect("amountsOut");
+        assert_eq!(out.len(), 3, "one answer per grid point, in order");
+        assert_eq!(out[0], "0", "zero in is zero out");
+        let one: u128 = out[1].as_str().expect("str").parse().expect("u128");
+        let two: u128 = out[2].as_str().expect("str").parse().expect("u128");
+        assert!(one > 0 && two > one, "a deeper fill pays more in total");
+    }
+
+    /// Which way round the pair is asked decides which side of the book answers.
+    #[tokio::test]
+    async fn the_token_order_selects_the_side() {
+        let (_, bid) = post_amounts(
+            prop_seeded(prop_state(CHAIN_NOW - 1)),
+            grid(BASE, QUOTE, &["1000000000000000000"]),
+        )
+        .await;
+        assert_eq!(bid["side"], "bid");
+
+        let (_, ask) = post_amounts(
+            prop_seeded(prop_state(CHAIN_NOW - 1)),
+            grid(QUOTE, BASE, &["2000000000"]),
+        )
+        .await;
+        assert_eq!(ask["side"], "ask");
+    }
+
+    /// The whole reason this endpoint exists is that the chain refused every quote as stale. It
+    /// must still refuse a genuinely stale one — moving the read off chain is not a licence to
+    /// quote a ladder the pool would no longer honour.
+    #[tokio::test]
+    async fn a_ladder_past_the_staleness_window_is_still_refused() {
+        let fresh = post_amounts(
+            prop_seeded(prop_state(CHAIN_NOW - 5)),
+            grid(BASE, QUOTE, &["1000000000000000000"]),
+        )
+        .await;
+        assert_eq!(fresh.0, StatusCode::OK, "exactly at the window is quotable");
+
+        let (status, body) = post_amounts(
+            prop_seeded(prop_state(CHAIN_NOW - 6)),
+            grid(BASE, QUOTE, &["1000000000000000000"]),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["error"], "no-market");
+    }
+
+    #[tokio::test]
+    async fn a_paused_pair_is_not_quoted() {
+        let mut state = prop_state(CHAIN_NOW - 1);
+        state.paused = true;
+        let (status, _) = post_amounts(
+            prop_seeded(state),
+            grid(BASE, QUOTE, &["1000000000000000000"]),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    /// A jump withdrawal posts a zero epoch. The venue stays reachable and simply pays nothing,
+    /// which is what lets the router drop it without a special case.
+    #[tokio::test]
+    async fn a_withdrawn_epoch_answers_zero_rather_than_disappearing() {
+        let mut state = prop_state(CHAIN_NOW - 1);
+        state.bid_capacity = 0;
+        let (status, body) = post_amounts(
+            prop_seeded(state),
+            grid(BASE, QUOTE, &["1000000000000000000"]),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["amountsOut"][0], "0");
+    }
+
+    /// The ramp is the pool's, not this endpoint's opinion: an older ladder offers less depth.
+    #[tokio::test]
+    async fn the_capacity_ramp_narrows_what_a_stale_ladder_will_take() {
+        let whole = (1_000 * ONE_ETH).to_string();
+        let (_, fresh) = post_amounts(
+            prop_seeded(prop_state(CHAIN_NOW)),
+            grid(BASE, QUOTE, &[&whole]),
+        )
+        .await;
+        assert_ne!(fresh["amountsOut"][0], "0", "a fresh epoch takes all of it");
+
+        let mut aged = prop_state(CHAIN_NOW - 4);
+        aged.stale_secs_max = 60;
+        let (_, decayed) = post_amounts(prop_seeded(aged), grid(BASE, QUOTE, &[&whole])).await;
+        assert_eq!(
+            decayed["amountsOut"][0], "0",
+            "the decayed room no longer covers the whole epoch"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_pair_this_pool_does_not_hold_is_refused() {
+        let (status, body) = post_amounts(
+            prop_seeded(prop_state(CHAIN_NOW - 1)),
+            grid(BASE, PMM_SETTLE, &["1000000000000000000"]),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["error"], "no-market");
+    }
+
+    /// Amounts cross the wire as strings for the same reason the RFQ order's do: a `u128` past
+    /// 2^53 is not a JSON number, and a truncated one is a route into a size nobody quoted.
+    #[tokio::test]
+    async fn prop_amounts_cross_the_wire_as_strings() {
+        let (_, body) = post_amounts(
+            prop_seeded(prop_state(CHAIN_NOW - 1)),
+            grid(BASE, QUOTE, &["1000000000000000000"]),
+        )
+        .await;
+        assert!(body["amountsOut"][0].is_string());
+    }
+
+    #[tokio::test]
+    async fn a_grid_larger_than_the_endpoint_will_price_is_refused() {
+        let many = vec!["1"; AMOUNTS_MAX + 1];
+        let (status, _) =
+            post_amounts(prop_seeded(prop_state(CHAIN_NOW - 1)), grid(BASE, QUOTE, &many)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        let (empty, _) = post_amounts(
+            prop_seeded(prop_state(CHAIN_NOW - 1)),
+            grid(BASE, QUOTE, &[]),
+        )
+        .await;
+        assert_eq!(empty, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn nothing_is_priced_before_the_cycle_has_published() {
+        let (status, body) = post_amounts(
+            Arc::new(Shared::new()),
+            grid(BASE, QUOTE, &["1000000000000000000"]),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["error"], "not-ready");
     }
 
     #[tokio::test]

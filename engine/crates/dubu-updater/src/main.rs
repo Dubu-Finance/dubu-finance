@@ -2164,6 +2164,31 @@ async fn run_cycle(
                 }),
                 None => rfq.retire(pair.pair_id),
             }
+
+            // The prop pool's own quote, mirrored for the aggregator.
+            //
+            // Unconditional, unlike the RFQ market above: this is the chain's state rather than
+            // this process's opinion of it, and every reason the pool would stop quoting is already
+            // *in* it. A jump withdrawal zeroes the epoch, so the curve pays nothing. A halted
+            // updater stops pushing, so the ladder ages past `maxStaleSecs` and the gate refuses.
+            // Withdrawing here as well would take the venue down while the chain was still quoting
+            // it, which is the disagreement this whole endpoint exists to remove.
+            rfq.publish_prop(serve::PropState {
+                pair_id: pair.pair_id,
+                base: meta.base,
+                quote: meta.quote,
+                ladder: snap.ladder(),
+                bid_capacity: snap.bid_capacity,
+                ask_capacity: snap.ask_capacity,
+                bid_used: snap.bid_used(),
+                ask_used: snap.ask_used(),
+                updated_at: snap.updated_at,
+                stale_secs_max: snap.stale_secs_max,
+                decay_secs: meta.decay_secs,
+                price_scale_exp: snap.price_scale_exp,
+                paused: snap.paused(),
+                observed_at: now,
+            });
         }
 
         // --- the half-spread ---------------------------------------------------------------

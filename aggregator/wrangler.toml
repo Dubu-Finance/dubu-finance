@@ -16,6 +16,19 @@ PMM_SETTLE = "0x68CFa6E265AffD5D0DB2C49E4bb9DaEC5A920A9E"
 PMM_ADAPTER = "0x92CC1139212d02c8CF198dE804161432feEa4eBD"
 PARTNER_ID = "0"
 
+# PROP_QUOTE_URL is deliberately absent, and is a secret for the same reason RFQ_MAKER_URL is: the
+# engine is reached over a tunnel whose hostname changes on every restart.
+#
+# The prop pool is priced by the engine over HTTP rather than by `eth_call`. GIWA serves pending
+# state and pending timestamps inconsistently, which made the pool compute an inflated quote age,
+# report STATUS_STALE and pay zero on every pair. See the note on transports in quote.ts.
+#
+# It is a FULL endpoint URL, POSTed to verbatim -- `https://<host>/prop/amounts`, never the bare
+# host. A base URL answers 404, and a 404 is easy to misread as the engine having withdrawn the
+# market. Unset is a working configuration and means UniV2-only routing. Set it with:
+#
+#   wrangler secret put PROP_QUOTE_URL
+
 # RFQ_MAKER_URL and RFQ_MAKER_ADDRESS are deliberately absent.
 #
 # The maker service is the one input this worker does not compute, and the address is what every

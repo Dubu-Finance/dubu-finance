@@ -1,6 +1,6 @@
 import { createPublicClient, encodeFunctionData, decodeFunctionResult, fallback, http, type Address, type PublicClient } from 'viem';
 
-import { ERC20_ABI, MULTICALL3_ABI, PROP_POOL_ABI, UNIV2_ROUTER_ABI } from './abi.js';
+import { ERC20_ABI, MULTICALL3_ABI, UNIV2_ROUTER_ABI } from './abi.js';
 import { MULTICALL3, type Config } from './config.js';
 
 /**
@@ -9,16 +9,35 @@ import { MULTICALL3, type Config } from './config.js';
  * # The split is searched, not derived
  *
  * The obvious implementation reimplements each venue's curve here and solves for the optimum. This
- * one asks the venues instead: it evaluates a grid of splits through their own view functions and
- * takes the best. That is slower by exactly one multicall and better for a reason that has already
- * bitten this codebase once — an off-chain reimplementation of `PropCurve` is a second
- * implementation that can disagree with the first, and the disagreements are found by users rather
- * than by tests. `IPropPool.getAmountOut` is the authority on what the pool will pay, so it is what
- * gets asked.
+ * one asks the venues instead: it evaluates a grid of splits and takes the best. That is slower by
+ * one round trip and better for a reason that has already bitten this codebase once — a curve
+ * reimplemented for the aggregator is a second implementation that can disagree with the first, and
+ * the disagreements are found by users rather than by tests.
  *
- * It also means the search needs no special case for the epoch capacity, the staleness ramp, a
- * paused pair, or anything else the pool might do next. Those all show up as `getAmountOut`
- * returning less, or returning zero, which the grid handles without knowing why.
+ * # The two venues are asked over different transports
+ *
+ * UniV2 is asked through `getAmountsOut` in a Multicall3 batch. The prop pool is asked over HTTP,
+ * of the engine that quotes it: one POST to [`Config.propQuoteUrl`] carrying all eleven grid
+ * amounts.
+ *
+ * That is not a weakening of the rule above. The engine prices from `dubu-core`'s `curve.rs`, an
+ * exact integer port of `PropCurve.sol` whose vectors are asserted against the Solidity in
+ * `contracts/test/PropCurve.t.sol`. The answer still comes from the venue's own arithmetic, and
+ * there is still no curve authored here — what changed is the transport the question travels over,
+ * not who answers it.
+ *
+ * The move off `eth_call` was forced. Pricing the pool needed `blockTag: 'pending'` to see a quote
+ * the maker had published inside the current block, and GIWA's node serves pending STATE and
+ * pending TIMESTAMP inconsistently: a `block.timestamp` running 6s ahead of a state whose
+ * `updatedAt` had advanced 2s made `PropPool` compute a 5s quote age against a 5s `maxStaleSecs`,
+ * return `STATUS_STALE`, and pay 0 on every pair. The engine knows how old its own quote is without
+ * asking a node what time it is. Quoting a maker over HTTP is also what 0x, 1inch and Hashflow all
+ * do. There is deliberately no on-chain fallback: an unreachable engine shows as prop being
+ * unavailable, not as a second and differently-wrong price.
+ *
+ * Either way the search needs no special case for the epoch capacity, the staleness ramp, a paused
+ * pair, or anything else the pool might do next. Those all show up as the venue quoting less, or
+ * quoting zero, which the grid handles without knowing why.
  *
  * The grid is coarse on purpose. Between two adjacent points the curve is smooth and nearly flat
  * near the optimum, and the gain from refining is smaller than the price move during the round
@@ -72,11 +91,13 @@ export function makeClient(cfg: Config): PublicClient {
 }
 
 /**
- * Every grid point, priced at both venues, in one round trip.
+ * Every grid point, priced at both venues. Two round trips that leave together, not one after the
+ * other — the multicall and the prop request are the same wall-clock second.
  *
- * `allowFailure` is set on every call. A venue that reverts — a paused pair, a UniV2 pool with no
- * reserves — must cost its own leg and nothing else. Voiding the batch would turn one venue's
- * outage into no quote at all, which is the opposite of what an aggregator is for.
+ * `allowFailure` is set on every call in the batch, and the prop leg degrades by hand to match. A
+ * venue that reverts, times out, or answers nonsense must cost its own leg and nothing else:
+ * voiding the whole quote would turn one venue's outage into no quote at all, which is the opposite
+ * of what an aggregator is for. [`quotePropGrid`] therefore has no throwing path.
  */
 export async function quoteAmms(
   client: PublicClient,
@@ -84,85 +105,202 @@ export async function quoteAmms(
   tokenIn: Address,
   tokenOut: Address,
   amountIn: bigint,
+  fetchImpl: typeof fetch = fetch,
 ): Promise<AmmQuote> {
-  const points = SPLIT_GRID.map((bps) => ({
-    bps,
-    toProp: (amountIn * BigInt(bps)) / BigInt(WEIGHT_DENOMINATOR),
-  })).map((p) => ({ ...p, toUniv2: amountIn - p.toProp }));
+  const toProp = SPLIT_GRID.map((bps) => (amountIn * BigInt(bps)) / BigInt(WEIGHT_DENOMINATOR));
+  const toUniv2 = toProp.map((a) => amountIn - a);
 
-  const calls = points.flatMap((p) => [
-    {
-      target: cfg.propPool,
-      allowFailure: true,
-      callData: encodeFunctionData({
-        abi: PROP_POOL_ABI,
-        functionName: 'getAmountOut',
-        args: [tokenIn, tokenOut, p.toProp],
-      }),
-    },
-    {
-      target: cfg.univ2Router,
-      allowFailure: true,
-      callData: encodeFunctionData({
-        abi: UNIV2_ROUTER_ABI,
-        functionName: 'getAmountsOut',
-        args: [p.toUniv2, [tokenIn, tokenOut]],
-      }),
-    },
+  const calls = toUniv2.map((amount) => ({
+    target: cfg.univ2Router,
+    allowFailure: true,
+    callData: encodeFunctionData({
+      abi: UNIV2_ROUTER_ABI,
+      functionName: 'getAmountsOut',
+      args: [amount, [tokenIn, tokenOut]],
+    }),
+  }));
+
+  const [raw, propOut] = await Promise.all([
+    client.readContract({
+      address: MULTICALL3,
+      abi: MULTICALL3_ABI,
+      functionName: 'aggregate3',
+      args: [calls],
+      // Sealed `latest`, which is viem's default and so is stated by omission. `pending` used to be
+      // set here, for the prop pool alone: preconfirmed state was the only way to see a quote the
+      // maker had published within the current block. The prop pool is no longer read this way (see
+      // the note on transports above), and for a constant-product pool `pending` bought nothing --
+      // UniV2 reserves move when a trade seals, not when the maker re-quotes, and a sealed read is
+      // the consistent one. Reading pending state also cost correctness on GIWA rather than just
+      // buying freshness, which is the whole reason this multicall is now UniV2-only.
+    }),
+    quotePropGrid(cfg, tokenIn, tokenOut, toProp, fetchImpl),
   ]);
+  const results = raw as readonly { success: boolean; returnData: `0x${string}` }[];
 
-  const results = (await client.readContract({
-    address: MULTICALL3,
-    abi: MULTICALL3_ABI,
-    functionName: 'aggregate3',
-    args: [calls],
-    // Preconfirmed state. viem defaults to `latest`, which is a SEALED block -- and the pool
-    // re-quotes every ~415ms, so `latest` served the previous quote for most of every second. See
-    // DEFAULT_RPC.
-    blockTag: 'pending',
-  })) as readonly { success: boolean; returnData: `0x${string}` }[];
-
-  let best: AmmQuote | null = null;
-  const solo: Record<VenueId, bigint> = { prop: 0n, univ2: 0n };
-
-  points.forEach((p, i) => {
-    const propOut = p.toProp === 0n ? 0n : decodeProp(results[i * 2]);
-    const univOut = p.toUniv2 === 0n ? 0n : decodeUniv2(results[i * 2 + 1]);
-
-    if (p.bps === WEIGHT_DENOMINATOR) solo.prop = propOut;
-    if (p.bps === 0) solo.univ2 = univOut;
-
-    // A zero from a venue that was asked for a non-zero amount is a refusal, not a free leg. It
-    // has to disqualify the whole point: routing input into a venue that pays nothing is strictly
-    // worse than not routing it at all, and the grid contains the not-routing-it point already.
-    if ((p.toProp > 0n && propOut === 0n) || (p.toUniv2 > 0n && univOut === 0n)) return;
-
-    const total = propOut + univOut;
-    if (best && total <= best.amountOut) return;
-
-    const legs: Leg[] = [];
-    if (p.toProp > 0n) legs.push({ venue: 'prop', weightBps: p.bps, amountIn: p.toProp, amountOut: propOut });
-    if (p.toUniv2 > 0n) {
-      legs.push({
-        venue: 'univ2',
-        weightBps: WEIGHT_DENOMINATOR - p.bps,
-        amountIn: p.toUniv2,
-        amountOut: univOut,
-      });
-    }
-    best = { legs, amountOut: total, solo, split: legs.length > 1 };
-  });
-
-  return best ?? { legs: [], amountOut: 0n, solo, split: false };
+  // The same search `chooseSplit` runs against hand-written arrays in the tests, run against these
+  // ones. Both venues now hand back a plain array per grid point, so there is no second copy of the
+  // search to keep in step with the tested one.
+  return chooseSplit(
+    amountIn,
+    propOut,
+    results.map((r) => decodeUniv2(r)),
+  );
 }
 
-function decodeProp(r: { success: boolean; returnData: `0x${string}` } | undefined): bigint {
-  if (!r?.success) return 0n;
+/**
+ * How long the prop venue gets to answer.
+ *
+ * Two seconds: several times the engine's own ~415ms quote cycle, and short enough that a hung
+ * maker costs a slower quote rather than a failed one. It runs concurrently with the multicall, so
+ * it bounds the quote's latency rather than adding to it.
+ */
+const PROP_QUOTE_TIMEOUT_MS = 2_000;
+
+/**
+ * An `observedAgeMs` past which the engine's view of the chain is worth a log line.
+ *
+ * Five seconds, matching `PropPool`'s own `maxStaleSecs` so the number means the same thing in both
+ * places. A threshold for noticing, not for refusing — see [`quotePropGrid`].
+ */
+const PROP_OBSERVED_AGE_SUSPECT_MS = 5_000;
+
+/**
+ * The prop venue's price for every grid amount, in one request.
+ *
+ * Never throws and never rejects. An unreachable engine, a non-2xx, a body of the wrong shape, an
+ * `amountsOut` of the wrong length, an entry that is not a whole non-negative integer — all of it
+ * degrades to zeros, which the grid reads as the venue refusing every size and routes around. The
+ * alternative is one HTTP failure taking down a quote UniV2 could have served, which is the same
+ * bargain `allowFailure` makes for the on-chain legs.
+ *
+ * A zero *from* the engine is not a failure but that same refusal at one size: capacity spent, out
+ * of domain, under the minimum price. It is the venue's answer, and it is the answer the old
+ * `getAmountOut` gave for those cases too.
+ *
+ * Split out from [`quoteAmms`] and given an injectable `fetchImpl` for the same reason
+ * `validateQuote` is split out of `requestQuote`: the interesting cases are hostile and malformed
+ * responses, and they should be testable without a chain or a network.
+ */
+export async function quotePropGrid(
+  cfg: Config,
+  tokenIn: Address,
+  tokenOut: Address,
+  amountsIn: readonly bigint[],
+  fetchImpl: typeof fetch = fetch,
+): Promise<bigint[]> {
+  const zeros = amountsIn.map(() => 0n);
+  if (cfg.propQuoteUrl === null) return zeros;
+
+  let body: unknown;
   try {
-    return decodeFunctionResult({ abi: PROP_POOL_ABI, functionName: 'getAmountOut', data: r.returnData }) as bigint;
-  } catch {
-    return 0n;
+    const res = await fetchImpl(cfg.propQuoteUrl, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        tokenIn,
+        tokenOut,
+        amountsIn: amountsIn.map((a) => a.toString()),
+      }),
+      // A maker that stops answering must not become a quote that stops answering.
+      signal: AbortSignal.timeout(PROP_QUOTE_TIMEOUT_MS),
+    });
+
+    if (!res.ok) {
+      const declined = await res
+        .json()
+        .then((b) => (b as { error?: string } | null)?.error)
+        .catch(() => undefined);
+      // `no-market` and `not-ready` are the engine speaking, and they are normal. A non-2xx with no
+      // error body is almost always this side pointing at the wrong path, because PROP_QUOTE_URL is
+      // a full endpoint and nothing appends one. RFQ_MAKER_URL taught that lesson already: a 404
+      // from a bare host read as the maker declining, and the search went to the pricing instead of
+      // to the URL. The two are logged apart so that cannot happen twice.
+      warn(
+        declined
+          ? `engine declined (http ${res.status}): ${declined}; no prop leg`
+          : `http ${res.status} with no error body; no prop leg`,
+        declined ? undefined : 'PROP_QUOTE_URL must be the full endpoint, path included',
+      );
+      return zeros;
+    }
+    body = await res.json();
+  } catch (e) {
+    // DNS, TLS, a dropped connection, or the 2s abort. Never a refusal: the engine was not heard
+    // from at all, which is a different fact from it having no market.
+    warn('engine unreachable; no prop leg', String(e));
+    return zeros;
   }
+
+  const amountsOut = parseAmountsOut(body, amountsIn.length);
+  if (!amountsOut) {
+    warn('malformed response; no prop leg', `expected ${amountsIn.length} integer amountsOut`);
+    return zeros;
+  }
+
+  // `observedAgeMs` is an ELAPSED age off the engine's own monotonic clock, and it is never
+  // compared against `Date.now()`. An absolute timestamp crossing hosts is what silently killed the
+  // RFQ leg once: the maker stamped expiry from a clock running 2s slow, this side refused anything
+  // with under a second left, and every order read as expired while nothing looked broken. An
+  // elapsed age cannot carry that offset because it never leaves the clock that measured it.
+  //
+  // Logged, never enforced. The engine owns its staleness rules and already answers 0 for the sizes
+  // they disqualify; a second staleness opinion computed here is precisely the arithmetic that
+  // returned zero on every pair and forced this rewrite. (`quoteAgeSecs` is the chain-side age of
+  // the ladder, which is what the pool's own window is measured against; this one is how long ago
+  // the engine looked.)
+  const observedAgeMs = readObservedAgeMs(body);
+  if (observedAgeMs !== null && observedAgeMs > PROP_OBSERVED_AGE_SUSPECT_MS) {
+    warn(`engine observation ${observedAgeMs}ms old`, 'quoted anyway — the engine decides its own staleness');
+  }
+
+  return amountsOut;
+}
+
+/** The engine's elapsed observation age, when it sent a usable one. Never fatal: a missing or
+ *  unreadable age costs a log line, not the quote — the amounts are the contract, this is telemetry. */
+function readObservedAgeMs(body: unknown): number | null {
+  const v = (body as { observedAgeMs?: unknown }).observedAgeMs;
+  return typeof v === 'number' && Number.isFinite(v) && v >= 0 ? v : null;
+}
+
+/** One line per prop-quote event worth an operator's attention, each naming its own outcome so the
+ *  facts do not collapse together — "the engine declined", "the engine was not reached" and "the
+ *  engine answered something else" point at three different things to go and fix, and an earlier
+ *  version of this problem on the RFQ leg reported all of them as the maker declining.
+ *
+ *  The URL is never logged: it is a secret in every deployment that has one. */
+function warn(reason: string, detail?: string): void {
+  console.warn(`prop quote: ${reason}${detail ? ` — ${detail}` : ''}`);
+}
+
+/**
+ * `amountsOut`, or `null` if the body is not the shape that was agreed.
+ *
+ * All-or-nothing on purpose. One entry this code cannot read means the response is not the contract
+ * it claims to be, and the rest of it is unverified rather than merely partial — salvaging the
+ * readable entries would route real input on the strength of a body already known to be wrong.
+ */
+function parseAmountsOut(body: unknown, expected: number): bigint[] | null {
+  if (typeof body !== 'object' || body === null) return null;
+  const raw = (body as { amountsOut?: unknown }).amountsOut;
+  // Same length and same order as `amountsIn`: the response carries no amounts of its own, so a
+  // short or long array cannot be realigned, only rejected.
+  if (!Array.isArray(raw) || raw.length !== expected) return null;
+
+  const out: bigint[] = [];
+  for (const v of raw) {
+    if (typeof v !== 'string' && typeof v !== 'number') return null;
+    try {
+      const n = BigInt(v);
+      // A negative is not a worse quote, it is a body this code does not understand.
+      if (n < 0n) return null;
+      out.push(n);
+    } catch {
+      return null;
+    }
+  }
+  return out;
 }
 
 function decodeUniv2(r: { success: boolean; returnData: `0x${string}` } | undefined): bigint {
@@ -252,8 +390,13 @@ export async function makerCanDeliver(
       abi: MULTICALL3_ABI,
       functionName: 'aggregate3',
       args: [calls],
-      // Same reason as the quote path: a sealed read cannot see a transfer or an approval the maker
-      // made in the last second, so a maker that CAN deliver gets refused as if it could not.
+      // A sealed read cannot see a transfer or an approval the maker made in the last second, so a
+      // maker that CAN deliver gets refused as if it could not.
+      //
+      // TODO: this is the same inconsistent pending read that forced the prop quote off chain. A
+      // balance does not decay against a clock, so the failure here would be a stale or mismatched
+      // number rather than a systematic zero — but it is the same node behaviour and should be
+      // revisited rather than left because it has not bitten yet.
       blockTag: 'pending',
     })) as readonly { success: boolean; returnData: `0x${string}` }[];
 

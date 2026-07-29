@@ -114,6 +114,7 @@ pub mod inverse;
 pub mod ladder;
 pub mod math;
 pub mod pack;
+pub mod pool;
 pub mod rfq;
 pub mod vectors;
 
@@ -128,4 +129,5 @@ pub use inverse::{
 };
 pub use ladder::LadderBuilder;
 pub use pack::QuoteWord;
+pub use pool::{Side, Unquotable};
 pub use rfq::{Domain as RfqDomain, Order as RfqOrder, ORDER_TYPEHASH, ORDER_TYPE_STRING};
