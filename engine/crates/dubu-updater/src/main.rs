@@ -320,6 +320,124 @@ fn kill_state_path(base: &std::path::Path, group: &str) -> std::path::PathBuf {
     path
 }
 
+/// The jump detector, one threshold per pair and contagion inside a group.
+fn build_jump_book(cfg: &Config) -> jump::Book {
+    let bounds: Vec<(u16, jump::Bounds)> = cfg
+        .pairs
+        .iter()
+        .map(|p| {
+            let floor = p.half_spread_bps.ceil() as u16;
+            (
+                p.pair_id,
+                jump::Bounds::new(p.jump_floor_bps.unwrap_or(floor), floor, p.width_bps),
+            )
+        })
+        .collect();
+    assert_eq!(bounds.len(), cfg.pairs.len(), "every pair gets a detector");
+
+    let groups: BTreeMap<u16, String> = cfg
+        .pairs
+        .iter()
+        .filter(|p| !p.jump_group.is_empty())
+        .map(|p| (p.pair_id, p.jump_group.clone()))
+        .collect();
+    assert!(groups.len() <= cfg.pairs.len());
+
+    for (id, b) in &bounds {
+        // The ceiling is the absorption limit and the floor is the noise gate. Equal means the
+        // clamp has collapsed to a constant, which is how narrowing the ladder once took the whole
+        // book dark -- normal volatility then reads as a jump on every pair at once.
+        assert!(
+            b.ceiling_bps_e2 >= b.floor_bps_e2,
+            "pair {id}: ceiling below floor"
+        );
+        info!(
+            target: "jump", event = "bounds", pair_id = id,
+            enabled = cfg.jump.enabled, scope = cfg.jump.scope.label(),
+            sigma_k = cfg.jump.sigma_k,
+            floor_bps_e2 = b.floor_bps_e2, ceiling_bps_e2 = b.ceiling_bps_e2,
+            cooloff_secs = cfg.jump.cooloff_secs, scan_interval_ms = cfg.jump.scan_interval_ms,
+            "jump trip threshold is clamp(sigma_k * sigma, half_spread, half_spread + width/2)"
+        );
+    }
+
+    jump::Book::grouped(
+        &bounds,
+        cfg.jump.params(&cfg.skew),
+        cfg.jump.scope,
+        cfg.jump.enabled,
+        &groups,
+    )
+}
+
+/// One websocket task per venue a pair actually names.
+///
+/// A venue is enabled by being used rather than by a switch, so there is no way to configure one
+/// that connects and quotes nothing.
+fn spawn_feeds(
+    cfg: &Config,
+    shutdown_rx: &watch::Receiver<bool>,
+) -> (Arc<VenueFeeds>, Vec<tokio::task::JoinHandle<()>>) {
+    let venues = cfg.venues();
+    assert!(
+        !venues.is_empty(),
+        "config validation admits no venueless book"
+    );
+
+    // Paired with the symbols each venue actually carries, so a venue never asked about a symbol is
+    // absent from that cross-section rather than reported as having lost it.
+    let coverage: Vec<(VenueId, Vec<String>)> = venues
+        .iter()
+        .map(|&v| {
+            let symbols = cfg
+                .venue_symbols(v)
+                .into_iter()
+                .map(|(_, canonical)| canonical)
+                .collect();
+            (v, symbols)
+        })
+        .collect();
+    assert_eq!(coverage.len(), venues.len());
+
+    let feeds = Arc::new(VenueFeeds::new(
+        &coverage,
+        Duration::from_millis(cfg.feed.stale_after_ms),
+    ));
+    let mut tasks = Vec::new();
+    for venue in &venues {
+        let symbols = cfg.venue_symbols(*venue);
+        assert!(
+            !symbols.is_empty(),
+            "a venue in `venues()` is named by some pair"
+        );
+        let client: Box<dyn MarketFeed> = match venue {
+            VenueId::Binance => Box::new(binance::Client::new(&symbols)),
+            VenueId::Okx => Box::new(okx::Client::new(&symbols)),
+            VenueId::Bybit => Box::new(bybit::Client::new(&symbols)),
+            VenueId::Coinbase => Box::new(coinbase::Client::new(&symbols)),
+            VenueId::Hyperliquid => Box::new(hyperliquid::Client::new(&symbols)),
+        };
+        let Some(shared) = feeds.venue(*venue) else {
+            continue;
+        };
+        info!(
+            target: "startup", event = "venue", venue = %venue,
+            url = %cfg.feed.urls.get(*venue),
+            symbols = %symbols.iter().map(|(v, c)| format!("{v}->{c}")).collect::<Vec<_>>().join(","),
+            "market data venue configured"
+        );
+        tasks.push(tokio::spawn(dubu_updater::feed::ws::run(
+            cfg.feed.clone(),
+            cfg.feed.urls.get(*venue).to_string(),
+            client,
+            shared,
+            shutdown_rx.clone(),
+        )));
+    }
+    assert_eq!(tasks.len(), venues.len(), "every venue got a task");
+    (feeds, tasks)
+}
+
 /// only thing waking this loop for an hour" is invisible otherwise.
 #[derive(Debug, Clone, Copy)]
 enum Wake {
@@ -532,53 +650,7 @@ async fn run(args: &Args) -> Result<i32, Box<dyn std::error::Error>> {
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
-    // One task per venue a pair actually names. A venue is enabled by being used, not by a
-    // separate switch, so there is no way to configure a venue that connects and quotes nothing.
-    let venues = cfg.venues();
-    // Paired with the symbols each venue actually carries, so a venue that was never asked about a
-    // symbol is absent from that cross-section rather than reported as having lost it.
-    let coverage: Vec<(VenueId, Vec<String>)> = venues
-        .iter()
-        .map(|&v| {
-            let syms = cfg
-                .venue_symbols(v)
-                .into_iter()
-                .map(|(_, canonical)| canonical)
-                .collect();
-            (v, syms)
-        })
-        .collect();
-    let feeds = Arc::new(VenueFeeds::new(
-        &coverage,
-        Duration::from_millis(cfg.feed.stale_after_ms),
-    ));
-    let mut feed_tasks = Vec::new();
-    for venue in &venues {
-        let symbols = cfg.venue_symbols(*venue);
-        let client: Box<dyn MarketFeed> = match venue {
-            VenueId::Binance => Box::new(binance::Client::new(&symbols)),
-            VenueId::Okx => Box::new(okx::Client::new(&symbols)),
-            VenueId::Bybit => Box::new(bybit::Client::new(&symbols)),
-            VenueId::Coinbase => Box::new(coinbase::Client::new(&symbols)),
-            VenueId::Hyperliquid => Box::new(hyperliquid::Client::new(&symbols)),
-        };
-        let Some(shared) = feeds.venue(*venue) else {
-            continue;
-        };
-        info!(
-            target: "startup", event = "venue", venue = %venue,
-            url = %cfg.feed.urls.get(*venue),
-            symbols = %symbols.iter().map(|(v, c)| format!("{v}->{c}")).collect::<Vec<_>>().join(","),
-            "market data venue configured"
-        );
-        feed_tasks.push(tokio::spawn(dubu_updater::feed::ws::run(
-            cfg.feed.clone(),
-            cfg.feed.urls.get(*venue).to_string(),
-            client,
-            shared,
-            shutdown_rx.clone(),
-        )));
-    }
+    let (feeds, feed_tasks) = spawn_feeds(&cfg, &shutdown_rx);
 
     // The `newHeads` subscription: what drives the loop. A `watch` channel rather than an `mpsc`
     // because it coalesces — two heads landing during one cycle should produce one more cycle
@@ -636,44 +708,7 @@ async fn run(args: &Args) -> Result<i32, Box<dyn std::error::Error>> {
     // Both trip bounds come from the pair's OWN configuration — the floor is its half-spread and
     // the ceiling is `half_spread + width/2`, its absorption limit — which is what lets one global
     // `sigma_k` be correct across two instruments whose measured sigmas differ by 3x.
-    let jump_bounds: Vec<(u16, jump::Bounds)> = cfg
-        .pairs
-        .iter()
-        .map(|p| {
-            (
-                p.pair_id,
-                jump::Bounds::new(
-                    p.jump_floor_bps
-                        .unwrap_or_else(|| p.half_spread_bps.ceil() as u16),
-                    p.half_spread_bps.ceil() as u16,
-                    p.width_bps,
-                ),
-            )
-        })
-        .collect();
-    let jump_groups: BTreeMap<u16, String> = cfg
-        .pairs
-        .iter()
-        .filter(|p| !p.jump_group.is_empty())
-        .map(|p| (p.pair_id, p.jump_group.clone()))
-        .collect();
-    let jump_book = jump::Book::grouped(
-        &jump_bounds,
-        cfg.jump.params(&cfg.skew),
-        cfg.jump.scope,
-        cfg.jump.enabled,
-        &jump_groups,
-    );
-    for (id, b) in &jump_bounds {
-        info!(
-            target: "jump", event = "bounds", pair_id = id,
-            enabled = cfg.jump.enabled, scope = cfg.jump.scope.label(),
-            sigma_k = cfg.jump.sigma_k,
-            floor_bps_e2 = b.floor_bps_e2, ceiling_bps_e2 = b.ceiling_bps_e2,
-            cooloff_secs = cfg.jump.cooloff_secs, scan_interval_ms = cfg.jump.scan_interval_ms,
-            "jump trip threshold is clamp(sigma_k * sigma, half_spread, half_spread + width/2)"
-        );
-    }
+    let jump_book = build_jump_book(&cfg);
     let withdraw_fees = Fees {
         max_fee: cfg.jump.withdraw_max_fee_wei()?,
         max_priority_fee: cfg.jump.withdraw_priority_fee_wei()?,
