@@ -1253,6 +1253,8 @@ struct HedgeLeg {
     routes: BTreeMap<u16, (dubu_updater::config::HedgeVenue, String)>,
     /// Every distinct HIP-3 book in use, so mids are polled once per book rather than per pair.
     dexs: Vec<String>,
+    /// Binance spot symbols whose paper fills price against the real book.
+    spot: Vec<String>,
     bands: BTreeMap<u16, hedge::Bands>,
     symbols: BTreeMap<u16, String>,
     /// Base-unit divisor per pair, so a `u128` of pool units becomes the decimal the venue wants.
@@ -1298,6 +1300,7 @@ fn start_hedge(cfg: &Config, sigma_millibps_per_sqrt_sec: u64) -> Option<HedgeLe
     let mut symbols = BTreeMap::new();
     let mut routes = BTreeMap::new();
     let mut dexs: Vec<String> = Vec::new();
+    let mut spot: Vec<String> = Vec::new();
     let mut scale = BTreeMap::new();
     let mut qty_decimals = BTreeMap::new();
     for hp in &hc.pairs {
@@ -1322,6 +1325,9 @@ fn start_hedge(cfg: &Config, sigma_millibps_per_sqrt_sec: u64) -> Option<HedgeLe
         );
         symbols.insert(hp.pair_id, hp.symbol.clone());
         routes.insert(hp.pair_id, (hp.venue, hp.dex.clone()));
+        if hp.venue == dubu_updater::config::HedgeVenue::BinancePaper {
+            spot.push(hp.symbol.clone());
+        }
         if hp.venue == dubu_updater::config::HedgeVenue::HyperliquidPaper && !dexs.contains(&hp.dex)
         {
             dexs.push(hp.dex.clone());
@@ -1348,10 +1354,15 @@ fn start_hedge(cfg: &Config, sigma_millibps_per_sqrt_sec: u64) -> Option<HedgeLe
             hc.hyperliquid_url.clone(),
             Duration::from_millis(hc.timeout_ms),
         ) {
-            Ok(p) => {
+            Ok(mut p) => {
+                // The same taker fee the real venue charges. A paper book that fills for free
+                // reports a hedge nobody could execute, and the fee is the larger half of the cost
+                // at these sizes -- 4 bp against a measured 0.001 bp spread on BTCUSDT.
+                p.charge(hc.taker_fee_bps_e2);
                 info!(target: "hedge", event = "paper_enabled", url = %hc.hyperliquid_url,
-                      books = dexs.len(),
-                      "equity pairs hedge on paper; the decision is taken and no order is sent");
+                      books = dexs.len(), spot_symbols = spot.len(),
+                      taker_fee_bps_e2 = hc.taker_fee_bps_e2,
+                      "paper pairs take the decision and book the fill; no order is sent");
                 Some(p)
             }
             Err(e) => {
@@ -1368,6 +1379,7 @@ fn start_hedge(cfg: &Config, sigma_millibps_per_sqrt_sec: u64) -> Option<HedgeLe
         paper,
         routes,
         dexs,
+        spot,
         bands,
         symbols,
         scale,
@@ -1420,7 +1432,13 @@ async fn run_hedge(rt: &mut Runtime, view: &ChainView) {
     // Mids first, and once per book rather than once per pair: `allMids` returns the whole book at
     // weight 2, so per-symbol polling would be the same information at fifty times the cost.
     let dexs = leg.dexs.clone();
+    let spot = leg.spot.clone();
     if let Some(paper) = leg.paper.as_mut() {
+        // Spot first: these carry both sides at depth, which is what prices a clip larger than the
+        // top of book. `allMids` below is a number per market and cannot answer that question.
+        if !spot.is_empty() {
+            paper.poll_books(&spot).await;
+        }
         for dex in &dexs {
             if let Err(e) = paper.poll_mids(dex).await {
                 warn!(target: "hedge", event = "paper_poll_failed", dex = %dex, error = %e,
@@ -1470,7 +1488,11 @@ async fn run_hedge(rt: &mut Runtime, view: &ChainView) {
         // Paper: the same decision, the same book, no order. A write that cannot be priced is
         // refused rather than invented -- an imaginary mid reports a cost that never existed, and
         // the drift would be settled against it exactly as if it had.
-        if route == dubu_updater::config::HedgeVenue::HyperliquidPaper {
+        if matches!(
+            route,
+            dubu_updater::config::HedgeVenue::HyperliquidPaper
+                | dubu_updater::config::HedgeVenue::BinancePaper
+        ) {
             let written = leg
                 .paper
                 .as_mut()
@@ -1484,7 +1506,8 @@ async fn run_hedge(rt: &mut Runtime, view: &ChainView) {
                     info!(
                         target: "hedge", event = "crossed_paper", pair_id = order.pair_id,
                         symbol = %symbol, side = order.side.as_str(), qty,
-                        mid = fill.mid, position = fill.position,
+                        mid = fill.mid, price = fill.price,
+                        cost_bps_e2 = fill.cost_bps_e2, position = fill.position,
                         "hedge decided and booked; no order was sent"
                     );
                 }

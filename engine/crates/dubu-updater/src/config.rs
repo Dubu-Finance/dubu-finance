@@ -361,6 +361,17 @@ pub enum HedgeVenue {
     /// experiments, not equities -- and hedging a mock-token pool with real capital leaves the only
     /// real position in the system unbacked. Everything is exercised except the fill.
     HyperliquidPaper,
+    /// Binance spot, read-only, filled into the same paper book.
+    ///
+    /// The crypto pairs' reference comes from Binance/OKX/Bybit **spot**, so a paper fill booked at
+    /// a Hyperliquid perp mid carries a basis against the very price the pool quotes off -- measured
+    /// 2026-07-29 at -4 to -6 bp across all five symbols, against an ETH half-spread of 1.75 bp.
+    /// Filling against the same market the reference is built from removes that by construction.
+    ///
+    /// Unlike [`Self::Binance`] this signs nothing and sends nothing: it reads the public order
+    /// book. No key, no clock sync, and no `-2019 Margin is insufficient` -- the account that
+    /// produced eighty of those held $5,000 against tens of millions of pool inventory.
+    BinancePaper,
 }
 
 /// How one pair maps onto the venue.

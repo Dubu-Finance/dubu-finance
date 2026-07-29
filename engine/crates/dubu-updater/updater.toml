@@ -1192,9 +1192,16 @@ clock_resync_secs = 300
 #
 # That gap is an artifact of a testnet faucet, not a fact about the design, and there is no version
 # of it worth chasing: funding it is impossible and shrinking the pool would delete the capital
-# efficiency the whole thing exists to demonstrate. So the crypto pairs move to the same paper book
-# the equities already use -- Hyperliquid core carries ETH, BTC, BNB, XRP and SOL, so this is a
-# route change and not new machinery.
+# efficiency the whole thing exists to demonstrate. So the crypto pairs move to a paper book.
+#
+# They price against Binance SPOT, not the Hyperliquid perps the equities use, because spot is the
+# same market the reference is built from. Measured 2026-07-29 the perps sit -4 to -6 bp against
+# spot on all five symbols, and ETH's half-spread is 1.75 bp -- booking hedges at a price three
+# times the spread away from the quote they hedge would bias every PnL number downstream.
+#
+# The fill is not at mid. It walks the real book for the clip size and pays the taker fee, because
+# a clip is routinely larger than the top of book: 25 ETH is $47,700 against $37,845 resting, and
+# 20,000 XRP is nearly six times the best bid.
 #
 # WHAT THIS COSTS, stated plainly: paper never rejects, never partially fills, and has no margin.
 # It cannot surface the class of problem it was just used to find. The signed path is not deleted --
@@ -1205,10 +1212,8 @@ clock_resync_secs = 300
 
 [[hedge.pairs]]
 pair_id = 1
-symbol = "ETH"
-venue = "hyperliquid_paper"
-# Core book, no builder prefix -- see `feed/hyperliquid.rs` for why the prefix matters elsewhere.
-dex = ""
+symbol = "ETHUSDT"
+venue = "binance_paper"
 # Binance USD-M ETHUSDT steps in 0.001 contracts.
 qty_decimals = 3
 # 0.01 ETH, above the venue's minimum with room to spare.
@@ -1223,10 +1228,8 @@ cooloff_ms = 2000
 
 [[hedge.pairs]]
 pair_id = 3
-symbol = "BNB"
-venue = "hyperliquid_paper"
-# Core book, no builder prefix -- see `feed/hyperliquid.rs` for why the prefix matters elsewhere.
-dex = ""
+symbol = "BNBUSDT"
+venue = "binance_paper"
 qty_decimals = 2
 min_qty_base = "10000000000000000"
 max_drift_base = "50000000000000000000"
@@ -1237,10 +1240,8 @@ cooloff_ms = 2000
 
 [[hedge.pairs]]
 pair_id = 4
-symbol = "XRP"
-venue = "hyperliquid_paper"
-# Core book, no builder prefix -- see `feed/hyperliquid.rs` for why the prefix matters elsewhere.
-dex = ""
+symbol = "XRPUSDT"
+venue = "binance_paper"
 qty_decimals = 1
 min_qty_base = "1000000"
 max_drift_base = "20000000000"
@@ -1251,10 +1252,8 @@ cooloff_ms = 2000
 
 [[hedge.pairs]]
 pair_id = 5
-symbol = "SOL"
-venue = "hyperliquid_paper"
-# Core book, no builder prefix -- see `feed/hyperliquid.rs` for why the prefix matters elsewhere.
-dex = ""
+symbol = "SOLUSDT"
+venue = "binance_paper"
 qty_decimals = 2
 min_qty_base = "10000000"
 max_drift_base = "250000000000"
@@ -1317,10 +1316,8 @@ cooloff_ms = 2000
 
 [[hedge.pairs]]
 pair_id = 2
-symbol = "BTC"
-venue = "hyperliquid_paper"
-# Core book, no builder prefix -- see `feed/hyperliquid.rs` for why the prefix matters elsewhere.
-dex = ""
+symbol = "BTCUSDT"
+venue = "binance_paper"
 qty_decimals = 3
 # 0.001 BTC (8 decimals).
 min_qty_base = "100000"

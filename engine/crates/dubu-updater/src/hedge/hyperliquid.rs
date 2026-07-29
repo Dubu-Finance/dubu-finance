@@ -62,8 +62,28 @@ pub struct PaperFill {
     pub qty: f64,
     /// The mid at the moment it was written.
     pub mid: f64,
+    /// What it filled at, after crossing the book and paying the taker fee.
+    pub price: f64,
+    /// What that cost against the mid, in hundredths of a basis point. Always positive: crossing is
+    /// never free, and a paper book that says it is reports a hedge cheaper than any real one.
+    pub cost_bps_e2: u32,
     /// Net position after this fill, signed. Positive is long.
     pub position: f64,
+}
+
+/// One market as the paper book sees it.
+///
+/// The curves are what make a paper fill honest about size. A hedge clip is routinely larger than
+/// the top of book -- 25 ETH is $47,700 against $37,845 resting, and 20,000 XRP is nearly six times
+/// the best bid -- so filling at mid understates the cost of every crossing the pool actually makes.
+#[derive(Debug, Clone, Default)]
+pub struct Quote {
+    /// Mid price.
+    pub mid: f64,
+    /// Bid side, best first, as a cumulative concession curve. Empty for a mid-only source.
+    pub bids: Vec<super::binance::DepthPoint>,
+    /// Ask side, same.
+    pub asks: Vec<super::binance::DepthPoint>,
 }
 
 /// Anything that can go wrong reading this venue.
@@ -85,8 +105,12 @@ pub enum VenueError {
 pub struct Paper {
     base: String,
     http: reqwest::Client,
-    /// Latest mid per symbol, across every dex polled.
-    mids: BTreeMap<String, f64>,
+    /// Public Binance REST, for the pairs that price against spot.
+    binance_base: String,
+    /// Taker fee charged on every paper fill, in hundredths of a basis point.
+    fee_bps_e2: u32,
+    /// Latest quote per symbol, across every book polled.
+    books: BTreeMap<String, Quote>,
     /// Signed position per symbol. Positive is long.
     positions: BTreeMap<String, f64>,
     /// Every paper fill, newest last. Bounded so a long run cannot grow without limit.
@@ -112,7 +136,9 @@ impl Paper {
         Ok(Self {
             base: base.into(),
             http,
-            mids: BTreeMap::new(),
+            binance_base: "https://api.binance.com".to_string(),
+            fee_bps_e2: 0,
+            books: BTreeMap::new(),
             positions: BTreeMap::new(),
             fills: Vec::new(),
             last_poll: None,
@@ -155,7 +181,15 @@ impl Paper {
             // venue's own precision instead of whatever a JSON float round-trip leaves.
             if let Some(px) = val.as_str().and_then(|s| s.parse::<f64>().ok()) {
                 if px > 0.0 {
-                    self.mids.insert(k.clone(), px);
+                    // Mid-only: `allMids` carries no depth, so a fill here pays the fee and
+                    // nothing for size. Honest and optimistic, and the equity pairs know it.
+                    self.books.insert(
+                        k.clone(),
+                        Quote {
+                            mid: px,
+                            ..Quote::default()
+                        },
+                    );
                     n += 1;
                 }
             }
@@ -170,10 +204,85 @@ impl Paper {
     /// # Errors
     /// [`VenueError::NoPrice`] if nothing has been polled for it.
     pub fn mid(&self, symbol: &str) -> Result<f64, VenueError> {
-        self.mids
+        self.books
             .get(symbol)
-            .copied()
+            .map(|q| q.mid)
             .ok_or_else(|| VenueError::NoPrice(symbol.to_string()))
+    }
+
+    /// Charge this taker fee on every paper fill, in hundredths of a basis point.
+    pub const fn charge(&mut self, fee_bps_e2: u32) {
+        self.fee_bps_e2 = fee_bps_e2;
+    }
+
+    /// Point the spot poller somewhere else. Defaults to public Binance.
+    pub fn spot_base(&mut self, base: impl Into<String>) {
+        self.binance_base = base.into();
+    }
+
+    /// Refresh the order book for each symbol from public Binance spot.
+    ///
+    /// Unsigned, so no key and no clock: `/api/v3/depth` is public. One request per symbol, which is
+    /// the cost of having both sides at depth -- `allMids` gives a number, and a number cannot say
+    /// what a 25 ETH clip pays.
+    ///
+    /// A symbol that fails keeps its previous quote rather than being dropped: a stale book prices a
+    /// hedge slightly wrong, an absent one refuses it entirely and leaves the exposure standing.
+    ///
+    /// # Errors
+    /// Never returns `Err`; per-symbol failures are counted. Returns how many books were refreshed.
+    pub async fn poll_books(&mut self, symbols: &[String]) -> usize {
+        let mut n = 0;
+        for symbol in symbols {
+            let url = format!(
+                "{}/api/v3/depth?symbol={symbol}&limit=100",
+                self.binance_base
+            );
+            let Ok(resp) = self.http.get(&url).send().await else {
+                self.failures = self.failures.saturating_add(1);
+                continue;
+            };
+            let Ok(v) = resp.json::<serde_json::Value>().await else {
+                self.failures = self.failures.saturating_add(1);
+                continue;
+            };
+            let side = |k: &str| -> Vec<(f64, f64)> {
+                v.get(k)
+                    .and_then(|l| l.as_array())
+                    .map(|l| {
+                        l.iter()
+                            .filter_map(|e| {
+                                let px = e.get(0)?.as_str()?.parse::<f64>().ok()?;
+                                let sz = e.get(1)?.as_str()?.parse::<f64>().ok()?;
+                                Some((px, sz))
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            };
+            let (bids, asks) = (side("bids"), side("asks"));
+            let (Some(&(best_bid, _)), Some(&(best_ask, _))) = (bids.first(), asks.first()) else {
+                self.failures = self.failures.saturating_add(1);
+                continue;
+            };
+            let mid = (best_bid + best_ask) / 2.0;
+            let depth = |l: &[(f64, f64)]| {
+                let cum: f64 = l.iter().map(|&(_, s)| s).sum();
+                super::binance::depth_curve(l, mid, cum)
+            };
+            self.books.insert(
+                symbol.clone(),
+                Quote {
+                    mid,
+                    bids: depth(&bids),
+                    asks: depth(&asks),
+                },
+            );
+            n += 1;
+        }
+        self.last_poll = Some(Instant::now());
+        self.polls = self.polls.saturating_add(1);
+        n
     }
 
     /// How stale the book is, or `None` before the first poll.
@@ -216,10 +325,34 @@ impl Paper {
     /// reports a cost that never existed, which is worse than reporting nothing. The caller sees
     /// the error and leaves the drift outstanding, exactly as it would for a rejected live order.
     ///
+    /// Priced by walking the book, not filled at mid. A hedge clip is routinely larger than the top
+    /// of book, so a mid fill quietly reports a hedge cheaper than any that could be executed --
+    /// which is exactly the number the whole exercise exists to measure. A mid-only source charges
+    /// the fee and nothing for size, which is optimistic and recorded as such in `cost_bps_e2`.
+    ///
     /// # Errors
-    /// [`VenueError::NoPrice`] if the symbol has no polled mid.
+    /// [`VenueError::NoPrice`] if the symbol has no polled quote.
     pub fn write(&mut self, symbol: &str, side: Side, qty: f64) -> Result<PaperFill, VenueError> {
-        let mid = self.mid(symbol)?;
+        let quote = self
+            .books
+            .get(symbol)
+            .cloned()
+            .ok_or_else(|| VenueError::NoPrice(symbol.to_string()))?;
+        let mid = quote.mid;
+        // Buying walks the asks, selling walks the bids. Using one curve for both would charge a
+        // thin side's concession on the deep side and vice versa.
+        let curve = match side {
+            Side::Buy => &quote.asks,
+            Side::Sell => &quote.bids,
+        };
+        let concession = super::binance::concession_for(curve, qty).unwrap_or(0);
+        let cost_bps_e2 = concession.saturating_add(self.fee_bps_e2);
+        let cost = f64::from(cost_bps_e2) / 1_000_000.0;
+        // Always against us. A crossing pays in whichever direction it goes.
+        let price = match side {
+            Side::Buy => mid * (1.0 + cost),
+            Side::Sell => mid * (1.0 - cost),
+        };
         let signed = match side {
             Side::Buy => qty,
             Side::Sell => -qty,
@@ -234,6 +367,8 @@ impl Paper {
             side,
             qty,
             mid,
+            price,
+            cost_bps_e2,
             position: *position,
         };
         self.fills.push(fill.clone());
@@ -266,13 +401,71 @@ impl Paper {
 mod tests {
     use super::*;
 
+    fn mid_only(mid: f64) -> Quote {
+        Quote {
+            mid,
+            ..Quote::default()
+        }
+    }
+
     fn book() -> Paper {
         let mut p = Paper::new("http://unused", Duration::from_secs(1)).expect("client");
-        p.mids.insert("ETH".into(), 1917.95);
-        p.mids.insert("xyz:TSLA".into(), 307.305);
-        p.mids.insert("xyz:SKHY".into(), 132.77);
+        p.books.insert("ETH".into(), mid_only(1917.95));
+        p.books.insert("xyz:TSLA".into(), mid_only(307.305));
+        p.books.insert("xyz:SKHY".into(), mid_only(132.77));
         p.last_poll = Some(Instant::now());
         p
+    }
+
+    /// A clip larger than the top of book pays for the levels it eats. Filling at mid reports a
+    /// hedge nobody could execute, and at these sizes that is the number the exercise is measuring.
+    #[test]
+    fn a_clip_past_the_top_of_book_pays_for_the_depth_it_eats() {
+        let mut p = Paper::new("http://unused", Duration::from_secs(1)).expect("client");
+        p.charge(400);
+        // Asks 2 bp, 6 bp and 14 bp from a mid of 100, ten units at each.
+        p.books.insert(
+            "X".into(),
+            Quote {
+                mid: 100.0,
+                bids: super::super::binance::depth_curve(
+                    &[(99.98, 10.0), (99.94, 10.0), (99.86, 10.0)],
+                    100.0,
+                    30.0,
+                ),
+                asks: super::super::binance::depth_curve(
+                    &[(100.02, 10.0), (100.06, 10.0), (100.14, 10.0)],
+                    100.0,
+                    30.0,
+                ),
+            },
+        );
+        p.last_poll = Some(Instant::now());
+
+        let small = p.write("X", Side::Buy, 5.0).expect("priced");
+        let large = p.write("X", Side::Buy, 25.0).expect("priced");
+        assert!(
+            large.cost_bps_e2 > small.cost_bps_e2,
+            "25 units walks past the top of book and 5 does not"
+        );
+        assert!(
+            small.cost_bps_e2 >= 400,
+            "even the smallest fill pays the taker fee"
+        );
+        assert!(large.price > large.mid, "a buy always fills above mid");
+
+        let sold = p.write("X", Side::Sell, 25.0).expect("priced");
+        assert!(sold.price < sold.mid, "and a sell below it");
+    }
+
+    /// A mid-only source has no depth to charge for, so it charges the fee and says so. Optimistic
+    /// and legible, rather than silently free.
+    #[test]
+    fn a_mid_only_source_still_pays_the_fee() {
+        let mut p = book();
+        p.charge(400);
+        let f = p.write("ETH", Side::Sell, 1_000_000.0).expect("priced");
+        assert_eq!(f.cost_bps_e2, 400, "no book, so nothing but the fee");
     }
 
     /// A sell leaves a short and a buy closes it, which is the whole arithmetic the band relies on.
@@ -322,7 +515,7 @@ mod tests {
     #[test]
     fn the_same_ticker_on_two_dexs_is_two_markets() {
         let mut p = book();
-        p.mids.insert("flx:TSLA".into(), 395.50);
+        p.books.insert("flx:TSLA".into(), mid_only(395.50));
 
         p.write("xyz:TSLA", Side::Sell, 10.0).expect("priced");
         p.write("flx:TSLA", Side::Sell, 10.0).expect("priced");
