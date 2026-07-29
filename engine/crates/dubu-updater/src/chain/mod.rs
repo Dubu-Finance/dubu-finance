@@ -545,6 +545,25 @@ impl Rpc {
             .sum()
     }
 
+    /// The same count split per endpoint, in pool order.
+    ///
+    /// The sum above cannot answer the only question worth asking when reads start failing —
+    /// *which* endpoint — and neither can the errors, because every variant is built with
+    /// `self.name`, the pool's label, under a field documented as "which endpoint". So a pool of
+    /// six reported six identical failures, and an afternoon of 429s was unattributable: the
+    /// obvious reading was that the endpoint named in the message was the one being throttled, and
+    /// nothing in the log could confirm or deny it.
+    ///
+    /// Positions rather than URLs. An endpoint's URL carries an API key and this crate has exactly
+    /// two places that unredact one; the caller matches these against its own configured list.
+    #[must_use]
+    pub fn rate_limit_events_by_endpoint(&self) -> Vec<u64> {
+        self.endpoints
+            .iter()
+            .map(|e| Self::lock_of(e).rate_limit_events)
+            .collect()
+    }
+
     fn lock_of(e: &Endpoint) -> std::sync::MutexGuard<'_, Limiter> {
         e.limiter
             .lock()

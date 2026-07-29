@@ -91,7 +91,78 @@ pub const OVERLAP_BLOCKS: u64 = 2;
 ///
 /// Public RPCs cap the range and the cap is not advertised; exceeding it returns an error rather
 /// than a truncated result, so a poll that spans more than this is split into several calls.
-pub const MAX_RANGE_BLOCKS: u64 = 500;
+///
+/// **Ten, because that is the cap [`OVERLAP_BLOCKS`] is already written around.** Five hundred was
+/// not a second opinion about the limit, it was the same limit forgotten a few lines down, and the
+/// read pool is what hid it: the rotation lands either on a public endpoint, which answers a wide
+/// range, or on Nodit, which returns `-32604`. So the scan half-worked, and half-working looks
+/// healthy.
+///
+/// It stopped working entirely the first time the gap outgrew what one lucky call could cover — an
+/// engine restart left the cursor 792 blocks behind the head — and then could not recover, because
+/// the cursor only advances over ranges that were read. Every poll re-requested the whole gap,
+/// every poll was refused, and markout went blind for half an hour behind nothing louder than a
+/// warning.
+pub const MAX_RANGE_BLOCKS: u64 = 10;
+
+/// Chunks one poll will request before leaving the rest to the next one.
+///
+/// Ten-block chunks turn a six-hundred-block gap into sixty sequential round trips, which would
+/// stall a 330 ms cycle for seconds — trading a scan that never catches up for a quote loop that
+/// stops quoting. The cursor persists between polls, so a bounded number of chunks drains the gap
+/// over a few cycles instead, and the read pool sees a trickle rather than a burst it rate-limits.
+pub const CHUNKS_PER_POLL_MAX: u32 = 8;
+
+/// The tightest `eth_getLogs` range cap any endpoint in the read pool imposes.
+///
+/// Nodit's free tier, measured: eleven blocks returns `-32604`, ten does not. Public because it is
+/// a fact about the environment rather than a knob — anything else that batches a range read has
+/// to respect the same ceiling, and the last time it was written down only in prose the range
+/// constant drifted to fifty times it.
+pub const GETLOGS_RANGE_CAP_MIN: u64 = 10;
+
+// Compile-time, not a test, because the two constants disagreeing is the entire defect and a
+// failing test is a weaker signal than a failing build. `MAX_RANGE_BLOCKS` was five hundred against
+// a cap of ten for as long as the rotation kept landing on an endpoint that tolerated it.
+const _: () = assert!(
+    MAX_RANGE_BLOCKS <= GETLOGS_RANGE_CAP_MIN,
+    "a chunk wider than the tightest cap fails whenever the read pool rotates onto that endpoint"
+);
+const _: () = assert!(
+    OVERLAP_BLOCKS < MAX_RANGE_BLOCKS,
+    "the overlap must fit inside one chunk or no range is ever readable"
+);
+
+/// Where a poll starts reading, and what it gave up on to get there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RangePlan {
+    /// First block this poll will request.
+    pub first: u64,
+    /// Blocks abandoned because the cursor had fallen further behind than [`MAX_LOOKBACK_BLOCKS`].
+    pub skipped: u64,
+}
+
+/// Where to start reading, given the cursor and the head.
+///
+/// Pure, and separated for one reason: this is the arithmetic that wedged the scan, and it was
+/// unreachable from a test because [`SwapWatch::poll`] needs a live [`Rpc`] to get to it. The bug
+/// was three lines of integer arithmetic guarded by two constants that disagreed with each other,
+/// which is exactly the shape that should never have needed a node to exercise.
+#[must_use]
+pub const fn plan_ranges(cursor: u64, head: u64) -> RangePlan {
+    let from = cursor.saturating_sub(OVERLAP_BLOCKS);
+    if head.saturating_sub(from) > MAX_LOOKBACK_BLOCKS {
+        let jump = head.saturating_sub(MAX_LOOKBACK_BLOCKS);
+        return RangePlan {
+            first: jump,
+            skipped: jump.saturating_sub(from),
+        };
+    }
+    RangePlan {
+        first: from,
+        skipped: 0,
+    }
+}
 
 /// How far behind the head the cursor may fall before the watcher gives up and jumps forward.
 ///
@@ -147,6 +218,15 @@ pub struct Polled {
     /// Fills dropped because their block's timestamp could not be established. See
     /// [`SwapWatch::resolve_timestamps`].
     pub unresolved: u64,
+    /// Chunks this poll gave up on. At most one: the poll stops at the first refusal so the fills
+    /// it already holds survive, and the cursor is left pointing at the range that failed.
+    pub unread_chunks: u64,
+    /// Blocks still between the cursor and the head when the poll ran out of its chunk budget.
+    ///
+    /// Zero on a poll that caught up. Non-zero is the scan draining a gap, which is normal after a
+    /// restart and a fault if it does not fall. A cursor quietly behind reads exactly like a chain
+    /// with nothing happening on it, and that is how half an hour of blindness went unnoticed.
+    pub behind_blocks: u64,
 }
 
 /// Follows `Swap` logs from one pool address.
@@ -233,23 +313,39 @@ impl SwapWatch {
             return Ok(Polled::default());
         }
 
-        let mut from = cursor.saturating_sub(OVERLAP_BLOCKS);
-        if head.saturating_sub(from) > MAX_LOOKBACK_BLOCKS {
-            let jump = head.saturating_sub(MAX_LOOKBACK_BLOCKS);
+        let plan = plan_ranges(cursor, head);
+        if plan.skipped > 0 {
             self.gaps += 1;
-            self.skipped_blocks += jump.saturating_sub(from);
-            from = jump;
+            self.skipped_blocks += plan.skipped;
         }
 
+        let mut from = plan.first;
         let mut out = Polled::default();
-        while from <= head {
+        let mut chunks = 0;
+        while from <= head && chunks < CHUNKS_PER_POLL_MAX {
             let to = head.min(from + MAX_RANGE_BLOCKS - 1);
-            let logs = self.fetch(rpc, from, BlockBound::Number(to)).await?;
+
+            // A failed chunk ends the poll but does not throw away the ones before it.
+            //
+            // `absorb` has already marked those fills seen, so returning `Err` here would discard
+            // the only copy there will ever be: the next poll re-reads the range and `remember`
+            // rejects every one of them as a duplicate. The cursor stays put for the failed range,
+            // which is what makes stopping here safe.
+            let Ok(logs) = self.fetch(rpc, from, BlockBound::Number(to)).await else {
+                out.unread_chunks += 1;
+                return Ok(out);
+            };
             self.absorb(&logs, &mut out);
-            // Only now: the range is in hand, so re-reading it is unnecessary. A `?` above leaves
-            // the cursor where it was and the next poll repeats this range.
+            // Only now: the range is in hand, so re-reading it is unnecessary. Leaving the cursor
+            // where it was makes the next poll repeat this range.
             self.cursor = Some(to);
             from = to + 1;
+            chunks += 1;
+        }
+        // The gap outlasted this poll's budget. Say so rather than letting a cursor that is quietly
+        // behind read as a chain with nothing on it.
+        if from <= head {
+            out.behind_blocks = head.saturating_sub(from).saturating_add(1);
         }
 
         // Preconfirmed fills, on a path that deliberately does NOT move the cursor.
@@ -453,6 +549,72 @@ mod tests {
     use super::*;
     use alloy_primitives::{address, b256, hex, U256};
     use alloy_sol_types::SolValue;
+
+    /// Walks the same loop `poll` runs, so the chunk widths and the budget are asserted rather
+    /// than assumed. Returns the ranges a single poll would request.
+    fn chunks_of(cursor: u64, head: u64) -> Vec<(u64, u64)> {
+        let mut from = plan_ranges(cursor, head).first;
+        let mut out = Vec::new();
+        while from <= head && u32::try_from(out.len()).unwrap_or(u32::MAX) < CHUNKS_PER_POLL_MAX {
+            let to = head.min(from + MAX_RANGE_BLOCKS - 1);
+            out.push((from, to));
+            from = to + 1;
+        }
+        out
+    }
+
+    #[test]
+    fn a_poll_never_requests_a_range_wider_than_one_chunk() {
+        for (cursor, head) in [(100, 101), (100, 130), (100, 900), (0, 5)] {
+            for (from, to) in chunks_of(cursor, head) {
+                assert!(
+                    to.saturating_sub(from) < MAX_RANGE_BLOCKS,
+                    "range {from}..={to} spans more blocks than one chunk may request"
+                );
+            }
+        }
+    }
+
+    /// The failure mode: an engine restart left the cursor 792 blocks back, every poll asked for
+    /// the whole gap, every poll was refused, and the cursor never moved. The scan must instead
+    /// take a bounded bite and leave the rest for the next poll.
+    #[test]
+    fn a_gap_too_large_for_one_poll_is_drained_rather_than_retried_whole() {
+        let head = 31_978_540;
+        let mut cursor = head - 792;
+
+        let first = chunks_of(cursor, head);
+        assert_eq!(
+            first.len(),
+            CHUNKS_PER_POLL_MAX as usize,
+            "a large gap should spend the whole chunk budget"
+        );
+
+        // Advance as `poll` does, and confirm the gap actually closes.
+        let mut polls = 0;
+        while cursor < head {
+            let taken = chunks_of(cursor, head);
+            assert!(!taken.is_empty(), "a poll behind the head must read something");
+            cursor = taken.last().expect("non-empty").1;
+            polls += 1;
+            assert!(polls < 100, "the gap is not draining");
+        }
+        assert_eq!(cursor, head, "the scan catches up exactly");
+    }
+
+    /// Past the lookback limit the scan gives up on the tail rather than reading forever, and says
+    /// how much it abandoned.
+    #[test]
+    fn a_gap_past_the_lookback_limit_jumps_forward_and_counts_what_it_skipped() {
+        let head = 1_000_000;
+        let plan = plan_ranges(head - 5_000, head);
+        assert_eq!(plan.first, head - MAX_LOOKBACK_BLOCKS);
+        assert_eq!(plan.skipped, 5_000 - MAX_LOOKBACK_BLOCKS + OVERLAP_BLOCKS);
+
+        let near = plan_ranges(head - 5, head);
+        assert_eq!(near.skipped, 0, "a small gap skips nothing");
+        assert_eq!(near.first, head - 5 - OVERLAP_BLOCKS);
+    }
 
     fn pool() -> Address {
         address!("00000000000000000000000000000000000000AA")

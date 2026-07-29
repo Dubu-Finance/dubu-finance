@@ -1709,6 +1709,18 @@ async fn scan_fills(rt: &mut Runtime, head: &heads::HeadSnapshot, view: &ChainVi
         }
     };
 
+    // A cursor quietly behind the head reads exactly like a chain with nothing happening on it,
+    // which is how this scan sat 792 blocks back for half an hour without anything louder than a
+    // per-poll warning. Draining is normal after a restart; not draining is the fault.
+    if polled.behind_blocks > 0 || polled.unread_chunks > 0 {
+        warn!(
+            target: "markout", event = "scan_behind",
+            behind_blocks = polled.behind_blocks, unread_chunks = polled.unread_chunks,
+            cursor = ?rt.swaps.cursor(), head = confirmed,
+            "the Swap scan has not caught up; fills in the gap are not in any markout total yet"
+        );
+    }
+
     if polled.undecodable > 0 || polled.unresolved > 0 {
         error!(
             target: "markout", event = "logs_lost",
@@ -1917,6 +1929,12 @@ async fn run_cycle(
             // once there is third-party flow to see.
             reads = rt.view.polls(), read_failures = rt.view.failures(),
             quiet_polls = rt.view.quiet_polls(),
+            // Per endpoint, in the order they were configured, because the failure messages cannot
+            // say which one: they all carry the pool's name. A rising count against one position is
+            // a key to rotate or a limit to raise; a rising count against every position is a rate
+            // the whole pool cannot serve, and the two want opposite responses.
+            rate_limited_by_endpoint = %rt.rpc.rate_limit_events_by_endpoint()
+                .iter().map(u64::to_string).collect::<Vec<_>>().join(","),
             "cycle"
         );
     }
