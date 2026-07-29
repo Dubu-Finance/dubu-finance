@@ -42,7 +42,18 @@
 # Observed: 231 consecutive cycles with heads down and no other symptom.
 #
 # The websocket still has no fallback list of its own, which is the remaining gap here.
-ws_url = "wss://giwa-sepolia.nodit.io/${NODIT_API_KEY_7}"
+# KEY_7 until its daily allowance ran out, which took the subscription down with it and was
+# invisible: 172 consecutive cycles with `heads_status: down`, one warning, and no alarm. The
+# symptom reached the screen instead -- with no block heads the cycle falls back to a timer that
+# measured 1.3s median but 14s at worst, the ladder aged past `maxStaleSecs` in every long gap, and
+# the prop venue blinked in and out of the aggregator while RFQ, which writes nothing, stayed up.
+#
+# Moved to KEY_6, which was one of two keys of seven still alive. That is a stopgap and worth naming
+# as one: KEY_6 also serves the read and write pools, and `newHeads` adds ~86k events a day on top,
+# so this trades a dead subscription today for a key that dies sooner. The real fix is a plan whose
+# allowance is monthly rather than daily -- the seven-key arrangement exists only to work around a
+# 1M/day cap, and it stops being necessary the moment that cap does.
+ws_url = "wss://giwa-sepolia.nodit.io/${NODIT_API_KEY_6}"
 
 # TRANSACTIONS AND ANYTHING CANONICAL: nonce, receipts, startup metadata. Defaults to Nodit now
 # that it exists — 20 rapid eth_blockNumber calls returned 200 every time, where the public
