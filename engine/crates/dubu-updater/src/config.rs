@@ -1901,6 +1901,16 @@ pub struct PairConfig {
     #[serde(default)]
     pub min_venues: Option<u8>,
 
+    /// Correlation group, for jump contagion. Pairs in the same group withdraw together.
+    ///
+    /// A claim about correlation, so it is stated rather than inferred. `jump.scope = "book"` used
+    /// to mean literally every pair, which was right when the book was BTC and ETH; listing
+    /// equities broke it, because SK Hynix moving says nothing about ETH and SKHY is the most
+    /// volatile market here. Leaving it unset puts a pair in the default group with every other
+    /// unset pair, which reproduces the old behaviour.
+    #[serde(default)]
+    pub jump_group: String,
+
     /// Which symbol each venue quotes this pair under. At least as many as the quorum needs.
     pub venues: PairVenues,
     /// Decimals of the base token. Verified against the deployed ERC-20 at startup.

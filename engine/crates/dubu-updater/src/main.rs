@@ -583,11 +583,18 @@ async fn run(args: &Args) -> Result<i32, Box<dyn std::error::Error>> {
             )
         })
         .collect();
-    let jump_book = jump::Book::new(
+    let jump_groups: BTreeMap<u16, String> = cfg
+        .pairs
+        .iter()
+        .filter(|p| !p.jump_group.is_empty())
+        .map(|p| (p.pair_id, p.jump_group.clone()))
+        .collect();
+    let jump_book = jump::Book::grouped(
         &jump_bounds,
         cfg.jump.params(&cfg.skew),
         cfg.jump.scope,
         cfg.jump.enabled,
+        &jump_groups,
     );
     for (id, b) in &jump_bounds {
         info!(

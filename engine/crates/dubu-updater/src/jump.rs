@@ -630,6 +630,18 @@ struct Measured {
 #[derive(Debug, Clone)]
 pub struct Book {
     detectors: BTreeMap<u16, Detector>,
+    /// Which correlation group each pair belongs to. Contagion travels inside a group, never across.
+    ///
+    /// [`Scope::Book`] used to mean the whole book, and that was right when the book was BTC and
+    /// ETH: 80-90% correlated, so one's jump is genuinely information about the other. Listing
+    /// equities broke the premise. SK Hynix moving 19.5 bp says nothing about ETH -- different
+    /// asset class, different hours, different drivers -- and because it is also the most volatile
+    /// market here, it was withdrawing all nine pairs. Measured on 2026-07-29: 6 trips produced 16
+    /// contagion withdrawals, and the pool spent the run dark.
+    ///
+    /// A group is a claim about correlation, so it is configuration rather than something inferred.
+    /// Pairs with no group named share the default one, which reproduces the old behaviour exactly.
+    groups: BTreeMap<u16, String>,
     scope: Scope,
     enabled: bool,
 }
@@ -638,14 +650,32 @@ impl Book {
     /// Build from `(pair_id, bounds)` pairs.
     #[must_use]
     pub fn new(pairs: &[(u16, Bounds)], params: Params, scope: Scope, enabled: bool) -> Self {
+        Self::grouped(pairs, params, scope, enabled, &BTreeMap::new())
+    }
+
+    /// The same, with each pair's correlation group. See [`Self::groups`].
+    #[must_use]
+    pub fn grouped(
+        pairs: &[(u16, Bounds)],
+        params: Params,
+        scope: Scope,
+        enabled: bool,
+        groups: &BTreeMap<u16, String>,
+    ) -> Self {
         Self {
             detectors: pairs
                 .iter()
                 .map(|&(id, b)| (id, Detector::new(params, b)))
                 .collect(),
+            groups: groups.clone(),
             scope,
             enabled,
         }
+    }
+
+    /// The group a pair belongs to. Unnamed pairs share one default group.
+    fn group_of(&self, id: u16) -> &str {
+        self.groups.get(&id).map_or("", String::as_str)
     }
 
     /// Whether detection is switched on at all. A disabled book never withdraws and never trips.
@@ -713,13 +743,28 @@ impl Book {
         if !self.enabled || self.scope == Scope::Pair {
             return Vec::new();
         }
+        // Resolved before the mutable borrow, and cloned rather than held: `group_of` borrows
+        // `self` and the loop below needs it mutably.
+        let origin_group = self.group_of(origin).to_string();
+        let peers: Vec<u16> = self
+            .groups
+            .iter()
+            .map(|(&id, g)| (id, g.as_str() == origin_group))
+            .chain(
+                self.detectors
+                    .keys()
+                    .filter(|id| !self.groups.contains_key(id))
+                    .map(|&id| (id, origin_group.is_empty())),
+            )
+            .filter(|&(id, same)| same && id != origin)
+            .map(|(id, _)| id)
+            .collect();
         let mut newly = Vec::new();
-        for (&id, d) in &mut self.detectors {
-            if id == origin {
-                continue;
-            }
-            if d.contagion(now) {
-                newly.push(id);
+        for id in peers {
+            if let Some(d) = self.detectors.get_mut(&id) {
+                if d.contagion(now) {
+                    newly.push(id);
+                }
             }
         }
         newly
@@ -1121,7 +1166,66 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Scope
+    /// Contagion travels inside a correlation group and stops at its edge.
+    ///
+    /// The regression: `scope = "book"` meant every pair, which was right for BTC and ETH but not
+    /// once equities were listed. SKHY is the most volatile market in the book and the least related
+    /// to any of the others; measured on 2026-07-29, six of its trips produced sixteen contagion
+    /// withdrawals and the whole pool went dark.
+    #[test]
+    fn a_jump_in_one_group_does_not_withdraw_another() {
+        let b = Bounds::from_pair(1, 8);
+        let mut book = Book::grouped(
+            &[(1, b), (2, b), (8, b), (9, b)],
+            params(),
+            Scope::Book,
+            true,
+            &[
+                (1, "crypto".to_string()),
+                (2, "crypto".to_string()),
+                (8, "equity".to_string()),
+                (9, "equity".to_string()),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        let hit = book.contagion(8, Instant::now());
+        assert_eq!(
+            hit,
+            vec![9],
+            "only the other equity; ETH and BTC are untouched"
+        );
+
+        let mut book2 = Book::grouped(
+            &[(1, b), (2, b), (8, b), (9, b)],
+            params(),
+            Scope::Book,
+            true,
+            &[
+                (1, "crypto".to_string()),
+                (2, "crypto".to_string()),
+                (8, "equity".to_string()),
+                (9, "equity".to_string()),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        assert_eq!(
+            book2.contagion(1, Instant::now()),
+            vec![2],
+            "and a crypto jump stays in crypto"
+        );
+    }
+
+    /// No groups named is the old behaviour exactly: one default group holding everything.
+    #[test]
+    fn ungrouped_pairs_share_one_group() {
+        let b = Bounds::from_pair(1, 8);
+        let mut book = Book::new(&[(1, b), (2, b), (8, b)], params(), Scope::Book, true);
+        assert_eq!(book.contagion(1, Instant::now()), vec![2, 8]);
+    }
+
+    // Scope    // Scope
     // -----------------------------------------------------------------------
 
     #[test]

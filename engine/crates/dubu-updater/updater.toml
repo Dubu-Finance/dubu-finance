@@ -654,7 +654,7 @@ half_spread_bps = 1
 # bound, not a target — the solver narrows it whenever the fair-value ceiling on maxBid binds.
 # Above ~500 bp here the ceiling binds first: the solver lifts maxBid by `W * capture / 2C`, the
 # ceiling allows only `half_spread` of lift, so `W <= 2 * 5bp * 1000/20 = 500 bp`.
-width_bps = 8
+width_bps = 17
 
 # The jump detector's floor, stated separately from s0 now that s0 is 1 bp.
 #
@@ -730,6 +730,10 @@ capacity_divergence_pct = 30
 # bias wearing the costume of redundancy — while its ETH-USDT book is the right unit but so thin
 # that its trade-driven `ticker` channel updated in 4 of 24 samples and would have counted toward
 # quorum while contributing nothing.
+# Jump contagion travels inside this group only. Crypto pairs are 80-90% correlated so
+# one's jump is information about the others; an equity's is not.
+jump_group = "crypto"
+
 [pairs.venues]
 binance = "ETHUSDT"
 okx     = "ETH-USDT"
@@ -753,7 +757,7 @@ quote_decimals = 6
 # reason its width is 40 against ETH's 25: it is the less liquid of the two references and
 # its own sigma carries it further anyway.
 half_spread_bps = 2
-width_bps = 12
+width_bps = 9
 
 # Same as pair 1. BTC's reference is noisier, so its floor stays the wider of the two.
 jump_floor_bps = 8
@@ -784,6 +788,10 @@ heartbeat_secs = 5
 adverse_drift_bps = 0.5
 favourable_drift_bps = 5
 capacity_divergence_pct = 30
+
+# Jump contagion travels inside this group only. Crypto pairs are 80-90% correlated so
+# one's jump is information about the others; an equity's is not.
+jump_group = "crypto"
 
 [pairs.venues]
 binance = "BTCUSDT"
@@ -837,7 +845,7 @@ ask_capacity = "2200"
 capacity_divergence_pct = 30
 
 half_spread_bps = 2
-width_bps = 6
+width_bps = 9
 jump_floor_bps = 5
 max_push_interval_ms = 330
 adverse_drift_bps = 0.3
@@ -846,6 +854,10 @@ heartbeat_secs = 5
 
 # Every venue's own spelling. Naming a venue here is what enables it; OKX hyphenates where the
 # other two do not, and getting that wrong drops the pair below its quorum rather than erroring.
+# Jump contagion travels inside this group only. Crypto pairs are 80-90% correlated so
+# one's jump is information about the others; an equity's is not.
+jump_group = "crypto"
+
 [pairs.venues]
 binance = "BNBUSDT"
 okx     = "BNB-USDT"
@@ -875,7 +887,7 @@ ask_capacity = "1000000"
 capacity_divergence_pct = 30
 
 half_spread_bps = 3
-width_bps = 10
+width_bps = 14
 jump_floor_bps = 8
 max_push_interval_ms = 330
 adverse_drift_bps = 0.5
@@ -884,6 +896,10 @@ heartbeat_secs = 5
 
 # Every venue's own spelling. Naming a venue here is what enables it; OKX hyphenates where the
 # other two do not, and getting that wrong drops the pair below its quorum rather than erroring.
+# Jump contagion travels inside this group only. Crypto pairs are 80-90% correlated so
+# one's jump is information about the others; an equity's is not.
+jump_group = "crypto"
+
 [pairs.venues]
 binance = "XRPUSDT"
 okx     = "XRP-USDT"
@@ -913,7 +929,7 @@ ask_capacity = "10000"
 capacity_divergence_pct = 30
 
 half_spread_bps = 3
-width_bps = 8
+width_bps = 18
 jump_floor_bps = 7
 max_push_interval_ms = 330
 adverse_drift_bps = 0.4
@@ -922,6 +938,10 @@ heartbeat_secs = 5
 
 # Every venue's own spelling. Naming a venue here is what enables it; OKX hyphenates where the
 # other two do not, and getting that wrong drops the pair below its quorum rather than erroring.
+# Jump contagion travels inside this group only. Crypto pairs are 80-90% correlated so
+# one's jump is information about the others; an equity's is not.
+jump_group = "crypto"
+
 [pairs.venues]
 binance = "SOLUSDT"
 okx     = "SOL-USDT"
@@ -981,7 +1001,7 @@ capacity_divergence_pct = 30
 
 # One venue, a closing bell, and an uncorrected basis -- not volatility. See the header.
 half_spread_bps = 8
-width_bps = 14
+width_bps = 6
 jump_floor_bps = 15
 max_push_interval_ms = 330
 adverse_drift_bps = 0.8
@@ -991,6 +1011,10 @@ heartbeat_secs = 5
 # The builder prefix is part of the venue's name for this market, not decoration: `flx:AAPL` is a
 # different market that happens to share a ticker. See `feed/hyperliquid.rs`.
 min_venues = 1
+
+# Jump contagion travels inside this group only. Crypto pairs are 80-90% correlated so
+# one's jump is information about the others; an equity's is not.
+jump_group = "equity"
 
 [pairs.venues]
 hyperliquid = "xyz:AAPL"
@@ -1017,7 +1041,7 @@ capacity_divergence_pct = 30
 # spread as the others: the disagreement is between books we do not use, and the vol difference is
 # inside the noise of an 11-sample estimate.
 half_spread_bps = 8
-width_bps = 14
+width_bps = 6
 jump_floor_bps = 15
 max_push_interval_ms = 330
 adverse_drift_bps = 0.8
@@ -1025,6 +1049,10 @@ favourable_drift_bps = 8
 heartbeat_secs = 5
 
 min_venues = 1
+
+# Jump contagion travels inside this group only. Crypto pairs are 80-90% correlated so
+# one's jump is information about the others; an equity's is not.
+jump_group = "equity"
 
 [pairs.venues]
 hyperliquid = "xyz:TSLA"
@@ -1048,7 +1076,7 @@ ask_capacity = "7600"
 capacity_divergence_pct = 30
 
 half_spread_bps = 8
-width_bps = 14
+width_bps = 43
 jump_floor_bps = 15
 max_push_interval_ms = 330
 adverse_drift_bps = 0.8
@@ -1056,6 +1084,10 @@ favourable_drift_bps = 8
 heartbeat_secs = 5
 
 min_venues = 1
+
+# Jump contagion travels inside this group only. Crypto pairs are 80-90% correlated so
+# one's jump is information about the others; an equity's is not.
+jump_group = "equity"
 
 [pairs.venues]
 hyperliquid = "xyz:SKHY"
@@ -1079,7 +1111,7 @@ ask_capacity = "8600"
 capacity_divergence_pct = 30
 
 half_spread_bps = 8
-width_bps = 14
+width_bps = 6
 jump_floor_bps = 15
 max_push_interval_ms = 330
 adverse_drift_bps = 0.8
@@ -1087,6 +1119,10 @@ favourable_drift_bps = 8
 heartbeat_secs = 5
 
 min_venues = 1
+
+# Jump contagion travels inside this group only. Crypto pairs are 80-90% correlated so
+# one's jump is information about the others; an equity's is not.
+jump_group = "equity"
 
 [pairs.venues]
 hyperliquid = "xyz:SPCX"
