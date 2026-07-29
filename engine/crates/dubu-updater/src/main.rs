@@ -2049,9 +2049,17 @@ async fn run_cycle(
         // that will actually be posted: a wider spread pushes the bid target lower and therefore
         // leaves less room to skew down, and clamping against the unwidened value would let the
         // skew push a row under the pair's `minPrice` and have it refused outright.
+        // Rescaled from the estimator's inventory window to the quote's own exposure window. The
+        // skew keeps the 300 s number because inventory really is held that long; a posted quote is
+        // not. See `spread::rescale_sigma`.
+        let spread_sigma = spread::rescale_sigma(
+            sigma_millibps,
+            rt.cfg.skew.vol_horizon_secs,
+            rt.cfg.skew.spread_horizon_secs,
+        );
         let spread = spread::compute(
             pair.half_spread_bps,
-            sigma_millibps,
+            spread_sigma,
             degraded_extra,
             &rt.cfg.spread.params(),
         );

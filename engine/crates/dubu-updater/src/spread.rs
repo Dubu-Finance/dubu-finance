@@ -108,6 +108,40 @@
 
 use dubu_core::ladder::MAX_BPS;
 
+/// Rescale a sigma measured over one window to the window a quote is actually exposed for.
+///
+/// # Why this exists
+///
+/// The volatility estimator reports over `skew.vol_horizon_secs`, 300 s, because that is roughly
+/// how long INVENTORY is held -- the skew's exposure. The half-spread's exposure is something else
+/// entirely: how long a posted quote can be hit at a price the market has left behind. The module
+/// docs above argued the 300 s horizon "already pays for it, seventeen times over" and named the
+/// measurement that would change the answer -- `quote_age_secs` showing a fat tail past a few
+/// seconds. It was measured on 2026-07-29 over 360 decisions:
+///
+/// ```text
+/// p50 0.00 s   p90 2.00 s   p99 3.00 s   p100 364.00 s
+/// ```
+///
+/// So the exposure window is two to three seconds, and sizing the spread off a five-minute move was
+/// covering it sqrt(300/3) = 10x over. On ETH that is the difference between 5.67 bp and 1.47 bp of
+/// half-spread -- the margin was not a rounding error, it was most of the price.
+///
+/// The p100 is the honest caveat: one quote sat for six minutes, and for that quote the 300 s
+/// horizon was right. That case has its own explicit widening (`degraded_extra_half_spread_bps`),
+/// which is the mechanism meant to catch it; whether it actually fired there is not established.
+///
+/// Sigma scales as the square root of time, so this is `sigma * sqrt(to / from)`. Returns the input
+/// unchanged when either window is zero -- there is no sensible rescaling of an unmeasured sigma.
+#[must_use]
+pub fn rescale_sigma(sigma_millibps: u64, from_secs: u64, to_secs: u64) -> u64 {
+    if from_secs == 0 || to_secs == 0 || sigma_millibps == 0 {
+        return sigma_millibps;
+    }
+    let ratio = (to_secs as f64 / from_secs as f64).sqrt();
+    (sigma_millibps as f64 * ratio) as u64
+}
+
 /// The two knobs. Global rather than per-pair: `s1` is dimensionless and multiplies each pair's
 /// own sigma, so one value is already per-pair-correct, and the cap is a statement about the worst
 /// price the desk is willing to show anywhere.
@@ -394,5 +428,37 @@ mod tests {
             wide < narrow,
             "a wider spread must leave less headroom, got {wide} vs {narrow}"
         );
+    }
+
+    /// The quote's exposure window is not the inventory's, and sizing one off the other was most of
+    /// the half-spread. Measured 2026-07-29: `quote_age_secs` p90 = 2 s, p99 = 3 s, against a
+    /// 300 s estimator horizon.
+    #[test]
+    fn sigma_rescales_to_the_window_the_quote_is_actually_exposed_for() {
+        // ETH's measured sigma over 300 s, in thousandths of a bp.
+        let sigma_300 = 16_090;
+        let three = rescale_sigma(sigma_300, 300, 3);
+        assert!(
+            (1_550..=1_650).contains(&three),
+            "sqrt(3/300) = 1/10, so ~1.61 bp, got {three}"
+        );
+        // s0 = 1 bp, s1 = 0.29: 1 + 0.29 * 1.61 = 1.47 bp against 1 + 0.29 * 16.09 = 5.67 bp.
+        assert!(
+            rescale_sigma(sigma_300, 300, 300) == sigma_300,
+            "same window, same sigma"
+        );
+        assert!(
+            rescale_sigma(sigma_300, 300, 1200) > sigma_300,
+            "a longer window is a bigger move"
+        );
+    }
+
+    /// An unmeasured sigma has no rescaling, and neither does a zero window. Returning the input
+    /// keeps the caller's behaviour identical to before the horizon was split out.
+    #[test]
+    fn a_zero_anything_passes_through() {
+        assert_eq!(rescale_sigma(0, 300, 3), 0);
+        assert_eq!(rescale_sigma(5_000, 0, 3), 5_000);
+        assert_eq!(rescale_sigma(5_000, 300, 0), 5_000);
     }
 }

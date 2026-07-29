@@ -1219,6 +1219,15 @@ pub struct SkewConfig {
     /// default is the same window as `risk.bleed_window_secs`.
     #[serde(default = "d_vol_horizon_secs")]
     pub vol_horizon_secs: u64,
+
+    /// The window the HALF-SPREAD is exposed for, in seconds. See [`crate::spread::rescale_sigma`].
+    ///
+    /// Distinct from `vol_horizon_secs`, which is how long inventory is held and is the skew's
+    /// window. A quote's exposure is how long it can be hit at a price the market has left behind,
+    /// measured at p90 = 2 s and p99 = 3 s over 360 decisions on 2026-07-29. Sizing the spread off
+    /// the 300 s inventory window covered that 10x over and was most of ETH's 5.67 bp half-spread.
+    #[serde(default = "d_spread_horizon_secs")]
+    pub spread_horizon_secs: u64,
     /// Samples closer together than this are skipped rather than divided by a tiny interval.
     #[serde(default = "d_vol_min_sample_ms")]
     pub vol_min_sample_ms: u64,
@@ -1243,6 +1252,11 @@ fn d_vol_tau_ms() -> u64 {
 }
 fn d_max_in_flight() -> usize {
     2
+}
+
+/// The measured p99 of `quote_age_secs`. See [`crate::spread::rescale_sigma`].
+const fn d_spread_horizon_secs() -> u64 {
+    3
 }
 
 fn d_vol_horizon_secs() -> u64 {
