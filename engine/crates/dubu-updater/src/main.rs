@@ -225,6 +225,14 @@ struct Runtime {
     facts: ChainFacts,
     /// Ordinary RPC: transactions, nonce, receipts, startup metadata. Canonical.
     rpc: Rpc,
+    /// The read pool, held only to report on it.
+    ///
+    /// The reader task owns it and the cycle never issues a call through it — but the cycle is
+    /// where logging happens, and a pool whose rate limiting cannot be pinned to an endpoint is a
+    /// pool nobody can act on. Note this is a *different* pool from [`Self::rpc`]: reads pin to the
+    /// keyless public flashblocks endpoint and fall through to Nodit, writes go the other way.
+    /// Measuring one and reading it as the other is a mistake this field exists to prevent.
+    read_rpc: Arc<Rpc>,
     /// The chain state, published by the reader task rather than fetched here.
     ///
     /// `flash` and `reader` used to live on this struct and the cycle called them itself, which
@@ -725,9 +733,13 @@ async fn run(args: &Args) -> Result<i32, Box<dyn std::error::Error>> {
     // cycle run at whatever cadence the read was triggered at -- `newHeads`, one second -- and so
     // made one second the ceiling on how often the pool could re-price. A 96ms round trip does not
     // belong in a 200ms decision loop, so it moves out rather than in.
+    // A handle kept back purely to report on it. The reader owns the pool and the cycle never
+    // calls it, but the cycle is the only place that logs — and a read pool whose failures cannot
+    // be attributed to an endpoint is one nobody can act on.
+    let read_rpc = Arc::new(flash);
     tokio::spawn(view::run(
         Arc::new(reader),
-        Arc::new(flash),
+        Arc::clone(&read_rpc),
         Arc::clone(&view),
         Arc::clone(&health),
         view::Pacing::default(),
@@ -741,6 +753,7 @@ async fn run(args: &Args) -> Result<i32, Box<dyn std::error::Error>> {
         cfg,
         facts,
         rpc,
+        read_rpc,
         view: Arc::clone(&view),
         feeds,
         watch: VenueWatch::new(),
@@ -1933,7 +1946,12 @@ async fn run_cycle(
             // say which one: they all carry the pool's name. A rising count against one position is
             // a key to rotate or a limit to raise; a rising count against every position is a rate
             // the whole pool cannot serve, and the two want opposite responses.
-            rate_limited_by_endpoint = %rt.rpc.rate_limit_events_by_endpoint()
+            //
+            // Both pools, because `read_failures` above is the READ pool's and reading the write
+            // pool's counters against it explains the wrong thing entirely.
+            read_rate_limited_by_endpoint = %rt.read_rpc.rate_limit_events_by_endpoint()
+                .iter().map(u64::to_string).collect::<Vec<_>>().join(","),
+            write_rate_limited_by_endpoint = %rt.rpc.rate_limit_events_by_endpoint()
                 .iter().map(u64::to_string).collect::<Vec<_>>().join(","),
             "cycle"
         );
