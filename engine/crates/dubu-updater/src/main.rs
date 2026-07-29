@@ -270,6 +270,56 @@ struct Runtime {
 }
 
 /// Why this cycle is running. Logged on every cycle, because "the fallback timer has been the
+/// One killswitch per correlation group, each latching to its own file.
+///
+/// Separate files so an operator clears one group without resuming another.
+fn load_kills(cfg: &Config) -> Result<BTreeMap<String, KillSwitch>, Box<dyn std::error::Error>> {
+    assert!(
+        !cfg.pairs.is_empty(),
+        "config validation admits no empty book"
+    );
+
+    let mut groups: Vec<String> = cfg.pairs.iter().map(|p| p.jump_group.clone()).collect();
+    groups.sort_unstable();
+    groups.dedup();
+    assert!(!groups.is_empty());
+    assert!(groups.len() <= cfg.pairs.len());
+
+    let mut kills = BTreeMap::new();
+    for group in &groups {
+        let path = kill_state_path(&cfg.risk.state_path, group);
+        kills.insert(
+            group.clone(),
+            KillSwitch::load(
+                &path,
+                cfg.risk.bleed_window_secs,
+                cfg.risk.bleed_limit_units()?,
+                cfg.risk.loss_budget_units()?,
+            )?,
+        );
+    }
+    assert_eq!(
+        kills.len(),
+        groups.len(),
+        "one switch per group, no collisions"
+    );
+    Ok(kills)
+}
+
+/// `risk.json` for the unnamed group, `risk-crypto.json` for a named one.
+fn kill_state_path(base: &std::path::Path, group: &str) -> std::path::PathBuf {
+    if group.is_empty() {
+        return base.to_path_buf();
+    }
+    let stem = base.file_stem().unwrap_or_default();
+    let extension = base
+        .extension()
+        .map_or_else(|| "json".into(), |e| e.to_string_lossy());
+    let path = base.with_file_name(format!("{}-{group}.{extension}", stem.to_string_lossy()));
+    assert_ne!(path, base, "a named group must not share the default file");
+    path
+}
+
 /// only thing waking this loop for an hour" is invisible otherwise.
 #[derive(Debug, Clone, Copy)]
 enum Wake {
@@ -396,37 +446,7 @@ async fn run(args: &Args) -> Result<i32, Box<dyn std::error::Error>> {
     //
     // Each gets its own state file, so a latched group stays latched across restarts on its own and
     // an operator clears them one at a time.
-    let groups: Vec<String> = {
-        let mut g: Vec<String> = cfg.pairs.iter().map(|p| p.jump_group.clone()).collect();
-        g.sort_unstable();
-        g.dedup();
-        g
-    };
-    let mut kills: BTreeMap<String, KillSwitch> = BTreeMap::new();
-    for g in &groups {
-        let path = if g.is_empty() {
-            cfg.risk.state_path.clone()
-        } else {
-            let stem = cfg.risk.state_path.file_stem().unwrap_or_default();
-            cfg.risk.state_path.with_file_name(format!(
-                "{}-{g}.{}",
-                stem.to_string_lossy(),
-                cfg.risk
-                    .state_path
-                    .extension()
-                    .map_or_else(|| "json".into(), |e| e.to_string_lossy())
-            ))
-        };
-        kills.insert(
-            g.clone(),
-            KillSwitch::load(
-                &path,
-                cfg.risk.bleed_window_secs,
-                cfg.risk.bleed_limit_units()?,
-                cfg.risk.loss_budget_units()?,
-            )?,
-        );
-    }
+    let kills = load_kills(&cfg)?;
 
     let mut sender = Sender::new(
         signer,
@@ -2133,6 +2153,11 @@ async fn run_cycle(
             &rt.cfg.spread.params(),
         );
         let half_spread = spread.half_spread_e2;
+        // The floor is the operator's and the volatility term only ever adds to it. A half-spread
+        // below `s0` would mean the cap narrowed the configured spread, which `spread::compute` and
+        // the config validator both refuse -- asserted again here, on the value reaching the chain.
+        assert!(half_spread >= pair.half_spread_bps_e2());
+        assert!(u128::from(half_spread) < dubu_core::ladder::BPS_E2_MAX);
         // Every row, every cycle. Without these five fields, back-solving `s1` from history later
         // is guesswork — `vol_decibps` next to `capped` is what says whether the model or the
         // ceiling has been doing the deciding.
@@ -2203,6 +2228,21 @@ async fn run_cycle(
                 sigma_millibps,
                 &rt.cfg.skew.params(),
                 floor_cap,
+            );
+            // Net exposure is a share of the book, so it cannot exceed it. This caught nothing
+            // today, but the field's meaning changed today -- it used to be a deviation from a
+            // funding target and is now the exposure itself -- and that is exactly when a domain
+            // assertion earns its place.
+            assert!(
+                s.imbalance_ppm.abs() <= 1_000_000,
+                "imbalance out of domain: {}",
+                s.imbalance_ppm
+            );
+            assert!(
+                i32::from(s.applied_bps) >= -i32::from(rt.cfg.skew.negative_bps_max),
+                "skew below its own floor: {} < -{}",
+                s.applied_bps,
+                rt.cfg.skew.negative_bps_max
             );
 
             // Every row, every cycle. This is the input to tuning gamma later, and without it
