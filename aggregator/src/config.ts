@@ -92,11 +92,40 @@ export const DEFAULT_RPC = 'https://sepolia-rpc-flashblocks.giwa.io';
 const MUSDC: Address = getAddress('0xd28596C6750D87C53EA146134AfAB53de86C5155');
 const MWETH: Address = getAddress('0x81e46C6379498beBEB5DCcD47ab2DdFaf967d445');
 const MWBTC: Address = getAddress('0x3548991B5EF2D7805EFa95bEa6CeDeAee3869875');
+const MBNB: Address = getAddress('0x54fbDB9F5bf1c345F0230773C66607DF3f7b99AC');
+const MXRP: Address = getAddress('0x4Cbc341D56232805B258ed5a33C7b80dbF1A9d01');
+const MSOL: Address = getAddress('0x1F96E44136D765802005c5083a51830841dca9b3');
+const MAAPL: Address = getAddress('0xab3F1C8A9358Feb5872F81330FC811C3c53Ae9ff');
+const MTSLA: Address = getAddress('0xf5456CF225efaf7807cBC14079733b211eAc84d7');
+const MSKHY: Address = getAddress('0x37D1e1307eba9B489844B9A1198b5F77577630FD');
+const MSPCX: Address = getAddress('0x38EfEf195b347B9EcEf07185C716C9A93E232B9a');
 
-/** GIWA Sepolia, matching `contracts/DEPLOYMENTS.md`. */
+/**
+ * GIWA Sepolia, matching `contracts/DEPLOYMENTS.md` and the pool's own `pairConfig`.
+ *
+ * All nine pairs the pool quotes, not the two that also have a UniV2 pool. Those are different
+ * sets, and listing the intersection is what made a taker asking for mSOL see "this pair is not
+ * available" while the maker was quoting it forty-eight times a minute.
+ *
+ * A pair with no UniV2 pool costs the grid nothing. `getAmountsOut` reverts with no reserves,
+ * `allowFailure` turns that into a zero, every split routing anything to UniV2 is disqualified for
+ * paying nothing, and the all-prop point wins on its own — which is the same path a UniV2 outage
+ * takes on a pair that does have a pool.
+ *
+ * `baseDecimals` was read from each token's `decimals()` rather than assumed. They are not uniform
+ * — mSOL is 9, mXRP is 6, the equities are 8 — and a wrong one misprices by orders of magnitude
+ * without failing anything.
+ */
 export const MARKETS: Market[] = [
   { pairId: 1, symbol: 'mWETH/mUSDC', base: MWETH, quote: MUSDC, baseDecimals: 18, quoteDecimals: 6 },
   { pairId: 2, symbol: 'mWBTC/mUSDC', base: MWBTC, quote: MUSDC, baseDecimals: 8, quoteDecimals: 6 },
+  { pairId: 3, symbol: 'mBNB/mUSDC', base: MBNB, quote: MUSDC, baseDecimals: 18, quoteDecimals: 6 },
+  { pairId: 4, symbol: 'mXRP/mUSDC', base: MXRP, quote: MUSDC, baseDecimals: 6, quoteDecimals: 6 },
+  { pairId: 5, symbol: 'mSOL/mUSDC', base: MSOL, quote: MUSDC, baseDecimals: 9, quoteDecimals: 6 },
+  { pairId: 6, symbol: 'mAAPL/mUSDC', base: MAAPL, quote: MUSDC, baseDecimals: 8, quoteDecimals: 6 },
+  { pairId: 7, symbol: 'mTSLA/mUSDC', base: MTSLA, quote: MUSDC, baseDecimals: 8, quoteDecimals: 6 },
+  { pairId: 8, symbol: 'mSKHY/mUSDC', base: MSKHY, quote: MUSDC, baseDecimals: 8, quoteDecimals: 6 },
+  { pairId: 9, symbol: 'mSPCX/mUSDC', base: MSPCX, quote: MUSDC, baseDecimals: 8, quoteDecimals: 6 },
 ];
 
 class ConfigError extends Error {}

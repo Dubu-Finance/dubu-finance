@@ -186,11 +186,57 @@ describe('slippage', () => {
   });
 });
 
-describe('the market table and the pair table agree', () => {
-  it.each(MARKETS)('has a UniV2 pair recorded for $symbol', (m) => {
-    expect(() => univ2Pair(cfg, m)).not.toThrow();
+/**
+ * The two tables are allowed to disagree, and used to be asserted not to.
+ *
+ * The pool quotes nine pairs; UniV2 has liquidity for two. Requiring a pool for every market meant
+ * the market list could only ever be the intersection, which is why a taker asking for mSOL was
+ * told the pair did not exist while the maker was quoting it. What actually has to hold is
+ * narrower: a market with no UniV2 pool must still route, on the prop leg alone.
+ */
+describe('markets without a UniV2 pool', () => {
+  const withPool = MARKETS.filter((m) => !throws(() => univ2Pair(cfg, m)));
+  const withoutPool = MARKETS.filter((m) => throws(() => univ2Pair(cfg, m)));
+
+  it('is not the empty set, or this file is asserting nothing', () => {
+    expect(withPool.length).toBeGreaterThan(0);
+    expect(withoutPool.length).toBeGreaterThan(0);
+  });
+
+  it.each(withoutPool)('still builds an all-prop route for $symbol', (m) => {
+    const route = buildRoute({
+      cfg,
+      market: m,
+      sellingBase: false,
+      tokenIn: m.quote,
+      tokenOut: m.base,
+      receiver: RECEIVER,
+      amountIn: 1_000_000n,
+      legs: [{ venue: 'prop', weightBps: WEIGHT_DENOMINATOR, amountIn: 1_000_000n, amountOut: 1n }],
+      rfq: null,
+      quotedAmountOut: 1n,
+      minAmountOut: 1n,
+      deadline: 1_785_000_120n,
+    });
+    expect(route.venues).toEqual(['prop']);
+  });
+
+  // The throw itself is the guard: it fires only if the split search ever hands UniV2 a leg on a
+  // market with no pool, which would otherwise pack the zero address as the pool and settle into
+  // nothing.
+  it.each(withoutPool)('refuses to pack a UniV2 leg for $symbol', (m) => {
+    expect(() => univ2Pair(cfg, m)).toThrow();
   });
 });
+
+function throws(f: () => unknown): boolean {
+  try {
+    f();
+    return false;
+  } catch {
+    return true;
+  }
+}
 
 describe('the split search', () => {
   const grid = SPLIT_GRID.length;

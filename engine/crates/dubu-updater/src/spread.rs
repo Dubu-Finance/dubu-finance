@@ -144,7 +144,13 @@ pub struct SpreadParams {
 pub struct Spread {
     /// The pair's configured half-spread, `s0`.
     pub s0_bps_e2: u32,
-    /// `sigma` over the estimator's horizon, in thousandths of a bp, exactly as the skew logs it.
+    /// `sigma` over the **quote's exposure window**, in thousandths of a bp — whatever
+    /// [`compute`] was handed, which is the estimator's output after [`rescale_sigma`].
+    ///
+    /// Not the number the skew logs, and the difference is a factor of `sqrt(300 / 3)` — ten. The
+    /// two windows measure different exposures: inventory is carried for the estimator's horizon,
+    /// a posted quote is exposed for as long as it stands. Reading this as the estimator's native
+    /// output makes a calm market look ten times calmer still.
     pub sigma_millibps: u64,
     /// `s1 * sigma`, in deci-bps. Deci-bps because whole-bps rounding hides everything under
     /// 0.5 bp, which for BTCUSDT is most of the term.
