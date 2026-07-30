@@ -322,6 +322,7 @@ fn load_kills(cfg: &Config) -> Result<BTreeMap<String, KillSwitch>, Box<dyn std:
                 cfg.risk.bleed_window_secs,
                 cfg.risk.bleed_limit_units()?,
                 cfg.risk.loss_budget_units()?,
+                cfg.risk.shadow,
             )?,
         );
     }
@@ -330,6 +331,19 @@ fn load_kills(cfg: &Config) -> Result<BTreeMap<String, KillSwitch>, Box<dyn std:
         groups.len(),
         "one switch per group, no collisions"
     );
+    // A disabled killswitch has to be impossible to run without knowing. The mode is deliberately
+    // temporary -- it exists to collect the drawdown data the limits cannot be sized without -- and
+    // the way it goes wrong is not that it fails, it is that it is left on and forgotten, at which
+    // point the book has no drawdown halt and every log line looks normal.
+    if cfg.risk.shadow {
+        error!(
+            target: "risk", event = "shadow_mode", groups = kills.len(),
+            bleed_limit = %cfg.risk.bleed_limit, bleed_window_secs = cfg.risk.bleed_window_secs,
+            loss_budget = %cfg.risk.loss_budget,
+            "SHADOW MODE: the killswitches measure but DO NOT latch. The drawdown halt is off for \
+             every group. Trips appear as event=halt_shadow. Set risk.shadow = false to enforce."
+        );
+    }
     Ok(kills)
 }
 
@@ -3199,78 +3213,105 @@ block_work,
     // preconfirmed fills to find rather than re-reading blocks it has already seen.
     scan_fills(rt, head, view).await;
 
-    // The killswitches. Skipped entirely when any pair has no fair value: marking inventory
-    // against a price we do not have would be an invention, and an invented NAV is worse than
-    // no observation at all.
-    if positions.len() == rt.cfg.pairs.len() {
-        let quote_balance = view.balances.get(&rt.facts.nav_token).copied().unwrap_or(0);
-        // Per group, each against its own share of the shared quote token.
-        //
-        // The even split is the same simplification `skew::Inventory::quote_share` already makes and
-        // is named as one there: both groups draw bids from the same mUSDC and nothing yet caps the
-        // sum of their liabilities against it.
-        let groups: Vec<String> = rt.kills.keys().cloned().collect();
-        let pairs_total = rt.cfg.pairs.len().max(1);
-        for g in groups {
-            let ids: Vec<u16> = rt
-                .cfg
-                .pairs
-                .iter()
-                .filter(|p| p.jump_group == g)
-                .map(|p| p.pair_id)
-                .collect();
-            let mine: Vec<dubu_updater::risk::Position> = positions
-                .iter()
-                .filter(|p| ids.contains(&p.pair_id))
-                .copied()
-                .collect();
-            if mine.is_empty() {
-                continue;
-            }
-            let share = quote_balance / pairs_total as u128 * ids.len() as u128;
-            let Some(kill) = rt.kills.get_mut(&g) else {
-                continue;
-            };
-            match kill.observe(share, &mine, now_unix()) {
-                Ok((obs, halt)) => {
-                    trace_at!(
+    // The killswitches. A group is skipped when any pair *in that group* has no fair value:
+    // marking inventory against a price we do not have would be an invention, and an invented NAV
+    // is worse than no observation at all.
+    //
+    // The completeness test is per group, and it used to be `positions.len() == cfg.pairs.len()`
+    // over all nine pairs. That is why nothing was observed for fourteen hours: the equity group
+    // halted on 2026-07-29, a halted group `continue`s before its reference is computed, so
+    // `positions` held only the five crypto pairs, `5 == 9` was never true, and **both** groups
+    // stopped being marked -- including the crypto one, whose drawdown halt therefore could not
+    // fire either. One group's latch silently disabled the other group's killswitch. Scoping the
+    // test to the group makes each group's observation depend only on its own pairs.
+    let quote_balance = view.balances.get(&rt.facts.nav_token).copied().unwrap_or(0);
+    // Per group, each against its own share of the shared quote token.
+    //
+    // The even split is the same simplification `skew::Inventory::quote_share` already makes and
+    // is named as one there: both groups draw bids from the same mUSDC and nothing yet caps the
+    // sum of their liabilities against it.
+    let groups: Vec<String> = rt.kills.keys().cloned().collect();
+    let pairs_total = rt.cfg.pairs.len().max(1);
+    for g in groups {
+        let ids: Vec<u16> = rt
+            .cfg
+            .pairs
+            .iter()
+            .filter(|p| p.jump_group == g)
+            .map(|p| p.pair_id)
+            .collect();
+        let mine: Vec<dubu_updater::risk::Position> = positions
+            .iter()
+            .filter(|p| ids.contains(&p.pair_id))
+            .copied()
+            .collect();
+        // Every pair in the group, not merely one of them. A partial group would mark a NAV that
+        // is missing whole positions and read the absence as a drawdown -- which is the failure
+        // this switch exists to catch, arriving as a false positive.
+        if mine.len() != ids.len() {
+            trace_at!(
+                block_work,
+                target: "risk", event = "mark_skipped", group = %g,
+                have = mine.len(), want = ids.len(),
+                "not every pair in this group has a fair value; skipping rather than inventing one"
+            );
+            continue;
+        }
+        let share = quote_balance / pairs_total as u128 * ids.len() as u128;
+        let Some(kill) = rt.kills.get_mut(&g) else {
+            continue;
+        };
+        match kill.observe(share, &mine, now_unix()) {
+            Ok((obs, halt)) => {
+                trace_at!(
                     block_work,
-
-                                        target: "risk", event = "mark", group = %g,
-                                        nav = %obs.nav, revaluation = %obs.revaluation,
-                                        trade_pnl = %obs.trade_pnl, drawdown = %obs.drawdown,
-                                        cumulative_trade_loss = %obs.cumulative_trade_loss,
-                                        seeded = obs.seeded, "NAV marked"
-                                    );
-                    if let Some(h) = halt {
-                        error!(target: "risk", event = "halt", group = %g, switch = h.label(),
-                               reason = %h, pairs = ids.len(),
-                               "KILLSWITCH TRIPPED for this group; its pairs stop quoting");
-                        // The fourteen-hour silence. This trip only ever produced one line in a
-                        // stream that emits several a second, and the group went on not quoting
-                        // until somebody happened to look at the state file.
-                        rt.notify.send(notify::Event::Halt {
-                            group: g.clone(),
-                            switch: h.label(),
-                            reason: h.to_string(),
-                        });
+                    target: "risk", event = "mark", group = %g,
+                    nav = %obs.nav, revaluation = %obs.revaluation,
+                    trade_pnl = %obs.trade_pnl, drawdown = %obs.drawdown,
+                    cumulative_trade_loss = %obs.cumulative_trade_loss,
+                    seeded = obs.seeded, "NAV marked"
+                );
+                // Shadow mode: the verdict is reported and the book keeps quoting. Read from the
+                // observation and never from `halt`, which is `None` here by construction -- that
+                // separation is the only thing keeping a measurement run from becoming an
+                // enforcing one. Logged at error level on purpose: a would-be trip is the single
+                // most important line a shadow run produces, and the whole point of the run is
+                // that somebody reads it.
+                if halt.is_none() {
+                    if let Some(h) = &obs.would_halt {
+                        error!(target: "risk", event = "halt_shadow", group = %g,
+                               switch = h.label(), reason = %h, pairs = ids.len(),
+                               drawdown = %obs.drawdown,
+                               cumulative_trade_loss = %obs.cumulative_trade_loss,
+                               "SHADOW: this WOULD have halted the group; not latching, \
+                                the book is still quoting");
                     }
                 }
-                Err(e) => {
-                    warn!(target: "risk", event = "mark_failed", group = %g, error = %e,
-                          "could not mark NAV")
+                if let Some(h) = halt {
+                    error!(target: "risk", event = "halt", group = %g, switch = h.label(),
+                           reason = %h, pairs = ids.len(),
+                           "KILLSWITCH TRIPPED for this group; its pairs stop quoting");
+                    // The fourteen-hour silence. This trip only ever produced one line in a
+                    // stream that emits several a second, and the group went on not quoting
+                    // until somebody happened to look at the state file.
+                    rt.notify.send(notify::Event::Halt {
+                        group: g.clone(),
+                        switch: h.label(),
+                        reason: h.to_string(),
+                    });
                 }
             }
+            Err(e) => {
+                warn!(target: "risk", event = "mark_failed", group = %g, error = %e,
+                      "could not mark NAV")
+            }
         }
-        // Only when every group is down is there nothing left to quote.
-        if rt.kills.values().all(KillSwitch::is_halted) {
-            error!(target: "risk", event = "halt_all",
-                   "every group is halted; withdrawing quotes and exiting");
-            return true;
-        }
-    } else {
-        info!(target: "risk", event = "mark_skipped", have = positions.len(), want = rt.cfg.pairs.len(),
-              "not every pair has a fair value; skipping the NAV observation rather than inventing one");
+    }
+    // Only when every group is down is there nothing left to quote.
+    if rt.kills.values().all(KillSwitch::is_halted) {
+        error!(target: "risk", event = "halt_all",
+               "every group is halted; withdrawing quotes and exiting");
+        return true;
     }
 
     false

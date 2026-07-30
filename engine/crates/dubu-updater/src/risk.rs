@@ -285,6 +285,11 @@ pub struct KillSwitch {
     bleed_window_secs: u64,
     bleed_limit: u128,
     loss_budget: u128,
+    /// Measure but do not latch. See [`Observation::would_halt`] for what a trip does instead, and
+    /// `RiskConfig::shadow` for why the mode exists. Never persisted: shadow is an operator's
+    /// decision about the current run, and a mode that survived a restart in the state file would
+    /// be a disabled killswitch that nobody remembers disabling.
+    shadow: bool,
     /// In-memory only; see the module docs on what must not survive a restart.
     prev: Option<(u128, BTreeMap<u16, Position>)>,
     window: Vec<NavPoint>,
@@ -306,6 +311,14 @@ pub struct Observation {
     pub cumulative_trade_loss: u128,
     /// Set when this observation only seeded the baseline and attributed nothing.
     pub seeded: bool,
+    /// The verdict this observation reached, **whether or not it was enforced**.
+    ///
+    /// In enforcing mode this matches the `Option<Halt>` [`KillSwitch::observe`] returns. In shadow
+    /// mode the returned option is `None` and the verdict appears only here, which is the whole
+    /// distinction: a caller that stops quoting on a trip reads the return value, and a caller that
+    /// merely reports one reads this. Acting on this field is how shadow mode would silently become
+    /// enforcement again.
+    pub would_halt: Option<Halt>,
 }
 
 impl KillSwitch {
@@ -319,6 +332,7 @@ impl KillSwitch {
         bleed_window_secs: u64,
         bleed_limit: u128,
         loss_budget: u128,
+        shadow: bool,
     ) -> Result<Self, RiskError> {
         // The config validator refuses all three; restated here because a zero window has no peak
         // to draw down from and a zero limit or budget trips on the first observation.
@@ -344,6 +358,7 @@ impl KillSwitch {
             bleed_window_secs,
             bleed_limit,
             loss_budget,
+            shadow,
             prev: None,
             window: Vec::new(),
         };
@@ -510,21 +525,36 @@ impl KillSwitch {
             "the next observation has a baseline to attribute against"
         );
 
-        let obs = Observation {
+        let mut obs = Observation {
             nav,
             revaluation,
             trade_pnl,
             drawdown,
             cumulative_trade_loss: self.state.cumulative_trade_loss,
             seeded,
+            would_halt: None,
         };
 
         if self.state.halted {
             return Ok((obs, None));
         }
 
-        let halt = self.verdict(drawdown);
-        if let Some(h) = &halt {
+        let verdict = self.verdict(drawdown);
+        obs.would_halt = verdict.clone();
+
+        if self.shadow {
+            // The measurement still happens -- the window filled, the drawdown was computed, the
+            // gross loss accumulated -- and only the latch is withheld. Persisting the totals here
+            // is what makes a shadow run worth anything after a restart.
+            self.persist()?;
+            assert!(
+                !self.state.halted,
+                "shadow mode latched the book; the mode has no other job than not doing this"
+            );
+            return Ok((obs, None));
+        }
+
+        if let Some(h) = &verdict {
             self.halt(h, now)?;
             assert!(self.state.halted, "a trip that did not latch is decoration");
         } else {
@@ -532,7 +562,7 @@ impl KillSwitch {
             // budget was consumed since the last one.
             self.persist()?;
         }
-        Ok((obs, halt))
+        Ok((obs, verdict))
     }
 
     /// Push this NAV into the bleed window, drop what has aged out, and return the peak-to-current
@@ -705,7 +735,7 @@ mod tests {
     const BUDGET: u128 = 10_000_000_000;
 
     fn ks(name: &str) -> KillSwitch {
-        KillSwitch::load(&scratch(name), 300, BLEED, BUDGET).unwrap()
+        KillSwitch::load(&scratch(name), 300, BLEED, BUDGET, false).unwrap()
     }
 
     /// A switch with the bleed limit disabled, for the tests that are about attribution or the
@@ -713,7 +743,7 @@ mod tests {
     /// enough to exhaust the budget also breaches a comparable bleed limit — so isolating one
     /// means turning the other off rather than hoping it stays quiet.
     fn ks_budget_only(name: &str) -> KillSwitch {
-        KillSwitch::load(&scratch(name), 300, u128::MAX, BUDGET).unwrap()
+        KillSwitch::load(&scratch(name), 300, u128::MAX, BUDGET, false).unwrap()
     }
 
     #[test]
@@ -798,7 +828,7 @@ mod tests {
         // peak has aged out of the 300s window — so the bleed switch sees a drawdown of zero
         // every single time. Being picked off for a little, repeatedly, is invisible to a
         // short-window drawdown limit and is exactly what the cumulative budget is for.
-        let mut k = KillSwitch::load(&scratch("budget"), 300, BLEED, BUDGET).unwrap();
+        let mut k = KillSwitch::load(&scratch("budget"), 300, BLEED, BUDGET, false).unwrap();
         let mut quote = 1_000_000_000_000u128;
         k.observe(quote, &[pos(0, FAIR)], 1_000).unwrap();
 
@@ -854,7 +884,7 @@ mod tests {
     fn the_bleed_window_forgets_a_peak_that_has_aged_out() {
         // Otherwise the switch is a permanent all-time-high drawdown limit and trips on any
         // slow drift, which is not what a short-window bleed limit means.
-        let mut k = KillSwitch::load(&scratch("window"), 300, BLEED, BUDGET).unwrap();
+        let mut k = KillSwitch::load(&scratch("window"), 300, BLEED, BUDGET, false).unwrap();
         k.observe(0, &[pos(10 * ETH, FAIR)], 1_000).unwrap();
 
         // 400 seconds later the old peak is outside the window, so the same price is not a
@@ -870,7 +900,7 @@ mod tests {
     fn the_latch_survives_a_restart_and_the_book_stays_down() {
         // The requirement in one test: a restart must not silently resume a halted book.
         let path = scratch("restart");
-        let mut k = KillSwitch::load(&path, 300, BLEED, BUDGET).unwrap();
+        let mut k = KillSwitch::load(&path, 300, BLEED, BUDGET, false).unwrap();
         k.observe(0, &[pos(10 * ETH, FAIR)], 1_000).unwrap();
         let (_, halt) = k
             .observe(0, &[pos(10 * ETH, FAIR - 200_000_000_000_000)], 1_100)
@@ -878,7 +908,7 @@ mod tests {
         assert!(halt.is_some());
         drop(k);
 
-        let restarted = KillSwitch::load(&path, 300, BLEED, BUDGET).unwrap();
+        let restarted = KillSwitch::load(&path, 300, BLEED, BUDGET, false).unwrap();
         assert!(restarted.is_halted(), "a restart resumed a halted book");
         assert!(restarted.halt_reason().unwrap().contains("bleed"));
         assert!(restarted.state().halted_at.is_some());
@@ -889,7 +919,7 @@ mod tests {
         // A restart that reset the running total would make the budget a per-process limit,
         // which an operator restarting after every trip would never reach.
         let path = scratch("cumulative");
-        let mut k = KillSwitch::load(&path, 300, u128::MAX, BUDGET).unwrap();
+        let mut k = KillSwitch::load(&path, 300, u128::MAX, BUDGET, false).unwrap();
         k.observe(1_000_000_000_000, &[pos(0, FAIR)], 1_000)
             .unwrap();
         k.observe(1_000_000_000_000 - 3_000_000_000, &[pos(0, FAIR)], 1_001)
@@ -897,7 +927,7 @@ mod tests {
         assert_eq!(k.state().cumulative_trade_loss, 3_000_000_000);
         drop(k);
 
-        let mut k = KillSwitch::load(&path, 300, u128::MAX, BUDGET).unwrap();
+        let mut k = KillSwitch::load(&path, 300, u128::MAX, BUDGET, false).unwrap();
         assert_eq!(k.state().cumulative_trade_loss, 3_000_000_000);
         assert!(!k.is_halted());
 
@@ -932,13 +962,13 @@ mod tests {
         let path = scratch("corrupt");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, "{ this is not json").unwrap();
-        let err = KillSwitch::load(&path, 300, BLEED, BUDGET).unwrap_err();
+        let err = KillSwitch::load(&path, 300, BLEED, BUDGET, false).unwrap_err();
         assert!(matches!(err, RiskError::Corrupt { .. }), "got {err}");
     }
 
     #[test]
     fn a_missing_latch_file_is_a_clean_start() {
-        let k = KillSwitch::load(&scratch("missing"), 300, BLEED, BUDGET).unwrap();
+        let k = KillSwitch::load(&scratch("missing"), 300, BLEED, BUDGET, false).unwrap();
         assert!(!k.is_halted());
         assert_eq!(k.state().cumulative_trade_loss, 0);
     }
@@ -946,7 +976,7 @@ mod tests {
     #[test]
     fn a_liveness_halt_latches_like_the_measured_ones() {
         let path = scratch("liveness");
-        let mut k = KillSwitch::load(&path, 300, BLEED, BUDGET).unwrap();
+        let mut k = KillSwitch::load(&path, 300, BLEED, BUDGET, false).unwrap();
         k.halt(
             &Halt::Liveness {
                 reason: "chain down for 600s".into(),
@@ -956,7 +986,7 @@ mod tests {
         .unwrap();
         assert!(k.is_halted());
         drop(k);
-        let k = KillSwitch::load(&path, 300, BLEED, BUDGET).unwrap();
+        let k = KillSwitch::load(&path, 300, BLEED, BUDGET, false).unwrap();
         assert!(k.is_halted());
         assert!(k.halt_reason().unwrap().contains("chain down"));
     }
@@ -967,7 +997,7 @@ mod tests {
         // there is no in-memory `Halt` left to ask by then — recognising the cause has to survive
         // the round trip through JSON, which is the whole reason the reason string carries it.
         let path = scratch("liveness-only");
-        let mut k = KillSwitch::load(&path, 300, BLEED, BUDGET).unwrap();
+        let mut k = KillSwitch::load(&path, 300, BLEED, BUDGET, false).unwrap();
         k.halt(
             &Halt::Liveness {
                 reason: "chain liveness lost for 615s (limit 600s)".into(),
@@ -978,7 +1008,7 @@ mod tests {
         assert!(k.is_liveness_only());
         drop(k);
 
-        let k = KillSwitch::load(&path, 300, BLEED, BUDGET).unwrap();
+        let k = KillSwitch::load(&path, 300, BLEED, BUDGET, false).unwrap();
         assert!(k.is_halted());
         assert!(k.is_liveness_only());
     }
@@ -1016,7 +1046,7 @@ mod tests {
     #[test]
     fn a_resume_clears_the_latch_and_keeps_the_spent_budget() {
         let path = scratch("resume");
-        let mut k = KillSwitch::load(&path, 300, u128::MAX, BUDGET).unwrap();
+        let mut k = KillSwitch::load(&path, 300, u128::MAX, BUDGET, false).unwrap();
         let quote = 1_000_000_000_000u128;
         k.observe(quote, &[pos(0, FAIR)], 1_000).unwrap();
         // A 3000 loss, then a 2000 gain, so both cumulative totals are non-zero and a resume that
@@ -1046,7 +1076,7 @@ mod tests {
 
         // Across the reload, because a resume that only cleared memory would be undone by the very
         // next restart — and it is the restarts that this whole path exists to survive.
-        let k = KillSwitch::load(&path, 300, u128::MAX, BUDGET).unwrap();
+        let k = KillSwitch::load(&path, 300, u128::MAX, BUDGET, false).unwrap();
         assert!(!k.is_halted());
         assert!(k.halt_reason().is_none());
         assert_eq!(
@@ -1058,14 +1088,119 @@ mod tests {
         assert_eq!(k.state().observations, observations);
     }
 
+    /// The same switch as `ks`, measuring but not latching.
+    fn ks_shadow(name: &str) -> KillSwitch {
+        KillSwitch::load(&scratch(name), 300, BLEED, BUDGET, true).unwrap()
+    }
+
+    /// Drive a drawdown past `BLEED` and hand back what the last observation concluded.
+    ///
+    /// Held in mUSDC's 6 decimals throughout: the peak is 1,000,000 mUSDC and the second mark is
+    /// 3,000 below it, against a `BLEED` of 2,000 and inside the 300s window. The base balance is
+    /// zero on both marks so NAV is the quote leg alone and the drawdown is exactly the difference.
+    fn breach(k: &mut KillSwitch) -> (Observation, Option<Halt>) {
+        k.observe(1_000_000_000_000, &[pos(0, FAIR)], 1_000).unwrap();
+        k.observe(997_000_000_000, &[pos(0, FAIR)], 1_100).unwrap()
+    }
+
+    #[test]
+    fn a_shadow_trip_is_reported_and_the_book_keeps_quoting() {
+        let mut k = ks_shadow("shadow-trip");
+        let (obs, halt) = breach(&mut k);
+        // The verdict was reached in full -- this is a real trip by every measure the enforcing
+        // switch uses.
+        assert_eq!(
+            obs.would_halt,
+            Some(Halt::Bleed {
+                drawdown: 3_000_000_000,
+                limit: BLEED,
+                window_secs: 300
+            })
+        );
+        // And none of it was enforced. The returned option is what a caller acts on, and it is the
+        // one thing that must stay empty.
+        assert!(halt.is_none(), "shadow mode returned an enforceable halt");
+        assert!(!k.is_halted(), "shadow mode latched the book");
+        assert!(k.halt_reason().is_none());
+        assert!(k.state().halted_at.is_none());
+    }
+
+    #[test]
+    fn the_same_breach_latches_once_shadow_is_off() {
+        // The control for the test above: same limits, same path shape, same numbers. Without it
+        // a shadow switch that never trips at all would pass.
+        let mut k = ks("shadow-control");
+        let (obs, halt) = breach(&mut k);
+        assert_eq!(obs.would_halt, halt, "enforcing: the two agree exactly");
+        assert!(halt.is_some());
+        assert!(k.is_halted());
+    }
+
+    #[test]
+    fn a_shadow_run_still_accumulates_and_still_persists() {
+        // The entire point of the mode is the data it leaves behind. A shadow run that measured
+        // nothing, or measured it only in memory, would collect nothing to size a limit from.
+        let path = scratch("shadow-persist");
+        let mut k = KillSwitch::load(&path, 300, BLEED, BUDGET, true).unwrap();
+        let mut quote = 1_000_000_000_000u128;
+        k.observe(quote, &[pos(0, FAIR)], 1_000).unwrap();
+        for i in 0..4u64 {
+            quote -= 1_000_000_000;
+            k.observe(quote, &[pos(0, FAIR)], 1_400 + i * 400).unwrap();
+        }
+        assert_eq!(k.state().cumulative_trade_loss, 4_000_000_000);
+        assert_eq!(k.state().observations, 4);
+
+        // On disk, not merely in memory.
+        let reloaded = KillSwitch::load(&path, 300, BLEED, BUDGET, true).unwrap();
+        assert_eq!(reloaded.state().cumulative_trade_loss, 4_000_000_000);
+        assert_eq!(reloaded.state().observations, 4);
+        assert!(!reloaded.is_halted());
+    }
+
+    #[test]
+    fn shadow_is_a_property_of_the_run_and_never_of_the_state_file() {
+        // A mode that persisted would be a killswitch somebody disabled once and nobody can see is
+        // disabled. Turning it off has to be enough to restore enforcement.
+        let path = scratch("shadow-not-sticky");
+        let mut shadowed = KillSwitch::load(&path, 300, BLEED, BUDGET, true).unwrap();
+        breach(&mut shadowed);
+        assert!(!shadowed.is_halted());
+        assert!(!std::fs::read_to_string(&path).unwrap().contains("shadow"));
+
+        let mut enforcing = KillSwitch::load(&path, 300, BLEED, BUDGET, false).unwrap();
+        let (_, halt) = breach(&mut enforcing);
+        assert!(halt.is_some(), "a restart without shadow must enforce again");
+        assert!(enforcing.is_halted());
+    }
+
+    #[test]
+    fn an_already_latched_group_reports_no_verdict_even_in_shadow() {
+        // A group halted before the process started stays halted -- shadow mode is not a way to
+        // clear a latch, and `observe` returns early on one. Clearing is `resume`, deliberately.
+        let path = scratch("shadow-prelatched");
+        let mut k = KillSwitch::load(&path, 300, BLEED, BUDGET, false).unwrap();
+        breach(&mut k);
+        assert!(k.is_halted());
+
+        let mut k = KillSwitch::load(&path, 300, BLEED, BUDGET, true).unwrap();
+        assert!(k.is_halted(), "shadow mode cleared a latch it found on disk");
+        let (obs, halt) = breach(&mut k);
+        assert!(halt.is_none());
+        assert!(
+            obs.would_halt.is_none(),
+            "a halted switch stops deciding; its numbers must not keep moving"
+        );
+    }
+
     #[test]
     fn large_totals_survive_the_json_round_trip_exactly() {
         // Past 2^53, which is where a JSON number would start lying.
         let path = scratch("bignum");
-        let mut k = KillSwitch::load(&path, 300, u128::MAX, u128::MAX).unwrap();
+        let mut k = KillSwitch::load(&path, 300, u128::MAX, u128::MAX, false).unwrap();
         k.state.cumulative_trade_loss = 123_456_789_012_345_678_901_234_567_890;
         k.persist().unwrap();
-        let back = KillSwitch::load(&path, 300, u128::MAX, u128::MAX).unwrap();
+        let back = KillSwitch::load(&path, 300, u128::MAX, u128::MAX, false).unwrap();
         assert_eq!(
             back.state().cumulative_trade_loss,
             123_456_789_012_345_678_901_234_567_890

@@ -1762,6 +1762,20 @@ pub struct RiskConfig {
     /// Cumulative gross loss that trips the budget switch. Gross: every negative NAV step is
     /// added, and a subsequent recovery does **not** give the budget back. Human units.
     pub loss_budget: String,
+    /// Measure the switches but do not latch them.
+    ///
+    /// Everything runs exactly as it would in enforcement — the window fills, the drawdown is
+    /// computed, the gross loss accumulates and is persisted — and a trip is logged as
+    /// `event = "halt_shadow"` instead of stopping the group. It exists because the limits cannot
+    /// be sized without data and the data cannot be collected while an unsized limit is latching
+    /// the book down: `bleed_limit` is one global 200000 that the equity group tripped on
+    /// 2026-07-29 with `cumulative_trade_loss = 0`, meaning no trade contributed and the whole
+    /// drawdown was revaluation across gaps in a sparse reference.
+    ///
+    /// **This disables the drawdown halt.** It is a measurement mode with an operator watching,
+    /// not a setting to leave on. Default is off, so a config that forgets the key enforces.
+    #[serde(default)]
+    pub shadow: bool,
 }
 
 fn d_nav_decimals() -> u8 {
