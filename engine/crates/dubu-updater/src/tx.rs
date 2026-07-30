@@ -53,6 +53,73 @@
 //! [`crate::config::TxConfig::pending_timeout_secs`] the intents are abandoned, the pair is
 //! unblocked, and the nonce is resynced from the node.
 //!
+//! # Reserved synchronously, broadcast concurrently
+//!
+//! `eth_sendRawTransaction` costs **264ms** here and almost none of it is ours. The local op-reth is
+//! started with `--rollup.sequencer-http` and forwards the call to the GIWA sequencer in Korea, so
+//! that number is a France-to-Korea round trip and no amount of local work reduces it. reth's own
+//! metrics make the shape unmistakable: 10.09s of a 20s window across 39 `eth_sendRawTransaction`
+//! calls, against 0.023s for *every other RPC method combined*. Awaiting five of them one after the
+//! other spent 1.323s of a 2.695s cycle — 49% of the price-setting loop — on five copies of the
+//! same wait.
+//!
+//! So the send phase is split in two, and the split is where all of the safety lives:
+//!
+//! 1. [`Sender::reserve_batch`] is **synchronous**. It assigns nonces N, N+1, … in the order the
+//!    caller pushed the intents, signs each envelope, and returns them. There is no `.await`
+//!    anywhere in it, so nothing can interleave with a half-advanced nonce.
+//! 2. [`Sender::send_batch`] then broadcasts the signed bytes through a `FuturesUnordered`, so five
+//!    sends cost one 264ms round trip rather than five.
+//!
+//! The shape this replaces read-modify-wrote `self.nonce` *across* the send await, which is exactly
+//! the read-modify-write that cannot be made concurrent — two futures would both read `n` and both
+//! sign `n`. Reserving before anything is awaited is not an optimisation of that; it is the only
+//! version of it that is correct.
+//!
+//! Reservation order is load-bearing beyond the nonce itself. `main.rs`'s per-pair loop argues that
+//! a `RefreshCapacity` must execute before the `UpdateQuote` for the same pair when the pool is
+//! dark, and that argument rests entirely on nonce order being absolute. Concurrency does not touch
+//! that as long as the nonces are handed out in the order the intents were pushed, which is why
+//! [`Sender::reserve_batch`] takes a slice and walks it in order rather than taking a set.
+//!
+//! # The nonce is tracked here, not asked for
+//!
+//! [`Nonces`] holds the next nonce in this process: seeded **once** at startup from
+//! `eth_getTransactionCount(addr, "pending")`, advanced by reservation, and re-read only on the two
+//! explicit recovery paths below. The hot path never asks the node, and that is a correctness
+//! requirement rather than a saved round trip.
+//!
+//! The reason is the local pool. op-reth's `send_transaction` forwards to the sequencer *first* and
+//! only then does `let _ = add_pool_transaction(...)`, discarding the local error — so a transaction
+//! past the node's `--txpool.max-account-slots` (**16**, and not being raised) has already reached
+//! the sequencer while the local pool silently drops it. `eth_getTransactionCount(pending)` on that
+//! node is derived from the truncated pool, so it reads **low by however many were dropped**. With
+//! roughly 37 transactions in flight at the new cadence, a per-send read would hand out a nonce
+//! twenty-odd values behind the truth, every send, forever. That is the same loop that produced
+//! 3,391 of 4,519 failed sends in a historical episode, and it is why nothing here may "fix" the
+//! reservation back into a read.
+//!
+//! The two paths that *are* allowed to re-read:
+//!
+//! * an abandoned intent — [`Sender::sweep_timeouts`], `pending_timeout_secs` after the last
+//!   acceptance, by which point nothing of ours is plausibly still queued and walking backwards over
+//!   ground we thought we had covered is the entire intent;
+//! * `nonce too low`, which is positive proof from the chain that our counter is behind.
+//!
+//! Everything else is handled without the node. A broadcast the upstream *provably* refused —
+//! the local limiter never opened a socket, or the sequencer answered `-32003` — returns its nonce
+//! to [`Nonces::free`] and the next reservation hands the same value out again, so the sequence
+//! stays gap-free without asking anyone. A broadcast of *unknown* fate does not: its nonce may be
+//! sitting in the sequencer, so it is recorded in [`Sender::pending`] under the hash we signed and
+//! the timeout sweep is what eventually resolves it.
+//!
+//! # `-32003` is backpressure, not a failed transaction
+//!
+//! See [`crate::chain::RpcError::is_txpool_full`]. The measured stakes: at 1.85 tx/s the account
+//! wedges 138s after inclusion stops, and at 19 tx/s that grace period compresses to about 13s. So
+//! the response has to be to stop offering transactions to a full pool rather than to keep offering
+//! them and log each refusal — one such hiccup, mishandled, already cost 59 minutes of downtime.
+//!
 //! # Why the envelope is encoded here
 //!
 //! `alloy-consensus` would supply `TxEip1559`, and it does not currently resolve against this
@@ -60,11 +127,12 @@
 //! a fully specified nine-field RLP list; it is encoded below and pinned byte-for-byte against
 //! `cast mktx` output in the tests.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
 use alloy_primitives::{keccak256, Address, Bytes, B256, U256};
+use futures_util::stream::{FuturesUnordered, StreamExt};
 use alloy_rlp::Encodable;
 use alloy_sol_types::SolCall;
 use k256::ecdsa::SigningKey;
@@ -90,6 +158,13 @@ pub enum TxError {
     /// Transmission was attempted with no key configured.
     #[error("transmit_allowed is set but no signing key is loaded")]
     NoKey,
+    /// The account's nonce is not established, so nothing could be signed.
+    ///
+    /// Distinct from [`Self::Rpc`] on purpose: the read that would establish it has its own error,
+    /// and this is the state *afterwards* — the phase declined to guess. Guessing is what a zero
+    /// initial nonce did, and the first send of every process paid for it.
+    #[error("the account nonce is not established; nothing was signed")]
+    NoNonce,
     /// The node rejected the raw transaction.
     #[error("node rejected the transaction: {0}")]
     Rejected(String),
@@ -449,6 +524,173 @@ pub enum Settled {
     },
 }
 
+/// The account's nonce sequence, held in this process.
+///
+/// See the module docs for why it is held rather than read: the node's `pending` count is derived
+/// from a pool that silently truncates this account at 16 slots, so at ~37 in flight it answers low
+/// by however many it dropped and a per-send read would hand out a used nonce every time.
+///
+/// Two pieces, because a refused broadcast leaves a hole and a hole must be filled rather than
+/// skipped. Everything above a gap in the sequence is unexecutable — nonce ordering is absolute for
+/// one sender — so a nonce that provably never reached a pool has to come back and be handed out
+/// again, or the account wedges at the gap until something times out.
+#[derive(Debug, Default)]
+struct Nonces {
+    /// The lowest nonce never yet handed out. `None` until seeded, which is the only state in which
+    /// a reservation is allowed to ask the node.
+    next: Option<u64>,
+    /// Nonces reserved and then *provably* refused, lowest first. Handed out again before `next`.
+    ///
+    /// Only ever holds values the upstream demonstrably never accepted — a local limiter refusal, or
+    /// a `-32003`. An unknown outcome must never land here: reusing a nonce that is actually sitting
+    /// in the sequencer signs a second transaction at the same nonce, which is the duplication this
+    /// whole structure exists to prevent.
+    free: BTreeSet<u64>,
+}
+
+impl Nonces {
+    /// What the next reservation would take, without taking it. `None` until seeded.
+    fn peek(&self) -> Option<u64> {
+        self.free.iter().next().copied().or(self.next)
+    }
+
+    /// Take the next nonce. `None` until seeded.
+    ///
+    /// Synchronous by construction, and every caller must keep it that way. This is the
+    /// read-modify-write that concurrency would break.
+    fn reserve(&mut self) -> Option<u64> {
+        if let Some(n) = self.free.pop_first() {
+            return Some(n);
+        }
+        let n = self.next?;
+        self.next = Some(n.saturating_add(1));
+        Some(n)
+    }
+
+    /// Give a reserved nonce back, for a broadcast the upstream provably refused.
+    fn release(&mut self, n: u64) {
+        // Only a nonce this book actually handed out. A value at or above `next` was never reserved,
+        // and admitting one would let a caller mistake shrink the sequence.
+        if self.next.is_some_and(|next| n < next) {
+            self.free.insert(n);
+        }
+    }
+
+    /// Forget everything and re-read on the next reservation. See [`Sender::resync_nonce`].
+    fn resync(&mut self) {
+        self.next = None;
+        // The holes go too. They are positions in a sequence this book is about to stop believing
+        // in, and carrying them across would hand out nonces below whatever the node reports.
+        self.free.clear();
+    }
+
+    /// Take the node's count as the sequence's new origin.
+    fn adopt(&mut self, from_node: u64) {
+        self.next = Some(from_node);
+        self.free.clear();
+    }
+
+    const fn seeded(&self) -> bool {
+        self.next.is_some()
+    }
+}
+
+/// A signed transaction whose nonce is already taken, waiting only for the wire.
+///
+/// Produced by [`Sender::reserve_batch`] with no await in sight, which is what makes the broadcast
+/// that follows safe to run concurrently.
+#[derive(Debug, Clone)]
+struct Reserved {
+    intent: Intent,
+    nonce: u64,
+    hash: B256,
+    raw: Vec<u8>,
+}
+
+/// How an in-progress `-32003` episode is doing.
+#[derive(Debug, Clone, Copy)]
+struct Backpressure {
+    opened: Instant,
+    last_refusal: Instant,
+    /// Transactions the upstream refused with `-32003` since the episode opened.
+    refusals: u64,
+    /// Intents never offered at all, because the phase was paused.
+    held: u64,
+}
+
+/// A backpressure episode changing state. Reported once, so the caller logs once.
+///
+/// Carried out of [`Sender::send_batch`] rather than logged here, because this module deliberately
+/// emits nothing: the same property that lets [`Sender::sweep_timeouts`] be tested without a node.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Episode {
+    /// The upstream pool started refusing. First occurrence in this episode.
+    Opened {
+        /// Refusals in the batch that opened it.
+        refusals: u64,
+    },
+    /// The upstream took a transaction again, and this is what the episode cost.
+    Closed {
+        /// Transactions refused with `-32003`.
+        refusals: u64,
+        /// Intents never offered, because the phase was paused.
+        held: u64,
+        /// How long the episode lasted.
+        secs: u64,
+    },
+}
+
+/// What one send phase did.
+#[derive(Debug)]
+pub struct Batch {
+    /// Per-intent outcomes, in the order the nonces were reserved.
+    ///
+    /// `-32003` refusals are deliberately **absent**: they are backpressure rather than
+    /// per-transaction failures, and they are counted into [`Self::held_backpressure`] and the
+    /// episode instead so that a wedged upstream produces one line rather than one per send.
+    pub sent: Vec<(Intent, Result<Sent, TxError>)>,
+    /// Intents not offered because the account is at its in-flight ceiling.
+    pub held_at_capacity: usize,
+    /// Intents refused with `-32003`, or never offered because the phase is paused behind one.
+    pub held_backpressure: usize,
+    /// Set only on the cycle an episode opens or closes.
+    pub episode: Option<Episode>,
+}
+
+impl Batch {
+    /// An empty phase: nothing offered, nothing held, nothing to report.
+    fn empty() -> Self {
+        Self {
+            sent: Vec::new(),
+            held_at_capacity: 0,
+            held_backpressure: 0,
+            episode: None,
+        }
+    }
+}
+
+/// The most transactions this account may have unconfirmed at once, across every pair.
+///
+/// GIWA's sequencer refuses new transactions from one account past **256 in flight** with
+/// `-32003 txpool is full`, and half of that stays as stall buffer: a burst that arrives while
+/// inclusion is briefly behind must have somewhere to go other than into the refusal path.
+///
+/// This is a backstop, not the pacer. The per-pair [`crate::config::TxConfig::in_flight_max`] is
+/// what actually binds in steady state, and it is sized from the cadence — see its documentation.
+/// The number that matters about this one is that it is a *global* ceiling: the resources a send
+/// consumes are the account's single nonce sequence and the sequencer's per-account limit, neither
+/// of which is divisible per pair.
+pub const IN_FLIGHT_TOTAL_MAX: usize = 128;
+
+/// How long the send phase stands down after the upstream answers `-32003`.
+///
+/// Sized against the two measured numbers. Inclusion advances about once per block, so a second
+/// gives the upstream a full block to drain — anything much shorter re-offers the same transactions
+/// to the same full pool five times a second, which is the flood this exists to avoid. And it has to
+/// be short against the grace period: at 19 tx/s the account wedges roughly 13s after inclusion
+/// stops, so a pause measured in seconds would spend most of the runway waiting.
+const BACKPRESSURE_PAUSE: Duration = Duration::from_secs(1);
+
 /// Builds, signs and submits. Owns the nonce and the pending set.
 #[derive(Debug)]
 pub struct Sender {
@@ -459,20 +701,8 @@ pub struct Sender {
     max_fee: u128,
     max_priority_fee: u128,
     transmit_allowed: bool,
-    nonce: Option<u64>,
-    /// One past the highest nonce this sender has actually broadcast. A floor under every re-read.
-    ///
-    /// A re-read asks `eth_getTransactionCount(addr, "pending")`, and "pending" is *that node's*
-    /// pending pool. The transmit pool holds nine endpoints, and when the pinned one is serving a
-    /// rate-limit penalty the question goes to another — one that has not seen the transactions we
-    /// handed to the first. It answers with a count from before them, the sender signs a nonce it
-    /// has already used, and the node refuses it as `nonce too low`, which drops the nonce and asks
-    /// again. Measured: 3,391 of 4,519 failed sends were this loop, and it is why the ladder aged
-    /// past `maxStaleSecs` and the pool went dark in bursts a taker sees as a venue flickering.
-    ///
-    /// Taking the larger of the two cannot skip a nonce. Every value counted here was broadcast, so
-    /// the chain will reach it; the floor can only refuse to walk back over ground already covered.
-    broadcast_next: u64,
+    /// The nonce sequence. See [`Nonces`], and the module docs for why it is not re-read per send.
+    nonces: Nonces,
     /// Outstanding transactions per pair, oldest first. A `Vec` rather than one slot because the
     /// send path pipelines — see [`Sender::at_capacity`].
     pending: BTreeMap<u16, Vec<Pending>>,
@@ -480,6 +710,10 @@ pub struct Sender {
     in_flight_max: usize,
     /// The chain's confirmed nonce. See [`Sender::observe_landed`].
     landed_nonce: u64,
+    /// The open `-32003` episode, if the upstream is currently refusing.
+    backpressure: Option<Backpressure>,
+    /// An episode transition waiting to be logged. Drained by [`Sender::take_episode`].
+    staged_episode: Option<Episode>,
 }
 
 impl Sender {
@@ -501,14 +735,17 @@ impl Sender {
             max_fee,
             max_priority_fee,
             transmit_allowed: cfg.transmit_allowed,
-            nonce: None,
-            // Zero floors nothing, which is right at startup: this process has broadcast nothing,
-            // so the node's count is the only truth there is.
-            broadcast_next: 0,
+            // Unseeded. `Sender::seed_nonce` fills it once at startup; until then the first
+            // reservation reads the node, which is the one moment in this process's life where that
+            // read is both necessary and trustworthy — nothing is in flight, so the local pool has
+            // nothing to have truncated.
+            nonces: Nonces::default(),
             pending: BTreeMap::new(),
             pending_timeout: Duration::from_secs(cfg.pending_timeout_secs),
             in_flight_max: cfg.in_flight_max,
             landed_nonce: 0,
+            backpressure: None,
+            staged_episode: None,
         }
     }
 
@@ -539,8 +776,21 @@ impl Sender {
     /// orders. `updateQuote` replaces the row without reading it, so a dropped one needs no
     /// retry: the next cycle computes a fresh row from the current reference and sends that. A
     /// pipeline of quotes is therefore safe in a way a pipeline of orders would not be.
+    ///
+    /// # Two ceilings, and why the second one is global
+    ///
+    /// The per-pair bound stays: it is what stops one pair's stall from occupying the whole queue,
+    /// and it is what `tx.in_flight_max` means in a config file somebody reviews.
+    ///
+    /// It is not sufficient on its own, because nothing a send consumes is divisible per pair. There
+    /// is one nonce sequence for the account, and the sequencer's refusal threshold — 256 in flight
+    /// from one address — is per account too. A per-pair cap of *k* over *n* pairs implies a global
+    /// ceiling of *k·n* that nobody wrote down and that changes when a pair is added, which is
+    /// exactly the shape of limit that is discovered in production. So the account's own ceiling is
+    /// stated directly, as [`IN_FLIGHT_TOTAL_MAX`].
     pub fn at_capacity(&self, pair_id: u16) -> bool {
         self.in_flight(pair_id) >= self.in_flight_max
+            || self.in_flight_total() >= IN_FLIGHT_TOTAL_MAX
     }
 
     /// How many transactions this pair has outstanding.
@@ -549,6 +799,20 @@ impl Sender {
         self.pending.get(&pair_id).map_or(0, |v| {
             v.iter().filter(|p| p.nonce >= self.landed_nonce).count()
         })
+    }
+
+    /// How many transactions this **account** has outstanding, across every pair.
+    ///
+    /// The quantity the sequencer's 256-per-account limit is measured in, and — because nonce
+    /// ordering is absolute — also the depth a jump withdrawal has to queue behind. Both of those
+    /// are properties of the key, and the key is shared by the whole book.
+    #[must_use]
+    pub fn in_flight_total(&self) -> usize {
+        self.pending
+            .values()
+            .flat_map(|v| v.iter())
+            .filter(|p| p.nonce >= self.landed_nonce)
+            .count()
     }
 
     /// Whether this pair already has an unconfirmed **withdrawal** in the air.
@@ -597,9 +861,68 @@ impl Sender {
         self.pending.get(&pair_id).and_then(|v| v.first())
     }
 
-    /// Force the next send to re-read the nonce from the node.
+    /// Force the next reservation to re-read the nonce from the node.
+    ///
+    /// There are exactly two callers, and the module docs say why there may not be a third:
+    /// [`Self::sweep_timeouts`] abandoning an intent, and a `nonce too low` proving the chain is
+    /// ahead of us. Both are recovery paths where the local counter has already been shown to be
+    /// wrong, so re-reading is the only way forward. On the hot path the node's answer is *less*
+    /// trustworthy than ours — it is derived from a pool that truncates this account at 16 slots —
+    /// and a read there would hand out a nonce that has already been used.
     pub fn resync_nonce(&mut self) {
-        self.nonce = None;
+        self.nonces.resync();
+    }
+
+    /// The nonce the next reservation would take, when the sequence is known.
+    #[must_use]
+    pub fn next_nonce(&self) -> Option<u64> {
+        self.nonces.peek()
+    }
+
+    /// Whether an upstream backpressure episode is currently open.
+    #[must_use]
+    pub const fn under_backpressure(&self) -> bool {
+        self.backpressure.is_some()
+    }
+
+    /// An episode that opened or closed since this was last called. Reported once, so it is logged
+    /// once. See [`Episode`].
+    pub fn take_episode(&mut self) -> Option<Episode> {
+        self.staged_episode.take()
+    }
+
+    /// Read the account's nonce once, so that the first send is not the thing that discovers it.
+    ///
+    /// This is the *only* unconditional `eth_getTransactionCount` in the process, and startup is the
+    /// one moment where the answer can be trusted without qualification: nothing of ours is in
+    /// flight, so the local pool has dropped nothing and its `pending` count is the chain's.
+    ///
+    /// Worth doing on its own terms even before concurrency. The floor that used to guard the first
+    /// send was initialised to zero, so the first send after every process start was unfloored — and
+    /// a first send at a nonce the chain has long passed is the head of the `nonce too low` loop that
+    /// accounted for 3,391 of 4,519 failed sends in one historical episode.
+    ///
+    /// # Errors
+    /// [`TxError::NoKey`] with no signer, or [`TxError::Rpc`] if the read fails. Neither is fatal to
+    /// the caller: an unseeded sequence simply means the first reservation reads it instead.
+    pub async fn seed_nonce(&mut self, rpc: &Rpc) -> Result<u64, TxError> {
+        let signer = self.signer.as_ref().ok_or(TxError::NoKey)?;
+        let n = rpc
+            .quantity(
+                "eth_getTransactionCount",
+                json!([signer.address().to_string(), "pending"]),
+            )
+            .await?;
+        self.nonces.adopt(n);
+        Ok(n)
+    }
+
+    /// Read the nonce if, and only if, nothing has established it yet.
+    async fn ensure_seeded(&mut self, rpc: &Rpc) -> Result<(), TxError> {
+        if self.nonces.seeded() {
+            return Ok(());
+        }
+        self.seed_nonce(rpc).await.map(|_| ())
     }
 
     /// Build the envelope for an intent without signing or sending it, at the configured fees.
@@ -665,77 +988,345 @@ impl Sender {
         fees: Option<Fees>,
     ) -> Result<Sent, TxError> {
         if !self.transmit_allowed {
-            // Dry run still signs when a key happens to be loaded, so that the encode-and-sign
-            // path is exercised rather than merely assumed to work on the day it is switched on.
-            let would_be = match (&self.signer, self.nonce) {
-                (Some(s), Some(n)) => Some(self.envelope_with_fees(intent, n, fees).sign(s)?.0),
-                _ => None,
-            };
-            return Ok(Sent::DryRun {
-                calldata: intent.calldata(),
-                would_be_hash: would_be,
-                would_be_nonce: self.nonce,
-            });
+            return self.dry_run(intent, fees);
+        }
+        self.ensure_seeded(rpc).await?;
+        let mut reserved = self.reserve_batch(std::slice::from_ref(&intent), fees)?;
+        // `reserve_batch` returns one entry per intent, and there is exactly one here.
+        let Some(r) = reserved.pop() else {
+            return Err(TxError::NoNonce);
+        };
+        let out = rpc
+            .call("eth_sendRawTransaction", json!([hex0x(&r.raw)]))
+            .await;
+        self.settle_broadcast(&r, out, Instant::now())
+    }
+
+    /// Describe what would have gone out, without sending it.
+    ///
+    /// Still signs when a key happens to be loaded, so that the encode-and-sign path is exercised
+    /// rather than merely assumed to work on the day it is switched on.
+    fn dry_run(&self, intent: Intent, fees: Option<Fees>) -> Result<Sent, TxError> {
+        let would_be_nonce = self.nonces.peek();
+        let would_be_hash = match (&self.signer, would_be_nonce) {
+            (Some(s), Some(n)) => Some(self.envelope_with_fees(intent, n, fees).sign(s)?.0),
+            _ => None,
+        };
+        Ok(Sent::DryRun {
+            calldata: intent.calldata(),
+            would_be_hash,
+            would_be_nonce,
+        })
+    }
+
+    /// Broadcast a whole cycle's intents at once: nonces assigned synchronously, sends concurrent.
+    ///
+    /// This is the send phase. See the module docs for the split and for why it is the only shape
+    /// that is safe; what follows is what happens around it.
+    ///
+    /// **Order.** `intents` is walked in order and the nonces come out in that order, so the
+    /// arbitration `main.rs` performs between a capacity refresh and a quote row still decides which
+    /// one executes first. Nothing else about the batch is ordered: the broadcasts complete in
+    /// whatever order the network returns them, and the outcomes are folded back in reservation order
+    /// regardless, so the pending queue for a pair stays oldest-first.
+    ///
+    /// **The in-flight ceiling.** Trimmed to [`IN_FLIGHT_TOTAL_MAX`] before anything is signed. The
+    /// per-pair gate in [`crate::policy`] has usually already done this work via [`Self::at_capacity`];
+    /// this is the account-level backstop, and it is here rather than only in the policy because the
+    /// sequencer's limit is not something a per-pair decision can see.
+    ///
+    /// **Backpressure.** A `-32003` pauses the phase for [`BACKPRESSURE_PAUSE`] rather than being
+    /// reported per transaction. Withholding quotes is the correct response to a full upstream: the
+    /// transactions are idempotent overwrites, so nothing is lost by not sending them, and the next
+    /// cycle computes fresh rows anyway. What *is* lost by sending them is the log — at 27 tx/s a
+    /// per-occurrence error is about 1600 lines a minute, which buries the one line that says the
+    /// account is wedging.
+    ///
+    /// # Errors
+    /// [`TxError`] only for the failures that stop the whole phase: no key, or a nonce that could not
+    /// be established. Per-intent failures are inside [`Batch::sent`].
+    pub async fn send_batch(
+        &mut self,
+        rpc: &Rpc,
+        intents: &[Intent],
+        fees: Option<Fees>,
+    ) -> Result<Batch, TxError> {
+        if intents.is_empty() {
+            return Ok(Batch::empty());
+        }
+        if !self.transmit_allowed {
+            let mut batch = Batch::empty();
+            for intent in intents {
+                batch.sent.push((*intent, self.dry_run(*intent, fees)));
+            }
+            return Ok(batch);
         }
 
-        let signer = self.signer.as_ref().ok_or(TxError::NoKey)?;
-        let nonce = match self.nonce {
-            Some(n) => n,
-            None => {
-                let n = rpc
-                    .quantity(
-                        "eth_getTransactionCount",
-                        json!([signer.address().to_string(), "pending"]),
-                    )
-                    .await?;
-                // Never below what we have already broadcast. See `broadcast_next`: the node that
-                // answers this is not always the node that took the last send.
-                let n = n.max(self.broadcast_next);
-                self.nonce = Some(n);
-                n
+        let now = Instant::now();
+        // Still inside the pause. Nothing is signed and nothing is offered: a pool that refused a
+        // transaction 200ms ago is a pool that will refuse this one, and asking again is how one
+        // wedged upstream becomes thousands of log lines.
+        if let Some(mut bp) = self.backpressure {
+            if now.saturating_duration_since(bp.last_refusal) < BACKPRESSURE_PAUSE {
+                bp.held = bp.held.saturating_add(intents.len() as u64);
+                self.backpressure = Some(bp);
+                return Ok(Batch {
+                    sent: Vec::new(),
+                    held_at_capacity: 0,
+                    held_backpressure: intents.len(),
+                    episode: self.staged_episode.take(),
+                });
             }
+        }
+
+        let headroom = IN_FLIGHT_TOTAL_MAX.saturating_sub(self.in_flight_total());
+        let offered: Vec<Intent> = intents.iter().copied().take(headroom).collect();
+        let held_at_capacity = intents.len().saturating_sub(offered.len());
+
+        self.ensure_seeded(rpc).await?;
+        let reserved = self.reserve_batch(&offered, fees)?;
+        assert_eq!(
+            reserved.len(),
+            offered.len(),
+            "one reservation per offered intent"
+        );
+
+        // The whole point. Five `eth_sendRawTransaction` calls at a fixed 264ms France-to-Korea RTT
+        // cost 264ms together instead of 1.32s in sequence. The raw bytes are hex-encoded up front so
+        // each future owns its own payload and borrows nothing but the client.
+        let mut flight: FuturesUnordered<_> = reserved
+            .iter()
+            .enumerate()
+            .map(|(i, r)| {
+                let raw = hex0x(&r.raw);
+                async move { (i, rpc.call("eth_sendRawTransaction", json!([raw])).await) }
+            })
+            .collect();
+        let mut outcomes: BTreeMap<usize, Result<serde_json::Value, RpcError>> = BTreeMap::new();
+        while let Some((i, out)) = flight.next().await {
+            outcomes.insert(i, out);
+        }
+        drop(flight);
+
+        // Folded back in reservation order, not completion order. `Sender::pending` is documented
+        // oldest-first per pair and `sweep_timeouts` acts on the head of it, so a pair carrying both
+        // a refresh and a row must record them in the order their nonces execute.
+        let settled_at = Instant::now();
+        let mut batch = Batch {
+            sent: Vec::with_capacity(reserved.len()),
+            held_at_capacity,
+            held_backpressure: 0,
+            episode: None,
         };
+        for (i, r) in reserved.iter().enumerate() {
+            let Some(out) = outcomes.remove(&i) else {
+                continue;
+            };
+            let refused = out.as_ref().err().is_some_and(RpcError::is_txpool_full);
+            let result = self.settle_broadcast(r, out, settled_at);
+            if refused {
+                // Counted, not returned. This is the upstream's state, not this transaction's.
+                batch.held_backpressure += 1;
+            } else {
+                batch.sent.push((r.intent, result));
+            }
+        }
+        batch.episode = self.staged_episode.take();
+        Ok(batch)
+    }
 
-        let tx = self.envelope_with_fees(intent, nonce, fees);
-        let (hash, raw) = tx.sign(signer)?;
+    /// Assign nonces and sign, in the order the intents were pushed.
+    ///
+    /// **There is no `.await` in this function and there must never be one.** That is the entire
+    /// reason it exists as a separate pass: the nonce is a read-modify-write, and an await inside it
+    /// is what would let two concurrent sends both read `n` and both sign `n`.
+    fn reserve_batch(
+        &mut self,
+        intents: &[Intent],
+        fees: Option<Fees>,
+    ) -> Result<Vec<Reserved>, TxError> {
+        if self.signer.is_none() {
+            return Err(TxError::NoKey);
+        }
+        if !self.nonces.seeded() {
+            return Err(TxError::NoNonce);
+        }
 
-        match rpc
-            .call("eth_sendRawTransaction", json!([hex0x(&raw)]))
-            .await
-        {
+        let mut nonces: Vec<u64> = Vec::with_capacity(intents.len());
+        for _ in intents {
+            // Checked seeded above, and nothing between here and there can unseed it.
+            let Some(n) = self.nonces.reserve() else {
+                break;
+            };
+            // The invariant the RefreshCapacity-before-UpdateQuote argument rests on. A reused hole
+            // is always below `next` and holes come out lowest-first, so the sequence a batch takes
+            // is strictly increasing even when it is not contiguous.
+            if let Some(prev) = nonces.last() {
+                assert!(
+                    n > *prev,
+                    "reserved nonces must strictly increase in intent order"
+                );
+            }
+            nonces.push(n);
+        }
+        if nonces.len() != intents.len() {
+            for n in nonces {
+                self.nonces.release(n);
+            }
+            return Err(TxError::NoNonce);
+        }
+
+        let signed: Result<Vec<Reserved>, TxError> = {
+            let Some(signer) = self.signer.as_ref() else {
+                return Err(TxError::NoKey);
+            };
+            intents
+                .iter()
+                .zip(&nonces)
+                .map(|(intent, &nonce)| {
+                    let (hash, raw) = self.envelope_with_fees(*intent, nonce, fees).sign(signer)?;
+                    Ok(Reserved {
+                        intent: *intent,
+                        nonce,
+                        hash,
+                        raw,
+                    })
+                })
+                .collect()
+        };
+        match signed {
+            Ok(v) => Ok(v),
+            // Signing a valid key cannot fail in practice, but a nonce reserved and then never used
+            // is a hole in the sequence, and a hole stops every nonce above it from executing. So it
+            // goes back rather than being left to a timeout that has nothing to time out.
+            Err(e) => {
+                for n in nonces {
+                    self.nonces.release(n);
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// Fold one broadcast's outcome into the nonce book, the pending set, and the episode counter.
+    ///
+    /// The classification is the delicate part, and it is a claim about whether the nonce was
+    /// consumed rather than about whether the send succeeded:
+    ///
+    /// * **Accepted** — tracked, nonce spent. A hash the node disagrees with is *still* accepted: it
+    ///   took the transaction, so the nonce is gone whatever it filed it under. Tracking it anyway is
+    ///   a change from the previous behaviour, which returned the error and left a possibly-live
+    ///   nonce with nothing to time it out.
+    /// * **Provably refused** — the local limiter never opened a socket, or the sequencer answered
+    ///   `-32003`. The nonce is untouched and goes back to [`Nonces::free`] to be handed out again,
+    ///   which is what keeps the sequence gap-free without asking the node anything.
+    /// * **`nonce too low`** — the chain has passed this nonce. The counter is behind, and this is one
+    ///   of the two conditions that may re-read it.
+    /// * **`already known`** — the node has these exact bytes already, so the transaction is in flight
+    ///   under the hash we signed. Treated as an acceptance; see [`RpcError::is_already_known`].
+    /// * **Anything else** — unknown fate. The transaction may be sitting in the sequencer, so the
+    ///   nonce must *not* be reused; it is recorded under the hash we signed and
+    ///   [`Self::sweep_timeouts`] is what eventually resolves it.
+    fn settle_broadcast(
+        &mut self,
+        r: &Reserved,
+        out: Result<serde_json::Value, RpcError>,
+        now: Instant,
+    ) -> Result<Sent, TxError> {
+        let e = match out {
             Ok(v) => {
                 let returned = v.as_str().unwrap_or_default();
-                if !returned.is_empty() && returned != hash.to_string() {
-                    // Not fatal, but it means the local hash and the node's disagree, and every
-                    // receipt lookup after this would be against the wrong one.
+                let mismatch = !returned.is_empty() && returned != r.hash.to_string();
+                self.track(r, now);
+                self.close_episode(now);
+                if mismatch {
+                    // Not fatal, but the local hash and the node's disagree, so every receipt lookup
+                    // after this would be against the wrong one.
                     return Err(TxError::Rejected(format!(
-                        "node returned hash {returned}, locally computed {hash}"
+                        "node returned hash {returned}, locally computed {}",
+                        r.hash
                     )));
                 }
-                self.nonce = Some(nonce + 1);
-                self.broadcast_next = self.broadcast_next.max(nonce + 1);
-                self.pending
-                    .entry(intent.pair_id())
-                    .or_default()
-                    .push(Pending {
-                        hash,
-                        kind: intent.label(),
-                        nonce,
-                        submitted_at: Instant::now(),
-                        withdrawal: intent.is_withdrawal(),
-                    });
-                Ok(Sent::Broadcast { hash, nonce })
+                return Ok(Sent::Broadcast {
+                    hash: r.hash,
+                    nonce: r.nonce,
+                });
             }
-            Err(e) => {
-                // A request the limiter refused before opening a socket cannot have consumed the
-                // nonce, so keeping it costs nothing and saves a re-read — and a re-read is the
-                // one operation that can hand back a stale count. Anything that did go out is
-                // dropped as before, because from here we cannot tell whether it landed.
-                if !e.never_sent() {
-                    self.resync_nonce();
-                }
-                Err(TxError::Rpc(e))
-            }
+            Err(e) => e,
+        };
+
+        if e.is_already_known() {
+            // Accepted, not refused. The node has these exact bytes, so the transaction is in flight
+            // under the hash we signed and the nonce is spent — the same state as an `Ok`, reached by
+            // a different reply. Tracking it and returning success is what makes it true rather than
+            // merely quiet: the pending entry is what a receipt lookup and the timeout sweep need,
+            // and an operator alert on a transaction that is on its way is noise that trains people
+            // to ignore the channel. Observed only on the one pair that spends ~30% of its time
+            // withdrawn, where the ladder is byte-identical between pushes and so a duplicate is
+            // possible at all.
+            self.track(r, now);
+            self.close_episode(now);
+            return Ok(Sent::Broadcast {
+                hash: r.hash,
+                nonce: r.nonce,
+            });
+        }
+        if e.is_txpool_full() {
+            self.nonces.release(r.nonce);
+            self.open_or_extend_episode(now);
+        } else if e.never_sent() {
+            self.nonces.release(r.nonce);
+        } else if e.is_nonce_too_low() {
+            self.resync_nonce();
+        } else {
+            self.track(r, now);
+        }
+        Err(TxError::Rpc(e))
+    }
+
+    /// Record a transaction as outstanding for its pair.
+    fn track(&mut self, r: &Reserved, now: Instant) {
+        self.pending
+            .entry(r.intent.pair_id())
+            .or_default()
+            .push(Pending {
+                hash: r.hash,
+                kind: r.intent.label(),
+                nonce: r.nonce,
+                submitted_at: now,
+                withdrawal: r.intent.is_withdrawal(),
+            });
+    }
+
+    /// Note a `-32003`, opening an episode if this is the first one.
+    fn open_or_extend_episode(&mut self, now: Instant) {
+        let (first, refusals) = {
+            let bp = self.backpressure.get_or_insert(Backpressure {
+                opened: now,
+                last_refusal: now,
+                refusals: 0,
+                held: 0,
+            });
+            let first = bp.refusals == 0;
+            bp.last_refusal = now;
+            bp.refusals = bp.refusals.saturating_add(1);
+            (first, bp.refusals)
+        };
+        // Refreshed while the `Opened` report is still undrained, so the one line the caller logs
+        // carries the whole batch's refusals rather than only the first of them.
+        if first || matches!(self.staged_episode, Some(Episode::Opened { .. })) {
+            self.staged_episode = Some(Episode::Opened { refusals });
+        }
+    }
+
+    /// The upstream took a transaction, so whatever episode was open is over.
+    fn close_episode(&mut self, now: Instant) {
+        if let Some(bp) = self.backpressure.take() {
+            self.staged_episode = Some(Episode::Closed {
+                refusals: bp.refusals,
+                held: bp.held,
+                secs: now.saturating_duration_since(bp.opened).as_secs(),
+            });
         }
     }
 
@@ -1436,9 +2027,10 @@ mod tests {
             50_000_000,
             5_000_000,
         );
-        s.nonce = Some(41);
+        s.nonces.adopt(41);
+        assert_eq!(s.next_nonce(), Some(41));
         s.resync_nonce();
-        assert_eq!(s.nonce, None);
+        assert_eq!(s.next_nonce(), None);
     }
 
     /// A re-read may reach a node that has not seen what we already broadcast.
@@ -1448,8 +2040,12 @@ mod tests {
     /// its own pending pool — a count from before the transactions the first node is holding. The
     /// sender then signs a nonce it has already used, the node refuses it as `nonce too low`, the
     /// refusal drops the nonce, and it asks again. 3,391 of 4,519 failed sends were this loop.
+    ///
+    /// The defence used to be a floor: whatever the node answered was raised to the highest nonce
+    /// already broadcast. It is now structural, and stronger for it — the sequence lives in this
+    /// process, so on the hot path there is no answer to raise because nothing is asked.
     #[test]
-    fn a_re_read_never_walks_the_nonce_back_over_ground_already_broadcast() {
+    fn a_lagging_node_is_never_consulted_about_a_nonce_already_handed_out() {
         let mut s = Sender::new(
             None,
             91_342,
@@ -1458,27 +2054,50 @@ mod tests {
             50_000_000,
             5_000_000,
         );
-        s.broadcast_next = 215_412; // 215409..=215411 went out
-
-        // What a node that saw them would say, and what a node that did not would say.
-        for answered in [215_412_u64, 215_409] {
-            assert_eq!(
-                answered.max(s.broadcast_next),
-                215_412,
-                "a lagging node must not pull the nonce back onto a number already used"
-            );
+        // Seeded once, as `seed_nonce` does at startup; 215409..=215411 then go out.
+        s.nonces.adopt(215_409);
+        for expected in [215_409_u64, 215_410, 215_411] {
+            assert_eq!(s.nonces.reserve(), Some(expected));
         }
-
-        // A node genuinely ahead — someone else spent nonces from this key — still wins.
-        assert_eq!(215_500_u64.max(s.broadcast_next), 215_500);
+        // A node whose pool truncated all three would answer 215409. It is not asked.
+        assert_eq!(s.next_nonce(), Some(215_412));
     }
 
-    /// The floor tracks what was broadcast, not what was signed.
+    /// A refused nonce comes back and is handed out again, lowest first.
     ///
-    /// A transaction that was built but never left must not raise it: the chain never saw that
-    /// nonce, so skipping it would leave a gap that every later transaction queues behind.
+    /// The property the whole two-piece [`Nonces`] exists for. Nonce ordering is absolute for one
+    /// sender, so a hole left by a refusal makes every nonce above it unexecutable until something
+    /// times out — filling it is not tidiness, it is the difference between the next cycle quoting
+    /// and the account wedging at the gap.
     #[test]
-    fn the_floor_only_moves_on_a_broadcast() {
+    fn a_refused_nonce_is_reused_rather_than_leaving_a_gap() {
+        let mut n = Nonces::default();
+        n.adopt(700);
+        let taken: Vec<u64> = (0..3).filter_map(|_| n.reserve()).collect();
+        assert_eq!(taken, vec![700, 701, 702]);
+
+        // The middle one was provably refused; the other two are in the air.
+        n.release(701);
+        assert_eq!(
+            n.reserve(),
+            Some(701),
+            "the hole is filled before the frontier"
+        );
+        assert_eq!(n.reserve(), Some(703));
+
+        // A value the book never handed out cannot shrink the sequence.
+        n.release(9_000);
+        assert_eq!(n.reserve(), Some(704));
+    }
+
+    /// A fresh sender has no opinion about the nonce at all, and that is the point.
+    ///
+    /// The floor this replaces was initialised to `0`, which does not mean "unknown" — it means
+    /// zero. So the first send of every process was floored at a nonce the chain passed long ago,
+    /// which is the head of the `nonce too low` loop above. [`Sender::seed_nonce`] is what gives it
+    /// an opinion, once, at startup.
+    #[test]
+    fn a_fresh_sender_has_no_nonce_until_something_seeds_it() {
         let s = Sender::new(
             None,
             91_342,
@@ -1488,8 +2107,9 @@ mod tests {
             5_000_000,
         );
         assert_eq!(
-            s.broadcast_next, 0,
-            "a fresh sender has broadcast nothing, so the node's count is the only truth"
+            s.next_nonce(),
+            None,
+            "an unseeded sequence must say so rather than answer zero"
         );
     }
 

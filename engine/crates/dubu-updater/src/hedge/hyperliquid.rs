@@ -31,9 +31,40 @@
 //! `xyz:TSLA` 307.31, `flx:TSLA` 395.50, `cash:TSLA` 400.21. Thirty percent apart. So the dex is
 //! part of the market's identity, not a routing detail -- picking one is picking a fair value, and
 //! [`Market::dex`] makes that choice explicit rather than implied.
+//!
+//! # The fetching is not on the quote loop, and the split is not cosmetic
+//!
+//! This used to be polled from inside `run_hedge`, which `run_cycle` called, and it was **51% of the
+//! cycle**: six sequential external HTTPS round trips every pass -- five
+//! `api.binance.com/api/v3/depth` calls at 1.274s together plus one `api.hyperliquid.xyz/info`
+//! `allMids` at 0.25s -- for a median 1.373s against a 2.695s cycle whose per-pair compute finished
+//! in under a millisecond.
+//!
+//! Two things made that pure waste rather than a cost worth paying. The calls were **sequential**
+//! when nothing orders them: no book's price depends on another's, so the whole 1.373s was six
+//! copies of one wait. And they poll a **paper** book -- nothing in the quote path reads a mid from
+//! here synchronously, so more than half of the price-setting loop was spent on work that sets no
+//! price.
+//!
+//! Both halves therefore moved, and they are separate fixes:
+//!
+//! * [`Paper::poll_all`] issues all six fetches through one `FuturesUnordered`, so a pass costs one
+//!   round trip rather than six.
+//! * `main.rs` runs that pass from a spawned hedge task instead of from the cycle, publishing the
+//!   position book the cycle actually reads. `feed::ws::run` and `chain::view::run` are the same
+//!   shape, and the measurement is why: post-restart the cycle was 1.657s, of which the last-send to
+//!   next-cycle gap -- this poll, and nothing else -- was 1.377s.
+//!
+//! What the cycle gives up is up to one hedge interval of staleness on a paper mid. That is the same
+//! trade `chain::view` documents and it is a smaller one here, because under the old arrangement the
+//! books were already up to a full cycle old. [`Paper::warn_if_stale`] is unchanged and is still the
+//! backstop that says when the staleness has stopped being acceptable.
 
 use std::collections::BTreeMap;
+use std::pin::Pin;
 use std::time::{Duration, Instant};
+
+use futures_util::stream::{FuturesUnordered, StreamExt};
 
 use tracing::{info, warn};
 
@@ -84,6 +115,92 @@ pub struct Quote {
     pub bids: Vec<super::binance::DepthPoint>,
     /// Ask side, same.
     pub asks: Vec<super::binance::DepthPoint>,
+}
+
+/// What one concurrent pass of [`Paper::poll_all`] refreshed, and what it could not.
+#[derive(Debug, Default)]
+pub struct PollReport {
+    /// Spot books refreshed, with both sides at depth.
+    pub books: usize,
+    /// Mids refreshed, summed across every dex polled.
+    pub mids: usize,
+    /// Per-dex failures, named rather than counted. Which book kept its previous mids is the
+    /// operator's question, because every paper fill on that book is now priced off them.
+    pub dex_failures: Vec<(String, VenueError)>,
+}
+
+/// One boxed in-flight fetch.
+///
+/// Erased because the two request shapes are two distinct opaque future types and a single
+/// `FuturesUnordered` cannot hold both otherwise — and holding all six at once is the entire point.
+/// Six allocations against six round trips is not a trade worth thinking about.
+type Fetch = Pin<Box<dyn std::future::Future<Output = Fetched> + Send>>;
+
+/// One in-flight fetch's result, tagged with what it was.
+enum Fetched {
+    /// A Binance spot depth response for one symbol. `None` if the request or the decode failed.
+    Depth {
+        symbol: String,
+        body: Option<serde_json::Value>,
+    },
+    /// A Hyperliquid `allMids` response for one dex.
+    Mids {
+        dex: String,
+        body: Result<serde_json::Value, VenueError>,
+    },
+}
+
+/// Turn a Binance `/api/v3/depth` body into a quote with both concession curves.
+///
+/// `None` rather than an error for anything malformed, because the caller's response to every such
+/// case is identical: keep the previous book and count a failure.
+fn depth_quote(v: &serde_json::Value) -> Option<Quote> {
+    let side = |k: &str| -> Vec<(f64, f64)> {
+        v.get(k)
+            .and_then(|l| l.as_array())
+            .map(|l| {
+                l.iter()
+                    .filter_map(|e| {
+                        let px = e.get(0)?.as_str()?.parse::<f64>().ok()?;
+                        let sz = e.get(1)?.as_str()?.parse::<f64>().ok()?;
+                        Some((px, sz))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let (bids, asks) = (side("bids"), side("asks"));
+    let (&(best_bid, _), &(best_ask, _)) = (bids.first()?, asks.first()?);
+    let mid = (best_bid + best_ask) / 2.0;
+    let depth = |l: &[(f64, f64)]| {
+        let cum: f64 = l.iter().map(|&(_, s)| s).sum();
+        super::binance::depth_curve(l, mid, cum)
+    };
+    Some(Quote {
+        mid,
+        bids: depth(&bids),
+        asks: depth(&asks),
+    })
+}
+
+/// Pull every positive mid out of an `allMids` body.
+///
+/// Prices arrive as decimal strings. Parsing them rather than reading a JSON float keeps the venue's
+/// own precision instead of whatever a float round-trip leaves behind.
+///
+/// # Errors
+/// [`VenueError::Decode`] if the body is not the object the endpoint documents.
+fn mids_from(v: &serde_json::Value) -> Result<Vec<(String, f64)>, VenueError> {
+    let map = v
+        .as_object()
+        .ok_or_else(|| VenueError::Decode("allMids was not an object".into()))?;
+    Ok(map
+        .iter()
+        .filter_map(|(k, val)| {
+            let px = val.as_str()?.parse::<f64>().ok()?;
+            (px > 0.0).then(|| (k.clone(), px))
+        })
+        .collect())
 }
 
 /// Anything that can go wrong reading this venue.
@@ -147,56 +264,105 @@ impl Paper {
         })
     }
 
-    /// Refresh every mid on one book.
+    /// Refresh every book this leg uses -- spot depth and per-dex mids -- in one concurrent pass.
     ///
-    /// `dex` empty polls the main perp book; a builder name polls that builder's. One call returns
-    /// the whole book at weight 2, so this is called once per dex rather than once per symbol --
-    /// per-symbol polling would be the same information at fifty times the cost.
+    /// **One `FuturesUnordered` over all of it**, because nothing here orders the requests: no book's
+    /// price depends on another's. Sequential, the six were 1.373s of a 2.695s cycle spent on six
+    /// copies of the same wait; concurrent, a pass costs one round trip.
     ///
-    /// # Errors
-    /// [`VenueError`].
-    pub async fn poll_mids(&mut self, dex: &str) -> Result<usize, VenueError> {
-        let body = if dex.is_empty() {
-            serde_json::json!({ "type": "allMids" })
-        } else {
-            serde_json::json!({ "type": "allMids", "dex": dex })
-        };
-        let url = format!("{}/info", self.base);
-        let resp = self.http.post(&url).json(&body).send().await.map_err(|e| {
-            self.failures = self.failures.saturating_add(1);
-            VenueError::Transport(e.to_string())
-        })?;
-        let v: serde_json::Value = resp.json().await.map_err(|e| {
-            self.failures = self.failures.saturating_add(1);
-            VenueError::Decode(e.to_string())
-        })?;
-        let Some(map) = v.as_object() else {
-            self.failures = self.failures.saturating_add(1);
-            return Err(VenueError::Decode("allMids was not an object".into()));
-        };
+    /// Spot is polled once per symbol and mids once per dex, and that asymmetry is deliberate rather
+    /// than an oversight. `allMids` returns a whole book at weight 2, so polling it per symbol would
+    /// be the same information at fifty times the cost. `/api/v3/depth` is the other way round: it is
+    /// the only call that carries both sides at depth, and depth is what prices a clip larger than the
+    /// top of book -- `allMids` gives a number, and a number cannot say what a 25 ETH clip pays.
+    ///
+    /// A symbol or a book that fails **keeps its previous quote** rather than being dropped. A stale
+    /// book prices a hedge slightly wrong; an absent one refuses it entirely and leaves the exposure
+    /// standing, which is the worse of the two by a wide margin.
+    pub async fn poll_all(&mut self, spot: &[String], dexs: &[String]) -> PollReport {
+        let mut report = PollReport::default();
+        if spot.is_empty() && dexs.is_empty() {
+            return report;
+        }
 
-        let mut n = 0;
-        for (k, val) in map {
-            // Prices arrive as decimal strings. Parsing rather than reading a float keeps the
-            // venue's own precision instead of whatever a JSON float round-trip leaves.
-            if let Some(px) = val.as_str().and_then(|s| s.parse::<f64>().ok()) {
-                if px > 0.0 {
-                    // Mid-only: `allMids` carries no depth, so a fill here pays the fee and
-                    // nothing for size. Honest and optimistic, and the equity pairs know it.
-                    self.books.insert(
-                        k.clone(),
-                        Quote {
-                            mid: px,
-                            ..Quote::default()
-                        },
-                    );
-                    n += 1;
-                }
+        // Each future owns its payload and borrows nothing: `reqwest::Client` is an `Arc` inside, so
+        // cloning it is a refcount bump rather than a second connection pool.
+        let mut flight: FuturesUnordered<Fetch> = FuturesUnordered::new();
+
+        for symbol in spot {
+            let http = self.http.clone();
+            let symbol = symbol.clone();
+            let url = format!(
+                "{}/api/v3/depth?symbol={symbol}&limit=100",
+                self.binance_base
+            );
+            flight.push(Box::pin(async move {
+                // Unsigned, so no key and no clock: `/api/v3/depth` is public.
+                let body = match http.get(&url).send().await {
+                    Ok(r) => r.json::<serde_json::Value>().await.ok(),
+                    Err(_) => None,
+                };
+                Fetched::Depth { symbol, body }
+            }));
+        }
+
+        for dex in dexs {
+            let http = self.http.clone();
+            let dex = dex.clone();
+            let url = format!("{}/info", self.base);
+            // An empty `dex` polls the main perp book; a builder name polls that builder's.
+            let request = if dex.is_empty() {
+                serde_json::json!({ "type": "allMids" })
+            } else {
+                serde_json::json!({ "type": "allMids", "dex": dex })
+            };
+            flight.push(Box::pin(async move {
+                let body = match http.post(&url).json(&request).send().await {
+                    Ok(r) => r
+                        .json::<serde_json::Value>()
+                        .await
+                        .map_err(|e| VenueError::Decode(e.to_string())),
+                    Err(e) => Err(VenueError::Transport(e.to_string())),
+                };
+                Fetched::Mids { dex, body }
+            }));
+        }
+
+        while let Some(fetched) = flight.next().await {
+            match fetched {
+                Fetched::Depth { symbol, body } => match body.as_ref().and_then(depth_quote) {
+                    Some(q) => {
+                        self.books.insert(symbol, q);
+                        report.books += 1;
+                    }
+                    None => self.failures = self.failures.saturating_add(1),
+                },
+                Fetched::Mids { dex, body } => match body.and_then(|v| mids_from(&v)) {
+                    Ok(mids) => {
+                        for (symbol, px) in mids {
+                            // Mid-only: `allMids` carries no depth, so a fill here pays the fee and
+                            // nothing for size. Honest and optimistic, and the equity pairs know it.
+                            self.books.insert(
+                                symbol,
+                                Quote {
+                                    mid: px,
+                                    ..Quote::default()
+                                },
+                            );
+                            report.mids += 1;
+                        }
+                    }
+                    Err(e) => {
+                        self.failures = self.failures.saturating_add(1);
+                        report.dex_failures.push((dex, e));
+                    }
+                },
             }
         }
+
         self.last_poll = Some(Instant::now());
         self.polls = self.polls.saturating_add(1);
-        Ok(n)
+        report
     }
 
     /// The latest mid for a symbol.
@@ -218,71 +384,6 @@ impl Paper {
     /// Point the spot poller somewhere else. Defaults to public Binance.
     pub fn spot_base(&mut self, base: impl Into<String>) {
         self.binance_base = base.into();
-    }
-
-    /// Refresh the order book for each symbol from public Binance spot.
-    ///
-    /// Unsigned, so no key and no clock: `/api/v3/depth` is public. One request per symbol, which is
-    /// the cost of having both sides at depth -- `allMids` gives a number, and a number cannot say
-    /// what a 25 ETH clip pays.
-    ///
-    /// A symbol that fails keeps its previous quote rather than being dropped: a stale book prices a
-    /// hedge slightly wrong, an absent one refuses it entirely and leaves the exposure standing.
-    ///
-    /// # Errors
-    /// Never returns `Err`; per-symbol failures are counted. Returns how many books were refreshed.
-    pub async fn poll_books(&mut self, symbols: &[String]) -> usize {
-        let mut n = 0;
-        for symbol in symbols {
-            let url = format!(
-                "{}/api/v3/depth?symbol={symbol}&limit=100",
-                self.binance_base
-            );
-            let Ok(resp) = self.http.get(&url).send().await else {
-                self.failures = self.failures.saturating_add(1);
-                continue;
-            };
-            let Ok(v) = resp.json::<serde_json::Value>().await else {
-                self.failures = self.failures.saturating_add(1);
-                continue;
-            };
-            let side = |k: &str| -> Vec<(f64, f64)> {
-                v.get(k)
-                    .and_then(|l| l.as_array())
-                    .map(|l| {
-                        l.iter()
-                            .filter_map(|e| {
-                                let px = e.get(0)?.as_str()?.parse::<f64>().ok()?;
-                                let sz = e.get(1)?.as_str()?.parse::<f64>().ok()?;
-                                Some((px, sz))
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default()
-            };
-            let (bids, asks) = (side("bids"), side("asks"));
-            let (Some(&(best_bid, _)), Some(&(best_ask, _))) = (bids.first(), asks.first()) else {
-                self.failures = self.failures.saturating_add(1);
-                continue;
-            };
-            let mid = (best_bid + best_ask) / 2.0;
-            let depth = |l: &[(f64, f64)]| {
-                let cum: f64 = l.iter().map(|&(_, s)| s).sum();
-                super::binance::depth_curve(l, mid, cum)
-            };
-            self.books.insert(
-                symbol.clone(),
-                Quote {
-                    mid,
-                    bids: depth(&bids),
-                    asks: depth(&asks),
-                },
-            );
-            n += 1;
-        }
-        self.last_poll = Some(Instant::now());
-        self.polls = self.polls.saturating_add(1);
-        n
     }
 
     /// How stale the book is, or `None` before the first poll.
@@ -507,6 +608,73 @@ mod tests {
         // SK Hynix, on the same book. Binance has no equivalent at any price.
         p.write("xyz:SKHY", Side::Buy, 50.0).expect("priced");
         assert!((p.position("xyz:SKHY") - 50.0).abs() < 1e-9);
+    }
+
+    /// The depth body decodes to a mid and two curves, and it does so off the wire format Binance
+    /// actually sends: prices and sizes are decimal **strings**, not JSON numbers.
+    ///
+    /// Worth a test of its own now that it is a function rather than a closure inside the poll loop.
+    /// It is the one piece of that loop with no I/O in it, so it is the one piece that can be checked
+    /// without pretending to be a venue.
+    #[test]
+    fn a_depth_body_decodes_to_a_mid_and_two_curves() {
+        let body = serde_json::json!({
+            "bids": [["99.00", "10"], ["98.00", "20"]],
+            "asks": [["101.00", "10"], ["102.00", "20"]],
+        });
+        let q = depth_quote(&body).expect("well formed");
+        assert!(
+            (q.mid - 100.0).abs() < 1e-9,
+            "mid is between the best of each side"
+        );
+        assert_eq!(q.bids.len(), 2);
+        assert_eq!(q.asks.len(), 2);
+        // Cumulative, so the far level carries both.
+        assert!((q.bids[1].cumulative - 30.0).abs() < 1e-9);
+    }
+
+    /// One side empty means no mid, and no mid means no quote at all.
+    ///
+    /// Filling against a half-book would price a crossing off a number the venue never quoted. The
+    /// caller keeps the previous book instead, which is stale but real.
+    #[test]
+    fn a_depth_body_missing_a_side_yields_no_quote() {
+        for body in [
+            serde_json::json!({ "bids": [], "asks": [["101.00", "1"]] }),
+            serde_json::json!({ "asks": [["101.00", "1"]] }),
+            serde_json::json!({ "code": -1121, "msg": "Invalid symbol." }),
+        ] {
+            assert!(
+                depth_quote(&body).is_none(),
+                "half a book is not a book: {body}"
+            );
+        }
+    }
+
+    /// `allMids` is an object of decimal strings, and a non-positive one is not a price.
+    #[test]
+    fn all_mids_parses_strings_and_drops_what_is_not_a_price() {
+        let body = serde_json::json!({
+            "xyz:TSLA": "307.305",
+            "xyz:SKHY": "132.77",
+            "xyz:DEAD": "0",
+            "xyz:ODD": "not a number",
+        });
+        let mut mids = mids_from(&body).expect("an object");
+        mids.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(mids.len(), 2, "zero and unparseable are dropped: {mids:?}");
+        assert_eq!(mids[0].0, "xyz:SKHY");
+        assert!((mids[1].1 - 307.305).abs() < 1e-9);
+    }
+
+    /// A body that is not the documented object is an error rather than an empty book.
+    ///
+    /// Empty would read as "this dex has no markets" and silently unhedge every pair on it; an error
+    /// names the dex in the log and leaves the previous mids standing.
+    #[test]
+    fn an_all_mids_body_that_is_not_an_object_is_an_error() {
+        let err = mids_from(&serde_json::json!(["ETH", "1917.95"])).expect_err("not an object");
+        assert!(matches!(err, VenueError::Decode(_)));
     }
 
     /// The dex is part of the identity, not a routing detail: measured in one second, `xyz:TSLA`

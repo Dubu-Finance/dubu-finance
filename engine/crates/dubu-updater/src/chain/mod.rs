@@ -313,6 +313,61 @@ impl RpcError {
             Self::RateLimited { .. } | Self::BackingOff { .. } | Self::BudgetExhausted { .. }
         )
     }
+
+    /// True when the upstream transaction pool refused the transaction because it is **full**.
+    ///
+    /// This is backpressure, not a fault, and the distinction is the whole reason it has a
+    /// predicate of its own. A `-32003` says nothing about the transaction and everything about the
+    /// pool it was offered to: the same bytes are perfectly valid a moment later, the nonce was not
+    /// consumed, and the correct response is to stop sending rather than to log a failure and try
+    /// the next intent. Treating it per-transaction is what makes a brief upstream hiccup produce
+    /// ~1600 error lines a minute at 27 tx/s — see [`crate::tx::Sender::send_batch`], which pauses
+    /// the phase and reports one episode with a count instead.
+    ///
+    /// Matched on the code alone. GIWA's sequencer answers `-32003 txpool is full` and reth answers
+    /// the same code for the same condition; the message text is the part that varies by node and
+    /// version, so keying on it would be keying on the half that is not specified.
+    #[must_use]
+    pub const fn is_txpool_full(&self) -> bool {
+        matches!(self, Self::Node { code: -32003, .. })
+    }
+
+    /// True when the node says the nonce has already been used.
+    ///
+    /// The one error that proves our own counter is *behind* the chain, and therefore the only
+    /// per-send outcome that justifies re-reading the account's nonce. See
+    /// [`crate::tx::Sender::send_batch`] for why every other outcome must not.
+    ///
+    /// Matched on the message rather than the code, and that is not a preference: geth, reth and
+    /// every gateway in front of them return this under `-32000`, the generic bucket that also
+    /// carries "intrinsic gas too low" and "replacement transaction underpriced". The code cannot
+    /// distinguish them; the text is the only thing that can.
+    #[must_use]
+    pub fn is_nonce_too_low(&self) -> bool {
+        match self {
+            Self::Node { message, .. } => message.to_ascii_lowercase().contains("nonce too low"),
+            _ => false,
+        }
+    }
+
+    /// The node already holds this exact transaction, which is an acceptance wearing an error's
+    /// clothes.
+    ///
+    /// A transaction's hash is a function of its contents, so getting this back means the bytes we
+    /// just signed are byte-identical to something already in the pool — and therefore that the
+    /// transaction is in flight under the hash we computed, so a receipt lookup finds it. Nothing is
+    /// lost, no gas is spent twice, and the nonce is not double-spent. Reporting it as a failed send
+    /// produced a stream of operator alerts for transactions that were on their way.
+    ///
+    /// Matched on the message for the same reason as [`Self::is_nonce_too_low`]: `-32000` is the
+    /// generic bucket and the text is the only thing that separates its occupants.
+    #[must_use]
+    pub fn is_already_known(&self) -> bool {
+        match self {
+            Self::Node { message, .. } => message.to_ascii_lowercase().contains("already known"),
+            _ => false,
+        }
+    }
 }
 
 fn decode_err(what: &'static str, detail: impl std::fmt::Display) -> RpcError {
@@ -1707,6 +1762,31 @@ pub async fn verify_against_chain(
 
 #[cfg(test)]
 mod tests {
+
+    /// The three `-32000` occupants must not be confused for one another. All three arrive under the
+    /// same code and only the text separates them, so a predicate that drifts here silently turns an
+    /// acceptance into an alert, a backpressure signal into a per-transaction failure, or a nonce
+    /// resync into neither.
+    #[test]
+    fn the_generic_error_bucket_is_separated_by_its_text() {
+        let node = |m: &str| RpcError::Node {
+            code: -32000,
+            message: m.to_string(),
+            endpoint: "rpc",
+        };
+        let known = node("already known");
+        assert!(known.is_already_known());
+        assert!(!known.is_nonce_too_low());
+
+        let low = node("nonce too low: next nonce 41, tx nonce 40");
+        assert!(low.is_nonce_too_low());
+        assert!(!low.is_already_known());
+
+        // Neither, and specifically not "already known" — this one really is a failed send.
+        let under = node("replacement transaction underpriced");
+        assert!(!under.is_already_known());
+        assert!(!under.is_nonce_too_low());
+    }
     use super::*;
 
     fn snap(cap_gen: u32, used_gen: u32, bid_used: u128, ask_used: u128) -> Snap {

@@ -42,7 +42,7 @@
 //! if it does not.
 
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use tokio::sync::watch;
@@ -74,7 +74,7 @@ use dubu_updater::risk::{Halt, KillSwitch, Position};
 use dubu_updater::serve::{self, Shared as RfqShared};
 use dubu_updater::skew::{self, Inventory, Volatility};
 use dubu_updater::spread;
-use dubu_updater::tx::{Fees, Intent, Sender, Sent, Settled, Signer};
+use dubu_updater::tx::{Episode, Fees, Intent, Sender, Sent, Settled, Signer, TxError};
 use dubu_updater::units::{self, FEED_SCALE};
 
 /// Emit a trace at `info` on a sampled cycle and at `debug` on the rest.
@@ -217,8 +217,11 @@ fn main() {
 struct Runtime {
     /// Whether the clock has been compared against the chain yet. See `check_clock_skew`.
     clock_checked: bool,
-    /// The hedge leg, when configured. See `dubu_updater::hedge`.
-    hedge: Option<HedgeLeg>,
+    /// What the hedge leg's task last published, when there is a leg. See [`HedgeShared`].
+    ///
+    /// The leg itself is not here any more: it lives in its own task, because its pass is six
+    /// external HTTPS round trips and the cycle only ever needed one number out of it.
+    hedge: Option<Arc<HedgeShared>>,
     /// The sealed block timestamp the per-block work last ran at.
     ///
     /// The cycle runs at the quote cadence now, several times per block, but some of what it does
@@ -861,6 +864,22 @@ async fn run(args: &Args) -> Result<i32, Box<dyn std::error::Error>> {
         return Ok(EXIT_HALTED);
     }
 
+    // Seed the nonce once, here, and never on the hot path again.
+    //
+    // `broadcast_next` used to start at 0, which left the first send after every restart with no
+    // floor under it -- the single largest contributor to a historical run of 3,391 failed sends.
+    // Reading it once here fixes that, and it is also the only read there is: `eth_getTransactionCount`
+    // on the local node is derived from a pool that holds at most 16 of our transactions and silently
+    // drops the rest, so at the ~37 in flight this cycle time allows, a per-send read would answer
+    // twenty-odd values behind the truth every time. Not fatal if it fails -- an unseeded sequence
+    // just means the first reservation reads it instead.
+    match sender.seed_nonce(&rpc).await {
+        Ok(n) => info!(target: "startup", event = "nonce_seeded", nonce = n,
+                       "next nonce read from the node once; the send path tracks it from here"),
+        Err(e) => warn!(target: "startup", event = "nonce_seed_failed", error = %e,
+                        "could not seed the nonce; the first reservation will read it"),
+    }
+
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
     let (feeds, feed_tasks) = spawn_feeds(&cfg, &shutdown_rx);
@@ -992,11 +1011,11 @@ async fn run(args: &Args) -> Result<i32, Box<dyn std::error::Error>> {
             let horizon = f64::from(u32::try_from(rt.cfg.skew.vol_horizon_secs).unwrap_or(300));
             (s as f64 / horizon.sqrt()) as u64
         });
-    rt.hedge = start_hedge(&rt.cfg, sigma_root_sec);
-    if let Some(leg) = rt.hedge.as_mut() {
+    let mut hedge_leg = start_hedge(&rt.cfg, sigma_root_sec);
+    if let Some(leg) = hedge_leg.as_mut() {
         // Probed only if a pair actually routes there, and a failure costs only those pairs.
         //
-        // This used to set `rt.hedge = None` on any Binance error, which quietly took the paper
+        // This used to drop the whole leg on any Binance error, which quietly took the paper
         // venue down with it -- so an exchange the equities never touch could leave them unhedged.
         // The venues are independent and the failure has to be too.
         let signed: Vec<u16> = leg
@@ -1032,9 +1051,39 @@ async fn run(args: &Args) -> Result<i32, Box<dyn std::error::Error>> {
         }
         if leg.bands.is_empty() {
             warn!(target: "hedge", event = "disabled", "no pair has a reachable venue");
-            rt.hedge = None;
+            hedge_leg = None;
         }
     }
+
+    // The hedge gets its own task, and the measurement is the entire reason.
+    //
+    // `run_hedge` was called from `run_cycle` and cost a median 1.373s of a 2.695s cycle -- and after
+    // the send phase was batched it was 1.377s of a 1.657s cycle, which is to say all of what was
+    // left. Every millisecond of it is six external HTTPS round trips polling a *paper* book, and
+    // nothing in the quote path reads a mid from that book synchronously. So more than half the
+    // price-setting loop was spent on work that sets no price.
+    //
+    // It publishes into `HedgeShared` and the cycle reads the slot, which is what `feed::ws::run` and
+    // `chain::view::run` already do. Nothing else on this struct is shared with the task: the leg owns
+    // its own bands, positions and venue clients outright, and the only thing crossing back is the
+    // signed position the skew needs. Pool balances come from the reader's slot, so the task does not
+    // need the cycle either -- which is what makes the extraction clean rather than a race.
+    let hedge_task = hedge_leg.map(|leg| {
+        let shared = Arc::new(HedgeShared::default());
+        rt.hedge = Some(Arc::clone(&shared));
+        // Only the base token per pair, because that is the only thing the pass reads out of
+        // `ChainFacts`. Handing over the whole struct would share far more state than the task needs.
+        let bases: BTreeMap<u16, Address> =
+            rt.facts.pairs.iter().map(|(id, m)| (*id, m.base)).collect();
+        tokio::spawn(run_hedge(
+            leg,
+            Arc::clone(&view),
+            bases,
+            shared,
+            hedge_interval(&rt.cfg),
+            shutdown_rx.clone(),
+        ))
+    });
 
     let limit = if args.once { Some(1) } else { args.cycles };
     let code = quote_loop(&mut rt, limit, head_rx, shutdown_rx).await;
@@ -1044,6 +1093,13 @@ async fn run(args: &Args) -> Result<i32, Box<dyn std::error::Error>> {
         let _ = tokio::time::timeout(Duration::from_secs(3), task).await;
     }
     let _ = tokio::time::timeout(Duration::from_secs(3), heads_task).await;
+    // Bounded like the feeds, and awaited for a stronger reason than they are: this is the only task
+    // that can have a real order in flight. Dropping it mid-`venue.market()` leaves a crossing whose
+    // fate nobody knows, where three seconds is usually enough for the venue to come back and let it
+    // log what filled.
+    if let Some(task) = hedge_task {
+        let _ = tokio::time::timeout(Duration::from_secs(3), task).await;
+    }
     // Every path out of the loop lands here — a killswitch, a signal, `--cycles` — and each of
     // them has just logged the reason it is leaving. Bounded, and best-effort in every direction:
     // this must not be able to delay a shutdown that is already under way.
@@ -1310,13 +1366,43 @@ async fn quote_loop(
         // in-memory feed snapshots, and costs zero RPC unless something actually trips. It does
         // NOT count as a wake: after scanning it goes straight back to waiting, so a scan never
         // consumes a chain read or a cycle.
-        // Whichever comes first: the quote clock, or the fallback that bounds how long a cycle
-        // can go without one when heads are down. With the quote clock at 200ms the fallback never
-        // wins, and that is the point -- it stays as the bound it always was rather than as the
-        // thing that decides the cadence.
+        // Whichever comes first: the quote clock, or the fallback that bounds how long a cycle can
+        // go without one when heads are down.
+        //
+        // As configured the fallback cannot win -- not "never wins", cannot. `quote_interval_ms` is
+        // 200 while config validation floors `fallback_poll_interval_ms` at 250, so `deadline` is
+        // always `tick_at` and `Wake::Fallback` is unreachable. Worth stating rather than leaving as
+        // a coincidence: the fallback stopped being a bound the moment the quote clock went below it,
+        // and `Wake::Fallback` appearing in a log would today be impossible rather than merely rare.
+        //
+        // The quote clock is not a floor yet either. It binds only when a cycle finishes inside it,
+        // and the measured cycle is 1.657s falling to roughly 0.30s once the hedge poll moves off --
+        // still above 200ms, because one `eth_sendRawTransaction` to the Korean sequencer is 264ms on
+        // its own and the phase cannot beat one round trip. Raising `quote_interval_ms` to about 330,
+        // which is the measured flashblock time and already what `push_interval_ms_max` is set to,
+        // would make this deadline genuinely engage. That is a config decision, not a code one.
         let tick_at = cycle_start + quote_every;
         let deadline = tick_at.min(cycle_start + fallback);
         wake = 'wait: loop {
+            // Shutdown and SIGTERM are polled BEFORE the deadline test, and that ordering is the fix
+            // rather than a tidy-up. They used to be reachable only through the `select!` further
+            // down, which a cycle longer than `quote_interval_ms` never reaches: the deadline is
+            // already past on entry, so the loop breaks on its first test. Against a 200ms interval
+            // that has been every pass of every cycle this bot has ever run -- so `withdraw_quotes`
+            // on shutdown has never once executed in production, a SIGTERM was simply not observed
+            // by this task, and the between-cycle `jump_scan` below has never fired either. The 0.30s
+            // cycle does not fix it on its own, because 0.30s is still past a 200ms deadline.
+            //
+            // Above the test, the check is unconditional: the body cannot be skipped without making
+            // it. The always-ready third arm keeps it non-blocking and `biased` is what guarantees
+            // the other two are polled first.
+            tokio::select! {
+                biased;
+                _ = shutdown.changed() => break 'outer,
+                () = &mut signal => break 'outer,
+                () = std::future::ready(()) => {}
+            }
+
             let now = Instant::now();
             if now >= deadline {
                 break if deadline == tick_at {
@@ -1617,6 +1703,68 @@ struct HedgeLeg {
     last_resync: Instant,
 }
 
+/// The hedge leg's net position per pair, published for the cycle to read.
+///
+/// The cycle needs exactly one number out of the hedge — the signed venue position, which the
+/// inventory skew values at the same reference as the pool's own balance — and it needs it without
+/// awaiting anything. Everything else the leg does is external I/O: six HTTPS round trips that were
+/// measured at 1.377s of a 1.657s cycle, polling a *paper* book nothing in the quote path reads
+/// synchronously. So the leg moved to its own task and left this slot behind, which is the same split
+/// `chain::view::SharedView` already makes for the chain read.
+///
+/// What the cycle gives up is a position book up to one hedge interval old, and it costs nothing here.
+/// This number only moves when the hedge crosses, and `hedge::Bands` will not cross twice inside its
+/// cool-off — 2s by default, against a pass interval derived to be half of it. So the worst case is a
+/// skew computed one crossing behind, on a control that `chain::view` already documents as slow.
+#[derive(Debug, Default)]
+struct HedgeShared {
+    /// Net position per pair, in the pool's base units and signed: negative is short.
+    positions: RwLock<BTreeMap<u16, i128>>,
+}
+
+impl HedgeShared {
+    /// This pair's net venue position, or `None` when the leg has not reported one.
+    ///
+    /// `None` rather than zero, because the two say different things to the skew: no position is an
+    /// exposure of zero, no *report* is an unknown, and treating an unknown as flat would skew against
+    /// a hedge that may well exist. `run_cycle` already distinguishes them, and this preserves that.
+    ///
+    /// Copied out from under the guard rather than borrowed through it, so a cycle cannot hold the
+    /// lock across the rest of its work and stall the pass that writes it.
+    fn position(&self, pair_id: u16) -> Option<i128> {
+        self.positions.read().ok()?.get(&pair_id).copied()
+    }
+
+    /// Replace the published book. Called once per pass, after the pass has settled its crossings.
+    fn publish(&self, positions: &BTreeMap<u16, i128>) {
+        if let Ok(mut g) = self.positions.write() {
+            *g = positions.clone();
+        }
+    }
+}
+
+/// How often the hedge task takes a pass.
+///
+/// Derived from the shortest configured cool-off rather than chosen. A pass observes the pool balance
+/// and may cross; `hedge::Bands` refuses a second crossing inside `cooloff_ms`, so observing faster
+/// than that cannot produce another order — it can only spend the venue's rate budget. Half the
+/// shortest cool-off, so a band that becomes crossable is acted on within one cool-off rather than
+/// after two.
+///
+/// Floored at 500ms, because the budget does not care why we are asking: `/api/v3/depth?limit=100` is
+/// weight 5, so five symbols at two passes a second is 3,000 a minute against Binance's documented
+/// 6,000-per-minute IP budget. Half the budget, for the one leg here that sends no orders at all.
+fn hedge_interval(cfg: &Config) -> Duration {
+    /// Never faster than this, whatever the cool-offs say.
+    const FLOOR: Duration = Duration::from_millis(500);
+    let shortest = cfg
+        .hedge
+        .as_ref()
+        .and_then(|hc| hc.pairs.iter().map(|p| p.cooloff_ms).min())
+        .unwrap_or(2_000);
+    Duration::from_millis(shortest / 2).max(FLOOR)
+}
+
 /// Build the hedge leg, or explain why there isn't one.
 ///
 /// Never fatal. A pool that cannot reach its hedge venue must still quote -- it just has to quote
@@ -1645,9 +1793,12 @@ fn start_hedge(cfg: &Config, sigma_millibps_per_sqrt_sec: u64) -> Option<HedgeLe
         }
     };
 
-    // The interval is derived, not configured. See `hedge::derive_hedge_interval`: below
-    // `(fee/sigma)^2` a crossing spends more on fees than the exposure it clears was worth.
-
+    // The band WIDTH is derived, not configured: `hedge::derive_band` sizes it from the pair's carry
+    // budget, because below `(fee/sigma)^2` a crossing spends more on fees than the exposure it clears
+    // was worth. What is configured per pair is the cool-off, and that is also what paces the hedge
+    // task -- see `hedge_interval`.
+    //
+    // This comment used to cite `hedge::derive_hedge_interval`, which has never existed in this crate.
     let mut bands = BTreeMap::new();
     let mut symbols = BTreeMap::new();
     let mut routes = BTreeMap::new();
@@ -1741,13 +1892,73 @@ fn start_hedge(cfg: &Config, sigma_millibps_per_sqrt_sec: u64) -> Option<HedgeLe
     })
 }
 
-/// Cross out whatever drift has earned a crossing.
+/// Poll the venues and cross out whatever drift has earned a crossing, forever, on its own clock.
 ///
-/// Runs after `scan_fills`, on the same cycle, because the fills it reacts to were just recorded.
-/// Sends at most one order per pair per cycle: the cool-off exists to stop a second crossing before
-/// the first is reflected, and cycling faster than the venue answers would defeat it.
-async fn run_hedge(rt: &mut Runtime, view: &ChainView) {
-    let Some(leg) = rt.hedge.as_mut() else { return };
+/// Never returns until shutdown. A failed pass is logged and the loop continues: a slot holding a
+/// slightly older position book is a far better outcome than a hedge task that gives up, which is the
+/// same call `chain::view::run` makes about the chain read.
+///
+/// # Why this is not on the cycle any more
+///
+/// It used to be called from `run_cycle` and it was the cycle's largest single cost — a median 1.373s
+/// of 2.695s, and 1.377s of 1.657s once the send phase was batched, which by then was everything that
+/// was left. All of it is external I/O against a paper book that nothing in the quote path reads
+/// synchronously, so the price-setting loop was spending more than half its time on work that set no
+/// price.
+///
+/// The docstring this replaces claimed it had to run "after `scan_fills`, on the same cycle, because
+/// the fills it reacts to were just recorded". That was never true, and `scan_fills` says so itself:
+/// the hedge is not told about fills, it reads the pool's balance and its own venue position directly.
+/// The only thing it needed from the cycle was the balance, and the balance comes from the reader's
+/// slot, which this task can read for itself.
+async fn run_hedge(
+    mut leg: HedgeLeg,
+    view: Arc<ViewSlot>,
+    bases: BTreeMap<u16, Address>,
+    shared: Arc<HedgeShared>,
+    every: Duration,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    info!(
+        target: "hedge", event = "task_started", interval_ms = every.as_millis() as u64,
+        pairs = leg.bands.len(),
+        "the hedge polls on its own clock now; the quote loop no longer waits for it"
+    );
+
+    // A ticker rather than `sleep(every)` at the bottom, for the reason `chain::view::run` gives:
+    // sleeping then working makes the real period `every + work`, and the work here is the six round
+    // trips this whole change exists to get off the critical path. `Delay` on a missed tick so a slow
+    // pass shifts the schedule rather than queueing catch-up passes behind it — which at these
+    // latencies would be a way to exceed the venue's rate budget without ever asking for it.
+    let mut ticker = tokio::time::interval(every);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    loop {
+        tokio::select! {
+            biased;
+            _ = shutdown.changed() => break,
+            _ = ticker.tick() => {}
+        }
+        // No view, no pass. A pair whose balance has not been read is skipped rather than observed as
+        // zero — see `hedge_pass` — and with no view at all every pair is in that state, so there is
+        // nothing to observe and a crossing would be against invented inventory.
+        let Some(v) = view.latest() else { continue };
+        hedge_pass(&mut leg, &v, &bases).await;
+        // After the crossings settle, so the cycle reads positions that include what this pass just
+        // committed. Publishing first would hand the skew a book one pass out of date in the one
+        // direction that matters: it would not know about exposure this task has already taken on.
+        shared.publish(&leg.positions);
+    }
+
+    info!(target: "hedge", event = "task_stopped", "shutting down; no further crossings");
+}
+
+/// One pass: observe every band, refresh the books, and send whatever crossings are due.
+///
+/// Sends at most one order per pair per pass. The cool-off exists to stop a second crossing before the
+/// first is reflected, and passing faster than the venue answers would defeat it — see
+/// [`hedge_interval`] for why the pass rate is derived from that cool-off rather than picked.
+async fn hedge_pass(leg: &mut HedgeLeg, view: &ChainView, bases: &BTreeMap<u16, Address>) {
     let now = Instant::now();
 
     // Where every band gets its exposure from, and the only place it comes from.
@@ -1757,10 +1968,10 @@ async fn run_hedge(rt: &mut Runtime, view: &ChainView) {
     // A pair whose balance did not make it into this view is SKIPPED rather than observed as zero --
     // a missing read is not a flat book, and treating it as one would unwind a live hedge.
     for (pair_id, band) in &mut leg.bands {
-        let Some(meta) = rt.facts.pairs.get(pair_id) else {
+        let Some(base) = bases.get(pair_id) else {
             continue;
         };
-        let Some(&pool_base) = view.balances.get(&meta.base) else {
+        let Some(&pool_base) = view.balances.get(base) else {
             continue;
         };
         let venue_base = leg.positions.get(pair_id).copied().unwrap_or(0);
@@ -1777,21 +1988,17 @@ async fn run_hedge(rt: &mut Runtime, view: &ChainView) {
         }
     }
 
-    // Mids first, and once per book rather than once per pair: `allMids` returns the whole book at
-    // weight 2, so per-symbol polling would be the same information at fifty times the cost.
+    // Every book in one concurrent pass. These were six sequential round trips — five spot depth
+    // calls and one `allMids` — and nothing orders them, so sequential was six copies of one wait.
+    // See `hedge::hyperliquid::Paper::poll_all`, which is also where the per-symbol/per-dex asymmetry
+    // is argued.
     let dexs = leg.dexs.clone();
     let spot = leg.spot.clone();
     if let Some(paper) = leg.paper.as_mut() {
-        // Spot first: these carry both sides at depth, which is what prices a clip larger than the
-        // top of book. `allMids` below is a number per market and cannot answer that question.
-        if !spot.is_empty() {
-            paper.poll_books(&spot).await;
-        }
-        for dex in &dexs {
-            if let Err(e) = paper.poll_mids(dex).await {
-                warn!(target: "hedge", event = "paper_poll_failed", dex = %dex, error = %e,
-                      "the book keeps its previous mids");
-            }
+        let report = paper.poll_all(&spot, &dexs).await;
+        for (dex, e) in &report.dex_failures {
+            warn!(target: "hedge", event = "paper_poll_failed", dex = %dex, error = %e,
+                  "the book keeps its previous mids");
         }
         paper.warn_if_stale(now, Duration::from_secs(10));
     }
@@ -2653,7 +2860,7 @@ async fn run_cycle(
                 hedge_value: rt
                     .hedge
                     .as_ref()
-                    .and_then(|h| h.positions.get(&pair.pair_id).copied())
+                    .and_then(|h| h.position(pair.pair_id))
                     .map(|base| {
                         let magnitude = dubu_updater::risk::value(
                             base.unsigned_abs(),
@@ -2907,8 +3114,79 @@ block_work,
         withdraw_pair(rt, pair_id, "jump_reassert").await;
     }
 
-    for intent in sends {
-        emit(rt, intent).await;
+    // One batch, not one send at a time.
+    //
+    // `send_batch` reserves the nonces synchronously in this order -- which is what keeps a
+    // `RefreshCapacity` ahead of the `UpdateQuote` for the same pair, since that argument rests
+    // entirely on nonce order being absolute -- and only then broadcasts them through a
+    // `FuturesUnordered`. Five sends cost one 264ms round trip instead of five, which is 1.323s of a
+    // 2.695s cycle recovered.
+    match rt.sender.send_batch(&rt.rpc, &sends, None).await {
+        Ok(batch) => {
+            for (intent, out) in batch.sent {
+                record(rt, intent, out);
+            }
+            // One line per phase for the ceiling; one line per EPISODE for backpressure. The
+            // difference is not stylistic. The ceiling is a fact about this batch and cannot repeat
+            // faster than the cycle, but a full upstream persists ACROSS batches, so a per-batch line
+            // repeats at the cycle rate for as long as the condition lasts -- on the order of 1,600
+            // lines a minute at 19 tx/s. That is exactly how the last episode buried the single line
+            // saying the account was about to wedge, and it cost 59 minutes of downtime.
+            if batch.held_at_capacity > 0 {
+                info!(
+                    target: "tx", event = "held_at_capacity", held = batch.held_at_capacity,
+                    in_flight = rt.sender.in_flight_total(),
+                    ceiling = dubu_updater::tx::IN_FLIGHT_TOTAL_MAX,
+                    "account is at its in-flight ceiling; these intents were not offered"
+                );
+            }
+            // `batch.held_backpressure` is deliberately not logged on its own. `Sender::send_batch`
+            // counts it into the episode and hands back a transition only when one opens or closes,
+            // which is the only cadence at which this is readable.
+            match batch.episode {
+                Some(Episode::Opened { refusals }) => {
+                    error!(
+                        target: "tx", event = "backpressure_opened", refusals,
+                        withheld = batch.held_backpressure,
+                        "upstream answered -32003; the send phase is standing down rather than \
+                         re-offering to a pool that just refused. At this cadence the account wedges \
+                         about 13s after inclusion stops, against 138s at the old rate"
+                    );
+                    // Coalesced by class on the other side rather than sent one-for-one: this is the
+                    // quote path, so the condition touches every send for as long as it lasts. See
+                    // `notify::ErrorLedger`.
+                    rt.notify.send(notify::Event::SendFailed {
+                        pair_id: None,
+                        kind: "txpool_full",
+                        error: format!("upstream refused {refusals} sends with -32003"),
+                    });
+                }
+                Some(Episode::Closed {
+                    refusals,
+                    held,
+                    secs,
+                }) => info!(
+                    target: "tx", event = "backpressure_closed", refusals, held, secs,
+                    "upstream took a transaction again; this is what the episode cost"
+                ),
+                None => {}
+            }
+        }
+        Err(e) => {
+            // Nothing was offered at all -- no key, or a nonce that could not be established. That is
+            // strictly worse than one intent failing, which is why it alerts rather than only logging:
+            // every pair is unquoted until it clears, and the pool's own `maxStaleSecs` is then the
+            // only thing withdrawing them.
+            error!(
+                target: "tx", event = "batch_failed", intents = sends.len(), error = %e,
+                "could not reserve the send batch; NO transaction was offered this cycle"
+            );
+            rt.notify.send(notify::Event::SendFailed {
+                pair_id: None,
+                kind: "send_batch",
+                error: e.to_string(),
+            });
+        }
     }
 
     // Every cycle, not once per sealed block.
@@ -2920,7 +3198,6 @@ block_work,
     // we knew. `SwapWatch::poll` now also reads the `pending` tag, so the extra frequency has
     // preconfirmed fills to find rather than re-reading blocks it has already seen.
     scan_fills(rt, head, view).await;
-    run_hedge(rt, view).await;
 
     // The killswitches. Skipped entirely when any pair has no fair value: marking inventory
     // against a price we do not have would be an invention, and an invented NAV is worse than
@@ -3042,8 +3319,15 @@ fn log_reference(
     }
 }
 
-async fn emit(rt: &mut Runtime, intent: Intent) {
-    match rt.sender.send(&rt.rpc, intent).await {
+/// Record one send's outcome. Split out of the send itself so a batch can reuse it.
+///
+/// This used to do both -- await one `eth_sendRawTransaction` and then log it -- and doing both was
+/// what forced the sends to be serial. The wait is 264ms of France-to-Korea round trip and none of
+/// it is ours, so five of them cost 1.323s of a 2.695s cycle on five copies of the same wait. The
+/// broadcast now happens concurrently in `Sender::send_batch` and this handles each result after the
+/// fact; there is no await left here, which is the point.
+fn record(rt: &mut Runtime, intent: Intent, out: Result<Sent, TxError>) {
+    match out {
         Ok(Sent::DryRun {
             calldata,
             would_be_hash,
