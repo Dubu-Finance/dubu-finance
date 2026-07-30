@@ -59,6 +59,23 @@ export interface Leg {
   amountOut: bigint;
 }
 
+/**
+ * A refusal the prop venue named, as opposed to one inferred from it paying nothing.
+ *
+ * One member today, and a union rather than a boolean because the engine has a whole vocabulary of
+ * these (`no-market`, `not-ready`, `size-out-of-range`) and the next one worth telling apart should
+ * cost a member, not a second flag. Same shape and same reasoning as `RfqRejection`.
+ */
+export type PropRefusal = 'no-capacity';
+
+/** What the prop venue answered for the whole grid, and what it said about answering that way. */
+export interface PropGrid {
+  /** One amount per grid point, in the order asked. Zeros whenever the venue could not be used. */
+  amountsOut: bigint[];
+  /** Set only when the engine named the reason itself; never inferred from zeros. */
+  refused: PropRefusal | null;
+}
+
 export interface AmmQuote {
   /** Best combination found. Legs with zero weight are dropped. */
   legs: Leg[];
@@ -67,6 +84,12 @@ export interface AmmQuote {
   solo: Record<VenueId, bigint>;
   /** True when the winner uses both venues. */
   split: boolean;
+  /**
+   * [`PropGrid.refused`], carried through so the HTTP layer can tell a venue that is between
+   * prices from one that is absent. The split search never sets it: the search sees amounts, and
+   * this is a fact about why the amounts are what they are.
+   */
+  propRefused: PropRefusal | null;
 }
 
 export function makeClient(cfg: Config): PublicClient {
@@ -120,7 +143,7 @@ export async function quoteAmms(
     }),
   }));
 
-  const [raw, propOut] = await Promise.all([
+  const [raw, prop] = await Promise.all([
     client.readContract({
       address: MULTICALL3,
       abi: MULTICALL3_ABI,
@@ -141,11 +164,14 @@ export async function quoteAmms(
   // The same search `chooseSplit` runs against hand-written arrays in the tests, run against these
   // ones. Both venues now hand back a plain array per grid point, so there is no second copy of the
   // search to keep in step with the tested one.
-  return chooseSplit(
+  const best = chooseSplit(
     amountIn,
-    propOut,
+    prop.amountsOut,
     results.map((r) => decodeUniv2(r)),
   );
+  // Attached here rather than passed into the search, which has no use for it and would have to
+  // carry it untouched through every branch.
+  return { ...best, propRefused: prop.refused };
 }
 
 /**
@@ -178,6 +204,13 @@ const PROP_OBSERVED_AGE_SUSPECT_MS = 5_000;
  * of domain, under the minimum price. It is the venue's answer, and it is the answer the old
  * `getAmountOut` gave for those cases too.
  *
+ * One of those degradations is labelled on the way past, and only one. A 503 carrying
+ * `no-capacity` is the engine saying it withdrew the side while it re-prices, which is over in
+ * tens of seconds; everything else that lands on zeros here is indefinite, and the two were
+ * indistinguishable to a caller until this existed. The label changes no routing — the amounts are
+ * still zeros and UniV2 still wins any grid point it can serve — so an engine that does not send
+ * the code, because it predates it or was rolled back, behaves exactly as it did before.
+ *
  * Split out from [`quoteAmms`] and given an injectable `fetchImpl` for the same reason
  * `validateQuote` is split out of `requestQuote`: the interesting cases are hostile and malformed
  * responses, and they should be testable without a chain or a network.
@@ -188,9 +221,9 @@ export async function quotePropGrid(
   tokenOut: Address,
   amountsIn: readonly bigint[],
   fetchImpl: typeof fetch = fetch,
-): Promise<bigint[]> {
+): Promise<PropGrid> {
   const zeros = amountsIn.map(() => 0n);
-  if (cfg.propQuoteUrl === null) return zeros;
+  if (cfg.propQuoteUrl === null) return { amountsOut: zeros, refused: null };
 
   let body: unknown;
   try {
@@ -222,20 +255,25 @@ export async function quotePropGrid(
           : `http ${res.status} with no error body; no prop leg`,
         declined ? undefined : 'PROP_QUOTE_URL must be the full endpoint, path included',
       );
-      return zeros;
+      // The status is matched as well as the code, because this is a claim about *why* there is no
+      // depth: a `no-capacity` arriving on anything but a 503 is not the response that was agreed,
+      // and promising a taker a retry that never comes good is worse than saying nothing.
+      const refused: PropRefusal | null =
+        res.status === 503 && declined === 'no-capacity' ? 'no-capacity' : null;
+      return { amountsOut: zeros, refused };
     }
     body = await res.json();
   } catch (e) {
     // DNS, TLS, a dropped connection, or the 2s abort. Never a refusal: the engine was not heard
     // from at all, which is a different fact from it having no market.
     warn('engine unreachable; no prop leg', String(e));
-    return zeros;
+    return { amountsOut: zeros, refused: null };
   }
 
   const amountsOut = parseAmountsOut(body, amountsIn.length);
   if (!amountsOut) {
     warn('malformed response; no prop leg', `expected ${amountsIn.length} integer amountsOut`);
-    return zeros;
+    return { amountsOut: zeros, refused: null };
   }
 
   // `observedAgeMs` is an ELAPSED age off the engine's own monotonic clock, and it is never
@@ -254,7 +292,9 @@ export async function quotePropGrid(
     warn(`engine observation ${observedAgeMs}ms old`, 'quoted anyway — the engine decides its own staleness');
   }
 
-  return amountsOut;
+  // A 200 makes no claim about capacity, including today's 200-with-zeros. Zeros here are the
+  // venue refusing every size, which is what they have always been.
+  return { amountsOut, refused: null };
 }
 
 /** The engine's elapsed observation age, when it sent a usable one. Never fatal: a missing or
@@ -323,13 +363,20 @@ function decodeUniv2(r: { success: boolean; returnData: `0x${string}` } | undefi
  *
  * `propOut[i]` and `univOut[i]` are what each venue pays for grid point `i`; a venue asked for a
  * non-zero amount that answers zero disqualifies that point.
+ *
+ * `propRefused` is the caller's to attach: the search is told what the venues paid and nothing
+ * about why, which is what keeps it testable against hand-written arrays.
  */
-export function chooseSplit(amountIn: bigint, propOut: bigint[], univOut: bigint[]): AmmQuote {
+export function chooseSplit(
+  amountIn: bigint,
+  propOut: bigint[],
+  univOut: bigint[],
+): Omit<AmmQuote, 'propRefused'> {
   const solo: Record<VenueId, bigint> = {
     prop: propOut[SPLIT_GRID.length - 1] ?? 0n,
     univ2: univOut[0] ?? 0n,
   };
-  let best: AmmQuote | null = null;
+  let best: Omit<AmmQuote, 'propRefused'> | null = null;
 
   SPLIT_GRID.forEach((bps, i) => {
     const toProp = (amountIn * BigInt(bps)) / BigInt(WEIGHT_DENOMINATOR);

@@ -135,6 +135,13 @@ pub fn value(
     )
 }
 
+/// What every liveness halt's persisted reason string begins with.
+///
+/// One place, written by [`Halt`]'s `Display` and read back by [`KillSwitch::is_liveness_only`].
+/// Those are the only two spellings of it, which is what makes matching on a prefix survivable —
+/// see `is_liveness_only` for why the reason string is what gets matched at all.
+const LIVENESS_PREFIX: &str = "liveness: ";
+
 /// A killswitch trip.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Halt {
@@ -195,7 +202,7 @@ impl std::fmt::Display for Halt {
                     "loss budget: cumulative gross trade loss {cumulative} exceeds {budget}"
                 )
             }
-            Self::Liveness { reason } => write!(f, "liveness: {reason}"),
+            Self::Liveness { reason } => write!(f, "{LIVENESS_PREFIX}{reason}"),
         }
     }
 }
@@ -357,6 +364,71 @@ impl KillSwitch {
     #[must_use]
     pub fn halt_reason(&self) -> Option<&str> {
         self.state.halt_reason.as_deref()
+    }
+
+    /// Whether the latch is set and was set by a liveness halt, with nothing else behind it.
+    ///
+    /// Chain liveness is the one halt cause that heals on its own — the chain comes back, and
+    /// nothing about the book has changed. `Bleed` and `LossBudget` are the book losing money, and
+    /// want a human's eyes before it quotes again. Only the caller in `main.rs` acts on this
+    /// distinction, and only at startup; see there.
+    ///
+    /// The persisted reason string is the discriminator, which looks fragile and is the deliberate
+    /// choice. [`RiskState`] is versioned and `deny_unknown_fields`, so a `halt_kind` field would
+    /// be a schema migration in both directions: an older binary reading a file written by a newer
+    /// one would fail to parse the latch and then, per [`RiskError::Corrupt`], refuse to start at
+    /// all. A rollback that cannot read the killswitch is a worse outcome than a prefix match, and
+    /// [`LIVENESS_PREFIX`] keeps the literal in one place rather than two.
+    #[must_use]
+    pub fn is_liveness_only(&self) -> bool {
+        self.state.halted
+            && self
+                .state
+                .halt_reason
+                .as_deref()
+                .is_some_and(|r| r.starts_with(LIVENESS_PREFIX))
+    }
+
+    /// Clear the latch, keeping everything the switches have measured.
+    ///
+    /// The inverse of [`Self::halt`] for exactly one cause, and it is not a general "clear the
+    /// killswitch": the caller must have established both that the halt is liveness-only and that
+    /// the condition behind it is gone. There is no path here for a bleed or an exhausted budget.
+    ///
+    /// `cumulative_trade_loss`, `cumulative_trade_gain` and `observations` deliberately survive.
+    /// The loss budget is all-time and gross, so resuming with fresh totals would hand back budget
+    /// the book has already spent — and worse, it would make waiting for a chain outage a way to
+    /// launder an exhausted one.
+    ///
+    /// # Errors
+    /// [`RiskError::Io`] if the cleared state cannot be written. Loud for the mirror of the reason
+    /// `halt` is: a resume that did not reach disk is one the next restart silently undoes, and
+    /// the caller would have gone on to quote against a file that still says the book is down.
+    pub fn resume(&mut self) -> Result<(), RiskError> {
+        let spent = (
+            self.state.cumulative_trade_loss,
+            self.state.cumulative_trade_gain,
+            self.state.observations,
+        );
+        self.state.halted = false;
+        self.state.halt_reason = None;
+        self.state.halted_at = None;
+        // All three or none, mirroring `halt`: a cleared latch still carrying a reason and a
+        // timestamp has an operator reading a halt that is not in force.
+        assert!(!self.state.halted);
+        assert!(self.state.halt_reason.is_none());
+        assert!(self.state.halted_at.is_none());
+        // Asserted rather than merely intended, because the tempting edit here is to zero the
+        // totals along with the latch and that is the one thing a resume must never do.
+        assert!(
+            spent
+                == (
+                    self.state.cumulative_trade_loss,
+                    self.state.cumulative_trade_gain,
+                    self.state.observations,
+                )
+        );
+        self.persist()
     }
 
     /// The persistent state, for logging.
@@ -887,6 +959,103 @@ mod tests {
         let k = KillSwitch::load(&path, 300, BLEED, BUDGET).unwrap();
         assert!(k.is_halted());
         assert!(k.halt_reason().unwrap().contains("chain down"));
+    }
+
+    #[test]
+    fn a_liveness_latch_is_still_recognisable_as_one_after_a_reload() {
+        // The startup recovery in `main.rs` runs against a file some previous process wrote, so
+        // there is no in-memory `Halt` left to ask by then — recognising the cause has to survive
+        // the round trip through JSON, which is the whole reason the reason string carries it.
+        let path = scratch("liveness-only");
+        let mut k = KillSwitch::load(&path, 300, BLEED, BUDGET).unwrap();
+        k.halt(
+            &Halt::Liveness {
+                reason: "chain liveness lost for 615s (limit 600s)".into(),
+            },
+            5_000,
+        )
+        .unwrap();
+        assert!(k.is_liveness_only());
+        drop(k);
+
+        let k = KillSwitch::load(&path, 300, BLEED, BUDGET).unwrap();
+        assert!(k.is_halted());
+        assert!(k.is_liveness_only());
+    }
+
+    #[test]
+    fn neither_measured_switch_latches_as_liveness_only() {
+        // The distinction has to hold in this direction or the recovery becomes a killswitch that
+        // any restart clears. A bleed and an exhausted budget are the book losing money.
+        let mut k = ks("bleed-not-liveness");
+        k.observe(0, &[pos(10 * ETH, FAIR)], 1_000).unwrap();
+        k.observe(0, &[pos(10 * ETH, FAIR - 200_000_000_000_000)], 1_100)
+            .unwrap();
+        assert!(k.is_halted());
+        assert!(!k.is_liveness_only());
+
+        let mut k = ks_budget_only("budget-not-liveness");
+        k.halt(
+            &Halt::LossBudget {
+                cumulative: BUDGET,
+                budget: BUDGET,
+            },
+            5_000,
+        )
+        .unwrap();
+        assert!(k.is_halted());
+        assert!(!k.is_liveness_only());
+
+        // And an unlatched switch is not liveness-only either, or the recovery path would fire on
+        // a book that was never down.
+        let k = ks("never-latched");
+        assert!(!k.is_halted());
+        assert!(!k.is_liveness_only());
+    }
+
+    #[test]
+    fn a_resume_clears_the_latch_and_keeps_the_spent_budget() {
+        let path = scratch("resume");
+        let mut k = KillSwitch::load(&path, 300, u128::MAX, BUDGET).unwrap();
+        let quote = 1_000_000_000_000u128;
+        k.observe(quote, &[pos(0, FAIR)], 1_000).unwrap();
+        // A 3000 loss, then a 2000 gain, so both cumulative totals are non-zero and a resume that
+        // reset either of them cannot pass by accident.
+        k.observe(quote - 3_000_000_000, &[pos(0, FAIR)], 1_001)
+            .unwrap();
+        k.observe(quote - 1_000_000_000, &[pos(0, FAIR)], 1_002)
+            .unwrap();
+        assert_eq!(k.state().cumulative_trade_loss, 3_000_000_000);
+        assert_eq!(k.state().cumulative_trade_gain, 2_000_000_000);
+        let observations = k.state().observations;
+
+        k.halt(
+            &Halt::Liveness {
+                reason: "chain liveness lost for 615s (limit 600s)".into(),
+            },
+            5_000,
+        )
+        .unwrap();
+        assert!(k.is_liveness_only());
+        k.resume().unwrap();
+        assert!(!k.is_halted());
+        assert!(!k.is_liveness_only());
+        assert!(k.halt_reason().is_none());
+        assert!(k.state().halted_at.is_none());
+        drop(k);
+
+        // Across the reload, because a resume that only cleared memory would be undone by the very
+        // next restart — and it is the restarts that this whole path exists to survive.
+        let k = KillSwitch::load(&path, 300, u128::MAX, BUDGET).unwrap();
+        assert!(!k.is_halted());
+        assert!(k.halt_reason().is_none());
+        assert_eq!(
+            k.state().cumulative_trade_loss,
+            3_000_000_000,
+            "a resume that hands back spent budget makes an outage a way to launder one"
+        );
+        assert_eq!(k.state().cumulative_trade_gain, 2_000_000_000);
+        assert_eq!(k.state().observations, observations);
     }
 
     #[test]

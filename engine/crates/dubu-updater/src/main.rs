@@ -328,6 +328,96 @@ fn kill_state_path(base: &std::path::Path, group: &str) -> std::path::PathBuf {
     path
 }
 
+/// What each pool reported the head to be, once both agreed the chain is moving.
+#[derive(Debug, Clone, Copy)]
+struct ProbedHeads {
+    /// The head the write pool reported, `cfg.chain.rpc_url`.
+    write_block: u64,
+    /// The head the read pool reported, `cfg.chain.flashblocks_rpc_url` — the pool that failed on
+    /// 2026-07-29, and so the one that actually has to answer before anything is cleared.
+    read_block: u64,
+}
+
+/// Whether the chain is answering right now on **both** pools. `None` means do not act on it.
+///
+/// Both, because the pool that broke on 2026-07-29 was the read one. `flash` is pinned to GIWA's
+/// free flashblocks endpoint, which answered `-32011 no backend is currently healthy to serve
+/// traffic`, while the canonical RPC behind `rpc` stayed healthy throughout. So a probe that only
+/// asks `rpc` interrogates the one path that never failed: it would clear the latch while
+/// flashblocks was still refusing, the reader task would go on failing, [`ChainHealth`] would walk
+/// back to `Down` and re-latch about 600s later, and every pass costs nine nonces re-asserting the
+/// withdrawals. Requiring both puts the path that actually broke inside the check.
+///
+/// Concurrently, so the cost is one gap rather than two and both pools are sampled over the same
+/// window — probing them in sequence would compare heads read four seconds apart and read a
+/// perfectly normal seal as a disagreement between the pools.
+///
+/// Worth knowing and deliberately not designed around: on the box today `rpc_url` and
+/// `flashblocks_rpc_url` are both `http://127.0.0.1:8545`, so both probes hit the same local node
+/// and the stricter check is a no-op there. It stops being one the moment either pool is pointed
+/// back at a remote endpoint, which is the configuration this has to be correct for.
+async fn chain_is_answering(rpc: &Rpc, flash: &Rpc) -> Option<ProbedHeads> {
+    let (write, read) = tokio::join!(probe_head(rpc), probe_head(flash));
+    // Both, never either. This pattern is the entire requirement, so it is written once and here.
+    match (write, read) {
+        (Some(write_block), Some(read_block)) => Some(ProbedHeads {
+            write_block,
+            read_block,
+        }),
+        _ => None,
+    }
+}
+
+/// Two head reads from one pool, a couple of seconds apart. `None` if either read failed or the
+/// head went backwards.
+///
+/// Two rather than one because a single answered read only proves an endpoint is reachable, and the
+/// mirror failure — an endpoint cheerfully serving a frozen number over a chain that has stopped —
+/// looks identical from one sample. Requiring both also stops a pool that is still mid-outage from
+/// passing by getting lucky once.
+///
+/// At-or-ahead rather than strictly ahead: GIWA seals at roughly 1s but nothing guarantees a seal
+/// inside this particular gap, and a chain that is briefly quiet is not a chain that is down. The
+/// cost of being wrong in that direction is bounded and self-correcting — [`ChainHealth`] re-decides
+/// liveness from the reads the loop is about to make anyway, and latches again within
+/// `halt_after_secs`. The cost of being too strict is the outage this exists to end.
+///
+/// Every failure names its pool, because "flashblocks is still down" and "the canonical RPC is
+/// down" call for different things from whoever is reading. [`Rpc::name`] is the name the pool was
+/// built with, so the log agrees with what that pool's `RpcError`s already say, and [`Rpc::url`] is
+/// the redacted form — there is no accessor for the real one.
+///
+/// `eth_blockNumber` through the existing [`Rpc::quantity`], so this shares the pool's rate limiter
+/// and endpoint failover with every other read rather than reaching around them.
+async fn probe_head(rpc: &Rpc) -> Option<u64> {
+    let first = match rpc.quantity("eth_blockNumber", serde_json::json!([])).await {
+        Ok(n) => n,
+        Err(e) => {
+            warn!(target: "risk", event = "liveness_probe_failed", pool = rpc.name(),
+                  url = %rpc.url(), attempt = 1, error = %e,
+                  "this pool did not answer a head read; leaving the latch alone");
+            return None;
+        }
+    };
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let second = match rpc.quantity("eth_blockNumber", serde_json::json!([])).await {
+        Ok(n) => n,
+        Err(e) => {
+            warn!(target: "risk", event = "liveness_probe_failed", pool = rpc.name(),
+                  url = %rpc.url(), attempt = 2, error = %e, first_block = first,
+                  "this pool answered one head read and then did not; leaving the latch alone");
+            return None;
+        }
+    };
+    if second < first {
+        warn!(target: "risk", event = "liveness_probe_reorg", pool = rpc.name(),
+              url = %rpc.url(), first_block = first, second_block = second,
+              "this pool's head went backwards between two reads; not a chain to resume onto");
+        return None;
+    }
+    Some(second)
+}
+
 /// The jump detector, one threshold per pair and contagion inside a group.
 fn build_jump_book(cfg: &Config) -> jump::Book {
     let bounds: Vec<(u16, jump::Bounds)> = cfg
@@ -572,7 +662,7 @@ async fn run(args: &Args) -> Result<i32, Box<dyn std::error::Error>> {
     //
     // Each gets its own state file, so a latched group stays latched across restarts on its own and
     // an operator clears them one at a time.
-    let kills = load_kills(&cfg)?;
+    let mut kills = load_kills(&cfg)?;
 
     let mut sender = Sender::new(
         signer,
@@ -642,6 +732,73 @@ async fn run(args: &Args) -> Result<i32, Box<dyn std::error::Error>> {
                    "this group is latched from a previous run; its pairs will not quote");
         }
     }
+
+    // ... except when the only thing holding the book down is a chain outage that has since ended.
+    //
+    // On 2026-07-29 the public flashblocks RPC began answering `-32011 / HTTP 503`, chain liveness
+    // was lost for 615s against the 600s limit, and the loop latched `Halt::Liveness` on every
+    // group. The stay-down check below then did precisely what it is for — re-asserted the
+    // withdrawals, exited `EXIT_HALTED` — and systemd's `Restart=on-failure` fed the process
+    // straight back into it, six times about 19s apart, spending ~9 nonces a pass, until
+    // `StartLimitBurst` was exhausted. The bot was then dead for 59 minutes, until a human noticed.
+    // A transient ten-minute outage became a permanent one, and nothing about the book was wrong.
+    //
+    // Latching stays: `KillSwitch::halt` is unchanged and a liveness halt is still recorded and
+    // still survives a reload, because at the moment it fires the chain genuinely is gone and the
+    // quotes genuinely must come down. What is added is the other half — recovery — and it belongs
+    // at startup rather than in the loop, because the process that latched has already exited by
+    // the time the chain comes back.
+    //
+    // Two conditions, both required. Every latched group must be liveness and nothing else: a
+    // `Bleed` or a `LossBudget` anywhere in the set is the book losing money, which wants a human
+    // before it quotes again, and clearing the liveness groups around it would resume half a book on
+    // a question nobody has answered. And both RPC pools must be demonstrably moving now, not merely
+    // reachable — see `chain_is_answering` for why asking only the write pool would clear the latch
+    // on the strength of the one path that did not fail.
+    let liveness_only: Vec<String> = kills
+        .iter()
+        .filter(|(_, k)| k.is_liveness_only())
+        .map(|(g, _)| g.clone())
+        .collect();
+    if !liveness_only.is_empty() && liveness_only.len() == latched.len() {
+        match chain_is_answering(&rpc, &flash).await {
+            Some(heads) => {
+                for group in &liveness_only {
+                    let kill = kills.get_mut(group).expect("named by the scan just above");
+                    let reason = kill.halt_reason().unwrap_or("(unrecorded)").to_string();
+                    let halted_at = kill.state().halted_at;
+                    kill.resume()?;
+                    // At `error!` and with its own event, deliberately. Clearing a killswitch
+                    // without a human in the loop is exactly the kind of thing that must never be
+                    // quiet: whoever reads this log after the next incident has to be able to find
+                    // the moment the latch went away and what it said when it was set.
+                    error!(
+                        target: "risk", event = "liveness_latch_cleared", group = %group,
+                        reason = %reason, halted_at = ?halted_at,
+                        write_block = heads.write_block, read_block = heads.read_block,
+                        state_path = %cfg.risk.state_path.display(),
+                        "this group was latched for chain liveness only and both RPC pools are \
+                         answering again; clearing the latch and resuming. The cumulative loss \
+                         budget is carried over untouched"
+                    );
+                    assert!(
+                        !kill.is_halted(),
+                        "a group logged as resumed that is still latched would exit below anyway"
+                    );
+                }
+            }
+            // Which pool fell short is in the `liveness_probe_failed` line immediately above this
+            // one; this is the decision, and it stays findable on its own.
+            None => error!(
+                target: "risk", event = "liveness_latch_kept",
+                groups = liveness_only.len(),
+                "every latched group is chain liveness only, but the chain is not answering on \
+                 both pools yet; keeping the latch and exiting rather than resuming into the \
+                 same outage"
+            ),
+        }
+    }
+
     if kills.values().all(KillSwitch::is_halted) {
         let kill = kills.values().next().expect("at least one group");
         error!(
@@ -1987,10 +2144,18 @@ async fn run_cycle(
         {
             // Only when the chain still shows capacity, so a group that is already down does not
             // re-send `refreshCapacity(pair, 0, 0)` every cycle and burn a nonce for nothing.
+            //
+            // Capacity alone is not enough, and this is the same defect the jump path had: the
+            // snapshot goes on showing depth until the withdrawal is included, which takes about
+            // two seconds against a cycle of under three, so a capacity-only guard fires again on
+            // the very next cycle and sends a second withdrawal for a pair already withdrawing.
+            // The equity group has been latched since 2026-07-29 and pays that on four pairs, on
+            // every cycle inside the inclusion window, at the 100x tip a withdrawal carries.
             if view
                 .snaps
                 .get(&pair.pair_id)
                 .is_some_and(|s| s.bid_capacity != 0 || s.ask_capacity != 0)
+                && !rt.sender.withdrawal_in_flight(pair.pair_id)
             {
                 reassert.push(pair.pair_id);
             }
@@ -2015,10 +2180,21 @@ async fn run_cycle(
         // pool is still armed and the detector believes otherwise. This is the only thing that
         // notices, and it runs at the chain's own cadence rather than the fast lane's because it
         // needs a chain read to answer the question at all.
+        //
+        // `withdrawal_in_flight` and not merely `at_capacity`, because `at_capacity` answers a
+        // different question. `in_flight_max` is 2, so the fast lane's own withdrawal leaves a
+        // slot open, and this runs ~1.4s behind it against a ~2s inclusion latency — the chain
+        // genuinely still shows capacity at that moment, so the test above is true for a reason
+        // that is already being fixed. Every one of those re-sends was a second transaction at the
+        // 100x withdrawal tip buying a state the first was about to reach: measured over 16.2
+        // hours, 150-154 withdrawal transactions per pair against 73-75 real episodes, so roughly
+        // 740 of them bought nothing at all. What is genuinely rejected or dropped still gets
+        // re-asserted, because that is exactly the case where nothing is left in flight.
         let jump_withdrawn = rt.jump.withdrawn(pair.pair_id);
         if jump_withdrawn
             && (snap.bid_capacity != 0 || snap.ask_capacity != 0)
             && !rt.sender.at_capacity(pair.pair_id)
+            && !rt.sender.withdrawal_in_flight(pair.pair_id)
         {
             warn!(
                 target: "jump", event = "reassert", pair_id = pair.pair_id,
@@ -2161,6 +2337,26 @@ async fn run_cycle(
         // retired outright: an RFQ order is a firm price for its whole TTL, so signing one against
         // a reference the venues no longer agree on is worse than leaving a stale ladder up, which
         // at least stops itself at `maxStaleSecs`.
+        //
+        // The `jump_withdrawn` half of that gate is what makes `withdraw_pair`'s `rfq.retire`
+        // mean anything. Without it the retire lasted exactly one cycle: this arm ran on nothing
+        // but `fair.is_some()`, so ~3s after the fast lane took the market down it went straight
+        // back up, and it did so for the rest of the cool-off. Measured on the live system: a trip
+        // at 05:45:31.730 and the maker signing that pair again at 05:45:38.569 — 6.8s into a
+        // 30.2s cool-off, at roughly a 1bp half-spread, into exactly the jump the curve had just
+        // fled. The zero epoch was holding the whole time; the leg that quotes without touching
+        // the chain was walking straight through it, which is the hole `withdraw_pair` documents
+        // as the single largest loss the flow simulator found.
+        //
+        // This is strictly more conservative, and it is worth naming what it costs because the
+        // cost is user-visible. The RFQ market was accidentally masking the prop pool's zero, so
+        // pairs 3/4/5 go from answering nothing ~0.4% of the day to ~5%, and what was a 3-second
+        // flicker becomes the full 30-second outage it always should have been. That is the right
+        // trade by a margin that is not close — `jump.rs` prices one 30s outage at $0.48 against
+        // $16,580 for one avoided pick-off, or ~34,000:1 — and the outage is not new, only honest.
+        // `serve::prop_amounts` is the other half: it now answers `no-capacity` with a 503 rather
+        // than a 200 of zeros, so the caller is told to come back rather than told there is no
+        // market here.
         if let Some(rfq) = &rt.rfq {
             match fair {
                 // NOT `base_balance` / `quote_balance`. Those are the POOL's, and `PmmSettle`
@@ -2168,7 +2364,7 @@ async fn run_cycle(
                 // the allowance rather than the balance. Sizing an RFQ quote against the pool's
                 // inventory means signing orders that revert inside a `transferFrom`, which costs
                 // the taker gas and leaves nothing useful in the trace.
-                Some(f) => rfq.publish(quoting::MarketState {
+                Some(f) if !jump_withdrawn => rfq.publish(quoting::MarketState {
                     pair_id: pair.pair_id,
                     base: meta.base,
                     quote: meta.quote,
@@ -2198,7 +2394,10 @@ async fn run_cycle(
                         0
                     },
                 }),
-                None => rfq.retire(pair.pair_id),
+                // No fair value, or a cool-off in force. Both are the same instruction to the
+                // maker — sign nothing for this pair — and neither costs a transaction, because an
+                // order that was never signed cannot be filled.
+                _ => rfq.retire(pair.pair_id),
             }
 
             // The prop pool's own quote, mirrored for the aggregator.

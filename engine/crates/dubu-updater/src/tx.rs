@@ -335,6 +335,18 @@ impl Intent {
         }
     }
 
+    /// Whether this intent takes the pair's depth to zero — the shape `withdraw_pair` sends.
+    ///
+    /// Deliberately not derived from [`Self::label`]. That is the calldata's name and both a
+    /// routine epoch and a withdrawal are `refreshCapacity` on chain, but the two want opposite
+    /// answers from [`Sender::withdrawal_in_flight`]: a pair with a *non-zero* epoch still in the
+    /// air is precisely a pair that has not been withdrawn yet and must be. The distinction lives
+    /// in the amounts, so it is read from the amounts.
+    #[must_use]
+    pub const fn is_withdrawal(self) -> bool {
+        matches!(self, Self::RefreshCapacity { bid: 0, ask: 0, .. })
+    }
+
     /// ABI-encoded calldata.
     ///
     /// # Panics
@@ -378,6 +390,11 @@ pub struct Pending {
     pub nonce: u64,
     /// When it was submitted.
     pub submitted_at: Instant,
+    /// Whether it was a withdrawal — a zero capacity epoch, per [`Intent::is_withdrawal`].
+    ///
+    /// Recorded here rather than re-derived later because `kind` cannot answer it: a withdrawal
+    /// and a routine epoch refresh are the same call. See [`Sender::withdrawal_in_flight`].
+    pub withdrawal: bool,
 }
 
 /// A per-transaction fee override. See [`Sender::send_with_fees`] for the only thing that uses it.
@@ -534,6 +551,29 @@ impl Sender {
         })
     }
 
+    /// Whether this pair already has an unconfirmed **withdrawal** in the air.
+    ///
+    /// [`Self::at_capacity`] is the wrong question for the jump re-assert, and asking it cost
+    /// about 740 transactions in 16 hours. `in_flight_max` is 2, so the fast lane's own withdrawal
+    /// leaves a slot open; the re-assert then fires ~1.4s later against a ~2s inclusion latency,
+    /// reads a chain snapshot that cannot yet show the zero, and sends the same withdrawal again.
+    /// Measured over 16.2 hours: 150-154 withdrawal transactions per pair against 73-75 actual
+    /// episodes, every one of them at the 100x tip `jump.withdraw_priority_fee_wei` pays to win a
+    /// fee auction that the first transaction had already entered.
+    ///
+    /// Built on the same bookkeeping as [`Self::in_flight`] rather than a second per-pair flag:
+    /// `nonce >= landed_nonce` is what "still in the air" means for a single sender, and a
+    /// parallel flag is one [`Self::sweep_timeouts`] and [`Self::observe_landed`] would each have
+    /// to remember to clear — a withdrawal that timed out with the flag still set would suppress
+    /// the very re-assert that exists to notice it.
+    #[must_use]
+    pub fn withdrawal_in_flight(&self, pair_id: u16) -> bool {
+        self.pending.get(&pair_id).is_some_and(|v| {
+            v.iter()
+                .any(|p| p.withdrawal && p.nonce >= self.landed_nonce)
+        })
+    }
+
     /// Tell the gate what the chain's confirmed nonce is.
     ///
     /// Everything below this has landed -- nonce ordering is absolute for one sender -- so it no
@@ -682,6 +722,7 @@ impl Sender {
                         kind: intent.label(),
                         nonce,
                         submitted_at: Instant::now(),
+                        withdrawal: intent.is_withdrawal(),
                     });
                 Ok(Sent::Broadcast { hash, nonce })
             }
@@ -866,6 +907,7 @@ mod tests {
                 kind: "updateQuote",
                 nonce: 500,
                 submitted_at: Instant::now() - Duration::from_secs(30),
+                withdrawal: false,
             }],
         );
         // Nonce 500 has NOT landed, so the receipt loop skips it entirely.
@@ -905,6 +947,7 @@ mod tests {
             kind: "updateQuote",
             nonce: n,
             submitted_at: Instant::now(),
+            withdrawal: false,
         };
         s.pending.insert(1, vec![p(1, 10), p(2, 11)]);
         assert!(s.at_capacity(1), "two in flight against in_flight_max 2");
@@ -920,6 +963,136 @@ mod tests {
         // The transaction is still tracked, because "did it land" and "did it succeed" are
         // different questions and only the receipt answers the second.
         assert_eq!(s.pending(1).map(|p| p.nonce), Some(10));
+    }
+
+    /// A withdrawal is a zero epoch, and nothing else is — including the routine refresh that
+    /// encodes to the identical call.
+    ///
+    /// The distinction is the whole fix: if a non-zero `refreshCapacity` counted as a withdrawal,
+    /// the re-assert would stand down on a pair whose epoch is about to be armed, which is the
+    /// opposite of what it is for.
+    #[test]
+    fn only_a_zero_epoch_is_a_withdrawal() {
+        assert!(Intent::RefreshCapacity {
+            pair_id: 1,
+            bid: 0,
+            ask: 0
+        }
+        .is_withdrawal());
+        assert!(!Intent::RefreshCapacity {
+            pair_id: 1,
+            bid: 0,
+            ask: 1
+        }
+        .is_withdrawal());
+        assert!(!Intent::RefreshCapacity {
+            pair_id: 1,
+            bid: 1,
+            ask: 0
+        }
+        .is_withdrawal());
+        assert!(!Intent::UpdateQuote {
+            pair_id: 1,
+            word: [0; 32]
+        }
+        .is_withdrawal());
+    }
+
+    /// The guard that stopped the jump re-assert from sending every withdrawal twice.
+    ///
+    /// Measured over 16.2 hours before it existed: 150-154 withdrawal transactions per pair
+    /// against 73-75 real episodes, or about 740 wasted sends, each at the 100x withdrawal tip.
+    /// The cause is entirely visible here — `in_flight_max` is 2, so one withdrawal in the air
+    /// leaves `at_capacity` false and the re-assert takes the free slot ~1.4s into a ~2s
+    /// inclusion.
+    #[test]
+    fn a_withdrawal_already_in_the_air_is_not_sent_again() {
+        let mut s = Sender::new(
+            None,
+            91_342,
+            Address::ZERO,
+            &tx_cfg(true),
+            50_000_000,
+            5_000_000,
+        );
+        let p = |b: u8, n: u64, withdrawal: bool| Pending {
+            hash: B256::repeat_byte(b),
+            kind: "refreshCapacity",
+            nonce: n,
+            submitted_at: Instant::now(),
+            withdrawal,
+        };
+
+        assert!(!s.withdrawal_in_flight(1), "nothing sent, nothing pending");
+
+        // What the fast lane leaves behind: one withdrawal, and a slot still open.
+        s.pending.insert(1, vec![p(1, 10, true)]);
+        assert!(
+            !s.at_capacity(1),
+            "the old guard would have let this through"
+        );
+        assert!(s.withdrawal_in_flight(1));
+
+        // The chain has accounted for it, so the pair is answerable again — by the same rule
+        // `in_flight` uses, and without waiting for a receipt.
+        s.observe_landed(11);
+        assert!(!s.withdrawal_in_flight(1));
+        assert_eq!(s.in_flight(1), 0);
+    }
+
+    /// A pair with a routine epoch refresh outstanding is exactly a pair that still needs
+    /// withdrawing, so the guard must not fire on one.
+    #[test]
+    fn a_pending_epoch_refresh_does_not_count_as_a_withdrawal() {
+        let mut s = Sender::new(
+            None,
+            91_342,
+            Address::ZERO,
+            &tx_cfg(true),
+            50_000_000,
+            5_000_000,
+        );
+        s.pending.insert(
+            4,
+            vec![
+                Pending {
+                    hash: B256::repeat_byte(1),
+                    kind: "updateQuote",
+                    nonce: 10,
+                    submitted_at: Instant::now(),
+                    withdrawal: false,
+                },
+                Pending {
+                    hash: B256::repeat_byte(2),
+                    kind: "refreshCapacity",
+                    nonce: 11,
+                    submitted_at: Instant::now(),
+                    withdrawal: false,
+                },
+            ],
+        );
+        assert!(!s.withdrawal_in_flight(4));
+
+        // And a timed-out withdrawal releases the guard, because the queue goes with it. A flag
+        // kept outside `pending` is the version of this that would have suppressed the re-assert
+        // for the one case it exists to catch.
+        s.pending_timeout = Duration::from_millis(1);
+        s.pending.insert(
+            5,
+            vec![Pending {
+                hash: B256::repeat_byte(3),
+                kind: "refreshCapacity",
+                nonce: 12,
+                submitted_at: Instant::now() - Duration::from_secs(30),
+                withdrawal: true,
+            }],
+        );
+        assert!(s.withdrawal_in_flight(5));
+        let _ = s.sweep_timeouts(Instant::now());
+        assert!(
+            !s.withdrawal_in_flight(5),
+            "a withdrawal that never landed must be re-assertable"
+        );
     }
 
     /// A view can arrive out of order; a nonce that went backwards would re-block settled sends.
@@ -942,6 +1115,7 @@ mod tests {
                 kind: "updateQuote",
                 nonce: 20,
                 submitted_at: Instant::now(),
+                withdrawal: false,
             }],
         );
         assert_eq!(
@@ -1190,6 +1364,7 @@ mod tests {
                 kind: "updateQuote",
                 nonce: 3,
                 submitted_at: Instant::now(),
+                withdrawal: false,
             }],
         );
         assert_eq!(s.in_flight(1), 1, "the send must be tracked");
@@ -1216,6 +1391,7 @@ mod tests {
             kind: "updateQuote",
             nonce: n,
             submitted_at: Instant::now(),
+            withdrawal: false,
         };
         s.pending.insert(1, vec![p(3)]);
         assert!(!s.at_capacity(1));
@@ -1241,6 +1417,7 @@ mod tests {
             kind: "updateQuote",
             nonce: n,
             submitted_at: Instant::now(),
+            withdrawal: false,
         };
         s.pending.insert(1, vec![p(3), p(4)]);
         s.pending.remove(&1); // what the timeout branch does

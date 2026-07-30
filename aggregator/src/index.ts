@@ -1,7 +1,15 @@
 import { getAddress, isAddress, type Address } from 'viem';
 
 import { findMarket, loadConfig, type Env } from './config.js';
-import { makeClient, makerCanDeliver, quoteAmms, WEIGHT_DENOMINATOR, type Leg } from './quote.js';
+import {
+  makeClient,
+  makerCanDeliver,
+  quoteAmms,
+  WEIGHT_DENOMINATOR,
+  type Leg,
+  type PropRefusal,
+  type VenueId,
+} from './quote.js';
 import { requestQuote, type RfqQuote } from './rfq.js';
 import { buildRoute } from './route.js';
 
@@ -158,19 +166,7 @@ async function handleQuote(request: Request, env: Env): Promise<Response> {
   const legs: Leg[] = useRfq ? [] : amm.legs;
   const chosenOut = useRfq ? (rfq.quote as RfqQuote).amountOut : amm.amountOut;
 
-  if (chosenOut === 0n) {
-    return json(
-      {
-        error: 'no venue would fill that size',
-        detail:
-          'Every venue returned zero. For the prop AMM that means the epoch capacity is spent, ' +
-          'the quote is stale, or the pair is paused — all of which resolve on their own — or ' +
-          'that the engine pricing it could not be reached, which does not.',
-        solo: { prop: amm.solo.prop.toString(), univ2: amm.solo.univ2.toString() },
-      },
-      404,
-    );
-  }
+  if (chosenOut === 0n) return nothingRoutable(amm.propRefused, amm.solo);
 
   const minAmountOut = (chosenOut * BigInt(WEIGHT_DENOMINATOR - slippageBps)) / BigInt(WEIGHT_DENOMINATOR);
   const deadline = BigInt(nowSecs + (body.deadlineSecs ?? DEFAULT_DEADLINE_SECS));
@@ -235,6 +231,56 @@ async function handleQuote(request: Request, env: Env): Promise<Response> {
       amountIn: amountIn.toString(),
     },
   });
+}
+
+/**
+ * The answer when no venue would fill: two different facts, which used to be one 404.
+ *
+ * A prop side withdrawn for a price-jump cool-off comes back on its own in tens of seconds, and
+ * saying so is the whole point — a frontend told "no venue would fill that size" shows the same
+ * "quote not available" it shows for a pair that does not exist, and the taker stops asking. A
+ * withdrawal is a 503 because the request is worth repeating; everything else is a 404 because it
+ * is not, at least not on any schedule this service can name.
+ *
+ * This only ever fires when *nothing* could be routed. A withdrawn prop pool on a pair UniV2 can
+ * serve never reaches here: the all-UniV2 grid point wins and the route is built as usual.
+ *
+ * Exported so the choice between the two is testable without a chain, for the same reason
+ * `chooseSplit` and `validateQuote` are.
+ */
+export function nothingRoutable(
+  propRefused: PropRefusal | null,
+  solo: Record<VenueId, bigint>,
+): Response {
+  const seen = { prop: solo.prop.toString(), univ2: solo.univ2.toString() };
+
+  if (propRefused === 'no-capacity') {
+    return json(
+      {
+        error: 'the pair is temporarily re-pricing',
+        detail:
+          'The prop pool has withdrawn its quotes for this side after a price move, and no other ' +
+          'venue would fill that size. The withdrawal is a cool-off measured in tens of seconds, ' +
+          'so the same request is worth retrying.',
+        retryable: true,
+        solo: seen,
+      },
+      503,
+    );
+  }
+
+  return json(
+    {
+      error: 'no venue would fill that size',
+      detail:
+        'Every venue returned zero. On the prop side that is spent epoch capacity, which refills ' +
+        'on the next epoch, or a stale quote, a paused pair, or an engine that could not be ' +
+        'reached. A pause can be a latched killswitch, so none of those last three is known to ' +
+        'clear without an operator. A side withdrawn to re-price answers 503 rather than this.',
+      solo: seen,
+    },
+    404,
+  );
 }
 
 function parseAddress(v: string | undefined): Address | null {

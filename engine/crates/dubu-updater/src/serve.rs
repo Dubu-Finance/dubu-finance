@@ -475,10 +475,13 @@ async fn quote(
 
 /// Prices a grid of sizes against the prop pool, the way `getAmountOut` would.
 ///
-/// A zero for one size is a refusal of that size — exhausted epoch, past the decayed room, out of
-/// domain — which is the same signal the aggregator already reads from a failed `eth_call`, so the
-/// router needs no new case. A pair the pool will not quote at all is a 404 instead, because a grid
-/// of zeros and a missing venue want different logs.
+/// A zero for one size is a refusal of that size — out of domain, past the decayed room, more than
+/// the epoch's remaining room — which is the same signal the aggregator already reads from a failed
+/// `eth_call`, so the router needs no new case. A pair the pool will not quote at all is a 404
+/// instead, because a grid of zeros and a missing venue want different logs.
+///
+/// A side offering **no depth whatsoever** is neither of those, and it is a 503 `no-capacity`. See
+/// the check below for why it cannot stay a 200.
 async fn prop_amounts(
     State(ctx): State<Ctx>,
     Json(req): Json<AmountsRequest>,
@@ -558,19 +561,78 @@ async fn prop_amounts(
     }
 
     let age = now_secs.saturating_sub(state.updated_at);
+
+    // A side offering nothing at all is a 503, not a grid of zeros.
+    //
+    // `pool::amount_out` returns `Ok(0)` for every size once `available` is zero, and until this
+    // existed that came back as a 200 carrying zeros — which the aggregator, having no way to tell
+    // it from a venue that refused every size on price, turned into `no venue would fill that
+    // size`, a 404. So "this pool is re-pricing for 30 seconds and will be back" and "there is no
+    // market here" were the same answer, and a taker was told the second when the first was true.
+    //
+    // `pool::refusal` above cannot cover this: it reads `paused` and the staleness clock and says
+    // nothing about capacity, so a withdrawal never reaches it. The jump defence in `main.rs` is
+    // what makes that gap matter — with the RFQ leg now correctly retired for the whole cool-off,
+    // a withdrawn pair really is dark for ~30s rather than flickering for ~3, and the caller has
+    // to be able to act on the difference. 503 with a retry is that difference; the aggregator
+    // already matches on the status *and* the code.
+    //
+    // `available` rather than `capacity`, so this covers the ramp having run to zero as well as
+    // the epoch having been zeroed. Both are the same fact to a caller — no depth now, ask again —
+    // and the log below carries `capacity` so the two remain distinguishable to a reader.
+    //
+    // What is tradeable does not move: every size this would have priced was going to be zero.
+    let (capacity, _, available) = side_depth(&state, side, age);
+    if available == 0 {
+        warn!(
+            target: "prop", event = "no_capacity", pair_id = state.pair_id,
+            side = side_label(side), capacity = %capacity, quote_age_secs = age,
+            decay_secs = state.decay_secs,
+            "this side is offering no depth; refusing with 503 no-capacity rather than a \
+             200 of zeros that reads as no market at all"
+        );
+        return Err(bad(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "no-capacity",
+            format!(
+                "pair {} has no depth on the {} side right now; it is re-pricing, so retry",
+                state.pair_id,
+                side_label(side)
+            ),
+        ));
+    }
+
     Ok(Json(price_grid(&state, side, age, &amounts_in)))
 }
 
-/// Applies the pool's own arithmetic to every grid point.
-fn price_grid(state: &PropState, side: Side, age: u64, amounts_in: &[u128]) -> AmountsResponse {
-    debug_assert!(!amounts_in.is_empty(), "the handler rejects an empty grid");
+/// Which way round this side is, for logs and for the wire.
+const fn side_label(side: Side) -> &'static str {
+    match side {
+        Side::Bid => "bid",
+        Side::Ask => "ask",
+    }
+}
 
+/// One side's epoch, what it has traded, and what the ramp leaves of it.
+///
+/// One place rather than two, because the no-capacity refusal above and [`price_grid`] below have
+/// to agree about what "no depth" means. A 503 computed from a different `available` than the grid
+/// it replaces would refuse sizes the pool would in fact have taken.
+fn side_depth(state: &PropState, side: Side, age: u64) -> (u128, u128, u128) {
     let (capacity, used) = match side {
         Side::Bid => (state.bid_capacity, state.bid_used),
         Side::Ask => (state.ask_capacity, state.ask_used),
     };
     let available = crate::chain::decayed(capacity, age, state.decay_secs);
     debug_assert!(available <= capacity, "the ramp only ever removes depth");
+    (capacity, used, available)
+}
+
+/// Applies the pool's own arithmetic to every grid point.
+fn price_grid(state: &PropState, side: Side, age: u64, amounts_in: &[u128]) -> AmountsResponse {
+    debug_assert!(!amounts_in.is_empty(), "the handler rejects an empty grid");
+
+    let (capacity, used, available) = side_depth(state, side, age);
 
     let amounts_out = amounts_in
         .iter()
@@ -598,10 +660,7 @@ fn price_grid(state: &PropState, side: Side, age: u64, amounts_in: &[u128]) -> A
 
     AmountsResponse {
         pair_id: state.pair_id,
-        side: match side {
-            Side::Bid => "bid",
-            Side::Ask => "ask",
-        },
+        side: side_label(side),
         amounts_out,
         observed_age_ms: Instant::now()
             .saturating_duration_since(state.observed_at)
@@ -1097,10 +1156,15 @@ mod tests {
         assert_eq!(status, StatusCode::NOT_FOUND);
     }
 
-    /// A jump withdrawal posts a zero epoch. The venue stays reachable and simply pays nothing,
-    /// which is what lets the router drop it without a special case.
+    /// A jump withdrawal posts a zero epoch, and that must be sayable.
+    ///
+    /// This asserted a 200 carrying zeros until the aggregator's side of it was traced: zeros are
+    /// indistinguishable from a venue refusing every size on price, so the router turned a pair
+    /// that was re-pricing for thirty seconds into `no venue would fill that size` — a 404. The
+    /// taker was told there is no market here when the truth was "come back in a moment", and the
+    /// engine logged nothing either way, which is what made it cost an investigation.
     #[tokio::test]
-    async fn a_withdrawn_epoch_answers_zero_rather_than_disappearing() {
+    async fn a_withdrawn_epoch_is_a_503_rather_than_a_silent_zero() {
         let mut state = prop_state(CHAIN_NOW - 1);
         state.bid_capacity = 0;
         let (status, body) = post_amounts(
@@ -1108,8 +1172,68 @@ mod tests {
             grid(BASE, QUOTE, &["1000000000000000000"]),
         )
         .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        // The aggregator matches on the status *and* this code; neither alone is the contract.
+        assert_eq!(body["error"], "no-capacity");
+        assert!(
+            body["detail"].as_str().expect("detail").contains("retry"),
+            "the caller has to be told this one is worth asking again: {body}"
+        );
+    }
+
+    /// Only the side that was actually withdrawn. A zero bid epoch says nothing about the ask,
+    /// and refusing both would take down depth the pool is still offering.
+    #[tokio::test]
+    async fn the_other_side_of_a_withdrawn_pair_still_quotes() {
+        let mut state = prop_state(CHAIN_NOW - 1);
+        state.bid_capacity = 0;
+        let shared = prop_seeded(state);
+        assert_eq!(
+            post_amounts(shared.clone(), grid(BASE, QUOTE, &["1000000000000000000"]))
+                .await
+                .0,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "base in is the bid, which is the side that was zeroed"
+        );
+        let (status, body) = post_amounts(shared, grid(QUOTE, BASE, &["2000000000"])).await;
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(body["amountsOut"][0], "0");
+        assert_eq!(body["side"], "ask");
+        assert_ne!(body["amountsOut"][0], "0");
+    }
+
+    /// The test is `available`, not `capacity`: a ramp that has run to zero leaves the pool
+    /// offering nothing just as surely as a withdrawal does, and a caller wants the same answer.
+    #[tokio::test]
+    async fn a_fully_decayed_epoch_is_also_a_503() {
+        let mut state = prop_state(CHAIN_NOW - 30);
+        state.stale_secs_max = 60;
+        assert_eq!(state.decay_secs, 30, "the fixture's ramp is the point here");
+        let (status, body) = post_amounts(
+            prop_seeded(state),
+            grid(BASE, QUOTE, &["1000000000000000000"]),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["error"], "no-capacity");
+    }
+
+    /// Nothing that had depth loses it. A side that can still fill *something* keeps answering a
+    /// grid, zeros and all — those zeros are a refusal of that size, which is a different claim.
+    #[tokio::test]
+    async fn a_side_with_depth_left_is_untouched_by_the_no_capacity_check() {
+        let mut state = prop_state(CHAIN_NOW - 1);
+        // One wei of room left on a thousand-ETH epoch: still depth, so still a 200.
+        state.bid_used = state.bid_capacity - 1;
+        let (status, body) = post_amounts(
+            prop_seeded(state),
+            grid(BASE, QUOTE, &["1000000000000000000"]),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body["amountsOut"][0], "0",
+            "the size is refused, but the venue is not claiming to be out of capacity"
+        );
     }
 
     /// The ramp is the pool's, not this endpoint's opinion: an older ladder offers less depth.

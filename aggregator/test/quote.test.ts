@@ -40,8 +40,12 @@ function throwing(error: Error) {
   }) as unknown as typeof fetch;
 }
 
-const ask = (fetchImpl: typeof fetch, config = cfg()) =>
+/** The whole result: the amounts, and what the engine said about answering that way. */
+const askFully = (fetchImpl: typeof fetch, config = cfg()) =>
   quotePropGrid(config, MWETH, MUSDC, AMOUNTS, fetchImpl);
+
+/** Just the amounts, which is what all but one of these cases is about. */
+const ask = async (fetchImpl: typeof fetch, config = cfg()) => (await askFully(fetchImpl, config)).amountsOut;
 
 beforeEach(() => {
   // The degradation logs one line per failure; the tests assert behaviour, not the log.
@@ -110,7 +114,7 @@ describe('the engine’s observation age', () => {
 describe('an engine that cannot be used', () => {
   it('does not ask at all when the venue is unconfigured', async () => {
     const { impl, calls } = stub({ amountsOut: ['1', '2', '3'] });
-    expect(await quotePropGrid(loadConfig({}), MWETH, MUSDC, AMOUNTS, impl)).toEqual([0n, 0n, 0n]);
+    expect(await ask(impl, loadConfig({}))).toEqual([0n, 0n, 0n]);
     expect(calls).toHaveLength(0);
   });
 
@@ -139,6 +143,57 @@ describe('an engine that cannot be used', () => {
     const { impl } = stub('<!doctype html><title>404</title>', { status: 404 });
     expect(await ask(impl)).toEqual([0n, 0n, 0n]);
     expect(vi.mocked(console.warn).mock.calls.flat().join(' ')).toContain('full endpoint');
+  });
+});
+
+/**
+ * A withdrawal is not an outage. The engine pulls a side for a price-jump cool-off and is quoting
+ * again in tens of seconds, and until it was told apart the aggregator reported it with the same
+ * 404 it uses for a pair that has no market at all.
+ *
+ * What is asserted here is the label on top of behaviour that is deliberately unchanged: the
+ * amounts are still zeros, because a route UniV2 can serve must not be blocked by the prop pool
+ * being between prices.
+ */
+describe('a prop side withdrawn while it re-prices', () => {
+  it('names the withdrawal, and still quotes zeros', async () => {
+    const { impl } = stub({ error: 'no-capacity', detail: 'bid capacity withdrawn' }, { status: 503 });
+    expect(await askFully(impl)).toEqual({ amountsOut: [0n, 0n, 0n], refused: 'no-capacity' });
+  });
+
+  it('reads no other decline as a withdrawal', async () => {
+    const others = [
+      [503, 'not-ready'],
+      [404, 'no-market'],
+      [400, 'bad-amount'],
+      [500, 'poisoned'],
+      // The code without the status it was agreed on is not the response this side was promised.
+      [200, 'no-capacity'],
+      [404, 'no-capacity'],
+    ] as const;
+    for (const [status, error] of others) {
+      const { impl } = stub({ error, detail: 'x' }, { status });
+      expect((await askFully(impl)).refused).toBeNull();
+    }
+  });
+
+  it('does not invent a withdrawal from a 503 with no error body', async () => {
+    const { impl } = stub('<!doctype html><title>503</title>', { status: 503 });
+    expect(await askFully(impl)).toEqual({ amountsOut: [0n, 0n, 0n], refused: null });
+  });
+
+  // The engine may ship this after the aggregator, or be rolled back afterwards. Zeros on a 200
+  // are what it sends today, and they must keep meaning exactly what they mean today.
+  it('makes no claim about capacity when the engine answers 200 with zeros', async () => {
+    const { impl } = stub({ amountsOut: ['0', '0', '0'], observedAgeMs: 412 });
+    expect(await askFully(impl)).toEqual({ amountsOut: [0n, 0n, 0n], refused: null });
+  });
+
+  it('makes no claim about capacity when the engine is unreachable', async () => {
+    expect(await askFully(throwing(new TypeError('fetch failed')))).toEqual({
+      amountsOut: [0n, 0n, 0n],
+      refused: null,
+    });
   });
 });
 
