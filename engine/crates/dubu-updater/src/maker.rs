@@ -1,34 +1,20 @@
 //! Turning a priced [`crate::quoting::Quote`] into a signed order a taker can settle.
 //!
-//! [`crate::quoting`] decides the price and reserves the inventory. This puts the maker's name on
-//! it. The split is not cosmetic: everything up to here is arithmetic that can be tested without a
-//! key, and everything here is a signature that authorises somebody to pull tokens out of the
-//! maker's balance.
+//! [`crate::quoting`] decides the price and reserves the inventory; this puts the maker's name on
+//! it. The split is not cosmetic: everything up to here is arithmetic testable without a key, and
+//! everything here authorises somebody to pull tokens out of the maker's balance.
 //!
-//! # The key is not the updater's key
+//! **The RFQ key is not the updater's key.** A leaked updater key pushes a wrong ladder, costing
+//! whatever the pool is quoting until somebody notices, with the killswitches watching. A leaked
+//! RFQ key signs an order transferring the maker's balance to an address of the attacker's
+//! choosing, up to the standing allowance, immediately and once per nonce. So [`MakerKey`] is
+//! loaded from its own [`crate::config::KeySource`] and RFQ is **off** unless that source is
+//! configured — off meaning the aggregator routes AMM-only, a worse quote and a working system.
 //!
-//! `tx::Intent` opens with "the only two things the updater key is allowed to do", and this would
-//! be a third. It is deliberately not given to that key, because the two authorities are not
-//! comparable:
-//!
-//! - A leaked updater key can push a wrong ladder. That costs whatever the pool is quoting until
-//!   somebody notices, and the killswitches are watching.
-//! - A leaked RFQ key can sign an order that transfers the maker's balance to an address of the
-//!   attacker's choosing, up to the standing allowance, immediately and once per nonce. There is
-//!   nothing to notice in time.
-//!
-//! So [`MakerKey`] is loaded from its own [`crate::config::KeySource`], and RFQ is **off** unless
-//! that source is configured. Off means the aggregator routes AMM-only, which is a worse quote and
-//! a working system. `DeployRfq` already anticipated this by taking `RFQ_MAKER` separately from
-//! the deployer.
-//!
-//! # The digest is computed here and nowhere else
-//!
-//! [`dubu_core::rfq`] owns the EIP-712 encoding, and it is the same code the settlement contract's
-//! tests pin from the other side. This module does not re-derive a domain separator or re-encode a
-//! struct; it fills in an [`Order`] and asks for the digest. A maker whose digest disagrees with
-//! the chain's by one byte produces quotes nobody can fill and sees no error of its own, which is
-//! exactly why there is one implementation rather than a convenient local copy.
+//! **The digest is computed here and nowhere else.** [`dubu_core::rfq`] owns the EIP-712 encoding
+//! and is what the settlement contract's tests pin from the other side, so this module fills in an
+//! [`Order`] and asks for the digest rather than re-deriving a domain separator. A maker whose
+//! digest disagrees with the chain's by one byte produces quotes nobody can fill and sees no error.
 
 use alloy_primitives::{Address, B256};
 use dubu_core::rfq::{Domain, Order};
@@ -44,15 +30,14 @@ pub struct SignedOrder {
     pub order: Order,
     /// 65 bytes of `(r, s, v)`, with `v` in `{27, 28}`.
     pub signature: [u8; 65],
-    /// The EIP-712 digest. Also the key `PmmSettle` accounts fills against, so it is what a log
+    /// The EIP-712 digest, and the key `PmmSettle` accounts fills against — so it is what a log
     /// line or an indexer joins on.
     pub digest: B256,
 }
 
-/// The RFQ signing key and the domain it signs for.
-///
-/// Holds the domain rather than taking it per call so that a misconfigured chain id or settlement
-/// address is a startup error, not a stream of unfillable quotes.
+/// The RFQ signing key and the domain it signs for. Holds the domain rather than taking it per
+/// call, so a misconfigured chain id or settlement address is a startup error rather than a
+/// stream of unfillable quotes.
 #[derive(Debug)]
 pub struct MakerKey {
     signer: Signer,
@@ -63,7 +48,6 @@ impl MakerKey {
     /// Loads the key and pins the domain.
     ///
     /// # Errors
-    ///
     /// [`TxError::Key`] if the key cannot be read or is not a valid secp256k1 scalar. The message
     /// never quotes the key material.
     pub fn load(source: &KeySource, chain_id: u64, pmm_settle: Address) -> Result<Self, TxError> {
@@ -79,33 +63,26 @@ impl MakerKey {
         }
     }
 
-    /// The address every order this key signs will name as `maker`.
-    ///
-    /// The taker checks that the recovered signer is the maker it expected, so this is the value
-    /// that has to match what `PmmSettle` was approved by and what the aggregator was configured
-    /// with. Exposed so startup can log it and a misconfiguration is visible before a quote is.
+    /// The address every order this key signs will name as `maker`. The taker checks the recovered
+    /// signer against it, so it must match what `PmmSettle` was approved by and what the aggregator
+    /// was configured with. Exposed so startup can log it.
     #[must_use]
     pub fn address(&self) -> Address {
         self.signer.address()
     }
 
-    /// The `PmmSettle.DOMAIN_SEPARATOR()` this key signs against.
-    ///
-    /// Worth logging at startup and comparing against the deployed contract: a maker whose domain
-    /// disagrees with the chain's signs quotes that recover to somebody else entirely, and the
-    /// symptom is silence rather than an error.
+    /// The `PmmSettle.DOMAIN_SEPARATOR()` this key signs against. Logged at startup and compared
+    /// against the deployed contract: a domain that disagrees with the chain's signs quotes that
+    /// recover to somebody else, and the symptom is silence rather than an error.
     #[must_use]
     pub fn domain_separator(&self) -> B256 {
         B256::from(self.domain.separator())
     }
 
-    /// Signs a priced quote.
-    ///
-    /// `nonce` comes from [`crate::quoting::Book::next_nonce`] — the cancellation handle, not a
-    /// replay guard.
+    /// Signs a priced quote. `nonce` comes from [`crate::quoting::Book::next_nonce`] — the
+    /// cancellation handle, not a replay guard.
     ///
     /// # Errors
-    ///
     /// [`TxError::Sign`] if the curve rejects the digest, which cannot happen for a well-formed
     /// 32-byte hash and is propagated rather than unwrapped anyway.
     pub fn sign(&self, quote: &Quote, nonce: u64) -> Result<SignedOrder, TxError> {
@@ -118,9 +95,9 @@ impl MakerKey {
             nonce,
             expiry: quote.expiry,
             // Decay is off. It exists so a streamed quote can widen as it ages instead of being
-            // cancelled and re-signed; this maker re-signs on request, so a decaying order would
-            // be a second, slower price control fighting the first. Turning it on is a change to
-            // how quotes are distributed, not a parameter to tune.
+            // re-signed; this maker re-signs on request, so a decaying order would be a second,
+            // slower price control fighting the first. Turning it on changes how quotes are
+            // distributed and is not a parameter to tune.
             decay_start: 0,
             decay_per_sec: 0,
             decay_cap: 0,
@@ -144,14 +121,13 @@ mod tests {
     use crate::quoting::{Book, MakerParams, MarketState};
     use alloy_primitives::address;
 
-    /// A throwaway key. Signatures below are real, so "the signature verifies" is tested rather
-    /// than asserted.
+    /// A throwaway key. The signatures below are real and are verified, not asserted.
     const KEY: &str = "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d";
     const PMM_SETTLE: Address = address!("68CFa6E265AffD5D0DB2C49E4bb9DaEC5A920A9E");
     const CHAIN_ID: u64 = 91342;
     const ONE_ETH: u128 = 1_000_000_000_000_000_000;
-    /// Roughly one base token's worth of quote at the fair value below. The taker's leg is
-    /// denominated in whatever it hands over, so the two directions take different numbers.
+    /// One base token's worth of quote at the fair value below; the taker's leg is denominated in
+    /// whatever it hands over, so the two directions take different numbers.
     const ONE_ETH_IN_USDC: u128 = 2_000_000_000;
 
     /// What a taker hands over for a one-base-token trade, in the direction's own units.
@@ -213,11 +189,7 @@ mod tests {
     }
 
     /// The value `PmmSettle.DOMAIN_SEPARATOR()` returns on GIWA Sepolia, read off the deployed
-    /// contract and independently derived by `DeployRfq` before it broadcast.
-    ///
-    /// This is the check that catches a maker signing into the void: a domain that disagrees with
-    /// the chain's by one byte produces signatures that recover to somebody else, and the maker
-    /// sees no error of its own — just quotes nobody fills.
+    /// contract.
     #[test]
     fn the_domain_matches_the_deployed_settlement_contract() {
         assert_eq!(
@@ -238,8 +210,8 @@ mod tests {
         );
     }
 
-    /// `MalleableSignature` is rejected on chain. k256 normalises to low-S, and this asserts that
-    /// rather than trusting it.
+    /// `MalleableSignature` is rejected on chain; k256 normalises to low-S, checked rather than
+    /// trusted.
     #[test]
     fn the_signature_is_low_s() {
         let s = signed(true);
@@ -255,7 +227,6 @@ mod tests {
         );
     }
 
-    /// The whole point: what the taker recovers has to be the maker the order names.
     #[test]
     fn the_signature_recovers_to_the_maker_the_order_names() {
         let s = signed(true);
@@ -275,8 +246,7 @@ mod tests {
         }
     }
 
-    /// A digest is over the whole order, so any field moving must move the digest. Testing one
-    /// field would leave the others free to be dropped from `encode_data` unnoticed.
+    /// Every field, not one: a field silently dropped from `encode_data` is otherwise invisible.
     #[test]
     fn every_field_changes_the_digest() {
         let mut book = Book::new();
@@ -327,8 +297,7 @@ mod tests {
         assert_ne!(sa.order.nonce, sb.order.nonce);
     }
 
-    /// Decay is off, and the three fields that switch it on stay zero. A non-zero decay would let
-    /// a taker fill at a worse price than the one that was quoted.
+    /// A non-zero decay lets a taker fill at a worse price than the one that was quoted.
     #[test]
     fn decay_is_off() {
         let s = signed(true);
@@ -342,8 +311,7 @@ mod tests {
         );
     }
 
-    /// A different settlement contract is a different domain, so the same order signs differently.
-    /// This is what stops an order for one deployment being replayed against another.
+    /// A different domain is what stops an order for one deployment being replayed against another.
     #[test]
     fn a_different_settlement_contract_yields_a_different_digest() {
         let other = MakerKey::new(
@@ -374,8 +342,7 @@ mod tests {
         );
     }
 
-    /// `ecrecover`, as the EVM does it, so the assertions above are testing the same thing the
-    /// chain will.
+    /// `ecrecover` as the EVM does it, so the assertions above test what the chain will.
     fn recover(digest: &B256, sig: &[u8; 65]) -> Option<Address> {
         use k256::ecdsa::{RecoveryId, Signature, VerifyingKey};
         let signature = Signature::from_slice(&sig[..64]).ok()?;

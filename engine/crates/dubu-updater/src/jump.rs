@@ -1,27 +1,18 @@
 //! Jump detection and withdrawal: the defence that does not try to price through a jump.
 //!
-//! # Why this exists, in one line of arithmetic
-//!
 //! A linear ladder absorbs a reference error up to
 //!
 //! ```text
 //! absorption = half_spread + width / 2
 //! ```
 //!
-//! and nothing beyond it. Past that point the pool pays
-//! `(reference error - absorption) x exposed depth` and there is no spread a market maker would
-//! post that makes a 100 bp gap profitable: the simulator's own sweep needs a **30 bp** constant
-//! half-spread before the sign flips, which is UniV2's fee and destroys the reason to exist.
-//!
-//! So the only winning move is not to be there. When the reference moves more than the ladder can
-//! absorb in one observation, this module withdraws quotes entirely — `refreshCapacity(pair, 0, 0)`,
-//! which makes `PropPool._outFor` return zero from every quote path — holds for a cool-off, and
-//! resumes only once the reference has stopped moving.
+//! and nothing beyond it; past that the pool pays `(reference error - absorption) x exposed
+//! depth`. No posted spread makes a 100 bp gap profitable — the sweep needs a 30 bp constant
+//! half-spread before the sign flips, which is UniV2's fee — so the response is to withdraw rather
+//! than to re-price. `refreshCapacity(pair, 0, 0)` makes `PropPool._outFor` return zero from every
+//! quote path, held for a cool-off and resumed only once the reference has stopped moving.
 //!
 //! # What counts as a jump
-//!
-//! Both an absolute move and a move in units of `sigma`, combined as **one threshold with two
-//! bounds**, because each arm fails in a way the other one catches:
 //!
 //! ```text
 //! threshold = clamp( k * sigma(dt),  half_spread,  half_spread + width/2 )
@@ -29,92 +20,49 @@
 //!                     the sigma arm   the floor     the absorption ceiling
 //! ```
 //!
-//! **The floor is the pair's own half-spread.** A fixed basis-point threshold is wrong across
-//! ETHUSDT and BTCUSDT — their measured 300 s sigmas are 10 bp and 3 bp — but the half-spread is
-//! not a fixed number, it is per-pair configuration, and it is the exact point at which the posted
-//! quote stops being on the right side of fair value. Below it the pool is still making money on
-//! the fill; there is nothing to run away from. It is also comfortably above the measured feed
-//! noise: cross-venue MAD on 2026-07-27 ran 0.1-1.0 bps with a largest single-venue deviation of
-//! 1.6 bps, against a 5 bp floor on ETH and 8 bp on BTC.
+//! The floor is the pair's own half-spread: per-pair configuration rather than a fixed bp
+//! threshold, the exact point at which the posted quote stops being on the right side of fair
+//! value, and above the measured cross-venue feed noise of 0.1-1.6 bps.
 //!
-//! **The ceiling is the pair's own absorption limit.** This is the answer to the failure the
-//! sigma arm has on its own: one 100 bp return entering a 60 s EWMA at `dt/tau = 1/60` raises
-//! ETH's per-second variance from 0.33 to ~167 bps^2/s, i.e. `sigma(1s)` from 0.58 bp to 12.9 bp.
-//! At `k = 6` the sigma arm would then ask for a **77 bp** move before it fired again — so the
-//! second leg of a two-stage jump would sail straight through the detector, which is precisely
-//! the case the defence exists for. Clamping the threshold at `half_spread + width/2` bounds that
-//! numbness with a fact about the ladder rather than a fact about the market: above the absorption
-//! limit the pool loses money whatever the volatility estimate says, so the detector must fire.
+//! The ceiling is the pair's own absorption limit, and it answers the sigma arm's own failure: one
+//! 100 bp return entering a 60 s EWMA lifts ETH's `sigma(1s)` from 0.58 bp to 12.9 bp, so at
+//! `k = 6` the arm would ask 77 bp before firing again and the second leg of a two-stage jump
+//! would sail through. Above the absorption limit the pool loses money whatever sigma says.
 //!
-//! **The sigma arm lives between them**, and its job is the opposite of the naive reading: in a
-//! calm market the floor binds and sigma does nothing, and as volatility rises the sigma arm
-//! *raises* the bar so the bot does not withdraw on every ordinary swing in a fast market. For
-//! ETH it starts to bind once `sigma(300s)` passes ~14 bp, i.e. 1.4x the measured level, and it is
-//! capped out by ~50 bp, i.e. 5x.
+//! Between them the sigma arm *raises* the bar as volatility rises, so the bot does not withdraw
+//! on every ordinary swing in a fast market.
 //!
-//! The bounds are computed from the pair's **configured** `half_spread_bps`, never from the
-//! volatility-scaled one in [`crate::spread`]. Widening the spread widens the real absorption, so
-//! feeding the widened value back in here would be defensible — and it would make the detector
-//! numb in exactly the regime where jumps cluster, which is the same failure the ceiling exists to
-//! prevent. The configured value is the protection the pool *always* has; that is the right thing
-//! to be sure of. (The configured `width_bps` is likewise an upper bound the inverse solver may
-//! narrow, so the ceiling is very slightly generous; the floor is exact.)
+//! Both bounds come from the pair's **configured** `half_spread_bps`, never the volatility-scaled
+//! one in [`crate::spread`]: feeding the widened value back in would make the detector numb in
+//! exactly the regime where jumps cluster. (`width_bps` is likewise an upper bound the inverse
+//! solver may narrow, so the ceiling is slightly generous; the floor is exact.)
 //!
-//! # A gap in the reference is a jump
+//! An observation separated from the previous one by more than `sample_max` is a hole rather than
+//! a return, and trips: `FeedNotLive` gates pushes but does not withdraw capacity, so through that
+//! hole the epoch stays armed behind a fixed ladder.
 //!
-//! An observation separated from the previous one by more than `sample_max` is not a return, it is
-//! a hole — the venues went away, or the process was blocked. During that hole the pool was
-//! quoting a fixed ladder against a market nobody was watching, and `FeedNotLive` gates *pushes*
-//! but does not withdraw *capacity*, so the epoch stayed armed the whole time. Treating the gap as
-//! a jump is the conservative reading and closes that hole: the pool comes back withdrawn and
-//! re-arms only after the reference has proved it is settled.
+//! # The cool-off
 //!
-//! # The cool-off, and the two-stage move
+//! Resuming into the second leg is the failure mode, so the cool-off is not a timer that runs
+//! down. It ends when all three hold:
 //!
-//! Resuming into the second leg is the failure mode, so the cool-off is **not a timer that runs
-//! down**. It ends when all of the following hold:
-//!
-//! 1. at least `cooloff` has passed **since the most recent trip** — retriggerable, so a second
-//!    leg restarts it rather than shortening it;
-//! 2. the trailing `cooloff` window of observations has a peak-to-trough **range** within the
-//!    current threshold — the reference has actually settled, which catches the staircase that
-//!    walks 100 bp in twenty 5 bp steps and never trips the single-observation test;
-//! 3. the newest observation is fresh. A dead feed can never satisfy the settle test by having no
+//! 1. at least `cooloff` has passed **since the most recent trip**, so a second leg restarts it
+//!    rather than shortening it;
+//! 2. the trailing `cooloff` window has a peak-to-trough **range** within the current threshold,
+//!    which catches the staircase that walks 100 bp in twenty 5 bp steps without ever tripping the
+//!    single-observation test. This is the load-bearing condition;
+//! 3. the newest observation is fresh, so a dead feed cannot satisfy the settle test by having no
 //!    observations to contradict it.
 //!
-//! (1) is a floor and (3) is a liveness check; (2) is the load-bearing one.
+//! One false positive costs ~$0.48 of foregone spread against $16,580 for one avoided pick-off, so
+//! the design is biased hard toward firing and a few trips per pair per day are expected. What
+//! bounds the bias is mechanical: a withdrawal is a transaction and an in-flight transaction
+//! blocks the pair, so the retriggerable cool-off makes each trip one transaction, not a stream.
 //!
-//! # False positives, and what they cost
-//!
-//! A false positive is a quoting outage of one cool-off. The simulator prices both sides of that
-//! trade and the ratio is not close:
-//!
-//! ```text
-//! cost of one 30 s outage      ~$122k/h of uninformed flow at 4.70 bp = ~$57/h  ->  $0.48
-//! value of one avoided pick-off                                                ->  $16,580
-//! break-even false-positive rate                                               ->  ~34,000 : 1
-//! ```
-//!
-//! So the design is biased hard toward firing, and the accepted rate is **a few trips per pair per
-//! day** — of order 0.1% of quoting time. The floor is set at the half-spread rather than anywhere
-//! higher for exactly this reason; for ETH at the measured `sigma(1s)` of 0.58 bp a 5 bp trip is an
-//! 8.7-sigma observation, which is rare without being unreachable.
-//!
-//! What stops the bias from running away is not the economics, it is the mechanics: each
-//! withdrawal is a transaction, an in-flight transaction blocks the pair, and a detector that
-//! flapped would keep the pair permanently blocked. The retriggerable cool-off is what makes each
-//! trip one transaction rather than a stream.
-//!
-//! # Per pair or across the book
-//!
-//! Across the book, by default ([`Scope::Book`]). A BTC jump is information about ETH: the two are
-//! 80-90% correlated, and in the market-wide case — a macro print, a liquidation cascade, an
-//! exchange outage — ETH's move is *coming* and its feed simply has not printed it yet. That
-//! window is the searcher's. The asymmetry decides it: contagion's false positive is one cool-off
-//! of foregone spread on the other pair, and its false negative is `(move - absorption) x $2M`.
-//!
-//! The **threshold** stays per-pair — each pair's own absorption limit and its own sigma. Only the
-//! withdrawal is shared.
+//! Withdrawal is shared across the correlation group by default ([`Scope::Book`]): in the
+//! market-wide case a correlated pair's move is *coming* and its feed has not printed it yet, and
+//! that window belongs to the searcher. Only the withdrawal is shared; the threshold stays
+//! per-pair.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::time::{Duration, Instant};
@@ -124,15 +72,10 @@ use dubu_core::math::mul_div_floor;
 use crate::skew::Volatility;
 
 /// 100%, in hundredths of a basis point — the unit every move and threshold here is carried in.
-///
-/// Hundredths rather than whole bps because the thresholds are single-digit bps and a whole-bp
-/// measurement would round the interesting range to nothing, exactly as
-/// [`crate::policy`] uses deci-bps for the same reason.
+/// Hundredths rather than whole bps, because the thresholds are single-digit bps.
 pub const BPS_E2: u128 = 1_000_000;
 
-// ---------------------------------------------------------------------------
-// Parameters
-// ---------------------------------------------------------------------------
+// --- Parameters ---
 
 /// Whether one pair's jump withdraws one pair or the whole book.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
@@ -165,15 +108,13 @@ pub struct Params {
     /// Observations closer together than this are recorded but not tested, so a fast-lane scan
     /// landing 10 ms before a cycle scan does not divide a rounding error by a tiny interval.
     pub sample_min: Duration,
-    /// A separation longer than this is a hole in the reference, not a return. See the module
-    /// docs: it trips.
+    /// A separation longer than this is a hole in the reference rather than a return, and trips.
     pub sample_max: Duration,
 }
 
-/// One pair's economic bounds, in hundredths of a bp.
-///
-/// Both come from the pair's own configuration, which is what makes a single global `sigma_k`
-/// correct across two instruments with very different volatilities and very different ladders.
+/// One pair's economic bounds, in hundredths of a bp. Both come from the pair's own
+/// configuration, which is what makes a single global `sigma_k` correct across two instruments
+/// with very different volatilities and ladders.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Bounds {
     /// The pair's configured half-spread: below this the posted quote is still on the right side
@@ -191,32 +132,23 @@ impl Bounds {
         Self::new(half_spread_bps, half_spread_bps, width_bps)
     }
 
-    /// The same bounds with the floor stated separately from the spread.
-    ///
-    /// The floor used to be `half_spread_bps` and that was right while that field *was* the
-    /// posted spread. It is not any more: `spread::compute` posts `s0 + s1 * sigma`, and when `s0`
-    /// dropped from 5 bp to 1 the floor followed it down to a level below the ordinary tick noise
-    /// of a four-venue combined reference. The detector then tripped on nothing — measured, four
-    /// trips in seven minutes, each holding capacity at zero for the 30s cool-off, which is 29% of
-    /// the run spent withdrawn with no jump anywhere.
-    ///
-    /// So the two numbers are separated, because they now answer different questions. `s0` is what
-    /// the pool charges in a dead market. This is how large a move it refuses to absorb, and it
-    /// belongs to the detector.
+    /// The same bounds with the floor stated separately from the spread. `floor_bps` and
+    /// `half_spread_bps` answer different questions: `s0` is what the pool charges in a dead
+    /// market, so tying the floor to it puts the floor under the tick noise of a combined
+    /// reference whenever `s0` is small. The floor is how large a move the detector refuses to
+    /// absorb.
     #[must_use]
     pub const fn new(floor_bps: u16, half_spread_bps: u16, width_bps: u16) -> Self {
         // `* 100` converts bps to hundredths of a bp; `* 50` is `width / 2` in the same step.
         let floor = (floor_bps as u32) * 100;
         // A zero floor would let feed noise trip the detector on every tick. The config validator
-        // already refuses `half_spread_bps = 0`, so this is a belt on top of braces.
+        // already refuses `half_spread_bps = 0`, so this is the second belt.
         let floor = if floor == 0 { 100 } else { floor };
-        // The ceiling stays the absorption limit -- `half_spread + width / 2` -- because that is a
-        // property of the ladder, not of the detector. A move the ladder can absorb is not a jump
-        // no matter how the floor is set, so the ceiling is computed from the posted spread and
-        // width as it always was, and only the floor was pulled out.
+        // The ceiling is a property of the ladder, not of the detector: a move the ladder absorbs
+        // is not a jump however the floor is set.
         let ceiling = (half_spread_bps as u32) * 100 + (width_bps as u32) * 50;
-        // A floor above the ceiling would make the clamp degenerate silently into always-floor.
-        // Raising the ceiling to meet it keeps `threshold` monotone in sigma.
+        // A floor above the ceiling would degenerate the clamp silently into always-floor; raising
+        // the ceiling to meet it keeps `threshold` monotone in sigma.
         let ceiling = if ceiling < floor { floor } else { ceiling };
         Self {
             floor_bps_e2: floor,
@@ -238,11 +170,11 @@ impl Bounds {
     }
 }
 
-/// Which of the three terms set the threshold. Logged, because "the sigma arm has been pinned at
-/// the absorption ceiling for ten minutes" is the shape of a market this bot should not be in.
+/// Which of the three terms set the threshold. Logged: a sigma arm pinned at the absorption
+/// ceiling for minutes is the shape of a market this bot should not be in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Bound {
-    /// The pair's half-spread. The calm-market case, and the one an untested observation reports.
+    /// The pair's half-spread: the calm-market case, and what an untested observation reports.
     #[default]
     Floor,
     /// `k * sigma`, strictly between the two bounds.
@@ -263,9 +195,7 @@ impl Bound {
     }
 }
 
-// ---------------------------------------------------------------------------
-// State
-// ---------------------------------------------------------------------------
+// --- State ---
 
 /// Why the detector tripped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -316,9 +246,8 @@ impl State {
     }
 }
 
-/// Everything one observation produced. All of it is logged on a trip or a state change, and the
-/// numeric part is logged every cycle alongside the row, so that `sigma_k` can be back-solved from
-/// history rather than guessed at again.
+/// Everything one observation produced. The numeric part is logged every cycle alongside the row,
+/// so `sigma_k` can be back-solved from history rather than guessed at.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Observation {
     /// How far the reference moved since the last tested observation, in hundredths of a bp.
@@ -326,18 +255,17 @@ pub struct Observation {
     /// The threshold it was tested against.
     pub threshold_bps_e2: u32,
     /// `sigma` scaled to this observation's own interval, in hundredths of a bp. Straight from
-    /// [`Volatility`] — there is exactly one volatility estimator in this crate.
+    /// [`Volatility`]: there is exactly one volatility estimator in this crate.
     pub sigma_bps_e2: u32,
     /// Which term set the threshold.
     pub bound: Bound,
     /// The observation interval.
     pub dt_ms: u64,
-    /// Peak-to-trough range of the trailing cool-off window, in hundredths of a bp. This is the
-    /// settle test's input.
+    /// Peak-to-trough range of the trailing cool-off window, in hundredths of a bp: the settle
+    /// test's input.
     pub range_bps_e2: u32,
-    /// Set when this observation *newly* moved the pair into [`State::Withdrawn`]. A second leg
-    /// arriving while already withdrawn re-arms the cool-off and reports `Some` again, so the
-    /// caller can re-assert the withdrawal; [`Observation::edge`] distinguishes them.
+    /// Why this observation tripped. A second leg arriving while already withdrawn re-arms the
+    /// cool-off and reports `Some` again; [`Observation::edge`] distinguishes the two cases.
     pub tripped: Option<Reason>,
     /// `true` when this observation was the transition into [`State::Withdrawn`], as opposed to a
     /// further trip while already there. Only the edge needs a transaction.
@@ -348,20 +276,16 @@ pub struct Observation {
     pub state: State,
 }
 
-// ---------------------------------------------------------------------------
-// The detector
-// ---------------------------------------------------------------------------
+// --- The detector ---
 
 /// One pair's jump detector and cool-off state machine.
 ///
 /// It keeps its **own** price anchor, separate from [`Volatility`]'s, because the two are sampled
-/// at different rates: the volatility estimator is fed once per quote cycle (~1 Hz) and this is fed
-/// by the fast-lane scan (~5 Hz). It reads `sigma` from that one estimator, scaled to whatever
-/// interval its own anchor happens to span — reusing the estimate, not duplicating it.
-///
-/// The sigma it reads is deliberately the estimate **as of before** the observation being tested.
-/// Folding a jump's own return into the variance and then asking whether it is surprising relative
-/// to that variance is a test that can never fire.
+/// at different rates — the estimator once per quote cycle (~1 Hz), this by the fast-lane scan
+/// (~5 Hz) — and reads `sigma` from that one estimator scaled to its own anchor's interval. The
+/// sigma it reads is the estimate **as of before** the observation being tested: folding a jump's
+/// own return into the variance and then asking whether it is surprising is a test that can never
+/// fire.
 #[derive(Debug, Clone)]
 pub struct Detector {
     params: Params,
@@ -417,9 +341,8 @@ impl Detector {
         self.last_reason
     }
 
-    /// How many times this detector has tripped since start. In every log line, because a detector
-    /// that has never fired and a detector that fires hourly need different responses and look
-    /// identical otherwise.
+    /// How many times this detector has tripped since start. In every log line: a detector that
+    /// has never fired and one that fires hourly need different responses.
     #[must_use]
     pub const fn trips(&self) -> u64 {
         self.trips
@@ -434,13 +357,11 @@ impl Detector {
         u64::try_from(self.params.cooloff.saturating_sub(elapsed).as_millis()).unwrap_or(u64::MAX)
     }
 
-    /// Fold in one reference observation and decide.
-    ///
-    /// `vol` is the pair's volatility estimator, read but never written: this module adds no
-    /// second estimator.
+    /// Fold in one reference observation and decide. `vol` is read but never written: this module
+    /// adds no second estimator.
     pub fn observe(&mut self, price: u128, now: Instant, vol: &Volatility) -> Observation {
-        // The window first, so the settle test below always sees the newest sample and so a
-        // sub-`sample_min` observation still contributes to the range.
+        // The window first, so the settle test below sees the newest sample and a sub-`sample_min`
+        // observation still contributes to the range.
         if price > 0 {
             self.window.push_back((price, now));
         }
@@ -460,9 +381,7 @@ impl Detector {
 
         let dt = now.saturating_duration_since(t0);
         let dt_ms = u64::try_from(dt.as_millis()).unwrap_or(u64::MAX);
-        // The estimate as of BEFORE this observation: the loop folds the tick into `vol` after the
-        // scan, never before it. Testing a jump against a variance that already contains it is a
-        // test that can never fire.
+        // The estimate as of BEFORE this observation: the loop folds the tick in after the scan.
         let sigma_bps_e2 = vol.sigma_bps_e2_over_ms(dt_ms.max(1));
         let base = Measured {
             threshold_bps_e2: self.threshold_bps_e2,
@@ -472,14 +391,14 @@ impl Detector {
         };
 
         if dt < self.params.sample_min {
-            // Too close together to test. Keep the old anchor so the next observation spans a
+            // Too close together to test. The anchor is kept so the next observation spans a
             // sensible interval rather than starting over.
             let resumed = self.maybe_resume(now);
             return self.report(Measured { resumed, ..base });
         }
 
         if dt > self.params.sample_max || prev == 0 {
-            // A hole in the reference. Not a return, and not safe to assume nothing happened.
+            // A hole in the reference: not a return, and not safe to assume nothing happened.
             self.anchor = Some((price, now));
             let edge = self.trip(now, Reason::FeedGap);
             return self.report(Measured {
@@ -525,8 +444,8 @@ impl Detector {
     fn trip(&mut self, now: Instant, reason: Reason) -> bool {
         let edge = !self.state.withdrawn();
         self.state = State::Withdrawn;
-        // Retriggerable: the cool-off is measured from the MOST RECENT trip, so the second leg of
-        // a two-stage move restarts it rather than being absorbed by the first leg's timer.
+        // Retriggerable: measured from the MOST RECENT trip, so a second leg restarts the cool-off
+        // rather than being absorbed by the first leg's timer.
         self.tripped_at = Some(now);
         self.last_reason = Some(reason);
         if edge {
@@ -537,7 +456,10 @@ impl Detector {
 
     /// End the cool-off if every condition holds. Returns whether it did.
     fn maybe_resume(&mut self, now: Instant) -> bool {
-        if !self.state.withdrawn() || !self.settled(now) {
+        if !self.state.withdrawn() {
+            return false;
+        }
+        if !self.settled(now) {
             return false;
         }
         self.state = State::Quoting;
@@ -564,8 +486,8 @@ impl Detector {
         if self.window.len() < 2 {
             return false;
         }
-        // 2. The reference has actually settled. The window holds only the last `cooloff` of
-        //    observations and the trip was at least that long ago, so it is entirely post-trip.
+        // 2. The reference has settled. The window holds only the last `cooloff` of observations
+        //    and the trip was at least that long ago, so it is entirely post-trip.
         self.range_bps_e2() <= self.threshold_bps_e2
     }
 
@@ -603,8 +525,8 @@ impl Detector {
 }
 
 /// The measurement half of an [`Observation`], threaded through [`Detector::observe`]'s early
-/// returns. A struct rather than eight positional arguments, because five of them are integers in
-/// the same units and any two adjacent ones would transpose without a type error.
+/// returns. A struct rather than eight positional arguments, because five are integers in the
+/// same units and any two adjacent ones would transpose without a type error.
 #[derive(Debug, Clone, Copy, Default)]
 struct Measured {
     move_bps_e2: u32,
@@ -617,30 +539,20 @@ struct Measured {
     resumed: bool,
 }
 
-// ---------------------------------------------------------------------------
-// The book
-// ---------------------------------------------------------------------------
+// --- The book ---
 
-/// Every pair's detector, plus the scope rule that decides whether one pair's jump is the whole
-/// book's problem.
-///
-/// Keyed by pair id rather than positionally: a `Vec` indexed in lock-step with `cfg.pairs` is an
+/// Every pair's detector, plus the scope rule that decides how far one pair's jump travels. Keyed
+/// by pair id rather than positionally: a `Vec` indexed in lock-step with `cfg.pairs` is an
 /// invariant nothing enforces, and getting it wrong tests one pair's move against another pair's
 /// absorption limit.
 #[derive(Debug, Clone)]
 pub struct Book {
     detectors: BTreeMap<u16, Detector>,
-    /// Which correlation group each pair belongs to. Contagion travels inside a group, never across.
-    ///
-    /// [`Scope::Book`] used to mean the whole book, and that was right when the book was BTC and
-    /// ETH: 80-90% correlated, so one's jump is genuinely information about the other. Listing
-    /// equities broke the premise. SK Hynix moving 19.5 bp says nothing about ETH -- different
-    /// asset class, different hours, different drivers -- and because it is also the most volatile
-    /// market here, it was withdrawing all nine pairs. Measured on 2026-07-29: 6 trips produced 16
-    /// contagion withdrawals, and the pool spent the run dark.
-    ///
-    /// A group is a claim about correlation, so it is configuration rather than something inferred.
-    /// Pairs with no group named share the default one, which reproduces the old behaviour exactly.
+    /// Which correlation group each pair belongs to. Contagion travels inside a group and never
+    /// across: [`Scope::Book`] meaning the literal whole book holds only while every pair is
+    /// correlated, and an equity's move says nothing about ETH while being the most volatile
+    /// market here. A group is a claim about correlation, so it is configuration rather than
+    /// inferred; pairs with no group named share one default group.
     groups: BTreeMap<u16, String>,
     scope: Scope,
     enabled: bool,
@@ -700,11 +612,13 @@ impl Book {
     /// disabled book, so a caller can use it as a gate without a second check.
     #[must_use]
     pub fn withdrawn(&self, pair_id: u16) -> bool {
-        self.enabled
-            && self
-                .detectors
+        if self.enabled {
+            self.detectors
                 .get(&pair_id)
                 .is_some_and(Detector::withdrawn)
+        } else {
+            false
+        }
     }
 
     /// Every pair currently withdrawn, in id order.
@@ -716,9 +630,7 @@ impl Book {
             .map(|(id, _)| *id)
     }
 
-    /// Fold one pair's reference observation in.
-    ///
-    /// Returns `None` for an unknown pair or a disabled book.
+    /// Fold one pair's reference observation in. `None` for an unknown pair or a disabled book.
     pub fn observe(
         &mut self,
         pair_id: u16,
@@ -733,18 +645,20 @@ impl Book {
         Some(d.observe(price, now, vol))
     }
 
-    /// Propagate a trip on `origin` to every other pair, if the scope says to.
+    /// Propagate a trip on `origin` to every other pair in its group, if the scope says to.
     ///
-    /// Returns the pairs that this *newly* moved into [`State::Withdrawn`] — the ones that owe a
-    /// withdrawal transaction. A pair already withdrawn has its cool-off re-armed and is not
-    /// returned, because re-sending `refreshCapacity(pair, 0, 0)` against a pair that is already at
-    /// zero buys nothing and burns a nonce.
+    /// Returns only the pairs this *newly* withdrew, i.e. those that owe a withdrawal transaction.
+    /// A pair already withdrawn has its cool-off re-armed and is not returned, because re-sending
+    /// `refreshCapacity(pair, 0, 0)` against a zero epoch only burns a nonce.
     pub fn contagion(&mut self, origin: u16, now: Instant) -> Vec<u16> {
-        if !self.enabled || self.scope == Scope::Pair {
+        if !self.enabled {
             return Vec::new();
         }
-        // Resolved before the mutable borrow, and cloned rather than held: `group_of` borrows
-        // `self` and the loop below needs it mutably.
+        if self.scope == Scope::Pair {
+            return Vec::new();
+        }
+        // Resolved before the mutable borrow and cloned rather than held: `group_of` borrows
+        // `self`, and the loop below needs it mutably.
         let origin_group = self.group_of(origin).to_string();
         let peers: Vec<u16> = self
             .groups
@@ -773,13 +687,8 @@ impl Book {
 
 #[cfg(test)]
 mod tests {
-    /// The regression that motivated splitting the floor out of the spread.
-    ///
-    /// Lowering `s0` from 5 bp to 1 used to drag the detector's floor down with it, and a 1 bp
-    /// floor is under the tick noise of a four-venue combined reference: a 3.24 bp move over a
-    /// 201ms sample -- an ordinary one, taken verbatim from a trip record in the run that exposed
-    /// this -- read as a jump and cost a 30s cool-off. With the floor stated on its own it does
-    /// not, and a real jump still does.
+    /// A 1 bp floor sits under the tick noise of a four-venue combined reference, so tying the
+    /// floor to `s0` turns an ordinary 3.24 bp move into a 30s cool-off.
     #[test]
     fn ordinary_reference_noise_is_not_a_jump_at_a_one_bp_spread() {
         let coupled = Bounds::from_pair(1, 25);
@@ -796,8 +705,7 @@ mod tests {
         assert_eq!((t, bound), (500, Bound::Floor));
         assert!(324 < t, "the same sample is now inside the floor");
 
-        // The ceiling is still the absorption limit, computed from the posted spread and width and
-        // untouched by the floor.
+        // The ceiling is still the absorption limit, untouched by the floor.
         assert_eq!(split.ceiling_bps_e2, coupled.ceiling_bps_e2);
         // And a move that gaps past the ladder is still a jump.
         assert!(10_000 > split.threshold(600, 3).0);
@@ -846,9 +754,8 @@ mod tests {
 
     const BASE: u128 = 400_000_000_000; // ETHUSDT at FEED_SCALE = 8.
 
-    /// A scripted path driver: feeds the SAME observations to the one volatility estimator and to
-    /// the detector, in the order the live loop does it (read sigma, then update sigma), so the
-    /// test exercises the real wiring rather than a mock of it.
+    /// Feeds the SAME observations to the one volatility estimator and to the detector, in the
+    /// order the live loop does (read sigma, then update sigma), so this exercises the real wiring.
     struct Path {
         vol: Volatility,
         det: Detector,
@@ -882,14 +789,11 @@ mod tests {
         }
     }
 
-    // -----------------------------------------------------------------------
-    // The threshold itself
-    // -----------------------------------------------------------------------
+    // --- The threshold itself ---
 
     #[test]
     fn the_bounds_are_the_pairs_own_spread_and_its_absorption_limit() {
-        // The whole reason a single global `sigma_k` works across two instruments: neither bound
-        // is a number picked here, both come from the pair's configuration.
+        // Why one global `sigma_k` works across two instruments: both bounds come from the pair.
         assert_eq!(
             eth(),
             Bounds {
@@ -909,29 +813,23 @@ mod tests {
     #[test]
     fn the_sigma_arm_is_clamped_at_both_ends() {
         let b = eth();
-        // Calm: k * sigma is under the half-spread, so the floor binds and sigma does nothing.
-        // ETH's measured sigma(1s) is 0.577 bp; 6 x that is 3.46 bp, under the 5 bp floor.
+        // Calm: ETH's sigma(1s) is 0.577 bp, so 6x that is 3.46 bp, under the 5 bp floor.
         assert_eq!(b.threshold(600, 57), (500, Bound::Floor));
         // Fast: strictly between. sigma(1s) = 1.5 bp -> 9 bp.
         assert_eq!(b.threshold(600, 150), (900, Bound::Sigma));
-        // THE CASE THE CEILING EXISTS FOR. One 100 bp return raises ETH's sigma(1s) to ~12.9 bp;
-        // 6 x that is 77 bp, so the sigma arm alone would let a 50 bp second leg straight through.
+        // The case the ceiling exists for: sigma(1s) at ~12.9 bp asks 77 bp on the arm alone.
         assert_eq!(b.threshold(600, 1_290), (1_750, Bound::Absorption));
     }
 
-    // -----------------------------------------------------------------------
-    // Ordinary diffusion must NOT trip it
-    // -----------------------------------------------------------------------
+    // --- Ordinary diffusion must NOT trip it ---
 
     #[test]
     fn ordinary_diffusion_never_trips_the_detector() {
-        // The simulator's diffusion path: 1 bp per second, which produced ZERO informed fills and
-        // is exactly the regime the pool is built to quote into. A detector that fires here is a
-        // quoting outage generator, so this is the test that keeps `sigma_k` honest.
+        // 1 bp/s is the regime the pool is built to quote into, so a detector firing here is a
+        // quoting-outage generator. This is what keeps `sigma_k` honest.
         let mut p = Path::new(eth());
         let bp = BASE / 10_000;
-        // A deterministic 1 bp/s sawtooth, 600 samples, plus a slow drift so it is not a pure
-        // oscillation the EWMA could special-case.
+        // A 1 bp/s sawtooth plus a slow drift, so it is not an oscillation the EWMA absorbs.
         for i in 0..600u128 {
             let price = if i % 2 == 0 {
                 BASE + i / 4 * bp
@@ -946,14 +844,13 @@ mod tests {
             assert_eq!(obs.state, State::Quoting);
         }
         assert_eq!(p.det.trips(), 0);
-        // ... and the estimator really did see the volatility, so this is not a test that passes
-        // because sigma stayed at zero.
+        // ... and the estimator did see the volatility, so this does not pass on a zero sigma.
         assert!(p.vol.sigma_millibps() > 0);
     }
 
     #[test]
     fn a_move_just_under_the_floor_holds_and_one_at_it_fires() {
-        // The boundary is a boundary, not a blanket. ETH's floor is 5 bp.
+        // ETH's floor is 5 bp, and it is a boundary rather than a blanket.
         let mut p = Path::new(eth());
         p.quiet(BASE, 5);
         let just_under = BASE + BASE * 49 / 100_000; // 4.9 bp
@@ -972,9 +869,7 @@ mod tests {
         assert_eq!(obs.state, State::Withdrawn);
     }
 
-    // -----------------------------------------------------------------------
-    // The jump
-    // -----------------------------------------------------------------------
+    // --- The jump ---
 
     #[test]
     fn a_one_hundred_bp_jump_withdraws_immediately_and_holds_for_the_cooloff() {
@@ -1014,9 +909,8 @@ mod tests {
 
     #[test]
     fn the_absorption_ceiling_is_what_catches_the_second_leg() {
-        // THE TEST THIS MODULE EXISTS FOR. Leg one raises sigma so far that a pure sigma-multiple
-        // would ask for ~77 bp before firing again. Leg two is 50 bp. Without the absorption
-        // ceiling the detector would be numb exactly when it matters.
+        // Leg one raises sigma so far that a pure sigma-multiple would ask ~77 bp; leg two is
+        // 50 bp, so without the ceiling the detector is numb when it matters most.
         let mut p = Path::new(eth());
         p.quiet(BASE, 60);
 
@@ -1086,9 +980,8 @@ mod tests {
 
     #[test]
     fn a_staircase_that_never_trips_a_single_observation_still_holds_the_cooloff_open() {
-        // The other way a two-stage move arrives: 100 bp delivered in 4 bp steps, none of which
-        // clears the 5 bp floor on its own. The single-observation test is blind to it; the
-        // settle test's peak-to-trough range is not, so a cool-off already open stays open.
+        // 100 bp in 4 bp steps, none clearing the 5 bp floor: the single-observation test is
+        // blind to it, and the settle test's peak-to-trough range is not.
         let mut p = Path::new(eth());
         p.quiet(BASE, 60);
         let jumped = BASE + BASE / 100;
@@ -1114,14 +1007,12 @@ mod tests {
         assert_eq!(settled.state, State::Quoting);
     }
 
-    // -----------------------------------------------------------------------
-    // The other trips
-    // -----------------------------------------------------------------------
+    // --- The other trips ---
 
     #[test]
     fn a_hole_in_the_reference_is_treated_as_a_jump() {
-        // `FeedNotLive` gates pushes but does not withdraw capacity, so during an outage the pool
-        // sits with a full epoch behind a fixed ladder. Coming back armed is the hole this closes.
+        // `FeedNotLive` gates pushes but not capacity, so an outage leaves a full epoch behind a
+        // fixed ladder. Coming back armed is the hole this closes.
         let mut p = Path::new(eth());
         p.quiet(BASE, 10);
         p.t += Duration::from_secs(120);
@@ -1136,15 +1027,13 @@ mod tests {
 
     #[test]
     fn samples_closer_than_min_sample_are_recorded_but_not_tested() {
-        // The fast-lane scan and the cycle scan can land milliseconds apart. Dividing a rounding
-        // error by 10 ms would manufacture a jump out of nothing.
+        // The two scans can land milliseconds apart, and a rounding error over 10 ms is a jump.
         let mut p = Path::new(eth());
         p.quiet(BASE, 5);
         let t = p.t + Duration::from_millis(10);
         let obs = p.det.observe(BASE * 2, t, &p.vol);
         assert!(obs.tripped.is_none(), "a 10 ms separation is not a return");
-        // The anchor is still the pre-gap price, so the next real observation measures the whole
-        // move rather than losing it.
+        // The anchor is still the pre-gap price, so the next observation measures the whole move.
         let obs = p
             .det
             .observe(BASE * 2, t + Duration::from_millis(1_000), &p.vol);
@@ -1153,8 +1042,8 @@ mod tests {
 
     #[test]
     fn a_dead_feed_can_never_satisfy_the_settle_test() {
-        // Silence is not settlement. Without this the cool-off would expire on a feed that stopped
-        // delivering and the pool would re-arm blind.
+        // Silence is not settlement: otherwise the cool-off expires on a dead feed and the pool
+        // re-arms blind.
         let mut p = Path::new(eth());
         p.quiet(BASE, 10);
         let jumped = BASE + BASE / 100;
@@ -1165,13 +1054,10 @@ mod tests {
         assert!(p.det.withdrawn());
     }
 
-    // -----------------------------------------------------------------------
-    /// Contagion travels inside a correlation group and stops at its edge.
-    ///
-    /// The regression: `scope = "book"` meant every pair, which was right for BTC and ETH but not
-    /// once equities were listed. SKHY is the most volatile market in the book and the least related
-    /// to any of the others; measured on 2026-07-29, six of its trips produced sixteen contagion
-    /// withdrawals and the whole pool went dark.
+    // --- Contagion ---
+
+    /// Contagion stops at the group edge: the most volatile market in the book is also the least
+    /// related to the rest of it.
     #[test]
     fn a_jump_in_one_group_does_not_withdraw_another() {
         let b = Bounds::from_pair(1, 8);
@@ -1217,7 +1103,7 @@ mod tests {
         );
     }
 
-    /// No groups named is the old behaviour exactly: one default group holding everything.
+    /// No groups named means one default group holding everything.
     #[test]
     fn ungrouped_pairs_share_one_group() {
         let b = Bounds::from_pair(1, 8);
@@ -1225,8 +1111,7 @@ mod tests {
         assert_eq!(book.contagion(1, Instant::now()), vec![2, 8]);
     }
 
-    // Scope    // Scope
-    // -----------------------------------------------------------------------
+    // --- Scope ---
 
     #[test]
     fn a_btc_jump_withdraws_eth_when_the_scope_is_the_book() {
@@ -1279,9 +1164,8 @@ mod tests {
     }
 
     #[test]
-    fn btc_needs_a_bigger_move_than_eth_and_that_is_the_point() {
-        // A single global `sigma_k` against two instruments. BTC's measured sigma is a third of
-        // ETH's, so a fixed bp threshold would either be numb on ETH or hair-triggered on BTC.
+    fn btc_needs_a_bigger_move_than_eth() {
+        // BTC's sigma is a third of ETH's, so a fixed bp threshold is numb on one or the other.
         let mut e = Path::new(eth());
         let mut b = Path::new(btc());
         e.quiet(BASE, 30);

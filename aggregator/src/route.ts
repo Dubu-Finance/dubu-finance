@@ -6,14 +6,8 @@ import { WEIGHT_DENOMINATOR, type Leg } from './quote.js';
 import type { RfqQuote } from './rfq.js';
 
 /**
- * Turning a chosen split into calldata the caller can sign.
- *
- * The service stops here. It never holds a key, never sends a transaction, and never takes
- * custody: it returns `to` and `data`, and the caller decides whether to broadcast them. That is
- * not modesty about the deployment — it is what keeps a geo-distributed edge worker from being a
- * thing worth compromising. An aggregator that signed would have a key in every region it ran in.
- *
- * # The step word
+ * Turning a chosen split into calldata the caller can sign. The service stops here: it returns `to`
+ * and `data`, and the caller decides whether to broadcast them. The step word:
  *
  * ```text
  *   bit  255      reverse       call sellQuote instead of sellBase
@@ -23,28 +17,29 @@ import type { RfqQuote } from './rfq.js';
  *   bits 159..0   pool          the venue contract
  * ```
  *
- * # Two things that are easy to get wrong here
+ * Two bits are easy to get wrong:
  *
- * 1. **`fundAdapter` for the RFQ leg only.** `PmmSettle` pulls the taker leg from `msg.sender`,
- *    which is the adapter, so the tokens must be at the adapter. The AMM legs settle against their
- *    own balance delta and want the tokens at the pool. Setting the bit wrongly on a prop or UniV2
- *    leg strands the input at the adapter; leaving it off the RFQ leg makes that adapter read a
- *    zero balance and revert `NothingToFill`.
+ * 1. `fundAdapter` is for the RFQ leg only. `PmmSettle` pulls the taker leg from `msg.sender`,
+ *    which is the adapter, so the tokens must be there; the AMM legs settle against their own
+ *    balance delta and want them at the pool. Set on a prop or UniV2 leg it strands the input at
+ *    the adapter; missing from the RFQ leg the adapter reads zero and reverts `NothingToFill`.
  *
- * 2. **`reverse` means the ladder side, not the token order.** `PropPoolAdapter` carries the pair
- *    as `(base, quote)` in its payload and uses the bit to pick which way to walk it. A route
- *    selling quote for base sets it; a route selling base for quote does not.
+ * 2. `reverse` means the ladder side, not the token order: `PropPoolAdapter` carries the pair as
+ *    `(base, quote)` and uses the bit to pick which way to walk it, so a route selling quote for
+ *    base sets it and a route selling base for quote does not.
  */
 
-/** `1 << 255`. */
 const BIT_REVERSE = 1n << 255n;
-/** `1 << 254`. */
 const BIT_FUND_ADAPTER = 1n << 254n;
 
-export function packStep(pool: Address, weightBps: number, reverse: boolean, fundAdapter: boolean): bigint {
-  if (weightBps < 0 || weightBps > WEIGHT_DENOMINATOR) {
-    throw new Error(`weightBps out of range: ${weightBps}`);
-  }
+export function packStep(
+  pool: Address,
+  weightBps: number,
+  reverse: boolean,
+  fundAdapter: boolean,
+): bigint {
+  if (weightBps < 0) throw new Error(`weightBps out of range: ${weightBps}`);
+  if (weightBps > WEIGHT_DENOMINATOR) throw new Error(`weightBps out of range: ${weightBps}`);
   let word = BigInt(getAddress(pool));
   word |= BigInt(weightBps) << 160n;
   if (reverse) word |= BIT_REVERSE;
@@ -68,7 +63,6 @@ export interface BuiltRoute {
 export interface BuildArgs {
   cfg: Config;
   market: Market;
-  /** True when the trade sells the market's base token. */
   sellingBase: boolean;
   tokenIn: Address;
   tokenOut: Address;
@@ -82,12 +76,8 @@ export interface BuildArgs {
 }
 
 /**
- * Builds one batch whose steps are the chosen legs, weighted.
- *
  * One batch with parallel forks rather than several weighted batches: a fork's weight is a share of
- * *this hop's* input, and with a single hop the two encodings are equivalent, so the flatter one
- * wins. Multi-hop routing is not implemented — every market here is a direct pair against mUSDC,
- * and a hop count the venue set cannot produce would be untested code.
+ * *this hop's* input, and with a single hop the two encodings are equivalent, so the flatter wins.
  */
 export function buildRoute(args: BuildArgs): BuiltRoute {
   const { cfg, market, sellingBase, legs, rfq } = args;
@@ -97,10 +87,9 @@ export function buildRoute(args: BuildArgs): BuiltRoute {
   const propPayload = encodeAbiParameters(PROP_PAYLOAD_ABI, [
     market.base,
     market.quote,
-    // `limitAmount` is the per-leg guard. Left at zero: the router already enforces
-    // `minAmountOut` over the whole route, and a per-leg minimum computed from the same quote
-    // would reject split routes for moving between the quote and the fill in a direction the
-    // route as a whole still satisfies.
+    // `limitAmount`, the per-leg guard, left at zero: the router already enforces `minAmountOut`
+    // over the whole route, and a per-leg minimum from the same quote would reject split routes
+    // for moving in a direction the route as a whole still satisfies.
     0n,
     cfg.partnerId,
     args.deadline,
@@ -128,7 +117,9 @@ export function buildRoute(args: BuildArgs): BuiltRoute {
   }
 
   if (rfq && rfq.weightBps > 0) {
-    if (!cfg.pmmAdapter || !cfg.pmmSettle) throw new Error('RFQ leg requested with the RFQ leg disabled');
+    if (!cfg.pmmAdapter || !cfg.pmmSettle) {
+      throw new Error('RFQ leg requested with the RFQ leg disabled');
+    }
     steps.push({
       adapter: cfg.pmmAdapter,
       // The step's pool is PmmSettle, never the maker — the maker is inside the signed order and
@@ -137,8 +128,8 @@ export function buildRoute(args: BuildArgs): BuiltRoute {
       payload: encodeAbiParameters(PMM_PAYLOAD_ABI, [
         rfq.quote.order as unknown as never,
         rfq.quote.signature,
-        // Decay tolerance. Zero means "fill at the order's stated terms or revert" — this service
-        // does not opt a caller into a worse price than it quoted them.
+        // Decay tolerance of zero: fill at the order's stated terms or revert, rather than opting
+        // the caller into a worse price than they were quoted.
         0,
       ]),
     });
@@ -147,7 +138,11 @@ export function buildRoute(args: BuildArgs): BuiltRoute {
 
   if (steps.length === 0) throw new Error('no legs to route');
 
-  const data = encodeFunctionData({
+  return { to: cfg.router, data: buildRouteCalldata(args, steps), venues };
+}
+
+function buildRouteCalldata(args: BuildArgs, steps: SwapStep[]): Hex {
+  return encodeFunctionData({
     abi: ROUTER_ABI,
     functionName: 'swapExactIn',
     args: [
@@ -168,19 +163,13 @@ export function buildRoute(args: BuildArgs): BuiltRoute {
       args.minAmountOut,
     ],
   });
-
-  return { to: cfg.router, data, venues };
 }
 
 /**
- * The UniV2 pair address for a market.
- *
- * Table rather than a `getPair` round trip, and rather than the `CREATE2` derivation — the
- * derivation needs the factory's init-code hash, which is one more constant to keep in step with a
- * deployment and buys nothing over writing the two answers down. Both are from
- * `contracts/DEPLOYMENTS.md`. Redeploying the UniV2 stack means editing this table, and
- * `test/route.test.ts` fails loudly if the market list and this table ever disagree about which
- * pairs exist.
+ * A table rather than a `getPair` round trip or the `CREATE2` derivation, which needs the factory's
+ * init-code hash — one more constant to keep in step with a deployment. Both addresses are from
+ * `contracts/DEPLOYMENTS.md`, so redeploying the UniV2 stack means editing this table, and
+ * `test/route.test.ts` fails if it and the market list disagree about which pairs exist.
  */
 const UNIV2_PAIRS: Record<number, Address> = {
   1: getAddress('0x94f0033BABBa0bEC1C17B808E0980ECFd3B35b4C'),

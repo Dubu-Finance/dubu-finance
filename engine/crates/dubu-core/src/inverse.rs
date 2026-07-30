@@ -1,130 +1,54 @@
 //! The inverse ladder solver: target executable price + capture size -> ladder.
 //!
-//! This is what the quoter actually runs, and it is the one piece of the engine with no Solidity
-//! counterpart. archi_v2 §5.2 sketches it; this module derives it, proves the integer bounds are
-//! tight, and implements it exactly.
+//! The one piece of the engine with no Solidity counterpart; archi_v2 §5.2 sketches it. Every
+//! rounding here is chosen so a taker can never do better than the target.
 //!
-//! # 0. Which forward curve this is derived against
+//! # 1. Inversion
 //!
-//! `PropCurve` was amended to stop quantising the intermediate price. It folds the price into the
-//! amount and rounds exactly once, so there is no longer an integer `avgBid` for the solver to
-//! hit. What the chain evaluates, over the base interval `[0, K]` of a side with capacity `C`, is
-//!
-//! ```text
-//! amountOut = floor( K * (2*maxBid*C - W*K) / (2*C*S) )
-//! ```
-//!
-//! whose implied average price is the **exact rational** `maxBid - W*K/(2C)`. Every previous
-//! revision of this module inverted a quantised price and could therefore close the round trip
-//! exactly; that is no longer available, and pretending otherwise would be the bug. What is
-//! available — and what is derived below — is a round trip that lands *at or below* the target on
-//! the bid side and *at or above* it on the ask side, by strictly less than one price unit.
-//!
-//! # 1. Forward map
-//!
-//! Write `W = maxBid - minBid` for the ladder width, `C` for the base capacity, and `K` for the
-//! capture size, clamped to `C`. The solver quotes from a freshly reset epoch (`u = 0`), so the
-//! doubled midpoint numerator `2u + q` is just `K`, and the impact on the average price is the
-//! rational `W*K/(2C)`.
-//!
-//! # 2. What "target" means
-//!
-//! The strategy hands us a price `T` it wants a taker to actually get on average over a capture
-//! chunk of size `K`. So the equation to invert is
+//! `PropCurve` (see [`crate::curve`]) implies an **exact rational** average price
+//! `maxBid - W*K/(2C)`, with `W = maxBid - minBid` the width, `C` the capacity and `K` the capture
+//! size clamped to `C`; there is no integer `avgBid` to hit. The solver quotes from a reset epoch
+//! (`u = 0`), so the doubled midpoint numerator `2u + q` is just `K`, and setting the average equal
+//! to the target `T` is linear in `maxBid`. It inverts in closed form, with no search:
 //!
 //! ```text
-//! maxBid - W*K/(2C)  ==  T
+//! impact = floor(W*K / (2C))          maxBid = T + impact          minBid = maxBid - W
 //! ```
 //!
-//! # 3. Inversion, and exactly how exact it is
+//! **FLOOR, not ceil.** The realised average is `T - frac(W*K/2C)`, in `(T - 1, T]` and exact when
+//! `2C | W*K`. A lower bid is worse for the taker, so that residual is pool-favourable; ceiling
+//! lands in `[T, T + 1)`, taker-favourable, the one direction not allowed. Exactness for arbitrary
+//! `W` would need snapping `W` to a multiple of `2C / gcd(2C, K)`, which for a small capture
+//! against a large capacity collapses the width to zero and posts no depth.
 //!
-//! The equation is linear in `maxBid`, and the impact term depends only on `(W, K, C)` — never on
-//! `maxBid` — so it inverts in closed form with no search:
+//! The other two residuals are structural and also pool-favourable: [`solve_two_sided`]'s
+//! crossed-book repair only ever raises the ask, and a trade that is not the one solved for is
+//! covered by the forward map's monotonicity.
 //!
-//! ```text
-//! impact = floor(W*K / (2C))
-//! maxBid = T + impact
-//! minBid = maxBid - W
-//! ```
+//! # 2. Widest safe width
 //!
-//! **FLOOR, not ceil.** The realised average is `maxBid - W*K/(2C) = T + floor(x) - x`, i.e.
-//! `T - frac(x)`, which lies in `(T - 1, T]`. A lower bid is worse for the taker, so the residual
-//! is pool-favourable, and it is exactly zero iff `2C | W*K`. Ceiling the impact instead would put
-//! the realised average in `[T, T + 1)` — above the target, i.e. *taker*-favourable — which is the
-//! one direction that is not allowed. There is no third option: exactness for arbitrary `W` would
-//! require `2C | W*K`, and the only way to force that is to snap `W` down to a multiple of
-//! `2C / gcd(2C, K)`, which for a small capture against a large capacity collapses the width to
-//! zero and posts no depth at all. A sub-unit pool-favourable residual is strictly better than no
-//! ladder.
-//!
-//! Restated as the invariant the property tests assert: for every input in the domain,
-//!
-//! ```text
-//! T - 1  <  realised_bid  <=  T          and          T  <=  realised_ask  <  T + 1
-//! ```
-//!
-//! and in amount terms the solved ladder never pays a taker more quote than a flat ladder posted
-//! at `T` would, nor charges less.
-//!
-//! The two other places a residual can appear are structural rather than arithmetic, and both are
-//! pool-favourable: [`solve_two_sided`]'s crossed-book repair, which only ever raises the ask, and
-//! a trade that is not the one solved for (a different size, or a partly consumed epoch), where
-//! §1's monotonicity in the consumed interval does the work.
-//!
-//! # 4. Widest safe width
-//!
-//! `W` is free — it is the *concentration* knob: a `width_bps` around 0.20 means the price decays
-//! 0.2 bp across the entire posted depth. Wider is better for the pool: the same top-of-book price
-//! is offered with more depth behind it before the price walks. Two bounds constrain it.
-//!
-//! Two elementary lemmas do all the work. For integers `a >= 1`, `d >= 1`, `N >= 0`:
+//! `W` is the *concentration* knob, and wider is better for the pool: the same top-of-book price
+//! with more depth behind it before the price walks. Two elementary lemmas over integers `a >= 1`,
+//! `d >= 1`, `N >= 0` give both bounds, each tight (`W + 1` breaches):
 //!
 //! ```text
 //! (A)  ceil(W*a/d)  <= N   <=>  W*a <= N*d          <=>  W <= floor(N*d / a)
 //! (B)  floor(W*a/d) <= N   <=>  W*a <  d*(N+1)      <=>  W <= floor((d*(N+1) - 1) / a)
+//!
+//! boundary, near endpoint under a ceiling P_hi, H_i = P_hi - T, impact <= H_i, lemma (B):
+//!     W_boundary = floor((2C*(H_i + 1) - 1) / K)               (vacuous at K == 0)
+//!
+//! endpoint, far endpoint above a floor P_lo, H_e = T - P_lo, span <= H_e, lemma (A):
+//!     span(W)    = W - floor(W*K/(2C)) = ceil(W * (2C - K) / (2C))
+//!     W_endpoint = floor(H_e * 2C / n),   n = 2C - K
 //! ```
 //!
-//! `(A)` because `ceil(x) <= N <=> x <= N` for integral `N`; `(B)` because
-//! `floor(x) <= N <=> x < N + 1`, and `W*a < d*(N+1)` over the integers is `W*a <= d*(N+1) - 1`.
+//! `P_hi` is archi_v2 §5.4's reference-oracle clamp or `PRICE_MAX`; `P_lo` is `minPrice` or the
+//! cost-basis floor. The span collapses to a ceiling by `-floor(x) = ceil(-x)`, is non-decreasing
+//! in `W`, and `n >= C >= 1` follows from `K <= C`, so the division needs no special case.
 //!
-//! **Boundary bound** (the near endpoint must stay under a ceiling `P_hi` — the reference-oracle
-//! deviation clamp of archi_v2 §5.4, or simply `PRICE_MAX`). With `H_i = P_hi - T` we need
-//! `impact = floor(W*K/(2C)) <= H_i`, which is lemma (B) with `a = K`, `d = 2C`:
-//!
-//! ```text
-//! W_boundary = floor((2C*(H_i + 1) - 1) / K)
-//! ```
-//!
-//! *Safe:* `W*K <= 2C*(H_i+1) - 1 < 2C*(H_i+1)` gives `W*K/(2C) < H_i + 1`, so
-//! `floor(W*K/(2C)) <= H_i`. *Tight:* `W+1 > (2C*(H_i+1) - 1)/K` gives `(W+1)*K >= 2C*(H_i+1)`,
-//! so `floor((W+1)*K/(2C)) >= H_i + 1`. ∎
-//!
-//! When `K == 0` the impact is identically zero and the bound is vacuous.
-//!
-//! **Endpoint bound** (the far endpoint must stay above a floor `P_lo` — `minPrice` or the
-//! cost-basis floor). With `H_e = T - P_lo` we need `span(W) = W - floor(W*K/(2C)) <= H_e`. The
-//! floor collapses that expression: for integral `W`, `-floor(x) = ceil(-x)`, so
-//!
-//! ```text
-//! span(W) = W - floor(W*K/(2C)) = ceil(W - W*K/(2C)) = ceil(W * (2C - K) / (2C))
-//! ```
-//!
-//! which is lemma (A) with `a = 2C - K =: n`, `d = 2C`:
-//!
-//! ```text
-//! W_endpoint = floor(H_e * 2C / n)
-//! ```
-//!
-//! *Safe:* `W*n <= H_e*2C` gives `W*n/(2C) <= H_e`, so `ceil(W*n/(2C)) <= H_e` as `H_e` is an
-//! integer. *Tight:* `W+1 > H_e*2C/n` gives `(W+1)*n/(2C) > H_e`, and the ceiling of that is
-//! `>= H_e + 1`. ∎
-//!
-//! `span` is non-decreasing in `W`, so a single largest-satisfying `W` is exactly what these
-//! bounds compute.
-//!
-//! ## Which bound carries the `-1`, and why it moved back
-//!
-//! The correction always sits on whichever of the two expressions is a `floor`:
+//! **Which bound carries the `-1`** follows the rounding: the correction sits on whichever
+//! expression is a `floor`.
 //!
 //! ```text
 //!                       impact            span              boundary   endpoint
@@ -132,43 +56,23 @@
 //! ceiled  impact    ceil(W*K/2C)  floor(W*n/2C)        lemma (A)  lemma (B)
 //! ```
 //!
-//! The revision before this one ceiled the impact and therefore had the bottom row. Amendment 4
-//! made the forward map's implied impact an exact rational and forced the solver to *floor* it
-//! (§3), which puts us back on the top row: `W_boundary` carries the `-1` and `W_endpoint` is a
-//! bare floor division. Using the wrong row is not merely loose, it is unsound in one direction —
-//! a bound one unit too large lets the near endpoint breach the price ceiling it was supposed to
-//! respect. `floor_binds_the_boundary_width` pins that case.
+//! §1 floors, so this module is the top row. Swapping the rows is unsound in one direction: a
+//! bound one unit too large lets the near endpoint breach the price ceiling it was meant to
+//! respect. Finally `W = min(W_requested, W_boundary, W_endpoint, PRICE_MAX)`.
 //!
-//! ## The endpoint denominator is never zero
+//! # 3. Ask side
 //!
-//! `n = 2C - K` with `K <= C` and `C >= 1` gives `n >= C >= 1`, so the division is always
-//! defined. The previous revision needed a special case here (`m == C` was reachable once the
-//! midpoint ceiled); working in doubled units removes it.
-//!
-//! Finally `W = min(W_requested, W_boundary, W_endpoint, PRICE_MAX)`.
-//!
-//! # 5. Ask side
-//!
-//! Exactly mirrored. The realised average is `minAsk + W*K/(2C)`, so `minAsk = T - impact` and
-//! `maxAsk = minAsk + W` with the *same* floored impact — which puts the realised ask in
-//! `[T, T + 1)`, i.e. at or worse for the taker. The floor is the near endpoint and the ceiling is
-//! the far endpoint, so the two headrooms swap roles: `H_i = T - P_lo` bounds the impact and
-//! `H_e = P_hi - T` bounds the span. [`widest_width`] serves both.
-//!
-//! # 6. Rounding direction, summarised
-//!
-//! One rule: every rounding is chosen so that a taker can never do better than the target.
-//! The impact floors on both sides (§3, §5); the two width bounds floor, because a width bound
-//! must never be overstated. A narrower ladder posts less depth behind the same price, which
-//! costs the pool volume, never money.
+//! Mirrored: `minAsk = T - impact` and `maxAsk = minAsk + W` with the *same* floored impact,
+//! putting the realised ask in `[T, T + 1)`. The floor is now the near endpoint and the ceiling the
+//! far one, so the headrooms swap roles — `H_i = T - P_lo` bounds the impact and `H_e = P_hi - T`
+//! bounds the span. [`widest_width`] serves both.
 
 use crate::curve::{amount_out_bid, avg_bid_price, Ladder, AMOUNT_MAX, PRICE_MAX};
 use crate::error::LadderError;
 use crate::math::{mul_div_floor, mul_div_rem};
 
-/// Which constraint pinned the ladder width. Logged by the quoter: a solver that is permanently
-/// `Boundary`-bound is being squeezed by the oracle clamp, which is a different problem from one
-/// that is permanently `Requested`-bound.
+/// Which constraint pinned the ladder width. Logged by the quoter: a permanently `Boundary`-bound
+/// solver is being squeezed by the oracle clamp, a different problem from a `Requested`-bound one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum WidthBinding {
     /// The strategy's requested width was the smallest.
@@ -181,10 +85,8 @@ pub enum WidthBinding {
     Saturated,
 }
 
-/// Inputs to one side of the inverse solver.
-///
-/// `capture` and `capacity` are in **base** units on both sides, matching the amended
-/// `PropCurve`, whose ask capacity is no longer quote-denominated.
+/// Inputs to one side of the inverse solver. `capture` and `capacity` are in **base** units on
+/// both sides, matching `PropCurve`, whose ask capacity is base-denominated too.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SolveInput {
     /// The average execution price the taker must get over `[0, capture]`.
@@ -211,26 +113,18 @@ pub struct Solution {
     pub high: u128,
     /// `high - low`.
     pub width: u128,
-    /// `min(capture, capacity)` — the interval the target is guaranteed over. This is also the
-    /// doubled midpoint numerator `2u + q` at `u == 0`, which is why the previous revision's
-    /// separate `mid_usage` field is gone: in doubled units the two coincide.
+    /// `min(capture, capacity)`, the interval the target is guaranteed over. In doubled units it
+    /// is also the midpoint numerator `2u + q` at `u == 0`.
     pub effective_capture: u128,
-    /// `floor(width * effective_capture / (2 * capacity))` — the price impact baked into the
-    /// near endpoint. Floored, which is what makes the realised average land on the pool's side
-    /// of the target; see §3.
+    /// `floor(width * effective_capture / (2 * capacity))`, the price impact baked into the near
+    /// endpoint. Floored so the realised average lands on the pool's side of the target; see §1.
     pub impact: u128,
     /// Which constraint pinned [`Solution::width`].
     pub binding: WidthBinding,
 }
 
-/// Largest `W` satisfying both integer bounds of §4.
-///
-/// * `headroom_impact` bounds `impact = floor(W * K / (2C))` — lemma (B), which carries the `-1`.
-/// * `headroom_span` bounds `span = W - floor(W * K / (2C)) = ceil(W * (2C - K) / (2C))` — lemma
-///   (A), a bare floor division.
-///
-/// Which of the two carries the correction is decided by the forward path's rounding, and it is
-/// the reverse of what a ceiled impact would need. See §4 of the module docs.
+/// Largest `W` satisfying both integer bounds of §2: `headroom_impact` bounds the impact (lemma
+/// (B), which carries the `-1`) and `headroom_span` bounds the span (lemma (A), a bare floor).
 ///
 /// Preconditions: `twice_capacity == 2 * capacity` with `capacity > 0`, and `capture <= capacity`
 /// (so `capture < twice_capacity`).
@@ -242,22 +136,20 @@ pub fn widest_width(
     headroom_span: u128,
     requested: u128,
 ) -> (u128, WidthBinding) {
-    debug_assert!(twice_capacity >= 2 && twice_capacity % 2 == 0);
+    debug_assert!(twice_capacity >= 2);
+    debug_assert!(twice_capacity % 2 == 0);
     debug_assert!(
         capture * 2 <= twice_capacity,
         "capture must be clamped to capacity"
     );
 
-    // W_boundary = floor((2C*(H_i + 1) - 1) / K), vacuous at K == 0.
-    //
-    // Lemma (B): bounding a `floor` by `H_i` is the strict `< H_i + 1`, which over the integers
-    // is `W*K <= 2C*(H_i+1) - 1`. Under the previous ceiled impact this bound was a bare floor
-    // division, and keeping that form here would overstate the safe width by one.
+    // W_boundary = floor((2C*(H_i + 1) - 1) / K), vacuous at K == 0. Dropping the `-1` overstates
+    // the safe width by one and breaches the ceiling.
     let boundary = if capture == 0 {
         PRICE_MAX
     } else {
-        // 2C*(H_i + 1) reaches 2^97 * 2^56 = 2^153, so it needs the 256-bit intermediate. A
-        // quotient above u128 means the bound is far beyond PRICE_MAX.
+        // 2C*(H_i + 1) reaches 2^153, so this needs the 256-bit intermediate; a quotient above
+        // u128 means the bound is far beyond PRICE_MAX.
         match mul_div_rem(twice_capacity, headroom_impact.saturating_add(1), capture) {
             // 2C*(H_i+1) >= 2C > K, so q >= 1 and the -1 borrows cleanly.
             Some((q, 0)) => q - 1,
@@ -266,16 +158,13 @@ pub fn widest_width(
         }
     };
 
-    // W_endpoint = floor(H_e * 2C / n) with n = 2C - K >= C >= 1: always defined, no branch.
-    //
-    // Lemma (A): the floored impact makes `span(W) = W - floor(W*K/2C)` collapse to the *ceiled*
-    // `ceil(W*n/2C)`, and a ceiling is bounded by `H_e` exactly when the real quotient is, so
-    // there is no `-1` correction to apply.
+    // W_endpoint = floor(H_e * 2C / n) with n = 2C - K >= C >= 1: always defined, no branch, and
+    // no `-1` since lemma (A) bounds a ceiling exactly when it bounds the real quotient.
     let endpoint =
         mul_div_floor(headroom_span, twice_capacity, twice_capacity - capture).unwrap_or(PRICE_MAX);
 
-    // Order matters only for the reported binding; ties report the earlier cause, which is the
-    // one the operator can act on.
+    // Order matters only for the reported binding; ties report the earlier cause, which is the one
+    // the operator can act on.
     let mut width = PRICE_MAX;
     let mut binding = WidthBinding::Saturated;
     for (candidate, cause) in [
@@ -291,14 +180,25 @@ pub fn widest_width(
     (width, binding)
 }
 
+/// Domain gate, split one field per check so a rejection points at the field that broke. Returns
+/// the effective capture, `min(capture, capacity)`.
 fn check_input(input: &SolveInput) -> Result<u128, LadderError> {
     if input.capacity == 0 {
         return Err(LadderError::ZeroCapacity);
     }
-    if input.capacity > AMOUNT_MAX || input.capture > AMOUNT_MAX {
+    if input.capacity > AMOUNT_MAX {
         return Err(LadderError::AmountOutOfRange);
     }
-    if input.target > PRICE_MAX || input.max_price > PRICE_MAX || input.min_price > PRICE_MAX {
+    if input.capture > AMOUNT_MAX {
+        return Err(LadderError::AmountOutOfRange);
+    }
+    if input.target > PRICE_MAX {
+        return Err(LadderError::PriceOutOfRange);
+    }
+    if input.max_price > PRICE_MAX {
+        return Err(LadderError::PriceOutOfRange);
+    }
+    if input.min_price > PRICE_MAX {
         return Err(LadderError::PriceOutOfRange);
     }
     if input.min_price > input.max_price {
@@ -316,11 +216,10 @@ fn check_input(input: &SolveInput) -> Result<u128, LadderError> {
 /// Solve the bid side: find the widest ladder whose average execution price over `[0, capture]`
 /// is `target`, or the largest representable price below it.
 ///
-/// Guarantees, all asserted by the property tests:
+/// Guarantees, all pinned by the property tests:
 ///
-/// * the realised average lies in `(target - 1, target]` — never above, so never favourable to
-///   the taker — and equals `target` exactly whenever `2*capacity` divides
-///   `width * effective_capture`. See §3 for why exactness is not available in general.
+/// * the realised average lies in `(target - 1, target]`, never above and so never favourable to
+///   the taker, and equals `target` exactly when `2*capacity` divides `width * effective_capture`.
 /// * `min_price <= low <= high <= max_price`.
 /// * A `W = 0` ladder (`low == high == target`) always exists, so the only failures are
 ///   input-domain failures.
@@ -332,8 +231,7 @@ pub fn solve_bid(input: &SolveInput) -> Result<Solution, LadderError> {
     let effective_capture = check_input(input)?;
     let twice_capacity = input.capacity * 2;
 
-    // Bid: the impact raises `maxBid` toward the ceiling; the span lowers `minBid` toward the
-    // floor.
+    // Bid: the impact raises `maxBid` toward the ceiling, the span lowers `minBid` to the floor.
     let (width, binding) = widest_width(
         effective_capture,
         twice_capacity,
@@ -342,7 +240,7 @@ pub fn solve_bid(input: &SolveInput) -> Result<Solution, LadderError> {
         input.requested_width,
     );
 
-    // FLOOR — see §3. The realised average is `target - frac(W*K/2C)`, at or below the target.
+    // FLOOR, see §1: the realised average is `target - frac(W*K/2C)`, at or below the target.
     let impact = mul_div_floor(width, effective_capture, twice_capacity)
         .ok_or(LadderError::PriceOutOfRange)?;
     let high = input.target + impact; // <= max_price by the boundary bound
@@ -361,8 +259,8 @@ pub fn solve_bid(input: &SolveInput) -> Result<Solution, LadderError> {
     })
 }
 
-/// Solve the ask side. Mirror of [`solve_bid`]; see §5 of the module docs. The realised average
-/// lies in `[target, target + 1)` — never below, so never favourable to the taker.
+/// Solve the ask side. Mirror of [`solve_bid`]; see §3 of the module docs. The realised average
+/// lies in `[target, target + 1)`, never below and so never favourable to the taker.
 ///
 /// # Errors
 /// [`LadderError`] variants for out-of-domain or infeasible inputs.
@@ -370,8 +268,8 @@ pub fn solve_ask(input: &SolveInput) -> Result<Solution, LadderError> {
     let effective_capture = check_input(input)?;
     let twice_capacity = input.capacity * 2;
 
-    // Ask: the impact lowers `minAsk` toward the floor; the span raises `maxAsk` toward the
-    // ceiling. Exactly the bid headrooms, swapped.
+    // Ask: the impact lowers `minAsk` to the floor, the span raises `maxAsk` toward the ceiling —
+    // the bid headrooms, swapped.
     let (width, binding) = widest_width(
         effective_capture,
         twice_capacity,
@@ -407,21 +305,19 @@ pub struct TwoSided {
     pub bid: Solution,
     /// The ask-side solution as solved, *before* any repair.
     pub ask: Solution,
-    /// Set when the two independently solved sides crossed and the ask side had to be lifted.
-    /// When set, `ladder.min_ask != ask.low` and the ask target is no longer honoured — the
-    /// realised ask is strictly worse for the taker, never better. The quoter should log this: a
-    /// row that repairs every cycle means the two targets are being computed from inconsistent
-    /// reference prices.
+    /// Set when the two independently solved sides crossed and the ask had to be lifted, so
+    /// `ladder.min_ask != ask.low` and the ask target is no longer honoured — the realised ask is
+    /// worse for the taker, never better. A row that repairs every cycle means the two targets come
+    /// from inconsistent reference prices, so this is worth logging.
     pub ask_repaired: bool,
 }
 
 /// Solve both sides and assemble a row that `PropCurve.validateLadder` accepts.
 ///
-/// The two sides are solved independently and then reconciled: `min_ask` is raised to `max_bid`
-/// if the targets crossed, and `max_ask` is raised to at least `min_bid + 1` to satisfy the
-/// validator's strict comparison. Raising the ask is the pool-favourable repair; the
-/// alternative — narrowing the bid — would silently deliver a worse-than-requested bid while
-/// reporting success.
+/// The sides are solved independently and then reconciled: `min_ask` rises to `max_bid` if the
+/// targets crossed, and `max_ask` rises to at least `min_bid + 1` for the validator's strict
+/// comparison. Raising the ask is the pool-favourable repair; narrowing the bid instead would
+/// silently deliver a worse-than-requested bid while reporting success.
 ///
 /// # Errors
 /// [`LadderError`] from either side, or [`LadderError::InfeasibleBounds`] when the repair would
@@ -446,7 +342,10 @@ pub fn solve_two_sided(bid: &SolveInput, ask: &SolveInput) -> Result<TwoSided, L
             .checked_add(1)
             .ok_or(LadderError::InfeasibleBounds)?;
     }
-    if max_ask > PRICE_MAX || min_ask > PRICE_MAX {
+    if min_ask > PRICE_MAX {
+        return Err(LadderError::InfeasibleBounds);
+    }
+    if max_ask > PRICE_MAX {
         return Err(LadderError::InfeasibleBounds);
     }
 
@@ -465,12 +364,9 @@ pub fn solve_two_sided(bid: &SolveInput, ask: &SolveInput) -> Result<TwoSided, L
     })
 }
 
-/// Round-trip check: run the solved bid ladder back through the on-chain quote path and confirm
-/// the realised average is at or below the target — never better for the taker.
-///
-/// Returns the realised average bid price, floored as [`avg_bid_price`] floors. The engine calls
-/// this as the pre-flight assertion described in archi_v2 §5.3 ("forward, inverse, validate — the
-/// same arithmetic in three places").
+/// Round-trip check: run the solved bid ladder back through the on-chain quote path and return the
+/// realised average bid price, floored as [`avg_bid_price`] floors. The engine calls this as the
+/// pre-flight assertion of archi_v2 §5.3.
 ///
 /// # Errors
 /// Propagates whatever the on-chain mirror would have reverted with.
@@ -508,8 +404,7 @@ mod tests {
         }
     }
 
-    /// The realised average, as the chain's own arithmetic implies it, expressed exactly:
-    /// `target` iff `2C | W*K`, else strictly between `target - 1` and `target`.
+    /// True iff `2C | W*K`, the one case where the realised average equals the target exactly.
     fn bid_residual_is_exact(sol: &Solution, capacity: u128) -> bool {
         mul_div_rem(sol.width, sol.effective_capture, capacity * 2)
             .unwrap()
@@ -524,7 +419,7 @@ mod tests {
         let realised =
             avg_bid_price(sol.low, sol.high, input.capacity, 0, sol.effective_capture).unwrap();
         assert!(realised <= input.target && input.target - realised <= 1);
-        // The quote path never pays a taker more than a flat ladder at the target would.
+        // Never more quote than a flat ladder at the target would pay.
         let solved = amount_out_bid(
             sol.effective_capture,
             sol.low,
@@ -551,8 +446,8 @@ mod tests {
 
     #[test]
     fn the_impact_floors_so_the_residual_points_at_the_pool() {
-        // W*K = 7*500 = 3_500, 2C = 2_000: 3_500/2_000 = 1.75, so the impact is 1 and the
-        // realised average is 1_000_000 - 0.75, i.e. 999_999 once floored.
+        // W*K = 7*500 = 3_500, 2C = 2_000: 3_500/2_000 = 1.75, impact 1, realised average
+        // 1_000_000 - 0.75, i.e. 999_999 once floored.
         let mut input = bid_input(1_000_000, 500, 1_000);
         input.requested_width = 7;
         let sol = solve_bid(&input).unwrap();
@@ -563,8 +458,7 @@ mod tests {
             avg_bid_price(sol.low, sol.high, input.capacity, 0, sol.effective_capture),
             Ok(999_999)
         );
-        // Ceiling the impact would have put the realised average at 1_000_000 + something, i.e.
-        // above the target — the one direction that is not allowed.
+        // Ceiling the impact would put the realised average above the target instead.
         assert_eq!(
             avg_bid_price(
                 sol.low + 1,
@@ -610,12 +504,8 @@ mod tests {
 
     #[test]
     fn floor_binds_the_endpoint_width() {
-        // target 1_000, floor 900 => the bottom may drop at most 100.
-        //
-        // K = C = 1_000, 2C = 2_000, n = 2C - K = 1_000, H_e = 100.
-        // Lemma (A): W_endpoint = floor(100 * 2_000 / 1_000) = 200.
-        // impact = floor(200 * 1_000 / 2_000) = 100, so high = 1_100 and low = 900, exactly on
-        // the floor; span = 200 - 100 = 100 = H_e. ✓
+        // K = C = 1_000, 2C = 2_000, n = 1_000, H_e = 100. Lemma (A): W = floor(100*2_000/1_000)
+        // = 200, impact = floor(200*1_000/2_000) = 100, so low = 900 sits exactly on the floor.
         let input = SolveInput {
             target: 1_000,
             capture: 1_000,
@@ -628,8 +518,8 @@ mod tests {
         assert_eq!(sol.binding, WidthBinding::Endpoint);
         assert_eq!((sol.width, sol.impact), (200, 100));
         assert_eq!((sol.low, sol.high), (900, 1_100));
-        // Tightness: one more unit of width would breach the floor. Probe with the same FLOOR the
-        // forward derivation uses, or the probe proves nothing about the real solver.
+        // Tightness, probed with the same FLOOR the forward derivation uses: one more unit of
+        // width breaches the floor.
         let w = sol.width + 1;
         let impact = mul_div_floor(w, sol.effective_capture, 2 * input.capacity).unwrap();
         assert!(input.target + impact - w < 900);
@@ -637,14 +527,9 @@ mod tests {
 
     #[test]
     fn floor_binds_the_boundary_width() {
-        // K = C = 1_000, 2C = 2_000, H_i = 1_010 - 1_000 = 10.
-        // Lemma (B): W_boundary = floor((2_000*11 - 1)/1_000) = floor(21_999/1_000) = 21,
-        // impact = floor(21*1_000/2_000) = floor(10.5) = 10, high = 1_010 exactly on the ceiling.
-        //
-        // This is the case that shows using lemma (A) here — the form the *previous*, ceiled
-        // revision needed — is now merely loose in the safe direction (it would give
-        // floor(10*2_000/1_000) = 20, one unit narrower), whereas using lemma (A) for the
-        // endpoint bound while the impact ceiled was unsound. The correction follows the floor.
+        // K = C = 1_000, 2C = 2_000, H_i = 10. Lemma (B): W = floor((2_000*11 - 1)/1_000) = 21,
+        // impact = floor(10.5) = 10, high = 1_010 exactly on the ceiling. Lemma (A) would give 20,
+        // loose in the safe direction; applying (A) to the endpoint bound would be unsound.
         let input = SolveInput {
             target: 1_000,
             capture: 1_000,
@@ -670,10 +555,10 @@ mod tests {
         input.requested_width = 7;
         let sol = solve_bid(&input).unwrap();
         assert_eq!((sol.width, sol.binding), (7, WidthBinding::Requested));
-        // K = C = 1_000, 2C = 2_000: impact = floor(7*1_000/2_000) = 3.
+        // K = C = 1_000, 2C = 2_000: impact = floor(7*1_000/2_000) = 3, and 7_000 is not a
+        // multiple of 2_000, so the realised average lands one unit under.
         assert_eq!(sol.impact, 3);
         assert_eq!((sol.low, sol.high), (999_996, 1_000_003));
-        // 7*1_000 = 7_000 is not a multiple of 2_000, so the realised average is one unit under.
         assert_eq!(
             avg_bid_price(sol.low, sol.high, input.capacity, 0, sol.effective_capture),
             Ok(999_999)
@@ -705,9 +590,8 @@ mod tests {
             max_price: PRICE_MAX,
         };
         let sol = solve_ask(&input).unwrap();
-        // K = 4_000_000, 2C = 20_000_000, so 2C/K = 5 and H_i = T - 1.
-        // Lemma (B): W = floor((20_000_000*T - 1)/4_000_000) = 5*T - 1 = 15_499_999_999_999_999.
-        // impact = floor(W*K/2C) = floor(W/5) = T - 1, so minAsk = 1, exactly on the floor.
+        // K = 4_000_000, 2C = 20_000_000 so 2C/K = 5, H_i = T - 1. Lemma (B): W = 5*T - 1 and
+        // impact = floor(W/5) = T - 1, so minAsk = 1, exactly on the floor.
         assert_eq!(sol.binding, WidthBinding::Boundary);
         assert_eq!(sol.width, 15_499_999_999_999_999);
         assert_eq!(sol.impact, 3_099_999_999_999_999);
@@ -715,7 +599,7 @@ mod tests {
         let realised =
             avg_ask_price(sol.low, sol.high, input.capacity, 0, sol.effective_capture).unwrap();
         assert!(realised >= input.target && realised - input.target <= 1);
-        // In amount terms: the solved ladder charges at least what a flat ladder at T charges.
+        // The solved ladder charges at least what a flat ladder at T charges.
         let solved = amount_in_ask(
             sol.effective_capture,
             sol.low,
@@ -752,18 +636,15 @@ mod tests {
         assert!(ladder.min_ask <= ladder.max_ask);
         assert!(ladder.max_ask > ladder.min_bid);
 
-        // K = 500, C = 1_000, 2C = 2_000, n = 2C - K = 1_500.
-        //
-        // Bid (T = 1_000_000, floor 0): lemma (A) endpoint bound is
-        //   W = floor(1_000_000 * 2_000 / 1_500) = 1_333_333,
-        //   impact = floor(1_333_333*500/2_000) = 333_333, high = 1_333_333, low = 0.
+        // K = 500, C = 1_000, 2C = 2_000, n = 1_500.
+        // Bid (T = 1_000_000, floor 0), lemma (A): W = floor(1_000_000*2_000/1_500) = 1_333_333,
+        // impact = 333_333, so low = 0.
         assert_eq!((out.bid.width, out.bid.impact), (1_333_333, 333_333));
         assert_eq!((out.bid.low, out.bid.high), (0, 1_333_333));
         assert_eq!(out.bid.binding, WidthBinding::Endpoint);
 
-        // Ask (T = 1_000_100, floor 0): lemma (B) boundary bound is
-        //   W = floor((2_000*1_000_101 - 1)/500) = floor(2_000_201_999/500) = 4_000_403,
-        //   impact = floor(4_000_403*500/2_000) = 1_000_100, so minAsk = 0.
+        // Ask (T = 1_000_100, floor 0), lemma (B): W = floor((2_000*1_000_101 - 1)/500) =
+        // 4_000_403, impact = 1_000_100, so minAsk = 0.
         assert_eq!((out.ask.width, out.ask.impact), (4_000_403, 1_000_100));
         assert_eq!((out.ask.low, out.ask.high), (0, 4_000_403));
         assert_eq!(out.ask.binding, WidthBinding::Boundary);
@@ -784,12 +665,9 @@ mod tests {
     #[test]
     fn two_sided_repairs_a_crossed_pair_of_targets() {
         // Ask target below the bid target: the repair must lift the ask, not drop the bid.
-        //
         // K = C = 100, 2C = 200, n = 100.
-        // Bid  (T = 1_000): lemma (A) => W = floor(1_000*200/100) = 2_000,
-        //                     impact = floor(2_000*100/200) = 1_000, high = 2_000, low = 0.
-        // Ask  (T =   900): lemma (B) => W = floor((200*901 - 1)/100) = 1_801,
-        //                     impact = floor(1_801*100/200) = 900, low = 0, high = 1_801.
+        // Bid (T = 1_000), lemma (A): W = 2_000, impact = 1_000, so 0..2_000.
+        // Ask (T =   900), lemma (B): W = 1_801, impact =   900, so 0..1_801.
         let bid = bid_input(1_000, 100, 100);
         let ask = bid_input(900, 100, 100);
         let out = solve_two_sided(&bid, &ask).unwrap();
@@ -811,8 +689,8 @@ mod tests {
                 max_ask: 2_000
             }
         );
-        // The repair is pool-favourable: the realised ask is strictly worse for the taker than
-        // the 900 that was requested, never better.
+        // The repair is pool-favourable: the realised ask is worse for the taker than the 900 that
+        // was requested, never better.
         let realised = avg_ask_price(
             out.ladder.min_ask,
             out.ladder.max_ask,

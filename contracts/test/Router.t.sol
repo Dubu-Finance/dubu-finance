@@ -14,24 +14,21 @@ import {MockERC20} from "../src/mocks/MockERC20.sol";
 import {UniswapV2Factory} from "../src/reference/univ2/UniswapV2Factory.sol";
 import {UniswapV2Pair} from "../src/reference/univ2/UniswapV2Pair.sol";
 
-// =========================================================================================
-//                                     Permit2 doubles
-// =========================================================================================
+// --- Permit2 doubles ---
 
 /// @notice A faithful re-implementation of the slice of canonical Permit2 the router uses.
 ///
-/// Faithful in the parts that matter for this test: the real EIP-712 domain (`name = "Permit2"`,
-/// no version field), the real `PermitTransferFrom` / `TokenPermissions` type strings, `spender`
-/// bound to `msg.sender`, an unordered nonce bitmap, the deadline check, and the
-/// `requestedAmount <= permitted.amount` check. Signatures produced against this mock are
-/// byte-identical to signatures a wallet would produce against the genesis pre-install, which is
-/// the whole point — a mock that skipped signature verification would let the router's Permit2
-/// path pass a test it should not.
+/// Faithful in the parts that matter here: the real EIP-712 domain (`name = "Permit2"`, no version
+/// field), the real `PermitTransferFrom` / `TokenPermissions` type strings, `spender` bound to
+/// `msg.sender`, an unordered nonce bitmap, the deadline check, and the
+/// `requestedAmount <= permitted.amount` check. Signatures against this mock are byte-identical to
+/// what a wallet produces against the genesis pre-install; a mock that skipped signature
+/// verification would let the router's Permit2 path pass a test it should not.
 ///
-/// @dev Deliberately free of immutables and constructor-written storage: it is installed with
-///      `vm.etch`, which copies runtime code only. `DOMAIN_SEPARATOR()` is therefore computed on
-///      every call from `block.chainid` and `address(this)`, so it resolves to the canonical
-///      address once etched.
+/// @dev No immutables and no constructor-written storage, because it is installed with `vm.etch`,
+///      which copies runtime code only. `DOMAIN_SEPARATOR()` is therefore computed on every call
+///      from `block.chainid` and `address(this)`, so it resolves to the canonical address once
+///      etched.
 contract MockPermit2 {
     error SignatureExpired();
     error InvalidAmount();
@@ -102,10 +99,9 @@ contract MockPermit2 {
     }
 }
 
-/// @notice **The OKX bug, reproduced.** `DEX-Router-EVM-V1`'s `_MODE_PERMIT2` branch is a bare
-///         `return;`: it moves no tokens and the router carries on into the swap against
-///         whatever balance it happened to hold. This contract is that behaviour, installed at
-///         the canonical address, so the tests can prove our router refuses it.
+/// @notice A Permit2 whose `permitTransferFrom` is a bare `return;` — it moves no tokens and does
+///         not revert. Installed at the canonical address so the tests can prove our router
+///         refuses to swap against whatever balance it happened to be holding.
 contract NoOpPermit2 {
     function permitTransferFrom(
         IPermit2.PermitTransferFrom memory,
@@ -140,9 +136,7 @@ contract ShortPermit2 {
     }
 }
 
-// =========================================================================================
-//                                    Misbehaving doubles
-// =========================================================================================
+// --- Misbehaving doubles ---
 
 /// @notice `transferFrom` returns `true` and moves nothing. The approval-path twin of the no-op
 ///         Permit2, and the reason `_pull` measures a balance delta instead of trusting the call.
@@ -154,10 +148,9 @@ contract SilentToken is MockERC20 {
     }
 }
 
-/// @notice An adapter that performs a real prop-pool swap but keeps a slice of the output.
-/// @dev This is the honest shape of "an adapter returned less than promised": the venue filled,
-///      the plan's quote was correct, and the shortfall appears only in the router's own balance
-///      delta. The router must catch it on the aggregate slippage check rather than shrug.
+/// @notice An adapter that performs a real prop-pool swap but keeps a slice of the output — the
+///         shape of "an adapter returned less than promised", where the venue filled, the plan's
+///         quote was correct, and the shortfall appears only in the router's own balance delta.
 contract SkimmingAdapter is IAdapter {
     uint256 public immutable KEEP_BPS;
 
@@ -183,9 +176,7 @@ contract SkimmingAdapter is IAdapter {
     }
 }
 
-// =========================================================================================
-//                                        Fixture
-// =========================================================================================
+// --- Fixture ---
 
 contract RouterTest is Test {
     // Canonical Permit2. Genesis pre-install on GIWA; the router hard-codes it.
@@ -226,10 +217,9 @@ contract RouterTest is Test {
     uint96 internal constant BID_CAPACITY = 1_000e18;
     /// @notice Base the pool will SELL this epoch. BASE units — see `PropCurve` amendment 1 and
     ///         `IPropPool.PairSnapshot`.
-    /// @dev Was `2_000_000e6`, read as quote. 1_000 base at the 2000 mid is the same $2M of risk
-    ///      budget, and it is now symmetric with `BID_CAPACITY`, which is what the two counters
-    ///      sharing a unit means. A quote-denominated ask `amountIn` is no longer comparable with
-    ///      this number: the epoch's quote ceiling is `getAmountIn(quote, base, ASK_CAPACITY)`.
+    /// @dev Symmetric with `BID_CAPACITY`, both counters sharing a unit. An ask `amountIn` is quote
+    ///      denominated and is NOT comparable with this number: the epoch's quote ceiling is
+    ///      `getAmountIn(quote, base, ASK_CAPACITY)`.
     uint96 internal constant ASK_CAPACITY = 1_000e18;
 
     function setUp() public {
@@ -308,9 +298,7 @@ contract RouterTest is Test {
         pool.updateQuote(packed);
     }
 
-    // ---------------------------------------------------------------------
-    // Route builders
-    // ---------------------------------------------------------------------
+    // --- Route builders ---
 
     function _propPayload(address base, address quote, uint256 limitAmount) internal view returns (bytes memory) {
         return propAdapter.encodePayload(base, quote, limitAmount, 0, block.timestamp + 1);
@@ -380,9 +368,7 @@ contract RouterTest is Test {
         );
     }
 
-    // ---------------------------------------------------------------------
-    // Off-chain-style quoting helpers
-    // ---------------------------------------------------------------------
+    // --- Off-chain-style quoting helpers ---
 
     function _uniQuote(UniswapV2Pair p, address tokenIn, uint256 amountIn) internal view returns (uint256) {
         (uint112 r0, uint112 r1,) = p.getReserves();
@@ -392,9 +378,7 @@ contract RouterTest is Test {
                 : uniAdapter.getAmountOut(amountIn, r1, r0);
     }
 
-    // =====================================================================
-    // Single hop — prop pool
-    // =====================================================================
+    // --- Single hop — prop pool ---
 
     function test_singleHopViaPropPoolAdapter() public {
         uint256 amountIn = 100e18;
@@ -409,8 +393,7 @@ contract RouterTest is Test {
         uint256 out = router.swapExactIn(p, quoted);
 
         // The adapter drives `swapWithContractBalance`, which prices against live storage in the
-        // same frame that moves the tokens. There is no window for the quote to drift, so the
-        // realised fill must equal the quote to the unit.
+        // same frame that moves the tokens, so the realised fill must equal the quote to the unit.
         assertEq(out, quoted, "routed output diverged from the pool's own quote");
         assertEq(tokenB.balanceOf(receiver) - before, out, "receiver was not paid the measured output");
         assertEq(tokenB.balanceOf(address(router)), 0, "router retained output");
@@ -432,9 +415,7 @@ contract RouterTest is Test {
         assertEq(tokenA.balanceOf(receiver), out);
     }
 
-    // =====================================================================
-    // Single hop — UniV2
-    // =====================================================================
+    // --- Single hop — UniV2 ---
 
     function test_singleHopViaUniV2Adapter() public {
         uint256 amountIn = 100e18;
@@ -462,9 +443,7 @@ contract RouterTest is Test {
         assertEq(tokenA.balanceOf(receiver), out);
     }
 
-    // =====================================================================
-    // Two hops
-    // =====================================================================
+    // --- Two hops ---
 
     /// @notice A -> B on the prop pool, then B -> C on a V2 pair. The second hop is funded by
     ///         what the first one actually produced, measured on-chain.
@@ -508,7 +487,7 @@ contract RouterTest is Test {
 
     function test_twoHopRoute_revertsWhenTheFirstHopProducesNothing() public {
         // Pause the prop pair so hop 0 cannot fill. The adapter's own call reverts, which is what
-        // the caller sees — `HopProducedNothing` is reachable only for a venue that silently
+        // the caller sees; `HopProducedNothing` is reachable only for a venue that silently
         // delivers zero, which the prop pool does not do.
         vm.prank(guardian);
         pool.pause(PAIR_ID);
@@ -542,11 +521,9 @@ contract RouterTest is Test {
         router.swapExactIn(p, 0);
     }
 
-    // =====================================================================
-    // Weighted split across two venues
-    // =====================================================================
+    // --- Weighted split across two venues ---
 
-    /// @notice 60% prop pool, 40% V2, in one hop. Asserts the weights were *honoured*, not just
+    /// @notice 60% prop pool, 40% V2, in one hop. Asserts the weights were *honoured*, not merely
     ///         that the total came out plausible: each venue's own accounting is checked against
     ///         the share the decoder should have handed it.
     function test_weightedSplitAcrossTwoVenuesHonoursTheWeights() public {
@@ -582,9 +559,8 @@ contract RouterTest is Test {
         vm.prank(user);
         uint256 out = router.swapExactIn(p, propQuote + uniQuote);
 
-        // The prop pool's own `used` counter is the authoritative record of what it received, and
-        // the pair's reserve delta is the authoritative record for the V2 leg. Neither is a number
-        // the test supplied.
+        // The pool's `used` counter and the pair's reserve delta are the authoritative records of
+        // what each venue received. Neither is a number the test supplied.
         assertEq(uint256(pool.snapshot(PAIR_ID).bidUsed), propShare, "prop leg did not receive its 60% weight");
         assertEq(_pairABReserveOfA() - uniABefore, uniShare, "V2 leg did not receive its 40% weight");
 
@@ -659,9 +635,7 @@ contract RouterTest is Test {
         router.swapExactIn(p, 0);
     }
 
-    // =====================================================================
-    // Exact output
-    // =====================================================================
+    // --- Exact output ---
 
     function test_exactOut() public {
         uint256 exactOut = 100_000e6;
@@ -681,8 +655,8 @@ contract RouterTest is Test {
     }
 
     /// @notice An overshooting plan delivers the surplus as extra *output*; only unspent input is
-    ///         refunded. Documented on `swapExactOut` and worth pinning, because the alternative
-    ///         reading (refund the overshoot in output token) would be a different contract.
+    ///         refunded. Pinned because the alternative reading — refund the overshoot in the
+    ///         output token — would be a different contract.
     function test_exactOut_overshootIsDeliveredNotRefunded() public {
         uint256 exactOut = 100_000e6;
         uint256 plannedIn = pool.getAmountIn(address(tokenA), address(tokenB), exactOut) * 2;
@@ -719,9 +693,7 @@ contract RouterTest is Test {
         assertEq(tokenA.balanceOf(user), userBefore, "tokens moved despite an over-limit plan");
     }
 
-    // =====================================================================
-    // Deadline and slippage
-    // =====================================================================
+    // --- Deadline and slippage ---
 
     function test_deadlineExpired() public {
         RouteParams memory p = _propRoute(100e18, true);
@@ -758,10 +730,9 @@ contract RouterTest is Test {
         uint256 amountIn = 100e18;
 
         uint256 half = (amountIn * 5_000) / 10_000;
-        // Both legs are simulated and rolled back rather than quoted. The second leg prices from a
-        // ladder the first one has already partly consumed, so quoting it from the current state
-        // would be the wrong number — and the difference is exactly the kind of thing this test
-        // would otherwise paper over.
+        // Both legs are simulated and rolled back rather than quoted: the second leg prices from a
+        // ladder the first has already partly consumed, so quoting it from the current state would
+        // be the wrong number.
         (uint256 honestFirst, uint256 honestSecond) = _simulateTwoLegs(half, amountIn - half);
 
         SwapStep[] memory steps = new SwapStep[](2);
@@ -792,15 +763,15 @@ contract RouterTest is Test {
         vm.expectRevert(abi.encodeWithSelector(Router.InsufficientOutput.selector, skimmedTotal, honestTotal));
         router.swapExactIn(p, honestTotal);
 
-        // Without the guard it would have "succeeded" at the lower number, which is the whole
-        // point: the shortfall is visible only in the aggregate balance delta.
+        // Without the guard it would have "succeeded" at the lower number, the shortfall being
+        // visible only in the aggregate balance delta.
         vm.prank(user);
         assertEq(router.swapExactIn(p, skimmedTotal), skimmedTotal, "the skimmed total is what actually arrives");
         assertEq(tokenB.balanceOf(address(skimmer)), honestSecond / 2, "the adapter kept exactly what it skimmed");
     }
 
     /// @dev Runs two sequential bid legs against the prop pool and rolls the state back, so the
-    ///      caller learns what an honest two-leg split would have produced.
+    ///      caller learns what an unskimmed two-leg split would have produced.
     function _simulateTwoLegs(uint256 legOne, uint256 legTwo) internal returns (uint256 outOne, uint256 outTwo) {
         uint256 snapId = vm.snapshotState();
         tokenA.mint(address(pool), legOne);
@@ -825,9 +796,7 @@ contract RouterTest is Test {
         router.swapExactIn(p, 0);
     }
 
-    // =====================================================================
-    // Permit2 — this section exists to prove we did not inherit OKX's no-op
-    // =====================================================================
+    // --- Permit2 ---
 
     function _signPermit(address token, uint256 amount, uint256 nonce, uint256 deadline)
         internal
@@ -909,14 +878,10 @@ contract RouterTest is Test {
         router.swapExactInWithPermit2(p, 0, permit, sig);
     }
 
-    /// @notice **The OKX bug, and proof we do not have it.**
-    ///
-    ///         `DEX-Router-EVM-V1`'s `_MODE_PERMIT2` body is `return;`. Enabling it transfers
-    ///         nothing and then continues into the swap, which executes against whatever balance
-    ///         the router happened to be holding. Here the no-op implementation is installed at
-    ///         the canonical Permit2 address **and** the router is pre-seeded with a stray balance
-    ///         of the input token — the exact condition under which the OKX version would happily
-    ///         swap someone else's money. Our router must still refuse, because it verifies the
+    /// @notice A Permit2 that moves nothing and does not revert cannot fund a swap, even when the
+    ///         router already holds a stray balance of the input token. The no-op is installed at
+    ///         the canonical address and the stray balance is seeded, so the only thing standing
+    ///         between the plan and someone else's money is `_pullWithPermit2` verifying the
     ///         transfer by balance delta rather than by the absence of a revert.
     function test_permit2NoOpCannotFundASwapEvenWithAStrayRouterBalance() public {
         _installPermit2(address(new NoOpPermit2()));
@@ -1046,12 +1011,11 @@ contract RouterTest is Test {
         vm.expectRevert(Router.NothingReceived.selector);
         router.swapExactOut(q, 1, type(uint256).max);
 
-        // And an address with no code cannot fund anything either. It fails earlier than the two
-        // cases above and with no error data at all: `_pull` reads `balanceOf` first, a `call` to a
-        // codeless account succeeds with empty returndata, and the ABI decoder rejects it. Worth
-        // pinning that the failure is a revert rather than a zero — a `balanceOf` that decoded to
-        // 0 would put the router into `NothingReceived`, which is still safe but is a different
-        // path, and a `staticcall` variant that swallowed the decode error would not be.
+        // An address with no code cannot fund anything either, and it fails earlier and with no
+        // error data: `_pull` reads `balanceOf` first, a `call` to a codeless account succeeds with
+        // empty returndata, and the ABI decoder rejects it. The revert is pinned rather than a
+        // zero, because a `balanceOf` decoding to 0 lands in `NothingReceived` — safe, but a
+        // different path — and a `staticcall` variant swallowing the decode error would not be.
         RouteParams memory r = _oneStepRoute(
             makeAddr("notAToken"),
             address(tokenC),
@@ -1063,9 +1027,7 @@ contract RouterTest is Test {
         router.swapExactIn(r, 0);
     }
 
-    // =====================================================================
-    // Route validation
-    // =====================================================================
+    // --- Route validation ---
 
     function test_routeValidation() public {
         vm.startPrank(user);
@@ -1128,9 +1090,7 @@ contract RouterTest is Test {
         router.swapExactIn(p, 0);
     }
 
-    // =====================================================================
-    // Auditability
-    // =====================================================================
+    // --- Auditability ---
 
     /// @notice `RouteExecuted` publishes realised next to quoted, which is the whole neutrality
     ///         argument in archi_v2.md §6.3. Pin the field order and the plan hash.

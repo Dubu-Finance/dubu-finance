@@ -1,59 +1,20 @@
 //! Chain access: JSON-RPC transport, the runaway guard, and the batched read that produces a
 //! [`ChainView`].
 //!
-//! # The loop is driven by `newHeads`, not by a timer
+//! [`heads`] holds an `eth_subscribe("newHeads")` and the quote loop wakes on it;
+//! [`crate::config::ChainConfig::fallback_poll_interval_ms`] is only a floor under that
+//! subscription. Multicall3 batches every read into one `eth_call` per head: six round trips would
+//! be worse on latency and worse on consistency, because a batch is answered at one block while six
+//! calls can straddle a boundary and produce a view that never existed. [`Limiter`] is a fuse
+//! against a runaway retry loop of *ours*, not a budget the normal path presses against.
 //!
-//! This module used to open with "GIWA has no `eth_subscribe` and no websocket — the endpoint
-//! answers 405", and everything below it was shaped by that. A dedicated Nodit endpoint removed
-//! the constraint: `eth_subscribe("newHeads")` over its WSS works, and heads arrive at the
-//! chain's 1s cadence. [`heads`] owns that subscription and the quote loop wakes on it, doing
-//! the reads a cycle needs when there is actually new state rather than on an arbitrary tick.
-//!
-//! Reads still produce a view with an age, and [`ChainView::at`] still carries it, because that
-//! never depended on how the read was triggered.
-//!
-//! # What survived the rewrite, and why
-//!
-//! Three things look like leftovers from the polling design and are not. They are here on their
-//! own merits, and a later reader should not mistake them for debris:
-//!
-//! 1. **Multicall3 batching.** One `eth_call` per head instead of six, whatever the pair count:
-//!    block number, block timestamp, every pair's `snapshot` and every token balance in one
-//!    `aggregate3`. This was *motivated* by the rate limit and is *justified* without it — six
-//!    round trips where one would do is worse on latency, and worse on consistency, because a
-//!    batch is answered at one block while six separate calls can straddle a block boundary and
-//!    produce a view that never existed.
-//! 2. **Backoff**, in [`Limiter`]. A dedicated endpoint is not an infinite one. More to the
-//!    point, the failure this defends against is *ours*: with no penalty window, any transient
-//!    upstream error turns the bot into a retry flood, which is how a small outage becomes a
-//!    large one.
-//! 3. **The health state machine**, [`ChainHealth`] — same thresholds, one new input. See below.
-//!
-//! What did **not** survive: the poll timer as the primary driver, demoted to
-//! [`crate::config::ChainConfig::fallback_poll_interval_ms`], a floor under the subscription
-//! rather than the thing that runs the bot; and the token-bucket *sizing* that assumed a hostile
-//! budget, along with the config cross-check that refused a poll interval whose steady-state
-//! rate exceeded it. [`Limiter`] remains as a fuse against a runaway loop, not as a budget the
-//! normal path is expected to press against.
-//!
-//! # Liveness has two signals now, and they fail differently
-//!
-//! [`ChainHealth`] escalates `Healthy -> Degraded -> Down` on the same thresholds it always
-//! did. What changed is what feeds it:
-//!
-//! * **Reads landing.** A failing `eth_call` is a failing endpoint. This is the original signal.
-//! * **The block number advancing.** New, and it closes a real hole: an endpoint that answers
-//!   every request cheerfully about a chain that has stopped used to read as perfectly healthy
-//!   forever, because "the RPC replied" was the only thing being measured. Progress is taken
-//!   from the block number the read itself returns, so a frozen chain escalates on exactly the
-//!   same ladder as an unreachable one.
-//!
-//! The head watchdog in [`heads`] deliberately does **not** feed this directly. When heads stop,
-//! the loop falls back to its timer and the *next read* answers the question that matters: if
-//! the block number is still climbing, only the socket died and quoting continues; if it is
-//! frozen too, the chain is genuinely down and the ladder escalates to a halt. Wiring a silent
-//! websocket straight to `Down` would withdraw quotes over a quiet socket on a healthy chain,
-//! which is the wrong trade — and never noticing would be the worse one.
+//! [`ChainHealth`] escalates `Healthy -> Degraded -> Down` on reads landing *and* on the block
+//! number advancing, because measuring only the first reads healthy forever against an endpoint
+//! that answers cheerfully about a chain that has stopped. The head watchdog in [`heads`]
+//! deliberately does **not** feed it: when heads stop, the loop falls back to its timer and the
+//! next read distinguishes a dead socket (block number still climbing, so quoting continues) from a
+//! dead chain, where wiring a silent websocket straight to `Down` would withdraw quotes over a
+//! quiet socket on a healthy chain.
 //!
 //! # Which endpoint, and which block tag
 //!
@@ -64,11 +25,9 @@
 //! | startup metadata | ordinary (Nodit HTTPS) | `latest` |
 //! | nonce, fees, submit, receipts | ordinary (Nodit HTTPS) | `pending` / `latest` |
 //!
-//! Heads say *when* to look; they are not what is read.
-//!
-//! **Most of the freshness is the tag, not the host**, and this used to say otherwise. Measured on
-//! GIWA by polling `snapshot(1).minBid` — which changes on every push, unlike `updatedAt`, which
-//! is `block.timestamp` and quantised to a second — against the moment the updater sent it:
+//! Heads say *when* to look; they are not what is read. Most of the freshness is the tag rather
+//! than the host, measured on GIWA by polling `snapshot(1).minBid` against the moment the updater
+//! sent it:
 //!
 //! ```text
 //!   flash `pending`  vs  ordinary `latest`     ordinary lags  ~871ms   <- the TAG
@@ -77,27 +36,12 @@
 //!   flashblock cadence                          327ms median, 3.0 per 1s block
 //! ```
 //!
-//! So `pending` over `latest` is worth most of a block, and the flashblocks host is worth a
-//! further ~82ms on top of that. Both are worth having for a maker, but the second is a tenth of
-//! what the first is, and the earlier framing credited the host with all of it.
-//!
-//! The 440ms is the one that matters for how this bot behaves. It is measured by timing how long
-//! after `eth_sendRawTransaction` returns the sender's nonce advances on the `pending` tag, over
-//! six transactions — a direct observation rather than a correlation, which an earlier attempt got
-//! wrong by matching a send against a state change some *other* send had caused and concluding a
-//! physically impossible 5ms. Seoul to the sequencer is ~70ms of round trip on its own.
-//!
-//! 440ms against a 327ms flashblock is roughly half an interval of waiting plus propagation, which
-//! is what arriving at a uniformly random point in the interval predicts.
-//!
-//! What follows from it: the quote is effective in ~440ms and a confirmed receipt takes about a
-//! second, so anything gating on a *confirmed* receipt is waiting about twice as long as the chain
-//! requires. See `tx::Sender`'s in-flight gate.
-//!
-//! Its `latest` **lags the ordinary RPC by about two blocks**, so reading `latest` from it is
-//! strictly worse than reading `latest` from the ordinary endpoint. Transactions go to the ordinary endpoint because that is the canonical
-//! view, and a nonce read from a preconfirmed state that later reorganises is a stuck
-//! transaction.
+//! 440ms is the number the rest of the bot is sized against and this module is its one home: it is
+//! send-to-preconfirmation, timed by watching the sender's nonce advance on the `pending` tag. A
+//! confirmed receipt takes about a second, so anything gating on one waits twice as long as the
+//! chain requires. Transactions still go to the ordinary endpoint, whose `latest` leads the
+//! flashblocks endpoint's by about two blocks: it is the canonical view, and a nonce read from a
+//! preconfirmed state that later reorganises is a stuck transaction.
 
 pub mod heads;
 pub mod swaps;
@@ -117,8 +61,8 @@ use crate::config::EndpointUrl;
 
 /// Generated ABI bindings for everything this bot calls.
 ///
-/// Struct field order is load-bearing: these are tuples on the wire, so a field in the wrong
-/// place decodes silently into the wrong meaning. They mirror `IPropPool.PairSnapshot` and
+/// Struct field order is load-bearing: these are tuples on the wire, so a field out of place
+/// decodes silently into the wrong meaning. They mirror `IPropPool.PairSnapshot` and
 /// `PropPool.PairConfig` exactly.
 #[allow(missing_docs)]
 pub mod abi {
@@ -188,9 +132,7 @@ pub mod abi {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Errors
-// ---------------------------------------------------------------------------
+// --- Errors ---
 
 /// Anything that can go wrong talking to a node.
 #[derive(Debug, thiserror::Error)]
@@ -259,11 +201,8 @@ pub enum RpcError {
 impl RpcError {
     /// True when the request provably never left this process.
     ///
-    /// Both variants are refused by the local limiter before a socket is opened, so nothing the
-    /// caller was about to do has happened yet. The transmit path needs this: a send that failed
-    /// *after* going out may have consumed a nonce, and a send that never went out cannot have.
-    /// Treating the two the same is what made the sender re-read its nonce thousands of times for
-    /// transactions it had not sent.
+    /// The transmit path needs the distinction: a send that failed *after* going out may have
+    /// consumed a nonce, and one the local limiter refused before opening a socket cannot have.
     #[must_use]
     pub const fn never_sent(&self) -> bool {
         matches!(self, Self::BackingOff { .. } | Self::BudgetExhausted { .. })
@@ -271,11 +210,9 @@ impl RpcError {
 
     /// True when the failure is the *endpoint's*, so another endpoint is worth trying.
     ///
-    /// [`Self::Node`] is deliberately excluded. A JSON-RPC error means this node parsed the
-    /// request and refused it — "execution reverted", "nonce too low", "already known" — and
-    /// every other node holding the same chain would refuse it identically. Retrying it elsewhere
-    /// would turn one refusal into several, and on the transmit path it would mean broadcasting
-    /// the same intent twice on the guess that the first one did not count.
+    /// [`Self::Node`] is excluded by default: a JSON-RPC error means this node parsed the request
+    /// and refused it, and every other node holding the same chain refuses it identically, so on
+    /// the transmit path a retry is a second broadcast of the same intent.
     #[must_use]
     pub const fn is_endpoint_fault(&self) -> bool {
         match self {
@@ -284,21 +221,10 @@ impl RpcError {
             | Self::RateLimited { .. }
             | Self::BackingOff { .. }
             | Self::BudgetExhausted { .. } => true,
-            // A node error usually means the node understood the request and refused it, so
-            // another node would refuse it identically and moving on is pointless. These codes are
-            // the exception: they say the endpoint refused to serve *this caller*, which is a
-            // property of the key, not of the request. A different key answers it fine.
-            //
-            // This is not theoretical, and it has now happened twice with different codes. First
-            // `403 API usage quota has been exceeded` from Nodit; then, after that was whitelisted,
-            // `-32016 over rate limit` from GIWA's public endpoint -- a code that was not on the
-            // list, so the pool gave up on the first endpoint again while seven alternatives sat
-            // behind it. The list is the wrong shape for the problem: anything meaning "not you,
-            // not now" belongs on it, and each new venue brings its own spelling.
-            //
-            // Safe on the transmit path, where a retry would otherwise risk a second broadcast:
-            // these are all refusals issued *before* the request was processed, so nothing was
-            // submitted and there is nothing to double.
+            // The exception: these codes refuse *this caller* rather than the request, which is a
+            // property of the key, so a different key answers fine. Each venue spells it
+            // differently, so anything meaning "not you, not now" belongs on the list. Safe on the
+            // transmit path because all of them are issued before the request is processed.
             Self::Node { code, .. } => matches!(code, 401 | 403 | 429 | -32005 | -32016),
             Self::Decode { .. } => false,
         }
@@ -316,17 +242,9 @@ impl RpcError {
 
     /// True when the upstream transaction pool refused the transaction because it is **full**.
     ///
-    /// This is backpressure, not a fault, and the distinction is the whole reason it has a
-    /// predicate of its own. A `-32003` says nothing about the transaction and everything about the
-    /// pool it was offered to: the same bytes are perfectly valid a moment later, the nonce was not
-    /// consumed, and the correct response is to stop sending rather than to log a failure and try
-    /// the next intent. Treating it per-transaction is what makes a brief upstream hiccup produce
-    /// ~1600 error lines a minute at 27 tx/s — see [`crate::tx::Sender::send_batch`], which pauses
-    /// the phase and reports one episode with a count instead.
-    ///
-    /// Matched on the code alone. GIWA's sequencer answers `-32003 txpool is full` and reth answers
-    /// the same code for the same condition; the message text is the part that varies by node and
-    /// version, so keying on it would be keying on the half that is not specified.
+    /// Backpressure, not a fault: the same bytes are valid a moment later and the nonce was not
+    /// consumed, so the response is to stop sending — see [`crate::tx::Sender::send_batch`].
+    /// Matched on the code alone, because the message text varies by node and version.
     #[must_use]
     pub const fn is_txpool_full(&self) -> bool {
         matches!(self, Self::Node { code: -32003, .. })
@@ -334,14 +252,10 @@ impl RpcError {
 
     /// True when the node says the nonce has already been used.
     ///
-    /// The one error that proves our own counter is *behind* the chain, and therefore the only
-    /// per-send outcome that justifies re-reading the account's nonce. See
-    /// [`crate::tx::Sender::send_batch`] for why every other outcome must not.
-    ///
-    /// Matched on the message rather than the code, and that is not a preference: geth, reth and
-    /// every gateway in front of them return this under `-32000`, the generic bucket that also
-    /// carries "intrinsic gas too low" and "replacement transaction underpriced". The code cannot
-    /// distinguish them; the text is the only thing that can.
+    /// The one error proving our counter is *behind* the chain, and so the only per-send outcome
+    /// that justifies re-reading the account's nonce. Matched on the message, not the code: this
+    /// shares `-32000` with "intrinsic gas too low" and "replacement transaction underpriced", so
+    /// only the text separates them.
     #[must_use]
     pub fn is_nonce_too_low(&self) -> bool {
         match self {
@@ -350,17 +264,11 @@ impl RpcError {
         }
     }
 
-    /// The node already holds this exact transaction, which is an acceptance wearing an error's
-    /// clothes.
+    /// The node already holds this exact transaction, which is an acceptance reported as an error.
     ///
-    /// A transaction's hash is a function of its contents, so getting this back means the bytes we
-    /// just signed are byte-identical to something already in the pool — and therefore that the
-    /// transaction is in flight under the hash we computed, so a receipt lookup finds it. Nothing is
-    /// lost, no gas is spent twice, and the nonce is not double-spent. Reporting it as a failed send
-    /// produced a stream of operator alerts for transactions that were on their way.
-    ///
-    /// Matched on the message for the same reason as [`Self::is_nonce_too_low`]: `-32000` is the
-    /// generic bucket and the text is the only thing that separates its occupants.
+    /// A hash is a function of the contents, so the bytes just signed are identical to something
+    /// already in the pool: the transaction is in flight under the hash we computed, a receipt
+    /// lookup finds it, and the nonce is not double-spent. Matched on the message, as above.
     #[must_use]
     pub fn is_already_known(&self) -> bool {
         match self {
@@ -377,30 +285,15 @@ fn decode_err(what: &'static str, detail: impl std::fmt::Display) -> RpcError {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Runaway guard
-// ---------------------------------------------------------------------------
+// --- Runaway guard ---
 
 /// Token bucket plus a rate-limit penalty window.
 ///
-/// **This is a fuse, not a budget.** It was originally sized to keep the bot underneath a
-/// hostile public endpoint's rate limit — the measured 429s during a 203-transaction broadcast.
-/// The dedicated endpoint took 20 rapid `eth_blockNumber` calls without one, so that sizing is
-/// gone: the defaults in [`crate::config::ChainConfig`] are now loose enough that normal
-/// operation never approaches them, and the config no longer refuses an interval on the grounds
-/// that its steady-state rate would exhaust the budget.
-///
-/// What is left is worth keeping on its own terms. A bug — a reconnect storm, a loop that stops
-/// awaiting, a retry with no ceiling — should hit a local limit before it hits the endpoint's,
-/// and an endpoint that starts failing should not be answered with a flood. Both are about this
-/// process misbehaving rather than the provider being stingy, and neither went away.
-///
-/// Deliberately not a queue, and that reasoning is unchanged. A queue in front of a limited
-/// endpoint converts a burst into latency, and latency in a quoting loop converts into adverse
-/// selection: the quote we would have sent lands three seconds late, against a market that has
-/// moved. Failing the request locally lets the caller decide — the loop skips a cycle, the
-/// transmit path aborts the push and logs why — which is always better than a stale action
-/// taken on time.
+/// A fuse, not a budget: the defaults in [`crate::config::ChainConfig`] are loose enough that
+/// normal operation never approaches them, and what this catches is *this process* misbehaving.
+/// Deliberately not a queue, because a queue in front of a limited endpoint converts a burst into
+/// latency, and latency in a quoting loop converts into adverse selection; failing locally lets the
+/// caller skip a cycle instead of taking a stale action on time.
 #[derive(Debug)]
 struct Limiter {
     tokens: f64,
@@ -458,14 +351,14 @@ impl Limiter {
     /// Enter (or extend) the penalty window. Returns its length.
     fn on_rate_limited(&mut self, now: Instant, initial: Duration, max: Duration) -> Duration {
         self.rate_limit_events += 1;
-        // Exponential in the number of *consecutive* 429s, so an isolated one costs the initial
-        // delay and a sustained squeeze walks up to the ceiling instead of hammering.
+        // Exponential in *consecutive* 429s: an isolated one costs the initial delay and a
+        // sustained squeeze walks to the ceiling instead of hammering.
         let shift = self.consecutive_429.min(16);
         let backoff = initial.saturating_mul(1u32 << shift).min(max);
         self.consecutive_429 = self.consecutive_429.saturating_add(1);
         self.penalty_until = Some(now + backoff);
-        // Spend the bucket too: the endpoint has told us we are over, and the local budget was
-        // evidently too generous for the current conditions.
+        // Spend the bucket too: the endpoint has said we are over, so the local budget was too
+        // generous for current conditions.
         self.tokens = 0.0;
         backoff
     }
@@ -475,19 +368,14 @@ impl Limiter {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Transport
-// ---------------------------------------------------------------------------
+// --- Transport ---
 
 /// How a pooled client picks which endpoint answers a call.
 ///
-/// The distinction is not a tuning knob. Spreading reads over several keys multiplies the request
-/// budget and costs nothing, because a read is a question about one block and any node can answer
-/// it. Spreading the *transmit* path over several nodes is a bug: `eth_getTransactionCount` on one
-/// node and `eth_sendRawTransaction` on another means the nonce was read from a node that has not
-/// seen the previous transaction, which produces a gap and a transaction that never lands. It is
-/// the same hazard as reading a nonce from the flashblocks `pending` tag, arriving by a different
-/// road.
+/// Not a tuning knob. Spreading *reads* over several keys multiplies the request budget for free,
+/// because a read is a question about one block that any node can answer. Spreading the *transmit*
+/// path is a bug: a nonce from one node and a send to another means the count came from a node that
+/// has not seen the previous transaction, which produces a gap and a transaction that never lands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Selection {
     /// Round-robin over healthy endpoints. For reads.
@@ -499,9 +387,8 @@ pub enum Selection {
 
 /// One endpoint in a pool: a URL and the runaway guard that belongs to it.
 ///
-/// The guard is per-endpoint rather than per-pool because a rate limit is a property of the key
-/// that hit it. One shared limiter would let a single throttled key back the whole pool off, which
-/// is the opposite of what having several keys is for.
+/// Per-endpoint rather than per-pool because a rate limit is a property of the key that hit it; one
+/// shared limiter would let a single throttled key back the whole pool off.
 struct Endpoint {
     url: EndpointUrl,
     limiter: Mutex<Limiter>,
@@ -522,12 +409,11 @@ pub struct Rpc {
 impl Rpc {
     /// Build a client for one endpoint.
     ///
-    /// Takes an [`EndpointUrl`] rather than a `String` so that the credential in the path cannot
-    /// reach a log line: every error this type produces carries the endpoint's *name*
-    /// (`"rpc"`, `"flashblocks"`), never its URL.
+    /// Takes an [`EndpointUrl`] rather than a `String` so the credential in the path cannot reach a
+    /// log line: every error carries the endpoint's *name* (`"rpc"`), never its URL.
     ///
     /// # Errors
-    /// [`RpcError::Transport`] if the HTTP client cannot be constructed.
+    /// [`RpcError::Transport`] if the client cannot be constructed.
     pub fn new(
         name: &'static str,
         url: &EndpointUrl,
@@ -538,14 +424,13 @@ impl Rpc {
 
     /// Build a client over several interchangeable endpoints.
     ///
-    /// `urls` must all be the same chain — nothing here checks that, and nothing could cheaply.
-    /// A mismatched endpoint would answer with another chain's state and the failure would look
-    /// like a reorg, so the startup verification in [`verify_against_chain`] is what has to catch
-    /// it, and it runs against the pool.
+    /// `urls` must all be the same chain and nothing here checks it: a mismatched endpoint answers
+    /// with another chain's state and the failure looks like a reorg, which is why
+    /// [`verify_against_chain`] runs against the pool.
     ///
     /// # Errors
-    /// [`RpcError::Transport`] if the HTTP client cannot be constructed, or if `urls` is empty —
-    /// a pool with no endpoints answers nothing, and failing at startup beats failing per call.
+    /// [`RpcError::Transport`] if the client cannot be constructed, or if `urls` is empty — a pool
+    /// with no endpoints answers nothing, and failing at startup beats failing per call.
     pub fn pooled(
         name: &'static str,
         urls: &[EndpointUrl],
@@ -614,15 +499,9 @@ impl Rpc {
 
     /// The same count split per endpoint, in pool order.
     ///
-    /// The sum above cannot answer the only question worth asking when reads start failing —
-    /// *which* endpoint — and neither can the errors, because every variant is built with
-    /// `self.name`, the pool's label, under a field documented as "which endpoint". So a pool of
-    /// six reported six identical failures, and an afternoon of 429s was unattributable: the
-    /// obvious reading was that the endpoint named in the message was the one being throttled, and
-    /// nothing in the log could confirm or deny it.
-    ///
-    /// Positions rather than URLs. An endpoint's URL carries an API key and this crate has exactly
-    /// two places that unredact one; the caller matches these against its own configured list.
+    /// Neither the sum nor the errors can say *which* endpoint is failing: every error carries the
+    /// pool's label, so a pool of six reports six identical failures. Positions rather than URLs,
+    /// because a URL carries an API key; the caller matches them against its configured list.
     #[must_use]
     pub fn rate_limit_events_by_endpoint(&self) -> Vec<u64> {
         self.endpoints
@@ -640,8 +519,8 @@ impl Rpc {
     /// One JSON-RPC call.
     ///
     /// # Errors
-    /// [`RpcError`]. Note that [`RpcError::BackingOff`] and [`RpcError::BudgetExhausted`] are
-    /// returned *without opening a socket*, which is the point.
+    /// [`RpcError`]. [`RpcError::BackingOff`] and [`RpcError::BudgetExhausted`] are returned
+    /// *without opening a socket*, which the transmit path relies on.
     pub async fn call(
         &self,
         method: &str,
@@ -652,8 +531,8 @@ impl Rpc {
 
         let n = self.endpoints.len();
         let start = match self.selection {
-            // Advance the cursor once per call, so consecutive reads land on different keys and
-            // the pool's budget is the sum of its keys rather than the smallest of them.
+            // Advance once per call, so the pool's budget is the sum of its keys rather than the
+            // smallest of them.
             Selection::Rotate => {
                 usize::try_from(self.cursor.fetch_add(1, Ordering::Relaxed)).unwrap_or(0) % n
             }
@@ -667,8 +546,7 @@ impl Rpc {
             #[allow(clippy::indexing_slicing)]
             let endpoint = &self.endpoints[idx];
 
-            // The runaway guard is consulted per endpoint, so one throttled key steps aside
-            // instead of backing the whole pool off.
+            // Per endpoint, so one throttled key steps aside instead of backing the pool off.
             if let Err(e) = Self::lock_of(endpoint).try_take(self.name, Instant::now()) {
                 last = Some(e);
                 continue;
@@ -677,11 +555,8 @@ impl Rpc {
             match self.call_one(endpoint, &body).await {
                 Ok(v) => return Ok(v),
                 Err(e) => {
-                    // Only *transport-level* failures are retried elsewhere. A `Node` error means
-                    // this node understood the request and refused it, so another node would
-                    // refuse it identically — and on the transmit path a retried submit is a
-                    // second broadcast of the same intent, which is exactly what must not be
-                    // guessed at.
+                    // Another node refuses a `Node` error identically, and on the transmit path a
+                    // retried submit is a second broadcast of the same intent.
                     if !e.is_endpoint_fault() {
                         return Err(e);
                     }
@@ -699,8 +574,8 @@ impl Rpc {
         endpoint: &Endpoint,
         body: &serde_json::Value,
     ) -> Result<serde_json::Value, RpcError> {
-        // One of exactly two `expose()` call sites in the crate; the other is the websocket
-        // connect in `heads`. Everything else — logs, errors, Debug output — sees the redaction.
+        // One of exactly two `expose()` call sites in the crate, the other being the websocket
+        // connect in `heads`. Logs, errors and Debug output all see the redaction.
         let resp = self
             .client
             .post(endpoint.url.expose())
@@ -718,8 +593,8 @@ impl Rpc {
             source,
         })?;
 
-        // The observed shape is a 429 with an "over rate limit" body, but some gateways answer
-        // 200 with the same text, so the body is checked either way.
+        // Some gateways answer 200 with an "over rate limit" body, so the body is checked either
+        // way rather than only on a 429.
         let looks_rate_limited =
             status.as_u16() == 429 || text.to_ascii_lowercase().contains("over rate limit");
         if looks_rate_limited {
@@ -809,15 +684,12 @@ pub fn unhex(s: &str) -> Option<Vec<u8>> {
         .collect()
 }
 
-// ---------------------------------------------------------------------------
-// Health
-// ---------------------------------------------------------------------------
+// --- Health ---
 
 /// What the chain connection is doing, as the quote loop sees it.
 ///
 /// `stale_secs` measures the *older* of the two liveness signals — the last landed read and the
-/// last block-number advance — so either one going quiet escalates on the same ladder. See
-/// [`ChainHealth`].
+/// last block-number advance — so either going quiet escalates on the same ladder.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChainStatus {
     /// Reads are landing and the chain is advancing.
@@ -846,18 +718,17 @@ impl ChainStatus {
     }
 }
 
-/// Which liveness signal has gone quiet. Purely for the log line that accompanies an escalation
-/// — the two cases have completely different diagnoses and saying "chain unhealthy" for both
-/// wastes the only signal an operator gets.
+/// Which liveness signal has gone quiet. Only for the escalation's log line, because the two cases
+/// have different diagnoses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Stall {
     /// Neither. Reads are landing and the block number is climbing.
     None,
     /// Reads are failing: timeouts, 429s, node errors. The endpoint is the problem.
     Reads,
-    /// Reads succeed and the block number has not moved. **The chain has stopped**, or this
-    /// endpoint is serving a frozen view of it. Either way, quoting into it is quoting into a
-    /// market whose state cannot change but whose fair value can.
+    /// Reads succeed and the block number has not moved: the chain has stopped, or this endpoint
+    /// serves a frozen view of it. Either way the pool's state cannot change while its fair value
+    /// can.
     Progress {
         /// The block number everything is stuck at.
         at_block: u64,
@@ -878,17 +749,9 @@ impl Stall {
 
 /// Rolling health of the chain connection, on two signals.
 ///
-/// The thresholds and the `Healthy -> Degraded -> Down` ladder are exactly what they were under
-/// polling. The change is that `Down` is now reachable two ways:
-///
-/// * **reads stop landing** — the original signal, and the one a dead endpoint trips;
-/// * **the block number stops advancing** — new. An RPC that answers every call about a chain
-///   that has halted used to read `Healthy` indefinitely, because the only thing measured was
-///   whether the socket replied. That is the same class of bug as a websocket that reconnects
-///   and delivers nothing: everything looks fine and the state is frozen.
-///
-/// [`ChainHealth::status`] takes the **older** of the two references, so whichever signal has
-/// been quiet longest is the one that drives the escalation, and neither can mask the other.
+/// `Down` is reachable two ways: reads stop landing, or the block number stops advancing.
+/// [`ChainHealth::status`] takes the **older** of the two references, so whichever signal has been
+/// quiet longest drives the escalation and neither can mask the other.
 #[derive(Debug)]
 pub struct ChainHealth {
     last_read: Option<Instant>,
@@ -902,8 +765,8 @@ pub struct ChainHealth {
 }
 
 impl ChainHealth {
-    /// Start a health tracker. The clock runs from construction, so a bot that never manages a
-    /// single successful read still halts on schedule instead of waiting forever.
+    /// Start a health tracker. The clock runs from construction, so a bot that never manages one
+    /// successful read still halts on schedule.
     #[must_use]
     pub fn new(now: Instant, degraded_after_secs: u64, halt_after_secs: u64) -> Self {
         Self {
@@ -920,10 +783,8 @@ impl ChainHealth {
 
     /// Record a successful read at the block number it was answered at.
     ///
-    /// The block number is what separates "the endpoint is up" from "the chain is moving". Only
-    /// a **strictly greater** number counts as progress: a repeated number is a chain that has
-    /// not produced a block, and a lower one is a reorg or a lagging replica, neither of which is
-    /// forward motion.
+    /// Only a **strictly greater** number counts as progress: a repeated one is a chain that has
+    /// produced no block, and a lower one is a reorg or a lagging replica.
     pub fn on_read(&mut self, now: Instant, block_number: u64) {
         self.last_read = Some(now);
         self.consecutive_failures = 0;
@@ -997,17 +858,14 @@ impl ChainHealth {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Decoded state
-// ---------------------------------------------------------------------------
+// --- Decoded state ---
 
 /// Port of `PropPool._decayed`. The staleness ramp: `capacity` at age zero, falling linearly to
 /// zero at `decay_secs`, floored. `decay_secs == 0` disables it.
 ///
-/// The pool applies this to `available`, and `_outFor` measures the epoch's remaining room against
-/// `available` rather than `capacity` — so a size priced on the nominal number is a size the chain
-/// will refuse once the ramp has run. `PropPool.sol` is authoritative; its `_decayed` doc comment
-/// records that both ends are exact on purpose and that this port is expected to exist.
+/// `_outFor` measures the epoch's remaining room against `available` rather than `capacity`, so a
+/// size priced on the nominal number is one the chain refuses once the ramp has run. Both ends are
+/// exact on purpose; `PropPool.sol` is authoritative.
 #[must_use]
 pub const fn decayed(capacity: u128, age_secs: u64, decay_secs: u16) -> u128 {
     debug_assert!(
@@ -1062,11 +920,9 @@ pub struct Snap {
 impl Snap {
     /// Effective bid usage.
     ///
-    /// `PropPool` only treats the stored counters as real while `usedGen == capGen`; otherwise
-    /// they belong to a superseded epoch and read as zero. Reproducing that rule here rather
-    /// than reading `bidUsed` directly is not a detail — on the live pool right now `capGen` is
-    /// 14 and `usedGen` is 13, so the raw ask counter says 499 mWETH has been sold this epoch
-    /// and the truth is zero. A policy that compared against the raw counter would compute the
+    /// `PropPool` treats the stored counters as real only while `usedGen == capGen`; otherwise they
+    /// belong to a superseded epoch and read as zero. Reproduced here rather than reading `bidUsed`
+    /// directly because the generations diverge routinely, and a stale raw counter puts the
     /// executable top at the wrong point on the ladder.
     #[must_use]
     pub const fn bid_used(&self) -> u128 {
@@ -1164,10 +1020,8 @@ pub struct PairMeta {
     pub stale_secs_max: u32,
     /// Age at which the staleness ramp reaches zero. Zero disables it. Feeds [`decayed`].
     ///
-    /// Read here rather than in the per-poll batch because it is manager-set and updater-invisible:
-    /// unlike capacity and used, nothing this process does moves it, and nothing that moves it
-    /// happens on a 330ms timescale. Polling it would buy one extra call per pair per poll for a
-    /// value that changes when a human changes it.
+    /// Read once at startup rather than per poll: it is manager-set, so nothing this process does
+    /// moves it and nothing that does moves it on a 330ms timescale.
     pub decay_secs: u16,
     /// Absolute floor on `minBid`, oracle-independent.
     pub min_price: u128,
@@ -1188,28 +1042,13 @@ pub struct ChainView {
     pub block_number: u64,
     /// Block timestamp the read was answered at.
     ///
-    /// **Do not use this for time arithmetic.** It comes from `getCurrentBlockTimestamp` under the
-    /// `pending` tag, and `pending` executes against a block that has not been sealed — the node
-    /// projects that block's header, and measured on GIWA it projects the timestamp **about 12
-    /// seconds into the future**, on both endpoints:
-    ///
-    /// ```text
-    ///   flash/pending  +11.5s      flash/latest  -2.3s
-    ///   canon/pending  +11.0s      canon/latest  -1.8s      block header  -1.4s
-    /// ```
-    ///
-    /// Twelve seconds is Ethereum L1's block interval, which is a strong hint that it is an
-    /// `op-geth` default nobody adjusted for a one-second L2.
-    ///
-    /// The consequences were not theoretical. Quote age came out as a constant 12s, so the
-    /// heartbeat fired every cycle — 85% of all pushes — and `markout` stamped its references 12s
-    /// ahead of the fills it compares them to, past `reference_at`'s tolerance, so every fill
-    /// would have settled `unmarked`.
-    ///
-    /// Use [`crate::chain::heads::Head::timestamp`] for anything time-based: it is a *sealed*
-    /// block's header, so it is real. It lags by about a second, which over-states age slightly —
-    /// the safe direction. This field is kept for logging, and because the block number beside it
-    /// is genuinely the freshest thing available.
+    /// **Do not use this for time arithmetic.** `getCurrentBlockTimestamp` under the `pending` tag
+    /// executes against an unsealed block whose header the node projects ~12s ahead on GIWA (L1's
+    /// block interval, most likely an `op-geth` default nobody adjusted for a one-second L2), which
+    /// pins quote age at a constant 12s and stamps `markout` references past `reference_at`'s
+    /// tolerance. Use [`crate::chain::heads::Head::timestamp`] for anything time-based: a *sealed*
+    /// header, lagging about a second, which over-states age in the safe direction. Kept for
+    /// logging, and because the block number beside it is the freshest available.
     pub block_timestamp: u64,
     /// One entry per configured pair.
     pub snaps: BTreeMap<u16, Snap>,
@@ -1218,35 +1057,24 @@ pub struct ChainView {
     /// What the RFQ maker could actually pay out per token: the **lesser** of its own balance and
     /// its allowance to `PmmSettle`. Empty when no maker is configured.
     ///
-    /// Separate from [`Self::balances`], and the separation is the point. `PmmSettle` custodies
-    /// nothing and pulls both legs with `transferFrom` from the *maker*, so the pool's inventory
-    /// says nothing about what an RFQ order can settle — they are different addresses. Sizing an
-    /// RFQ quote against the pool's balance means signing orders that revert at fill time, which
-    /// costs the taker gas and tells them nothing useful.
+    /// Separate from [`Self::balances`] because `PmmSettle` custodies nothing and pulls both legs
+    /// with `transferFrom` from the *maker*, a different address from the pool. Sizing an RFQ quote
+    /// against the pool's balance signs orders that revert at fill time.
     pub maker_deliverable: BTreeMap<Address, u128>,
-    /// The most recent **sealed** block, as `(number, timestamp)`.
+    /// The most recent **sealed** block, as `(number, timestamp)`. The clock.
     ///
-    /// The clock. Not [`Self::block_timestamp`], which comes from the `pending` tag and lands about
-    /// twelve seconds in the future; and not the `newHeads` subscription either, which is where it
-    /// used to come from and which dies with whatever key it is on. Six of seven keys exhausted
-    /// today, the socket went with them, and `chain_now` silently fell back to the host clock --
-    /// so quote age, markout stamps and `scan_fills` all quietly stopped meaning anything.
-    ///
-    /// Read here instead because the reader is already making a round trip on a keyless endpoint
-    /// every 330ms. `newHeads` remains as the fast wake signal it is good at; it is no longer the
-    /// only source of the time.
+    /// Not [`Self::block_timestamp`], which is a projection into the future; and not the `newHeads`
+    /// subscription, which dies with whatever key it is on and takes quote age, markout stamps and
+    /// `scan_fills` with it. Read here because the reader is already making a keyless round trip
+    /// every 330ms, which leaves `newHeads` as the fast wake signal it is good at.
     pub sealed: Option<(u64, u64)>,
     /// Our own confirmed nonce, when a sender was configured.
     ///
-    /// This is what says a transaction has landed, and it says so exactly: nonce ordering is
-    /// absolute for one sender, so a confirmed nonce above a pending transaction's own proves that
-    /// transaction is on chain, however many others are in flight beside it.
-    ///
-    /// It exists because asking for receipts did not scale to the quote cadence. The receipt calls
-    /// competed with quote traffic for the same rate limit, and measured, that made transactions
-    /// which had actually landed in ~570ms get reported 2.5s later -- so the in-flight gate refused
-    /// to re-quote 14.7% of the time over a queue that was already empty. This arrives with a read
-    /// the reader was making anyway.
+    /// What says a transaction has landed, exactly: nonce ordering is absolute for one sender, so a
+    /// confirmed nonce above a pending transaction's proves that transaction is on chain however
+    /// many others are in flight beside it. Receipts do not scale to the quote cadence — they
+    /// compete for the same rate limit, reporting a ~570ms landing 2.5s later — whereas this
+    /// arrives with a read the reader was making anyway.
     pub sender_nonce: Option<u64>,
     /// When this view was received locally.
     pub at: Instant,
@@ -1260,28 +1088,22 @@ impl ChainView {
     }
 }
 
-// ---------------------------------------------------------------------------
-// The read
-// ---------------------------------------------------------------------------
+// --- The read ---
 
-/// Batches everything one cycle needs into a single `eth_call`.
-///
-/// Named for what it does rather than when it runs: this used to be `ChainPoller` and it is no
-/// longer driven by a poll. It runs on a `newHeads` notification, and on the fallback timer when
-/// heads have gone quiet.
+/// Batches everything one cycle needs into a single `eth_call`. Runs on a `newHeads` notification,
+/// and on the fallback timer when heads have gone quiet.
 pub struct ChainReader {
     pool: Address,
     multicall: Address,
     pair_ids: Vec<u16>,
     tokens: Vec<Address>,
-    /// `(maker, settler)` when the RFQ leg is on. Its presence is what puts the two extra reads
-    /// per token at the end of the batch, so it is also what `read` dispatches on when decoding.
+    /// `(maker, settler)` when the RFQ leg is on. Its presence appends two reads per token to the
+    /// batch, so it is also what `read` dispatches on when decoding.
     maker: Option<(Address, Address)>,
     /// The transaction sender, when the caller wants its confirmed nonce read alongside the state.
     ///
     /// Read on the **`latest`** tag, never `pending`: `pending` counts our own unconfirmed
-    /// transactions, so it would report every in-flight send as already landed and free the gate
-    /// instantly, which is the exact opposite of what this is for.
+    /// transactions, so it would report every in-flight send as landed and free the gate instantly.
     sender: Option<Address>,
     calldata: Bytes,
 }
@@ -1290,8 +1112,8 @@ impl ChainReader {
     /// Build the reader and precompute its calldata.
     ///
     /// The call list is fixed for the process lifetime, so it is encoded once: two Multicall3
-    /// helpers, then one `snapshot` per pair, then one `balanceOf` per token. Order is the
-    /// decode contract.
+    /// helpers, one `snapshot` per pair, one `balanceOf` per token. That order is the decode
+    /// contract.
     #[must_use]
     pub fn new(
         pool: Address,
@@ -1304,9 +1126,8 @@ impl ChainReader {
 
     /// The same reader, plus the two reads that say what the RFQ maker can deliver.
     ///
-    /// Folded into the existing batch rather than fetched separately: it is the same block, and a
-    /// deliverable read at a different block than the inventory it is compared against would be a
-    /// view that never existed.
+    /// Folded into the existing batch rather than fetched separately: a deliverable read at a
+    /// different block from the inventory it is compared against is a view that never existed.
     #[must_use]
     pub fn with_maker(
         pool: Address,
@@ -1396,24 +1217,18 @@ impl ChainReader {
 
     /// Read everything one cycle needs. Exactly one RPC request, whatever the pair count.
     ///
-    /// Uses the `pending` tag, which on the flashblocks endpoint is the ~200ms preconfirmed
-    /// state. That is *fresher than the head that triggered this call* — the head is a confirmed
-    /// block at 1s, and preconfirmed state at 200ms already reflects swaps that block does not.
-    /// It matters concretely: a swap that has been preconfirmed but not yet included has already
-    /// moved `bidUsed`/`askUsed`, and quoting against the pre-swap usage would compute the
-    /// executable top at a point on the ladder the pool has already walked past.
+    /// Uses the `pending` tag, which on the flashblocks endpoint is the ~200ms preconfirmed state,
+    /// *fresher than the head that triggered this call*: a preconfirmed swap has already moved
+    /// `bidUsed`/`askUsed`, and quoting against pre-swap usage puts the executable top at a point
+    /// on the ladder the pool has already walked past.
     ///
     /// # Errors
-    /// [`RpcError`] — including the two that never leave the process.
-    /// Indexing into `results` is bounded by `decode_batch`, which rejects any length other than
-    /// the exact one asked for on the line above. The bound is local and explicit rather than an
-    /// invariant held somewhere else, which is why it is exempted here and not suppressed
-    /// crate-wide.
+    /// [`RpcError`]. Indexing into `results` is bounded by the `decode_batch` above, which rejects
+    /// any length but the one asked for.
     #[allow(clippy::indexing_slicing)]
     pub async fn read(&self, rpc: &Rpc) -> Result<ChainView, RpcError> {
-        // Issued together rather than in sequence. The nonce is not part of the multicall -- it is
-        // account state, not contract state -- so it costs a second request, and paying for it
-        // serially would add a round trip to the interval that decides how fast the gate reopens.
+        // Concurrent, not serial: the nonce is account state so it cannot join the multicall, and
+        // a serial round trip lands in the interval that decides how fast the gate reopens.
         let nonce_call = async {
             match self.sender {
                 Some(a) => rpc
@@ -1428,20 +1243,13 @@ impl ChainReader {
                 None => None,
             }
         };
-        // The sealed head, on the same trip. One more request on a keyless endpoint, against a
-        // websocket that costs a key and takes the clock with it when that key runs out.
+        // The sealed head, on the same trip: one keyless request, against a websocket that costs a
+        // key and takes the clock with it when that key runs out.
         let sealed_call = async {
             rpc.call("eth_getBlockByNumber", serde_json::json!(["latest", false]))
                 .await
                 .ok()
-                .and_then(|v| {
-                    let hex = |k: &str| {
-                        v.get(k)
-                            .and_then(serde_json::Value::as_str)
-                            .and_then(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok())
-                    };
-                    Some((hex("number")?, hex("timestamp")?))
-                })
+                .and_then(|v| read_sealed(&v))
         };
         let (raw, sender_nonce, sealed) = tokio::join!(
             rpc.eth_call(self.multicall, &self.calldata, "pending"),
@@ -1480,9 +1288,9 @@ impl ChainReader {
             );
         }
 
-        // What the RFQ maker could pay out, per token: the lesser of what it holds and what it has
-        // let `PmmSettle` pull. Either being short is the same failure, because the settler
-        // custodies nothing and issues a `transferFrom` against the maker's own balance.
+        // The lesser of what the maker holds and what it has let `PmmSettle` pull: either being
+        // short is the same failure, since the settler custodies nothing and pulls with
+        // `transferFrom` against the maker's own balance.
         let mut maker_deliverable = BTreeMap::new();
         if self.maker.is_some() {
             let base = 2 + self.pair_ids.len() + self.tokens.len();
@@ -1514,12 +1322,22 @@ impl ChainReader {
     }
 }
 
+/// `(number, timestamp)` out of an `eth_getBlockByNumber` result. `None` unless both are present.
+fn read_sealed(block: &serde_json::Value) -> Option<(u64, u64)> {
+    let hex = |k: &str| {
+        block
+            .get(k)
+            .and_then(serde_json::Value::as_str)
+            .and_then(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok())
+    };
+    Some((hex("number")?, hex("timestamp")?))
+}
+
 /// Decode an `aggregate3` response and insist every sub-call succeeded.
 ///
 /// `allowFailure` is `false` on every call this crate builds, so a revert should surface as a
-/// reverted `eth_call` rather than a `false` here — but a partial batch decoding into a
-/// zero-filled snapshot is the kind of silent wrong answer that ends up quoted, so the length
-/// and the success flags are both checked rather than assumed.
+/// reverted `eth_call` rather than a `false` here. Length and flags are checked anyway, because a
+/// partial batch decodes into a zero-filled snapshot and gets quoted.
 fn decode_batch(raw: &[u8], expected: usize) -> Result<Vec<abi::Call3Result>, RpcError> {
     let results = abi::aggregate3Call::abi_decode_returns(raw)
         .map_err(|e| decode_err("aggregate3 results", e))?;
@@ -1538,9 +1356,7 @@ fn decode_batch(raw: &[u8], expected: usize) -> Result<Vec<abi::Call3Result>, Rp
     Ok(results)
 }
 
-// ---------------------------------------------------------------------------
-// Startup verification
-// ---------------------------------------------------------------------------
+// --- Startup verification ---
 
 /// What the chain says about the configured pairs, and whether the config agrees.
 #[derive(Debug, Clone)]
@@ -1557,46 +1373,25 @@ pub struct ChainFacts {
     pub nav_decimals: u8,
 }
 
-/// Read the immutable facts and check the config against them.
-///
-/// This is where every check that needs the chain lives, and it runs before the loop starts.
-/// The checks are the ones whose failure mode is silent:
-///
-/// * a `pair_id` that does not exist would poll a zeroed snapshot forever;
-/// * `base_decimals` off by one prices the pair by a factor of ten;
-/// * a `heartbeat_secs` at or above the pool's own `maxStaleSecs` means the quote expires
-///   before the heartbeat re-posts it, so the pool stops quoting between pushes — the exact
-///   condition this bot exists to prevent;
-/// * pairs with different quote tokens cannot share one NAV, so the killswitches would be
-///   measuring an incoherent number.
-///
-/// # Errors
-/// [`RpcError`] for a failed read, or [`RpcError::Decode`] carrying the mismatch.
-/// Indexing into `res` is bounded by `decode_batch` on the line that produced it, which rejects
-/// any length but the exact one requested. The `BTreeMap` indexes below are over maps this
-/// function has just built from the same `pair_ids` and token list it is now iterating.
-#[allow(clippy::indexing_slicing)]
-pub async fn verify_against_chain(
-    rpc: &Rpc,
+/// Round one's call list: `pairCount`, `updater`, every `pairConfig`, then every
+/// `effectiveCapacity`. The last group is here only for its `decaySecs`, which `pairConfig` does
+/// not carry; the order is what [`verify_against_chain`]'s indexes decode against.
+fn verify_against_chain_calls(
     pool: Address,
-    multicall: Address,
-    cfg: &crate::config::Config,
-) -> Result<ChainFacts, RpcError> {
-    // Round one: pairCount, updater, every pairConfig, then every effectiveCapacity. The last
-    // group is only here for its `decaySecs`, which `pairConfig` does not carry.
-    let mut calls = vec![
-        abi::Call3 {
+    pairs: &[crate::config::PairConfig],
+) -> Vec<abi::Call3> {
+    let mut calls = Vec::with_capacity(2 + 2 * pairs.len());
+    for call_data in [
+        abi::pairCountCall {}.abi_encode(),
+        abi::updaterCall {}.abi_encode(),
+    ] {
+        calls.push(abi::Call3 {
             target: pool,
             allowFailure: false,
-            callData: abi::pairCountCall {}.abi_encode().into(),
-        },
-        abi::Call3 {
-            target: pool,
-            allowFailure: false,
-            callData: abi::updaterCall {}.abi_encode().into(),
-        },
-    ];
-    for p in &cfg.pairs {
+            callData: call_data.into(),
+        });
+    }
+    for p in pairs {
         calls.push(abi::Call3 {
             target: pool,
             allowFailure: false,
@@ -1605,7 +1400,7 @@ pub async fn verify_against_chain(
                 .into(),
         });
     }
-    for p in &cfg.pairs {
+    for p in pairs {
         calls.push(abi::Call3 {
             target: pool,
             allowFailure: false,
@@ -1614,6 +1409,41 @@ pub async fn verify_against_chain(
                 .into(),
         });
     }
+    calls
+}
+
+/// Every distinct token across the configured pairs, in first-seen order.
+fn verify_against_chain_tokens(configs: &BTreeMap<u16, abi::PairConfigAbi>) -> Vec<Address> {
+    let mut tokens: Vec<Address> = Vec::new();
+    for c in configs.values() {
+        for t in [c.base, c.quote] {
+            if !tokens.contains(&t) {
+                tokens.push(t);
+            }
+        }
+    }
+    tokens
+}
+
+/// Read the immutable facts and check the config against them, before the loop starts.
+///
+/// Every check has a silent failure mode: a `pair_id` that does not exist polls a zeroed snapshot
+/// forever; `base_decimals` off by one prices the pair by a factor of ten; a `heartbeat_secs` at or
+/// above the pool's `maxStaleSecs` lets the quote expire between pushes; pairs with different quote
+/// tokens cannot share one NAV.
+///
+/// # Errors
+/// [`RpcError`] for a failed read, or [`RpcError::Decode`] carrying the mismatch. Indexing into
+/// `res` is bounded by the `decode_batch` that produced it, and the `BTreeMap` indexes are over
+/// maps this function just built from the list it is iterating.
+#[allow(clippy::indexing_slicing)]
+pub async fn verify_against_chain(
+    rpc: &Rpc,
+    pool: Address,
+    multicall: Address,
+    cfg: &crate::config::Config,
+) -> Result<ChainFacts, RpcError> {
+    let calls = verify_against_chain_calls(pool, &cfg.pairs);
     let raw = rpc
         .eth_call(
             multicall,
@@ -1657,14 +1487,7 @@ pub async fn verify_against_chain(
     }
 
     // Round two: decimals() for every distinct token.
-    let mut tokens: Vec<Address> = Vec::new();
-    for c in configs.values() {
-        for t in [c.base, c.quote] {
-            if !tokens.contains(&t) {
-                tokens.push(t);
-            }
-        }
-    }
+    let tokens = verify_against_chain_tokens(&configs);
     let calls: Vec<_> = tokens
         .iter()
         .map(|&t| abi::Call3 {
@@ -1763,10 +1586,8 @@ pub async fn verify_against_chain(
 #[cfg(test)]
 mod tests {
 
-    /// The three `-32000` occupants must not be confused for one another. All three arrive under the
-    /// same code and only the text separates them, so a predicate that drifts here silently turns an
-    /// acceptance into an alert, a backpressure signal into a per-transaction failure, or a nonce
-    /// resync into neither.
+    /// The three `-32000` occupants share a code and only the text separates them, so a predicate
+    /// that drifts turns an acceptance into an alert, or a resync into neither.
     #[test]
     fn the_generic_error_bucket_is_separated_by_its_text() {
         let node = |m: &str| RpcError::Node {
@@ -1782,7 +1603,7 @@ mod tests {
         assert!(low.is_nonce_too_low());
         assert!(!low.is_already_known());
 
-        // Neither, and specifically not "already known" — this one really is a failed send.
+        // Neither, and specifically not "already known": this one is a failed send.
         let under = node("replacement transaction underpriced");
         assert!(!under.is_already_known());
         assert!(!under.is_nonce_too_low());
@@ -1810,8 +1631,7 @@ mod tests {
 
     #[test]
     fn usage_reads_as_zero_across_a_generation_boundary() {
-        // Exactly the live pool's shape: capGen 14, usedGen 13, and a large raw ask counter
-        // that the pool itself ignores.
+        // A live-pool shape: capGen 14, usedGen 13, and a raw ask counter the pool ignores.
         let stale = snap(14, 13, 0, 499_438_326_634_891_408_781);
         assert_eq!(
             stale.ask_used(),
@@ -1824,8 +1644,7 @@ mod tests {
         assert_eq!(current.ask_used(), 499_438_326_634_891_408_781);
     }
 
-    /// The two ends of the ramp are exact by construction on chain, so they are exact here.
-    /// `PropPool._decayed`'s own doc comment says this is worth checking rather than assuming.
+    /// Both ends of the ramp are exact by construction on chain, so they are exact here.
     #[test]
     fn the_ramp_is_exact_at_both_of_its_ends() {
         let cap = 1_000_000_000_000_000_000_000;
@@ -1839,7 +1658,7 @@ mod tests {
 
     #[test]
     fn a_zero_window_disables_the_ramp_entirely() {
-        // Live pair 3's shape: no ramp, so age must not touch capacity at any age.
+        // No ramp, so age must not touch capacity at any age.
         let cap = 1_000_000_000_000_000_000_000;
         assert_eq!(decayed(cap, 0, 0), cap);
         assert_eq!(decayed(cap, 86_400, 0), cap);
@@ -1850,7 +1669,6 @@ mod tests {
     fn the_ramp_floors_rather_than_rounds() {
         // 100 * 23 / 30 = 76.66..., and the pool keeps the 0.66.
         assert_eq!(decayed(100, 7, 30), 76);
-        // Same shape at the live pair's capacity: 1000e18 * 23 / 30.
         assert_eq!(
             decayed(1_000_000_000_000_000_000_000, 7, 30),
             766_666_666_666_666_666_666
@@ -1972,13 +1790,8 @@ mod tests {
         assert_eq!(l.rate_limit_events, 6);
     }
 
-    /// A quota refusal must move the pool to the next key, not end the call.
-    ///
-    /// This is the regression that stopped the bot starting at all: `403 API usage quota has been
-    /// exceeded` arrives as a JSON-RPC error object, so it read as "the node refused this request"
-    /// -- the one class the pool deliberately does not retry, because another node would refuse it
-    /// identically. For a quota that reasoning is exactly inverted: the refusal is about the key,
-    /// and six working keys were sitting behind the one that hit its limit.
+    /// A quota refusal arrives as a JSON-RPC error object, which the pool otherwise treats as "the
+    /// node refused this request" — but it is about the key, so the other keys answer fine.
     #[test]
     fn a_quota_refusal_is_the_endpoints_fault_not_the_requests() {
         let quota = RpcError::Node {
@@ -2000,8 +1813,8 @@ mod tests {
             );
         }
 
-        // And the ordinary case is unchanged: a malformed request is malformed everywhere, and
-        // retrying it on the transmit path would be a second broadcast of the same intent.
+        // The ordinary case is unchanged: a malformed request is malformed everywhere, and a
+        // retry on the transmit path would be a second broadcast of the same intent.
         let bad = RpcError::Node {
             endpoint: "rpc",
             code: -32000,
@@ -2013,9 +1826,8 @@ mod tests {
         );
     }
 
-    /// The same bug, second spelling. `403` was whitelisted this morning; GIWA's public endpoint
-    /// answers `-32016 over rate limit`, which was not, so the pool gave up on the first endpoint
-    /// again -- with seven alternatives configured and idle.
+    /// The same rule in other spellings: a code off the list makes the pool give up on the first
+    /// endpoint with the rest sitting idle.
     #[test]
     fn a_rate_limit_refusal_fails_over_whatever_the_venue_calls_it() {
         for code in [-32016, -32005, 429] {
@@ -2052,7 +1864,7 @@ mod tests {
             ChainStatus::Down { stale_secs: 300 }
         );
 
-        // A read at a new block at any point returns to healthy.
+        // A read at a new block returns to healthy.
         h.on_read(t0 + Duration::from_secs(300), 1_001);
         assert_eq!(
             h.status(t0 + Duration::from_secs(301)),
@@ -2073,9 +1885,8 @@ mod tests {
 
     #[test]
     fn a_frozen_chain_escalates_even_though_every_read_succeeds() {
-        // The hole the block-number signal closes. Every `eth_call` lands, so the old
-        // "did the RPC reply" test says Healthy forever, while the chain has not produced a
-        // block in ten minutes and the bot happily quotes into it.
+        // The hole the block-number signal closes: every `eth_call` lands, so "did the RPC reply"
+        // says Healthy forever while the chain has produced no block.
         let t0 = Instant::now();
         let mut h = ChainHealth::new(t0, 30, 300);
         h.on_read(t0, 5_000);
@@ -2109,8 +1920,8 @@ mod tests {
 
         let now = t0 + Duration::from_secs(40);
         assert_eq!(h.status(now), ChainStatus::Degraded { stale_secs: 40 });
-        // Both references are the same instant here, so the tie must resolve to the endpoint
-        // rather than accusing the chain of stopping.
+        // Both references are the same instant, so the tie must resolve to the endpoint rather
+        // than accuse the chain of stopping.
         assert_eq!(h.stall(now), Stall::Reads);
         assert_eq!(h.consecutive_failures(), 1);
         assert!(h.last_error().is_some());
@@ -2127,8 +1938,8 @@ mod tests {
             5_000,
             "a lagging replica must not rewind the high-water mark"
         );
-        // Staleness runs from the QUIETER signal, which is progress at t0 rather than the read
-        // at t0+1s — so a stream of reads that never advance cannot mask a stalled chain.
+        // Staleness runs from the quieter signal, so a stream of reads that never advance cannot
+        // mask a stalled chain.
         assert_eq!(
             h.status(t0 + Duration::from_secs(40)),
             ChainStatus::Degraded { stale_secs: 40 }
@@ -2159,7 +1970,7 @@ mod tests {
             vec![1, 2],
             vec![Address::repeat_byte(1), Address::repeat_byte(2)],
         );
-        // Decoding our own calldata proves the layout the read's decoder assumes.
+        // Decoding our own calldata pins the layout the read's decoder assumes.
         let decoded = abi::aggregate3Call::abi_decode(&p.calldata).unwrap();
         assert_eq!(decoded.calls.len(), 6, "2 helpers + 2 pairs + 2 tokens");
         assert_eq!(decoded.calls[0].target, mc);

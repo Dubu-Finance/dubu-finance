@@ -1,4 +1,12 @@
-import { createPublicClient, encodeFunctionData, decodeFunctionResult, fallback, http, type Address, type PublicClient } from 'viem';
+import {
+  createPublicClient,
+  encodeFunctionData,
+  decodeFunctionResult,
+  fallback,
+  http,
+  type Address,
+  type PublicClient,
+} from 'viem';
 
 import { ERC20_ABI, MULTICALL3_ABI, UNIV2_ROUTER_ABI } from './abi.js';
 import { MULTICALL3, type Config } from './config.js';
@@ -6,42 +14,24 @@ import { MULTICALL3, type Config } from './config.js';
 /**
  * What each venue will pay for a given input, and the best way to divide the input between them.
  *
- * # The split is searched, not derived
+ * The split is searched, not derived: a grid of splits is evaluated against the venues' own
+ * answers rather than against curves reimplemented here, because a second implementation of a
+ * curve can disagree with the first and the disagreements get found by users, not by tests.
  *
- * The obvious implementation reimplements each venue's curve here and solves for the optimum. This
- * one asks the venues instead: it evaluates a grid of splits and takes the best. That is slower by
- * one round trip and better for a reason that has already bitten this codebase once — a curve
- * reimplemented for the aggregator is a second implementation that can disagree with the first, and
- * the disagreements are found by users rather than by tests.
+ * UniV2 answers `getAmountsOut` inside a Multicall3 batch; the prop pool answers one POST to
+ * [`Config.propQuoteUrl`] carrying all eleven grid amounts. That is still the venue's own
+ * arithmetic — the engine prices from `dubu-core`'s `curve.rs`, an exact integer port of
+ * `PropCurve.sol` asserted against the Solidity in `contracts/test/PropCurve.t.sol`. Pricing the
+ * pool on chain needed `blockTag: 'pending'` to see a quote published inside the current block,
+ * and GIWA serves pending state and pending timestamp inconsistently: a `block.timestamp` ahead of
+ * the state whose `updatedAt` it is compared against makes `PropPool` return `STATUS_STALE` and
+ * pay zero on every pair. There is deliberately no on-chain fallback — an unreachable engine shows
+ * as prop being unavailable, not as a second and differently-wrong price.
  *
- * # The two venues are asked over different transports
- *
- * UniV2 is asked through `getAmountsOut` in a Multicall3 batch. The prop pool is asked over HTTP,
- * of the engine that quotes it: one POST to [`Config.propQuoteUrl`] carrying all eleven grid
- * amounts.
- *
- * That is not a weakening of the rule above. The engine prices from `dubu-core`'s `curve.rs`, an
- * exact integer port of `PropCurve.sol` whose vectors are asserted against the Solidity in
- * `contracts/test/PropCurve.t.sol`. The answer still comes from the venue's own arithmetic, and
- * there is still no curve authored here — what changed is the transport the question travels over,
- * not who answers it.
- *
- * The move off `eth_call` was forced. Pricing the pool needed `blockTag: 'pending'` to see a quote
- * the maker had published inside the current block, and GIWA's node serves pending STATE and
- * pending TIMESTAMP inconsistently: a `block.timestamp` running 6s ahead of a state whose
- * `updatedAt` had advanced 2s made `PropPool` compute a 5s quote age against a 5s `maxStaleSecs`,
- * return `STATUS_STALE`, and pay 0 on every pair. The engine knows how old its own quote is without
- * asking a node what time it is. Quoting a maker over HTTP is also what 0x, 1inch and Hashflow all
- * do. There is deliberately no on-chain fallback: an unreachable engine shows as prop being
- * unavailable, not as a second and differently-wrong price.
- *
- * Either way the search needs no special case for the epoch capacity, the staleness ramp, a paused
- * pair, or anything else the pool might do next. Those all show up as the venue quoting less, or
- * quoting zero, which the grid handles without knowing why.
- *
- * The grid is coarse on purpose. Between two adjacent points the curve is smooth and nearly flat
- * near the optimum, and the gain from refining is smaller than the price move during the round
- * trip that refining costs.
+ * The search needs no special case for epoch capacity, the staleness ramp or a paused pair: all of
+ * those show up as the venue quoting less, or quoting zero. The grid is coarse because near the
+ * optimum the curve is nearly flat, and refining gains less than the price moves during the extra
+ * round trip.
  */
 
 /** Splits evaluated, as the share of input sent to the prop pool. */
@@ -60,15 +50,12 @@ export interface Leg {
 }
 
 /**
- * A refusal the prop venue named, as opposed to one inferred from it paying nothing.
- *
- * One member today, and a union rather than a boolean because the engine has a whole vocabulary of
- * these (`no-market`, `not-ready`, `size-out-of-range`) and the next one worth telling apart should
- * cost a member, not a second flag. Same shape and same reasoning as `RfqRejection`.
+ * A refusal the prop venue named, as opposed to one inferred from it paying nothing. A union
+ * rather than a boolean: the engine has a vocabulary of these (`no-market`, `not-ready`,
+ * `size-out-of-range`) and the next one worth telling apart should cost a member, not a flag.
  */
 export type PropRefusal = 'no-capacity';
 
-/** What the prop venue answered for the whole grid, and what it said about answering that way. */
 export interface PropGrid {
   /** One amount per grid point, in the order asked. Zeros whenever the venue could not be used. */
   amountsOut: bigint[];
@@ -82,28 +69,17 @@ export interface AmmQuote {
   amountOut: bigint;
   /** Each venue alone at the full size, for the response to show its work. */
   solo: Record<VenueId, bigint>;
-  /** True when the winner uses both venues. */
   split: boolean;
-  /**
-   * [`PropGrid.refused`], carried through so the HTTP layer can tell a venue that is between
-   * prices from one that is absent. The split search never sets it: the search sees amounts, and
-   * this is a fact about why the amounts are what they are.
-   */
+  /** [`PropGrid.refused`], carried through so the HTTP layer can tell a venue that is between
+   *  prices from one that is absent. The split search never sets it: it sees amounts only. */
   propRefused: PropRefusal | null;
 }
 
 export function makeClient(cfg: Config): PublicClient {
-  // `fallback`, not a single endpoint, and the reason is a live incident rather than a precaution.
-  //
-  // The worker read one URL. When GIWA's public RPC rate-limited us -- `-32016 over rate limit`,
-  // reproduced by hand on both public endpoints -- the multicall failed, `allowFailure: true`
-  // turned that into `success: false`, `decodeProp` returned 0n, and the pool showed as `prop: —`.
-  // Not "the pool is down": the pool was quoting, one second old, at a price 0.2% off the
-  // reference. It simply could not be read, and a silent zero is indistinguishable from no quote.
-  //
-  // viem's fallback transport moves to the next URL on error and ranks by observed latency, so a
-  // throttled endpoint stops being asked. `rank` is off: reordering during a burst would spread the
-  // burst across every endpoint rather than draining one and moving on.
+  // `fallback` rather than one endpoint: when GIWA's public RPC rate-limits, the multicall fails,
+  // `allowFailure: true` turns that into `success: false`, and the venue decodes as 0n — a silent
+  // zero indistinguishable from a pool that is not quoting. `rank` is off because reordering
+  // during a burst spreads the burst across every endpoint rather than draining one.
   const urls = [cfg.rpcUrl, ...cfg.fallbackRpcUrls].filter((u, i, a) => u && a.indexOf(u) === i);
   return createPublicClient({
     transport: fallback(
@@ -114,13 +90,11 @@ export function makeClient(cfg: Config): PublicClient {
 }
 
 /**
- * Every grid point, priced at both venues. Two round trips that leave together, not one after the
- * other — the multicall and the prop request are the same wall-clock second.
+ * Every grid point, priced at both venues, in two round trips that leave together.
  *
- * `allowFailure` is set on every call in the batch, and the prop leg degrades by hand to match. A
- * venue that reverts, times out, or answers nonsense must cost its own leg and nothing else:
- * voiding the whole quote would turn one venue's outage into no quote at all, which is the opposite
- * of what an aggregator is for. [`quotePropGrid`] therefore has no throwing path.
+ * `allowFailure` is set on every call in the batch and the prop leg degrades by hand to match: a
+ * venue that reverts, times out or answers nonsense must cost its own leg and nothing else, so
+ * [`quotePropGrid`] has no throwing path.
  */
 export async function quoteAmms(
   client: PublicClient,
@@ -149,71 +123,50 @@ export async function quoteAmms(
       abi: MULTICALL3_ABI,
       functionName: 'aggregate3',
       args: [calls],
-      // Sealed `latest`, which is viem's default and so is stated by omission. `pending` used to be
-      // set here, for the prop pool alone: preconfirmed state was the only way to see a quote the
-      // maker had published within the current block. The prop pool is no longer read this way (see
-      // the note on transports above), and for a constant-product pool `pending` bought nothing --
-      // UniV2 reserves move when a trade seals, not when the maker re-quotes, and a sealed read is
-      // the consistent one. Reading pending state also cost correctness on GIWA rather than just
-      // buying freshness, which is the whole reason this multicall is now UniV2-only.
+      // Sealed `latest`, viem's default, so stated by omission. For a constant-product pool
+      // `pending` buys nothing — reserves move when a trade seals, not when the maker re-quotes —
+      // and on GIWA it costs correctness (see the header).
     }),
     quotePropGrid(cfg, tokenIn, tokenOut, toProp, fetchImpl),
   ]);
   const results = raw as readonly { success: boolean; returnData: `0x${string}` }[];
 
-  // The same search `chooseSplit` runs against hand-written arrays in the tests, run against these
-  // ones. Both venues now hand back a plain array per grid point, so there is no second copy of the
-  // search to keep in step with the tested one.
+  // The same search the tests run against hand-written arrays: no second copy to keep in step.
   const best = chooseSplit(
     amountIn,
     prop.amountsOut,
     results.map((r) => decodeUniv2(r)),
   );
-  // Attached here rather than passed into the search, which has no use for it and would have to
-  // carry it untouched through every branch.
   return { ...best, propRefused: prop.refused };
 }
 
 /**
- * How long the prop venue gets to answer.
- *
- * Two seconds: several times the engine's own ~415ms quote cycle, and short enough that a hung
- * maker costs a slower quote rather than a failed one. It runs concurrently with the multicall, so
- * it bounds the quote's latency rather than adding to it.
+ * How long the prop venue gets to answer: several times the engine's own ~415ms quote cycle, and
+ * short enough that a hung maker costs a slower quote rather than a failed one. It runs
+ * concurrently with the multicall, so it bounds the quote's latency rather than adding to it.
  */
 const PROP_QUOTE_TIMEOUT_MS = 2_000;
 
 /**
- * An `observedAgeMs` past which the engine's view of the chain is worth a log line.
- *
- * Five seconds, matching `PropPool`'s own `maxStaleSecs` so the number means the same thing in both
- * places. A threshold for noticing, not for refusing — see [`quotePropGrid`].
+ * An `observedAgeMs` past which the engine's view of the chain is worth a log line. Matches
+ * `PropPool`'s own `maxStaleSecs` so the number means the same thing in both places. A threshold
+ * for noticing, not for refusing — see [`quotePropGrid`].
  */
 const PROP_OBSERVED_AGE_SUSPECT_MS = 5_000;
 
 /**
- * The prop venue's price for every grid amount, in one request.
+ * The prop venue's price for every grid amount, in one request. Never throws and never rejects: an
+ * unreachable engine, a non-2xx, a body of the wrong shape or length, an entry that is not a whole
+ * non-negative integer — all of it degrades to zeros, which the grid reads as the venue refusing
+ * every size and routes around, the same bargain `allowFailure` makes for the on-chain legs. A zero
+ * *from* the engine is that same refusal at one size (capacity spent, out of domain, under the
+ * minimum price), not a failure.
  *
- * Never throws and never rejects. An unreachable engine, a non-2xx, a body of the wrong shape, an
- * `amountsOut` of the wrong length, an entry that is not a whole non-negative integer — all of it
- * degrades to zeros, which the grid reads as the venue refusing every size and routes around. The
- * alternative is one HTTP failure taking down a quote UniV2 could have served, which is the same
- * bargain `allowFailure` makes for the on-chain legs.
+ * Exactly one degradation is labelled: a 503 carrying `no-capacity` is the engine withdrawing the
+ * side while it re-prices, over in tens of seconds, where everything else here is indefinite. The
+ * label changes no routing, so an engine that does not send the code behaves as it did before.
  *
- * A zero *from* the engine is not a failure but that same refusal at one size: capacity spent, out
- * of domain, under the minimum price. It is the venue's answer, and it is the answer the old
- * `getAmountOut` gave for those cases too.
- *
- * One of those degradations is labelled on the way past, and only one. A 503 carrying
- * `no-capacity` is the engine saying it withdrew the side while it re-prices, which is over in
- * tens of seconds; everything else that lands on zeros here is indefinite, and the two were
- * indistinguishable to a caller until this existed. The label changes no routing — the amounts are
- * still zeros and UniV2 still wins any grid point it can serve — so an engine that does not send
- * the code, because it predates it or was rolled back, behaves exactly as it did before.
- *
- * Split out from [`quoteAmms`] and given an injectable `fetchImpl` for the same reason
- * `validateQuote` is split out of `requestQuote`: the interesting cases are hostile and malformed
- * responses, and they should be testable without a chain or a network.
+ * `fetchImpl` is injectable so hostile and malformed responses are testable without a network.
  */
 export async function quotePropGrid(
   cfg: Config,
@@ -235,37 +188,14 @@ export async function quotePropGrid(
         tokenOut,
         amountsIn: amountsIn.map((a) => a.toString()),
       }),
-      // A maker that stops answering must not become a quote that stops answering.
       signal: AbortSignal.timeout(PROP_QUOTE_TIMEOUT_MS),
     });
 
-    if (!res.ok) {
-      const declined = await res
-        .json()
-        .then((b) => (b as { error?: string } | null)?.error)
-        .catch(() => undefined);
-      // `no-market` and `not-ready` are the engine speaking, and they are normal. A non-2xx with no
-      // error body is almost always this side pointing at the wrong path, because PROP_QUOTE_URL is
-      // a full endpoint and nothing appends one. RFQ_MAKER_URL taught that lesson already: a 404
-      // from a bare host read as the maker declining, and the search went to the pricing instead of
-      // to the URL. The two are logged apart so that cannot happen twice.
-      warn(
-        declined
-          ? `engine declined (http ${res.status}): ${declined}; no prop leg`
-          : `http ${res.status} with no error body; no prop leg`,
-        declined ? undefined : 'PROP_QUOTE_URL must be the full endpoint, path included',
-      );
-      // The status is matched as well as the code, because this is a claim about *why* there is no
-      // depth: a `no-capacity` arriving on anything but a 503 is not the response that was agreed,
-      // and promising a taker a retry that never comes good is worse than saying nothing.
-      const refused: PropRefusal | null =
-        res.status === 503 && declined === 'no-capacity' ? 'no-capacity' : null;
-      return { amountsOut: zeros, refused };
-    }
+    if (!res.ok) return await quotePropGridRejected(res, zeros);
     body = await res.json();
   } catch (e) {
-    // DNS, TLS, a dropped connection, or the 2s abort. Never a refusal: the engine was not heard
-    // from at all, which is a different fact from it having no market.
+    // DNS, TLS, a dropped connection or the abort. Never a refusal: not being heard from is a
+    // different fact from having no market.
     warn('engine unreachable; no prop leg', String(e));
     return { amountsOut: zeros, refused: null };
   }
@@ -276,50 +206,63 @@ export async function quotePropGrid(
     return { amountsOut: zeros, refused: null };
   }
 
-  // `observedAgeMs` is an ELAPSED age off the engine's own monotonic clock, and it is never
-  // compared against `Date.now()`. An absolute timestamp crossing hosts is what silently killed the
-  // RFQ leg once: the maker stamped expiry from a clock running 2s slow, this side refused anything
-  // with under a second left, and every order read as expired while nothing looked broken. An
-  // elapsed age cannot carry that offset because it never leaves the clock that measured it.
-  //
-  // Logged, never enforced. The engine owns its staleness rules and already answers 0 for the sizes
-  // they disqualify; a second staleness opinion computed here is precisely the arithmetic that
-  // returned zero on every pair and forced this rewrite. (`quoteAgeSecs` is the chain-side age of
-  // the ladder, which is what the pool's own window is measured against; this one is how long ago
-  // the engine looked.)
+  // `observedAgeMs` is an ELAPSED age off the engine's own monotonic clock and must never be
+  // compared against `Date.now()`: an absolute timestamp crossing hosts carries the offset between
+  // the two clocks, which once made every RFQ order read as expired. (`quoteAgeSecs` is the
+  // chain-side age of the ladder, which the pool's own window is measured against; this is how
+  // long ago the engine looked.) Logged, never enforced — the engine owns its staleness rules and
+  // already answers 0 for the sizes they disqualify, and a second opinion computed here is the
+  // arithmetic that returned zero on every pair.
   const observedAgeMs = readObservedAgeMs(body);
   if (observedAgeMs !== null && observedAgeMs > PROP_OBSERVED_AGE_SUSPECT_MS) {
-    warn(`engine observation ${observedAgeMs}ms old`, 'quoted anyway — the engine decides its own staleness');
+    warn(
+      `engine observation ${observedAgeMs}ms old`,
+      'quoted anyway — the engine decides its own staleness',
+    );
   }
 
-  // A 200 makes no claim about capacity, including today's 200-with-zeros. Zeros here are the
-  // venue refusing every size, which is what they have always been.
+  // A 200 makes no claim about capacity: zeros here are the venue refusing every size.
   return { amountsOut, refused: null };
 }
 
-/** The engine's elapsed observation age, when it sent a usable one. Never fatal: a missing or
- *  unreadable age costs a log line, not the quote — the amounts are the contract, this is telemetry. */
+/** The non-2xx arm of [`quotePropGrid`]: always zeros, labelled only when the engine named it. */
+async function quotePropGridRejected(res: Response, zeros: bigint[]): Promise<PropGrid> {
+  const declined = await res
+    .json()
+    .then((b) => (b as { error?: string } | null)?.error)
+    .catch(() => undefined);
+  // A non-2xx with no error body is almost always a wrong path: `PROP_QUOTE_URL` is a full endpoint
+  // and nothing appends one. Named declines (`no-market`, `not-ready`) are normal, so the two are
+  // logged apart — a 404 reading as a refusal sends the search to the pricing.
+  warn(
+    declined
+      ? `engine declined (http ${res.status}): ${declined}; no prop leg`
+      : `http ${res.status} with no error body; no prop leg`,
+    declined ? undefined : 'PROP_QUOTE_URL must be the full endpoint, path included',
+  );
+  // The status is matched as well as the code: `no-capacity` on anything but a 503 is not the
+  // agreed response, and promising a retry that never comes good is worse than saying nothing.
+  const refused: PropRefusal | null =
+    res.status === 503 && declined === 'no-capacity' ? 'no-capacity' : null;
+  return { amountsOut: zeros, refused };
+}
+
+/** A missing or unreadable age costs a log line, not the quote: this is telemetry, not contract. */
 function readObservedAgeMs(body: unknown): number | null {
   const v = (body as { observedAgeMs?: unknown }).observedAgeMs;
   return typeof v === 'number' && Number.isFinite(v) && v >= 0 ? v : null;
 }
 
-/** One line per prop-quote event worth an operator's attention, each naming its own outcome so the
- *  facts do not collapse together — "the engine declined", "the engine was not reached" and "the
- *  engine answered something else" point at three different things to go and fix, and an earlier
- *  version of this problem on the RFQ leg reported all of them as the maker declining.
- *
- *  The URL is never logged: it is a secret in every deployment that has one. */
+/** Each outcome names itself — declined, not reached, and answered something else point at three
+ *  different things to fix. The URL is never logged: it is a secret in every deployment. */
 function warn(reason: string, detail?: string): void {
   console.warn(`prop quote: ${reason}${detail ? ` — ${detail}` : ''}`);
 }
 
 /**
- * `amountsOut`, or `null` if the body is not the shape that was agreed.
- *
- * All-or-nothing on purpose. One entry this code cannot read means the response is not the contract
- * it claims to be, and the rest of it is unverified rather than merely partial — salvaging the
- * readable entries would route real input on the strength of a body already known to be wrong.
+ * `amountsOut`, or `null` if the body is not the shape that was agreed. All-or-nothing: one entry
+ * this code cannot read leaves the rest unverified rather than merely partial, and salvaging the
+ * readable ones would route real input on a body already known to be wrong.
  */
 function parseAmountsOut(body: unknown, expected: number): bigint[] | null {
   if (typeof body !== 'object' || body === null) return null;
@@ -358,14 +301,10 @@ function decodeUniv2(r: { success: boolean; returnData: `0x${string}` } | undefi
 }
 
 /**
- * Picks the best grid point from pre-computed venue outputs. Split out so the search is testable
- * without a chain.
- *
- * `propOut[i]` and `univOut[i]` are what each venue pays for grid point `i`; a venue asked for a
- * non-zero amount that answers zero disqualifies that point.
- *
- * `propRefused` is the caller's to attach: the search is told what the venues paid and nothing
- * about why, which is what keeps it testable against hand-written arrays.
+ * Picks the best grid point from pre-computed venue outputs, split out so the search is testable
+ * without a chain. `propOut[i]` and `univOut[i]` are what each venue pays for grid point `i`; a
+ * venue asked for a non-zero amount that answers zero disqualifies that point. `propRefused` is the
+ * caller's to attach — the search is told what the venues paid and nothing about why.
  */
 export function chooseSplit(
   amountIn: bigint,
@@ -383,7 +322,8 @@ export function chooseSplit(
     const toUniv2 = amountIn - toProp;
     const p = toProp === 0n ? 0n : (propOut[i] ?? 0n);
     const u = toUniv2 === 0n ? 0n : (univOut[i] ?? 0n);
-    if ((toProp > 0n && p === 0n) || (toUniv2 > 0n && u === 0n)) return;
+    if (toProp > 0n && p === 0n) return;
+    if (toUniv2 > 0n && u === 0n) return;
 
     const total = p + u;
     if (best && total <= best.amountOut) return;
@@ -391,7 +331,12 @@ export function chooseSplit(
     const legs: Leg[] = [];
     if (toProp > 0n) legs.push({ venue: 'prop', weightBps: bps, amountIn: toProp, amountOut: p });
     if (toUniv2 > 0n) {
-      legs.push({ venue: 'univ2', weightBps: WEIGHT_DENOMINATOR - bps, amountIn: toUniv2, amountOut: u });
+      legs.push({
+        venue: 'univ2',
+        weightBps: WEIGHT_DENOMINATOR - bps,
+        amountIn: toUniv2,
+        amountOut: u,
+      });
     }
     best = { legs, amountOut: total, solo, split: legs.length > 1 };
   });
@@ -401,16 +346,11 @@ export function chooseSplit(
 
 /**
  * The most the RFQ maker could pay out in `token`: the lesser of what it holds and what it has
- * allowed `PmmSettle` to pull.
+ * allowed `PmmSettle` to pull. The lesser, because `PmmSettle` custodies nothing — it issues a
+ * `transferFrom` against the maker's own balance, so either being short is the same failure.
  *
- * The lesser of the two, because `PmmSettle` custodies nothing — it issues a `transferFrom` against
- * the maker's own balance, so either being short is the same failure. Reading both is the direct
- * form of the question "will this order settle", which is what an earlier version tried to infer
- * from how good the price looked. See `rfq.ts`.
- *
- * `undefined` when either read fails, and the caller must treat that as *unverified* rather than
- * as passing. A missing observation that quietly reads as a clean bill of health is the failure
- * mode `markout`'s `unmarked` counter exists to avoid, in a different corner of the system.
+ * `undefined` when either read fails, and the caller must treat that as *unverified*, not as
+ * passing.
  */
 export async function makerCanDeliver(
   client: PublicClient,
@@ -427,7 +367,11 @@ export async function makerCanDeliver(
     {
       target: token,
       allowFailure: true,
-      callData: encodeFunctionData({ abi: ERC20_ABI, functionName: 'allowance', args: [maker, settler] }),
+      callData: encodeFunctionData({
+        abi: ERC20_ABI,
+        functionName: 'allowance',
+        args: [maker, settler],
+      }),
     },
   ];
 
@@ -441,9 +385,8 @@ export async function makerCanDeliver(
       // maker that CAN deliver gets refused as if it could not.
       //
       // TODO: this is the same inconsistent pending read that forced the prop quote off chain. A
-      // balance does not decay against a clock, so the failure here would be a stale or mismatched
-      // number rather than a systematic zero — but it is the same node behaviour and should be
-      // revisited rather than left because it has not bitten yet.
+      // balance does not decay against a clock, so the failure here would be a stale number rather
+      // than a systematic zero, but it is the same node behaviour and should be revisited.
       blockTag: 'pending',
     })) as readonly { success: boolean; returnData: `0x${string}` }[];
 

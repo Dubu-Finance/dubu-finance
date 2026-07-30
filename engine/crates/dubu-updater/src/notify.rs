@@ -1,66 +1,31 @@
 //! Telling the operator, on Telegram, that something happened.
 //!
-//! # Why this exists
+//! The failures worth alerting on — a liveness latch that exits into a systemd restart loop, a
+//! group killswitch that latches and stays latched — are each fully described in the log, and each
+//! removes the reason anyone would go and read the log. So this pushes instead.
 //!
-//! Two incidents, and neither of them was a failure of the log.
+//! It matters more that this **cannot affect a quote** than that any particular message arrives.
+//! [`Notifier::send`] is a `try_send` into a bounded channel and is not `async` at all, so no call
+//! site can put the network on the cycle's critical path; a full channel drops and counts. With
+//! `TELEGRAM_BOT_TOKEN` or `TELEGRAM_CHAT_ID` absent nothing is spawned and `send` is a no-op,
+//! because an alerting credential that can stop a market maker from quoting is a worse liability
+//! than no alerting. A 429, a revoked token or a DNS outage is logged once and the batch dropped,
+//! never retried.
 //!
-//! On 2026-07-29 a ten-minute flashblocks outage latched `Halt::Liveness`, the stay-down check
-//! re-asserted the withdrawals and exited `EXIT_HALTED`, and systemd fed the process back into the
-//! same wall six times until `StartLimitBurst` was exhausted. **The bot was then dead for 59
-//! minutes**, and the only thing that ended it was a human happening to look. Separately, the
-//! equity group's killswitch latched and stayed latched for over fourteen hours, silently: the
-//! record of it was one `INFO` line in a stream that emits several a second and reads, at a
-//! glance, exactly like routine bookkeeping.
+//! # Coalescing
 //!
-//! Both were fully described in the log at the moment they happened. Nobody was reading the log at
-//! the moment they happened, which is the whole problem — a log is a thing you consult once you
-//! already suspect something, and both of these are the kind of failure that removes the reason to
-//! suspect anything. So this pushes.
+//! Telegram's per-chat limit is far tighter than its headline ~30/second: sustained traffic to one
+//! group is documented at **20 messages per minute**, and a burst past it answers 429 with a
+//! `retry_after`. So the task collects into a [`Batch`], opening a window on the *first* event and
+//! closing it [`BATCH_WINDOW`] later — one message per window plus one round trip, which at three
+//! seconds is exactly Telegram's ceiling and strictly under it, because the next window cannot open
+//! until the previous send has returned.
 //!
-//! # What it must never do
-//!
-//! This is alerting bolted onto a live trading system, so the ordering of its obligations is not
-//! the obvious one. It is more important that this **cannot affect a quote** than that any
-//! particular message arrives:
-//!
-//! * **It never blocks the quote loop.** [`Notifier::send`] is a `try_send` into a bounded channel
-//!   and returns immediately; on a full channel the message is dropped and counted. There is no
-//!   spelling of it that awaits, which is enforced by it not being `async` at all. The cycle is
-//!   already 2.7s against a 200ms target and is about to be optimised hard — a millisecond spent
-//!   here would be a millisecond taken from that.
-//! * **A missing credential is not a failure.** With `TELEGRAM_BOT_TOKEN` or `TELEGRAM_CHAT_ID`
-//!   absent, [`Notifier::from_env`] returns a notifier that spawns nothing and whose `send` is a
-//!   no-op. Nothing else in the process behaves differently. An alerting credential that can stop
-//!   a market maker from quoting is a worse liability than no alerting.
-//! * **A Telegram failure is not a trading failure.** A 429, a revoked token, a DNS outage: each
-//!   is logged once and the batch is dropped. Nothing is retried, because the only retry policy
-//!   that is safe here is none — see [`deliver`].
-//! * **The token is never printed.** Not at startup, not in an error, not redacted. It is a path
-//!   segment of the API URL, which is exactly the shape [`crate::config::EndpointUrl`] already
-//!   exists to keep out of logs, and `reqwest`'s own errors carry the URL they failed on — see
-//!   [`post`] for the one line that handles that.
-//!
-//! # Coalescing, and why the window is what it is
-//!
-//! Telegram's per-chat limits are far tighter than its headline ~30 messages/second: sustained
-//! traffic to a single group is documented at **20 messages per minute**, and bursts past it are
-//! answered with 429 and a `retry_after`. A flow simulator is about to start generating trades, so
-//! fills will arrive in bursts of tens rather than the current zero.
-//!
-//! So the task collects into a [`Batch`] and sends one message per window. The window opens on the
-//! *first* event and closes [`BATCH_WINDOW`] later, which bounds the send rate at one message per
-//! window plus one round trip — at three seconds that is at most 20 per minute, exactly Telegram's
-//! per-group ceiling, and strictly under it in practice because the next window cannot open until
-//! the previous send has returned. Three seconds is also nothing against what is being reported:
-//! the liveness halt it exists to announce fires after a 600s outage, and the killswitch it exists
-//! to announce went unnoticed for fourteen hours.
-//!
-//! Repeated *errors* need a second mechanism, because they do not stop when the window does. A
-//! node answering `-32003 txpool is full` answers it for every send for minutes, which at one
-//! message per window is still 20 identical messages a minute. [`ErrorLedger`] reports a class of
-//! failure once, then goes quiet for [`ERROR_QUIET`] and reports the accumulated count when it
-//! next speaks. Its key space is capped, so an endpoint inventing a new error string per request
-//! cannot grow it.
+//! Repeated *errors* need a second mechanism because they do not stop when the window does: a node
+//! answering `-32003 txpool is full` answers it for every send for minutes, which is still 20
+//! identical messages a minute. [`ErrorLedger`] reports a class once, goes quiet for
+//! [`ERROR_QUIET`], and reports the accumulated count when it next speaks. Its key space is capped,
+//! because the key comes from a string an endpoint controls.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -72,41 +37,30 @@ use tracing::{info, warn};
 
 use crate::units::{format_fixed, FEED_SCALE};
 
-/// How long a batch collects before it is sent.
-///
-/// See the module docs: one message per window bounds the per-chat rate at Telegram's documented
-/// 20-per-minute ceiling for a group, and three seconds of latency is immaterial against the
-/// events this reports.
+/// How long a batch collects before it is sent. One message per window bounds the per-chat rate
+/// at Telegram's 20-per-minute group ceiling; see the module docs.
 const BATCH_WINDOW: Duration = Duration::from_secs(3);
 
-/// Messages the quote loop may get ahead by before they start being dropped.
-///
-/// Bounded on purpose and sized generously rather than tightly: the whole point is that the
-/// producer never waits, so the only question the capacity answers is how large a burst survives a
-/// slow round trip. Two hundred and fifty-six is several windows' worth of the busiest flow the
-/// simulator generates, and it is a few kilobytes.
+/// Messages the quote loop may get ahead by before they start being dropped. The producer never
+/// waits, so this only sets how large a burst survives a slow round trip: several windows of the
+/// busiest simulated flow, and a few kilobytes.
 const QUEUE_CAPACITY: usize = 256;
 
 /// How long a class of send failure stays quiet after it has been reported once.
 const ERROR_QUIET: Duration = Duration::from_secs(60);
 
-/// Distinct failure classes the ledger will track. Past this, occurrences are counted in one
-/// bucket rather than allocating a key per error string.
+/// Distinct failure classes the ledger will track. Past this, occurrences go in one bucket rather
+/// than allocating a key per error string.
 const ERROR_CLASSES_MAX: usize = 32;
 
-/// Fills written out in full in one message. The rest are counted.
-///
-/// Twelve rather than a round twenty, and the number is arithmetic rather than taste: a fill line
-/// carrying a 66-character transaction hash, both legs, both prices and the inventory runs to
-/// about 250 characters, so twenty of them is 5,000 — past [`TEXT_MAX`], which means the tail of
-/// the message would be cut off and the tail is where the "and N more" and the dropped-message
-/// notice live. A cap that silently loses the count of what it capped is worse than a lower cap.
+/// Fills written out in full in one message; the rest are counted. Twelve rather than twenty by
+/// arithmetic: a fill line with a 66-character hash, both legs, both prices and the inventory runs
+/// to about 250 characters, so twenty would exceed [`TEXT_MAX`] and truncation takes the tail —
+/// which is where the "and N more" notice lives.
 const FILLS_SHOWN_MAX: usize = 12;
 
-/// Alerts written out in full in one message. The rest are counted.
-///
-/// There are a handful of correlation groups and at most one live alert per group, so this is a
-/// ceiling on pathology rather than a working limit.
+/// Alerts written out in full in one message; the rest are counted. A ceiling on pathology: there
+/// are a handful of correlation groups with at most one live alert each.
 const ALERTS_SHOWN_MAX: usize = 8;
 
 /// Where the text is cut. Telegram's own limit is 4096 UTF-8 characters and answers 400 past it;
@@ -119,20 +73,14 @@ const RATE_LIMIT_BACKOFF_MAX: Duration = Duration::from_secs(60);
 /// Request timeout for one `sendMessage`.
 const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
 
-// ---------------------------------------------------------------------------
-// Events
-// ---------------------------------------------------------------------------
+// --- events ---
 
 /// One fill, in the terms a human needs to judge it.
 ///
-/// Everything here is a plain number or an owned string, deliberately: the event crosses a channel
-/// into a task that must not reach back into the [`crate::chain::ChainView`] or the config, and a
-/// formatting decision that depends on live state is one that cannot be tested.
-///
-/// **There is no markout field, and that is not an omission.** A markout is the fill's value at
-/// +1s, +10s and +60s against a later reference; at the moment the fill is observed none of those
-/// references exists yet. `markout::Markout::settle` produces them a minute later, and wiring that
-/// in would be a second class of message rather than a field on this one.
+/// Plain numbers and owned strings only: the event crosses a channel into a task that must not
+/// reach back into the [`crate::chain::ChainView`] or the config. No markout field — that needs
+/// references at +1s, +10s and +60s, none of which exist yet when the fill is observed, so
+/// `markout::Markout::settle` reports them separately a minute later.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Fill {
     /// Which market.
@@ -151,12 +99,10 @@ pub struct Fill {
     pub quote_decimals: u8,
     /// The price the fill actually executed at, at [`FEED_SCALE`].
     pub price_e8: u128,
-    /// Our own reference at the fill's timestamp, at [`FEED_SCALE`].
-    ///
-    /// `None` when `markout::Markout::reference_at` had nothing inside its tolerance. The caller
-    /// falls back to the executed price for scoring purposes, and passing that back here as a
-    /// reference would render a perfect zero of edge on every such fill — a confident number about
-    /// a comparison that was never made.
+    /// Our own reference at the fill's timestamp, at [`FEED_SCALE`]. `None` when
+    /// `markout::Markout::reference_at` had nothing inside its tolerance: the caller then scores
+    /// against the executed price, which would render a structural zero of edge as if a comparison
+    /// had been made.
     pub reference_e8: Option<u128>,
     /// The pool's base balance as of the latest chain read.
     pub inventory_base: Option<u128>,
@@ -193,9 +139,8 @@ pub enum Event {
         group: String,
         /// What latched it.
         reason: String,
-        /// True when *every* group is down, so the process is about to withdraw and exit. This is
-        /// the shape of the 59-minute outage, and it is the one alert that must survive the exit —
-        /// see [`Notifier::flush`].
+        /// True when *every* group is down, so the process is about to withdraw and exit. The one
+        /// alert that must survive that exit; see [`Notifier::flush`].
         exiting: bool,
     },
     /// A transaction could not be sent. Coalesced by class; see [`ErrorLedger`].
@@ -209,16 +154,11 @@ pub enum Event {
     },
 }
 
-// ---------------------------------------------------------------------------
-// Credentials
-// ---------------------------------------------------------------------------
+// --- credentials ---
 
-/// The bot token and the chat to post into.
-///
-/// [`std::fmt::Debug`] is written by hand and prints the chat and nothing else, the same defence
-/// `tx::Signer` makes for the signing key: the derived one would put the token in any log line
-/// that ever formats this struct, and the point of a rule like "never log the token" is that it
-/// holds for code nobody has written yet.
+/// The bot token and the chat to post into. [`std::fmt::Debug`] is hand-written and prints the chat
+/// alone, the same defence `tx::Signer` makes for the signing key: a derived one puts the token in
+/// any log line that ever formats this struct, including ones nobody has written yet.
 #[derive(Clone)]
 struct Credentials {
     token: String,
@@ -234,11 +174,9 @@ impl std::fmt::Debug for Credentials {
 }
 
 impl Credentials {
-    /// Both values, or nothing.
-    ///
-    /// Blank is treated as absent. A `TELEGRAM_BOT_TOKEN=` line left in a `.env` is how a
-    /// credential most often goes missing, and it must land in the same place a missing variable
-    /// does rather than starting a notifier that 401s on every window forever.
+    /// Both values, or nothing. Blank counts as absent: a `TELEGRAM_BOT_TOKEN=` line left in a
+    /// `.env` must land where a missing variable lands rather than starting a notifier that 401s on
+    /// every window forever.
     fn from_parts(token: Option<String>, chat_id: Option<String>) -> Option<Self> {
         let token = token
             .map(|t| t.trim().to_string())
@@ -253,12 +191,10 @@ impl Credentials {
     }
 }
 
-// ---------------------------------------------------------------------------
-// The handle
-// ---------------------------------------------------------------------------
+// --- the handle ---
 
-/// What the channel carries. Not [`Event`], because a flush is an instruction rather than
-/// something to report, and keeping it out of `Event` keeps that type plain data a test can build.
+/// What the channel carries. Not [`Event`]: a flush is an instruction rather than something to
+/// report, and keeping it out leaves `Event` plain data a test can build.
 enum Msg {
     /// Something to report.
     Report(Event),
@@ -266,26 +202,19 @@ enum Msg {
     Flush(oneshot::Sender<()>),
 }
 
-/// The producer side, held by the quote loop.
-///
-/// A disabled notifier — no credentials — holds `None` and every method is a no-op. That is the
-/// whole of the "everything else behaves exactly as it does today" requirement: there is no task,
-/// no HTTP client, no channel, and `send` compiles down to a null check.
+/// The producer side, held by the quote loop. With no credentials it holds `None`: no task, no
+/// HTTP client, no channel, and `send` is a null check.
 pub struct Notifier {
     tx: Option<mpsc::Sender<Msg>>,
-    /// Messages that never reached the task. Shared with it so the count is reported rather than
-    /// merely incremented — a drop is the alerting lying by omission, which is worth a line.
+    /// Messages that never reached the task. Shared with it so the count is reported in the next
+    /// batch rather than merely incremented; a silent drop is alerting incomplete in a way nobody
+    /// can see.
     dropped: Arc<AtomicU64>,
 }
 
 impl Notifier {
     /// Read `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID`, and start the task if both are there.
-    ///
-    /// Never fails and never panics. The absent case is logged at `info` and is the ordinary state
-    /// of a dry run or a developer's machine.
-    ///
-    /// # Panics
-    /// Never. It is called from inside the tokio runtime and only spawns.
+    /// Never fails; the absent case is the ordinary state of a dry run.
     #[must_use]
     pub fn from_env() -> Self {
         let creds = Credentials::from_parts(
@@ -293,8 +222,7 @@ impl Notifier {
             std::env::var("TELEGRAM_CHAT_ID").ok(),
         );
         let Some(creds) = creds else {
-            // Which of the two is missing is useful and leaks nothing; the presence of a token is
-            // not the token. There is no spelling of the value itself in this module.
+            // Which of the two is missing leaks nothing: the presence of a token is not the token.
             info!(
                 target: "notify", event = "disabled",
                 token_set = std::env::var_os("TELEGRAM_BOT_TOKEN").is_some(),
@@ -334,12 +262,8 @@ impl Notifier {
         self.tx.is_some()
     }
 
-    /// Hand an event to the task. **Never blocks, never awaits, never fails.**
-    ///
-    /// Deliberately not `async`, so no call site can accidentally put the network on the quote
-    /// loop's critical path — the type system is doing the enforcing rather than a comment.
-    /// `try_send` returning `Full` means the task is behind, which is the case this exists to be
-    /// safe in: the message is dropped, the counter goes up, and the next batch says so.
+    /// Hand an event to the task. **Never blocks, never awaits, never fails.** `Full` means the
+    /// task is behind: the message is dropped, the counter goes up, the next batch says so.
     pub fn send(&self, event: Event) {
         let Some(tx) = &self.tx else { return };
         if tx.try_send(Msg::Report(event)).is_err() {
@@ -347,16 +271,10 @@ impl Notifier {
         }
     }
 
-    /// Send whatever is batched, now, and wait up to `within` for it to go out.
-    ///
-    /// The one method here that awaits, and it exists for exactly one situation: the process is
-    /// about to exit. `stay_down` and a killswitch halt both end in `EXIT_HALTED` within
-    /// milliseconds of being logged, and a batch still inside its three-second window when the
-    /// process exits is a batch nobody ever sees — which is precisely the 59-minute outage this
-    /// module was written for. It is never called from the cycle.
-    ///
-    /// Bounded and best-effort in every direction: a full channel, a dead task, or a slow round
-    /// trip all resolve as "carry on and exit".
+    /// Send whatever is batched, now, and wait up to `within` for it to go out. The one method here
+    /// that awaits, and never called from the cycle: a killswitch halt reaches `EXIT_HALTED` within
+    /// milliseconds of being logged, so a batch still inside its window is a batch nobody sees.
+    /// Best-effort in every direction — a dead task and a slow round trip both mean "carry on".
     pub async fn flush(&self, within: Duration) {
         let Some(tx) = &self.tx else { return };
         let (ack, done) = oneshot::channel();
@@ -367,21 +285,15 @@ impl Notifier {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Coalescing repeated failures
-// ---------------------------------------------------------------------------
+// --- coalescing repeated failures ---
 
 /// The class a send failure is coalesced under.
 ///
-/// Matched on the error's text rather than on a structured code, because the two failures that
-/// actually repeat arrive by different routes: `nonce too low` is a `RpcError::Node` message from
-/// the sequencer, and `-32003 txpool is full` has been seen both as a node error and inside an
-/// HTTP body. A classifier that only understood `RpcError::Node { code }` would miss the second
-/// spelling of the same outage, and the point of the class is that it groups what an operator
-/// would group.
-///
-/// Anything unrecognised keeps a truncated form of its own message, so two genuinely different
-/// failures do not collapse into one line that says nothing.
+/// Matched on the error's text rather than a structured code because the failures that repeat
+/// arrive by different routes: `-32003 txpool is full` has been seen both as an `RpcError::Node`
+/// and inside an HTTP body, so a classifier keyed on the code misses one spelling of one outage.
+/// Anything unrecognised keeps a truncated form of its own message, so two failures do not
+/// collapse into one line that says nothing.
 #[must_use]
 pub fn classify(error: &str) -> String {
     let lower = error.to_ascii_lowercase();
@@ -400,8 +312,8 @@ pub fn classify(error: &str) -> String {
     if lower.contains("replacement transaction underpriced") || lower.contains("underpriced") {
         return "underpriced".to_string();
     }
-    // Truncated on a character boundary, because an error carrying a hash or a nonce would
-    // otherwise be a new class on every occurrence and defeat the coalescing entirely.
+    // Truncated on a character boundary: an error carrying a hash or a nonce would otherwise be a
+    // new class on every occurrence and defeat the coalescing entirely.
     let cut = error.char_indices().nth(60).map_or(error.len(), |(i, _)| i);
     error.get(..cut).unwrap_or(error).trim().to_string()
 }
@@ -428,17 +340,13 @@ struct Entry {
     sample: String,
 }
 
-/// Collapses repeated send failures into one line per class per [`ERROR_QUIET`].
-///
-/// The alternative — one message per occurrence — is what makes an alerting channel unreadable,
-/// and an unread alerting channel is the state this module exists to leave. A node with a full
-/// txpool refuses every send for as long as the condition lasts, so the honest report is "this
-/// started, and it is still going, and here is how many".
+/// Collapses repeated send failures into one line per class per [`ERROR_QUIET`]: a node with a full
+/// txpool refuses every send for minutes, so the useful report is a start, a state and a count.
 #[derive(Debug, Default)]
 pub struct ErrorLedger {
     classes: BTreeMap<String, Entry>,
-    /// Occurrences of classes past [`ERROR_CLASSES_MAX`], counted rather than keyed. A bound is
-    /// required here and not merely tidy: the key comes from an error string an endpoint controls.
+    /// Occurrences of classes past [`ERROR_CLASSES_MAX`], counted rather than keyed. The bound is
+    /// required rather than tidy: the key comes from an error string an endpoint controls.
     overflow: u64,
 }
 
@@ -484,10 +392,8 @@ impl ErrorLedger {
         })
     }
 
-    /// Classes whose quiet window has expired with occurrences waiting behind it.
-    ///
-    /// Called when a batch closes rather than on a timer of its own: a failure that stopped
-    /// happening needs no follow-up, and one that is still happening will open a window anyway.
+    /// Classes whose quiet window has expired with occurrences waiting behind it. Called when a
+    /// batch closes rather than on a timer: a failure that stopped needs no follow-up.
     pub fn due(&mut self, now: Instant) -> Vec<ErrorReport> {
         let mut out = Vec::new();
         for (class, entry) in &mut self.classes {
@@ -507,15 +413,10 @@ impl ErrorLedger {
     }
 }
 
-// ---------------------------------------------------------------------------
-// The batch
-// ---------------------------------------------------------------------------
+// --- the batch ---
 
-/// What one message is made of.
-///
-/// Every bucket is capped and the overflow is counted rather than kept, so a batch that cannot be
-/// delivered — a 429 holds sends off for up to [`RATE_LIMIT_BACKOFF_MAX`] — occupies a bounded
-/// amount of memory however long the burst behind it lasts.
+/// What one message is made of. Every bucket is capped and the overflow counted rather than kept,
+/// so a batch held back by a 429 stays bounded however long the burst behind it lasts.
 #[derive(Debug, Default)]
 pub struct Batch {
     alerts: Vec<Event>,
@@ -572,20 +473,17 @@ impl Batch {
             && self.alerts_omitted == 0
     }
 
-    /// The message text.
+    /// The message text. Alerts, then failures, then fills: a phone notification shows the first
+    /// line, and something being wrong outranks something having happened.
     ///
-    /// Alerts first, then failures, then fills. The ordering is the point: something is wrong
-    /// matters more than something happened, and a phone notification shows the first line.
-    ///
-    /// Plain text, with no `parse_mode`. Markdown would have to escape `_`, `*`, `[` and more out
-    /// of every symbol, address and error message that passes through here, and Telegram answers a
-    /// mis-escaped entity with a 400 — so the formatting would fail exactly on the malformed input
-    /// an operator most needs to see.
+    /// Plain text, no `parse_mode`. Markdown would have to escape `_`, `*`, `[` and more out of
+    /// every symbol, address and error message passing through here, and Telegram answers a
+    /// mis-escaped entity with a 400 — so it would fail on exactly the malformed input an operator
+    /// most needs to see.
     #[must_use]
     pub fn render(&self) -> String {
         let mut out = String::new();
-        // First, above even the alerts, because it is the alerting admitting it is incomplete —
-        // and because anything at the bottom of a long message is what truncation takes.
+        // Above even the alerts, because truncation takes the bottom of a long message.
         if self.dropped > 0 {
             out.push_str(&format!(
                 "({} alerts dropped: the notifier queue was full)\n",
@@ -616,11 +514,8 @@ impl Batch {
     }
 }
 
-/// Cut to `max` characters on a character boundary, saying so.
-///
-/// Telegram counts UTF-8 characters and refuses a longer message outright, so a message that grew
-/// past the limit would be the one that is lost — and the way a message grows is by carrying an
-/// unusual number of events, which is the way an interesting one grows.
+/// Cut to `max` characters on a character boundary, saying so. Telegram refuses a longer message
+/// outright, and a message grows by carrying more events — so the lost one is the interesting one.
 fn truncate(text: &str, max: usize) -> String {
     assert!(
         max > 64,
@@ -663,9 +558,9 @@ fn render_alert(event: &Event) -> String {
             "BOT EXITING [{group}] every group is latched from a previous run; withdrawing quotes \
              and exiting. THE POOL IS NOT QUOTING UNTIL SOMEONE CLEARS THIS. Reason: {reason}"
         ),
-        // Neither reaches here: `absorb` routes fills and failures into their own buckets. Handled
+        // Neither reaches here; `absorb` routes fills and failures into their own buckets. Handled
         // rather than `unreachable!` because a panic in the alerting task is the one way this
-        // module could take the process down, and it must not have one.
+        // module could take the process down.
         Event::Fill(fill) => render_fill(fill),
         Event::SendFailed { kind, error, .. } => format!("TX FAILED {kind}: {error}"),
     }
@@ -690,9 +585,8 @@ fn render_fill(fill: &Fill) -> String {
                 None => line.push_str(" (edge unavailable)"),
             }
         }
-        // Said out loud rather than left blank. A fill whose reference was outside `reference_at`'s
-        // tolerance is scored against its own execution price, so any "edge" printed for it would
-        // be a structural zero — a number that looks like a measurement and is not one.
+        // Named rather than left blank: a fill outside `reference_at`'s tolerance is scored against
+        // its own execution price, so any edge printed would be a structural zero.
         None => line.push_str(" (no reference within tolerance at the fill's timestamp)"),
     }
     if let (Some(base), Some(quote)) = (fill.inventory_base, fill.inventory_quote) {
@@ -707,14 +601,10 @@ fn render_fill(fill: &Fill) -> String {
 }
 
 /// Hundredths of a basis point of edge, positive when the price we gave was on our side of the
-/// reference.
-///
-/// The pool wants to buy below the reference and sell above it, so the sign has to flip with the
-/// side — printing a raw `price - reference` would report every profitable bid as a loss. `_e2`
-/// matches [`crate::markout`]'s unit, which is what the same fill will be scored in an hour later.
-///
-/// A ratio, so it is indifferent to the scale both prices arrive at; `None` only for a zero or
-/// unrepresentable reference, which is not a comparison worth inventing an answer for.
+/// reference. The pool buys below the reference and sells above it, so the sign flips with the
+/// side: a raw `price - reference` reports every profitable bid as a loss. `_e2` matches
+/// [`crate::markout`]'s unit, which is what the same fill is scored in an hour later; a ratio, so
+/// it is indifferent to the scale both prices arrive at.
 #[must_use]
 pub fn edge_e2(price_e8: u128, reference_e8: u128, is_bid: bool) -> Option<i64> {
     let price = i128::try_from(price_e8).ok()?;
@@ -739,22 +629,16 @@ fn signed_bps(e2: i64) -> String {
     format!("{sign}{}.{:02} bp", magnitude / 100, magnitude % 100)
 }
 
-// ---------------------------------------------------------------------------
-// The task
-// ---------------------------------------------------------------------------
+// --- the task ---
 
-/// Owns the HTTP client and does every byte of the network work.
-///
-/// Spawned the way `feed::ws::run` and `chain::view::run` are, and for the same reason those are:
-/// the work is I/O on somebody else's schedule, and the loop that has to keep time must not be the
-/// loop that waits for it. Never returns an error and never panics — the process must be able to
-/// withdraw quotes on the way out, and it cannot do that if the alerting task takes it down first.
+/// Owns the HTTP client and every byte of the network work, because the loop that keeps time must
+/// not be the one that waits. Never returns an error and never panics — the process must be able to
+/// withdraw quotes on the way out, which it cannot do if this takes it down first.
 async fn run(creds: Credentials, mut rx: mpsc::Receiver<Msg>, dropped: Arc<AtomicU64>) {
     let http = match reqwest::Client::builder().timeout(HTTP_TIMEOUT).build() {
         Ok(c) => c,
         Err(e) => {
-            // No URL has been constructed yet, so there is nothing here that could carry the
-            // token; this is a TLS or resolver failure at construction.
+            // No URL exists yet, so nothing here can carry the token.
             warn!(target: "notify", event = "client_failed", error = %e,
                   "could not build the HTTP client; alerts are off for this run");
             return;
@@ -788,8 +672,8 @@ async fn run(creds: Credentials, mut rx: mpsc::Receiver<Msg>, dropped: Arc<Atomi
         };
 
         let Some(msg) = msg else {
-            // Every `Notifier` is gone, which means `run` in `main.rs` has returned. Anything still
-            // batched is said on the way out rather than lost with the process.
+            // Every `Notifier` is gone, so `run` in `main.rs` has returned; anything still batched
+            // goes out here rather than being lost with the process.
             close(
                 &http,
                 &creds,
@@ -845,15 +729,12 @@ async fn close(
 
 /// Send one batch, or decide not to.
 ///
-/// **There is no retry, and that is the design rather than a gap.** A retry loop here is a loop
-/// whose length is decided by Telegram: an outage on their side becomes a growing backlog of
-/// attempts inside a process whose actual job is to keep a market. A dropped alert costs one
-/// message; an unbounded retry costs the thing the alerting is supposed to protect. The batch is
-/// cleared before the request so a failure cannot even accidentally accumulate one.
-///
-/// A 429 is the exception, and only in the direction of doing *less*: `retry_after` silences
-/// sending for that long, capped at [`RATE_LIMIT_BACKOFF_MAX`], while events keep batching into
-/// the bounded buckets [`Batch`] already enforces.
+/// **There is no retry.** A retry loop here is a loop whose length Telegram decides: their outage
+/// becomes a growing backlog inside a process whose job is to keep a market, where a dropped alert
+/// costs one message. The batch is cleared before the request so a failure cannot accumulate one
+/// either. A 429 is the exception, and only toward doing *less*: `retry_after` silences sending for
+/// that long, capped at [`RATE_LIMIT_BACKOFF_MAX`], while events keep batching into the bounded
+/// buckets [`Batch`] already enforces.
 async fn deliver(
     http: &reqwest::Client,
     creds: &Credentials,
@@ -871,8 +752,8 @@ async fn deliver(
         *quiet_until = None;
     }
 
-    // Taken only once the message is definitely going out, so a batch held back by a 429 does not
-    // zero the counter and lose the fact that anything was dropped at all.
+    // Taken only once the message is definitely going out: a batch held back by a 429 must not zero
+    // the counter and lose the fact that anything was dropped.
     batch.dropped = dropped.swap(0, Ordering::Relaxed);
     let text = batch.render();
     *batch = Batch::default();
@@ -900,14 +781,9 @@ enum Outcome {
     Failed,
 }
 
-/// POST one message.
-///
-/// The URL carries the bot token as a path segment, which is why nothing in this function logs the
-/// URL and why the `reqwest` error is passed through `without_url` before it is formatted:
-/// `reqwest`'s own `Display` reads `error sending request for url (https://api.telegram.org/bot
-/// <TOKEN>/sendMessage)`, so logging the error as it arrives would print the token in full on
-/// every network failure — the exact leak a hand-written redaction elsewhere in this crate exists
-/// to prevent, arriving through a third party's `Display` impl.
+/// POST one message. The URL carries the bot token as a path segment, so nothing here logs the URL
+/// and every `reqwest` error goes through `without_url` first — its own `Display` embeds the URL it
+/// failed on, which would print the token in full on every network failure.
 async fn post(http: &reqwest::Client, creds: &Credentials, text: &str) -> Outcome {
     let url = format!("https://api.telegram.org/bot{}/sendMessage", creds.token);
     let body = serde_json::json!({
@@ -930,8 +806,8 @@ async fn post(http: &reqwest::Client, creds: &Credentials, text: &str) -> Outcom
         return Outcome::Sent;
     }
 
-    // Telegram's error body is `{"ok":false,"error_code":..,"description":".."}` and carries no
-    // credential, but it is truncated anyway rather than trusted to stay that way.
+    // Telegram's error body carries no credential, and is truncated rather than trusted to stay
+    // that way.
     let body = response.text().await.unwrap_or_default();
     let retry_after = serde_json::from_str::<serde_json::Value>(&body)
         .ok()
@@ -974,10 +850,9 @@ mod tests {
         }
     }
 
-    // --- the missing-credential path ------------------------------------------------------
+    // --- the missing-credential path ---
 
-    /// The requirement that outranks every other one in this module: no credentials means no
-    /// notifier, and a no-op that cannot touch a socket, a channel or a task.
+    /// No credentials means no notifier: a no-op that cannot touch a socket, a channel or a task.
     #[test]
     fn without_both_variables_there_is_no_notifier() {
         assert!(Credentials::from_parts(None, None).is_none());
@@ -986,24 +861,22 @@ mod tests {
         assert!(Credentials::from_parts(Some("t".into()), Some("-100".into())).is_some());
     }
 
-    /// A `TELEGRAM_BOT_TOKEN=` line with nothing after it is the likeliest way a credential goes
-    /// missing, and it must land where an absent variable lands rather than starting a notifier
-    /// that 401s on every window for the life of the process.
+    /// A blank variable must land where an absent one lands, rather than starting a notifier that
+    /// 401s on every window for the life of the process.
     #[test]
     fn a_blank_variable_counts_as_absent() {
         assert!(Credentials::from_parts(Some(String::new()), Some("-100".into())).is_none());
         assert!(Credentials::from_parts(Some("   ".into()), Some("-100".into())).is_none());
         assert!(Credentials::from_parts(Some("t".into()), Some("  ".into())).is_none());
-        // And surrounding whitespace is trimmed rather than sent, since a trailing newline out of
-        // a `.env` would otherwise become part of the URL path.
+        // Trimmed rather than sent: a trailing newline out of a `.env` becomes part of the URL.
         let creds = Credentials::from_parts(Some(" t ".into()), Some(" -100 ".into()))
             .expect("both present");
         assert_eq!(creds.token, "t");
         assert_eq!(creds.chat_id, "-100");
     }
 
-    /// A disabled notifier must be safe to call from anywhere, including outside a tokio runtime —
-    /// which is the strongest available statement that it spawns nothing and touches no channel.
+    /// Called outside a tokio runtime, which is the strongest available statement that it spawns
+    /// nothing and touches no channel.
     #[test]
     fn a_disabled_notifier_swallows_everything_without_a_runtime() {
         let n = Notifier::disabled();
@@ -1018,7 +891,6 @@ mod tests {
         assert_eq!(n.dropped.load(Ordering::Relaxed), 0, "nothing to drop");
     }
 
-    /// The debug impl exists to keep the token out of a log line nobody has written yet.
     #[test]
     fn the_credentials_never_debug_print_the_token() {
         let creds = Credentials::from_parts(Some("123:SECRET".into()), Some("-100".into()))
@@ -1028,16 +900,15 @@ mod tests {
         assert!(shown.contains("-100"), "the chat address is fine to print");
     }
 
-    // --- the edge arithmetic ---------------------------------------------------------------
+    // --- the edge arithmetic ---
 
-    /// The sign has to flip with the side, or every profitable bid reads as a loss.
     #[test]
     fn edge_is_positive_when_the_price_favoured_the_pool() {
         // Sold 1% above the reference: the pool won 100 bp.
         assert_eq!(edge_e2(101_000_000, 100_000_000, false), Some(10_000));
         // Bought 1% above the reference: the pool lost 100 bp.
         assert_eq!(edge_e2(101_000_000, 100_000_000, true), Some(-10_000));
-        // And the mirror, so neither sign is an accident of one example.
+        // The mirror, so neither sign is an accident of one example.
         assert_eq!(edge_e2(99_000_000, 100_000_000, true), Some(10_000));
         assert_eq!(edge_e2(99_000_000, 100_000_000, false), Some(-10_000));
         assert_eq!(edge_e2(100_000_000, 100_000_000, true), Some(0));
@@ -1058,10 +929,10 @@ mod tests {
         assert_eq!(signed_bps(-7), "-0.07 bp");
     }
 
-    // --- coalescing ------------------------------------------------------------------------
+    // --- coalescing ---
 
-    /// The two failures the brief names arrive with different wrappers around them, so the
-    /// classifier is matched on what an operator would read rather than on a wire code.
+    /// The failures that repeat arrive with different wrappers, so the classifier matches text
+    /// rather than a wire code.
     #[test]
     fn the_failures_that_actually_repeat_share_a_class() {
         assert_eq!(
@@ -1086,18 +957,16 @@ mod tests {
         );
         let long = "x".repeat(500);
         assert!(classify(&long).chars().count() <= 60);
-        // Two errors differing only past the cut collapse together, which is the point: an error
-        // carrying a nonce or a transaction hash would otherwise be a fresh class on every
-        // occurrence and defeat the ledger entirely. The prefix here is deliberately longer than
-        // the cut — a shorter one would leave the varying part inside it and prove nothing.
+        // Two errors differing only past the cut collapse together; otherwise one carrying a nonce
+        // is a fresh class every time. The shared prefix is longer than the cut on purpose — a
+        // shorter one leaves the varying part inside it and proves nothing.
         let a = "flashblocks: node error -32999: the sequencer refused this envelope, ref 41";
         let b = "flashblocks: node error -32999: the sequencer refused this envelope, ref 42";
         assert!(a.len() > 60, "the fixture has to reach past the cut");
         assert_eq!(classify(a), classify(b));
     }
 
-    /// The whole reason the ledger exists: a node with a full txpool refuses every send for
-    /// minutes, and that is one alert, not three hundred.
+    /// A node with a full txpool refuses every send for minutes: one alert, not three hundred.
     #[test]
     fn a_repeated_failure_is_reported_once_and_then_counted() {
         let mut ledger = ErrorLedger::default();
@@ -1138,8 +1007,7 @@ mod tests {
         );
     }
 
-    /// Distinct classes are distinct alerts — collapsing a txpool outage into a nonce fault would
-    /// report the wrong problem.
+    /// Collapsing a txpool outage into a nonce fault would report the wrong problem.
     #[test]
     fn different_classes_do_not_suppress_each_other() {
         let mut ledger = ErrorLedger::default();
@@ -1167,17 +1035,16 @@ mod tests {
         assert_eq!(ledger.overflow, 500 - ERROR_CLASSES_MAX as u64);
     }
 
-    // --- batching --------------------------------------------------------------------------
+    // --- batching ---
 
-    /// A burst is one message, not one message per fill. This is what keeps the channel under
-    /// Telegram's per-chat limit once the flow simulator starts trading.
+    /// A burst is one message, not one per fill, which keeps the channel under Telegram's per-chat
+    /// limit.
     #[test]
     fn a_burst_of_fills_becomes_one_message() {
         let mut batch = Batch::default();
         let mut ledger = ErrorLedger::default();
-        // A real transaction hash, because the cap is sized against the length of a rendered fill
-        // line and the hash is a quarter of it. The three-character stub the other tests use would
-        // let a too-high cap pass here and truncate in production.
+        // A real transaction hash: the cap is sized against a rendered fill line and the hash is a
+        // quarter of it, so the short stub the other tests use would let a too-high cap pass.
         let long_hash = format!("0x{}", "ab".repeat(32));
         for _ in 0..50 {
             let mut f = fill();
@@ -1190,8 +1057,7 @@ mod tests {
             FILLS_SHOWN_MAX,
             "the rest are counted rather than written out"
         );
-        // The count of what was left out has to survive the length cap, or a burst reports fewer
-        // fills than happened and says nothing about the difference.
+        // The count of what was left out has to survive the length cap.
         assert!(
             text.contains(&format!("and {} more fills", 50 - FILLS_SHOWN_MAX)),
             "{text}"
@@ -1199,8 +1065,7 @@ mod tests {
         assert!(!text.contains("truncated"), "a full burst must still fit");
     }
 
-    /// Something being wrong outranks something having happened: a phone notification shows the
-    /// first line, so a halt cannot sit underneath twenty fills.
+    /// A phone notification shows the first line, so a halt cannot sit underneath twenty fills.
     #[test]
     fn alerts_come_before_failures_and_failures_before_fills() {
         let mut batch = Batch::default();
@@ -1224,8 +1089,6 @@ mod tests {
         assert!(failed < fill_at, "{text}");
     }
 
-    /// An empty batch must never become a message; the window closes on a schedule and most of
-    /// those closes have nothing behind them.
     #[test]
     fn an_empty_batch_says_nothing() {
         let batch = Batch::default();
@@ -1233,7 +1096,6 @@ mod tests {
         assert!(batch.render().is_empty());
     }
 
-    /// Dropping is the alerting lying by omission, so it is said out loud.
     #[test]
     fn a_full_queue_is_confessed_in_the_next_message() {
         let mut batch = Batch::default();
@@ -1243,8 +1105,8 @@ mod tests {
         assert!(batch.render().contains("7 alerts dropped"));
     }
 
-    /// Telegram refuses anything past 4096 characters outright, and the message that grows past it
-    /// is by construction the one carrying the most events.
+    /// Telegram refuses anything past 4096 characters, and the message that grows past it is the
+    /// one carrying the most events.
     #[test]
     fn an_oversized_message_is_cut_rather_than_refused() {
         let long = "0123456789".repeat(1_000);
@@ -1262,7 +1124,7 @@ mod tests {
         );
     }
 
-    // --- what a fill actually reads like ---------------------------------------------------
+    // --- rendering ---
 
     /// The line has to answer, on a phone, whether this fill was one we wanted.
     #[test]
@@ -1284,7 +1146,6 @@ mod tests {
         assert!(line.contains("0xabc"), "{line}");
     }
 
-    /// A bid at the same numbers is the other sign, and the message must say so.
     #[test]
     fn the_same_numbers_on_the_other_side_report_the_opposite_edge() {
         let mut bid = fill();
@@ -1294,9 +1155,6 @@ mod tests {
         assert!(line.contains("(-1.64 bp to us)"), "{line}");
     }
 
-    /// When `reference_at` had nothing inside its tolerance the caller scores the fill against its
-    /// own execution price, so any edge printed would be a structural zero. Saying "no reference"
-    /// is the only honest line.
     #[test]
     fn a_fill_with_no_reference_says_so_instead_of_printing_a_zero() {
         let mut orphan = fill();
@@ -1306,8 +1164,7 @@ mod tests {
         assert!(!line.contains("bp to us"), "{line}");
     }
 
-    /// Inventory is optional because the chain view can be empty on the first cycles; a fill is
-    /// still worth reporting without it.
+    /// The chain view can be empty on the first cycles, and a fill is still worth reporting.
     #[test]
     fn a_fill_without_inventory_still_renders() {
         let mut bare = fill();
@@ -1318,8 +1175,7 @@ mod tests {
         assert!(line.contains("@ 1944.12000000"), "{line}");
     }
 
-    /// The alerts carry the two things an operator needs before opening a terminal: which group,
-    /// and why.
+    /// The two things an operator needs before opening a terminal: which group, and why.
     #[test]
     fn every_alert_names_its_group_and_its_reason() {
         let halt = render_alert(&Event::Halt {
@@ -1347,8 +1203,6 @@ mod tests {
         assert!(down.contains("will not quote"), "{down}");
     }
 
-    /// The 59-minute outage in one line. It has to be unmistakable, because the failure mode it
-    /// reports is that nobody looks.
     #[test]
     fn the_exiting_case_says_the_pool_has_stopped() {
         let exiting = render_alert(&Event::StayDown {

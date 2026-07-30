@@ -1,140 +1,53 @@
 //! Building, signing and submitting the two transactions the updater role may send.
 //!
-//! # The updater's authority, which is the whole safety story
-//!
-//! `PropPool` grants the updater exactly two functions — `updateQuote` and `refreshCapacity` —
-//! and neither transfers a token or touches `_reserve`. The contract's comment is explicit that
-//! this key "signs many times a minute from a hot process; assume it leaks". This module can
-//! therefore only ever encode those two calls, and [`Intent`] has no third variant by design.
-//!
-//! # Fees: no escalator, deliberately
-//!
-//! Gas on GIWA is **0.001 gwei**. The whole 203-transaction demo cost 0.0000156 ETH. At that
-//! price the entire spread between a minimal priority fee and an absurdly generous one is worth
-//! less than a rounding error on a single quote, so the usual machinery — measure the base fee,
-//! bump on each retry, cap the escalation — buys nothing and adds a failure mode of its own
-//! (a replacement transaction racing the original).
-//!
-//! There is a real argument for caring, and it does not survive contact with the number: GIWA's
-//! sequencer is single-operator with no public mempool and orders by **highest fee first**, so
-//! the fee does buy ordering. The response is to pay a flat, generously-over-base fee from
-//! config and never think about it again, rather than to build a controller. The config default
-//! is 0.05 gwei, fifty times the observed base fee.
-//!
-//! What this does mean is that a genuine base-fee spike past `max_fee_per_gas_gwei` produces a
-//! transaction that never lands. That is not silently absorbed: the pending intent times out,
-//! logs loudly with the fee it used, and the pair is unblocked. Raising the config value is the
-//! operator's move.
+//! `PropPool` grants the updater exactly `updateQuote` and `refreshCapacity`; neither transfers a
+//! token or touches `_reserve`, because the contract assumes this key leaks. [`Intent`] therefore
+//! has two variants and may never grow a third. Gas is 0.001 gwei, so an escalator buys less than a
+//! rounding error on one quote and adds a replacement racing the original; the fee is one flat
+//! over-base config number, and a spike past `max_fee_per_gas_gwei` produces a transaction that
+//! never lands, which the pending timeout reports with the fee it used.
 //!
 //! # A bounded pipeline, not one at a time
 //!
 //! Up to [`crate::config::TxConfig::in_flight_max`] unconfirmed transactions per pair, tracked in
-//! [`Sender::pending`]. Beyond that [`crate::policy`] gates the pair with `PushInFlight` and
-//! computes nothing new for it.
-//!
-//! This used to be one at a time, because "two rows in flight are ordered by a sequencer that
-//! sorts on fee rather than on intent, and the one that wins may be the older one". That is true
-//! across senders and false within one: nonce ordering is absolute, so `k + 1` cannot execute
-//! before `k` however the fees compare. The old rule was paying a real cost for a hazard that
-//! does not exist here — 66 of about 300 cycles on a live run were held waiting for a receipt on
-//! a transaction that had already been preconfirmed 440ms earlier.
-//!
-//! What a pipeline does cost is head-of-line blocking: if `k` never lands, every nonce behind it
-//! is unexecutable. So the depth is bounded rather than unbounded, and a timeout on the oldest
-//! drops the whole queue for that pair rather than just the one that expired — transactions
-//! behind a gap cannot settle, and tracking them would be tracking the impossible.
-//!
-//! The reason a pipeline is safe at all is that these transactions are **idempotent overwrites,
-//! not orders**. `updateQuote` replaces the row without reading it, so a dropped one needs no
-//! retry: the next cycle computes a fresh row from the current reference and sends that. A
-//! pipeline of orders would need every one of them to arrive.
-//!
-//! The escape hatch is still a timeout rather than a replacement: after
-//! [`crate::config::TxConfig::pending_timeout_secs`] the intents are abandoned, the pair is
-//! unblocked, and the nonce is resynced from the node.
+//! [`Sender::pending`]; beyond that [`crate::policy`] gates the pair with `PushInFlight`.
+//! Pipelining is safe only because these transactions are idempotent overwrites rather than orders
+//! — `updateQuote` replaces the row without reading it. The cost is head-of-line blocking, so the
+//! depth is bounded and a [`crate::config::TxConfig::pending_timeout_secs`] timeout abandons the
+//! pair's whole queue: everything behind a gap is unexecutable anyway.
 //!
 //! # Reserved synchronously, broadcast concurrently
 //!
-//! `eth_sendRawTransaction` costs **264ms** here and almost none of it is ours. The local op-reth is
-//! started with `--rollup.sequencer-http` and forwards the call to the GIWA sequencer in Korea, so
-//! that number is a France-to-Korea round trip and no amount of local work reduces it. reth's own
-//! metrics make the shape unmistakable: 10.09s of a 20s window across 39 `eth_sendRawTransaction`
-//! calls, against 0.023s for *every other RPC method combined*. Awaiting five of them one after the
-//! other spent 1.323s of a 2.695s cycle — 49% of the price-setting loop — on five copies of the
-//! same wait.
-//!
-//! So the send phase is split in two, and the split is where all of the safety lives:
-//!
-//! 1. [`Sender::reserve_batch`] is **synchronous**. It assigns nonces N, N+1, … in the order the
-//!    caller pushed the intents, signs each envelope, and returns them. There is no `.await`
-//!    anywhere in it, so nothing can interleave with a half-advanced nonce.
-//! 2. [`Sender::send_batch`] then broadcasts the signed bytes through a `FuturesUnordered`, so five
-//!    sends cost one 264ms round trip rather than five.
-//!
-//! The shape this replaces read-modify-wrote `self.nonce` *across* the send await, which is exactly
-//! the read-modify-write that cannot be made concurrent — two futures would both read `n` and both
-//! sign `n`. Reserving before anything is awaited is not an optimisation of that; it is the only
-//! version of it that is correct.
-//!
-//! Reservation order is load-bearing beyond the nonce itself. `main.rs`'s per-pair loop argues that
-//! a `RefreshCapacity` must execute before the `UpdateQuote` for the same pair when the pool is
-//! dark, and that argument rests entirely on nonce order being absolute. Concurrency does not touch
-//! that as long as the nonces are handed out in the order the intents were pushed, which is why
-//! [`Sender::reserve_batch`] takes a slice and walks it in order rather than taking a set.
+//! `eth_sendRawTransaction` costs 264ms France-to-Korea, so five awaited in series spent 1.323s of
+//! a 2.695s cycle on five copies of one wait. [`Sender::reserve_batch`] is therefore
+//! **synchronous**: it assigns nonces N, N+1, … in the order the caller pushed the intents and
+//! signs each envelope with no `.await` anywhere, so nothing can interleave with a half-advanced
+//! nonce. Moving that read-modify-write across the send await is not a slower version of this; it
+//! is the version where two futures both sign `n`. The order is load-bearing beyond the nonce:
+//! `main.rs`'s per-pair loop requires a `RefreshCapacity` to execute before the `UpdateQuote` for
+//! the same pair when the pool is dark, and that rests entirely on nonce order being absolute,
+//! which is why [`Sender::reserve_batch`] takes a slice and walks it rather than taking a set.
 //!
 //! # The nonce is tracked here, not asked for
 //!
-//! [`Nonces`] holds the next nonce in this process: seeded **once** at startup from
-//! `eth_getTransactionCount(addr, "pending")`, advanced by reservation, and re-read only on the two
-//! explicit recovery paths below. The hot path never asks the node, and that is a correctness
-//! requirement rather than a saved round trip.
+//! [`Nonces`] holds the next nonce in this process: seeded at startup, advanced by reservation,
+//! re-read only when [`Sender::sweep_timeouts`] abandons an intent or the node answers `nonce too
+//! low`. Not asking on the hot path is correctness rather than a saved round trip — op-reth
+//! forwards to the sequencer and only then discards the local pool error, so a transaction past
+//! `--txpool.max-account-slots` (16) is live at the sequencer while the local pool has dropped it,
+//! and a `pending` count from that pool reads twenty-odd low at ~37 in flight.
 //!
-//! The reason is the local pool. op-reth's `send_transaction` forwards to the sequencer *first* and
-//! only then does `let _ = add_pool_transaction(...)`, discarding the local error — so a transaction
-//! past the node's `--txpool.max-account-slots` (**16**, and not being raised) has already reached
-//! the sequencer while the local pool silently drops it. `eth_getTransactionCount(pending)` on that
-//! node is derived from the truncated pool, so it reads **low by however many were dropped**. With
-//! roughly 37 transactions in flight at the new cadence, a per-send read would hand out a nonce
-//! twenty-odd values behind the truth, every send, forever. That is the same loop that produced
-//! 3,391 of 4,519 failed sends in a historical episode, and it is why nothing here may "fix" the
-//! reservation back into a read.
-//!
-//! The two paths that *are* allowed to re-read:
-//!
-//! * an abandoned intent — [`Sender::sweep_timeouts`], `pending_timeout_secs` after the last
-//!   acceptance, by which point nothing of ours is plausibly still queued and walking backwards over
-//!   ground we thought we had covered is the entire intent;
-//! * `nonce too low`, which is positive proof from the chain that our counter is behind.
-//!
-//! Everything else is handled without the node. A broadcast the upstream *provably* refused —
-//! the local limiter never opened a socket, or the sequencer answered `-32003` — returns its nonce
-//! to [`Nonces::free`] and the next reservation hands the same value out again, so the sequence
-//! stays gap-free without asking anyone. A broadcast of *unknown* fate does not: its nonce may be
-//! sitting in the sequencer, so it is recorded in [`Sender::pending`] under the hash we signed and
-//! the timeout sweep is what eventually resolves it.
-//!
-//! # `-32003` is backpressure, not a failed transaction
-//!
-//! See [`crate::chain::RpcError::is_txpool_full`]. The measured stakes: at 1.85 tx/s the account
-//! wedges 138s after inclusion stops, and at 19 tx/s that grace period compresses to about 13s. So
-//! the response has to be to stop offering transactions to a full pool rather than to keep offering
-//! them and log each refusal — one such hiccup, mishandled, already cost 59 minutes of downtime.
-//!
-//! # Why the envelope is encoded here
-//!
-//! `alloy-consensus` would supply `TxEip1559`, and it does not currently resolve against this
-//! toolchain — see the workspace manifest for the exact version deadlock. EIP-1559's payload is
-//! a fully specified nine-field RLP list; it is encoded below and pinned byte-for-byte against
-//! `cast mktx` output in the tests.
+//! `alloy-consensus` would supply `TxEip1559` and does not resolve against this toolchain, so the
+//! nine-field EIP-1559 RLP list is encoded below and pinned byte-for-byte against `cast mktx`.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
 use alloy_primitives::{keccak256, Address, Bytes, B256, U256};
-use futures_util::stream::{FuturesUnordered, StreamExt};
 use alloy_rlp::Encodable;
 use alloy_sol_types::SolCall;
+use futures_util::stream::{FuturesUnordered, StreamExt};
 use k256::ecdsa::SigningKey;
 use serde_json::json;
 
@@ -144,9 +57,7 @@ use crate::config::KeySource;
 /// Anything that can go wrong on the transmit path.
 #[derive(Debug, thiserror::Error)]
 pub enum TxError {
-    /// The key could not be obtained.
-    ///
-    /// The message deliberately never contains the value, only where it was looked for.
+    /// The key could not be obtained. The message names where it was looked for, never the value.
     #[error("cannot load signing key: {0}")]
     Key(String),
     /// Signing failed.
@@ -160,9 +71,8 @@ pub enum TxError {
     NoKey,
     /// The account's nonce is not established, so nothing could be signed.
     ///
-    /// Distinct from [`Self::Rpc`] on purpose: the read that would establish it has its own error,
-    /// and this is the state *afterwards* — the phase declined to guess. Guessing is what a zero
-    /// initial nonce did, and the first send of every process paid for it.
+    /// Distinct from [`Self::Rpc`]: the state *after* that read failed, saying the phase declined
+    /// to guess. A guessed initial nonce is a `nonce too low` on every first send.
     #[error("the account nonce is not established; nothing was signed")]
     NoNonce,
     /// The node rejected the raw transaction.
@@ -170,14 +80,10 @@ pub enum TxError {
     Rejected(String),
 }
 
-// ---------------------------------------------------------------------------
-// Key
-// ---------------------------------------------------------------------------
+// --- Key ---
 
-/// A loaded signing key.
-///
-/// [`std::fmt::Debug`] is implemented by hand to print the address and nothing else. The derived
-/// one would put the scalar in every log line that formats a [`Sender`].
+/// A loaded signing key. [`std::fmt::Debug`] is by hand and prints the address only, because the
+/// derived one would put the scalar in every log line that formats a [`Sender`].
 pub struct Signer {
     key: SigningKey,
     address: Address,
@@ -195,9 +101,8 @@ impl Signer {
     /// Parse a 32-byte hex private key, with or without `0x`.
     ///
     /// # Errors
-    /// [`TxError::Key`] — and the message never quotes the input.
-    /// The two slices are over fixed-size values: an uncompressed SEC1 point is always 65 bytes
-    /// and a keccak digest always 32, neither of which can be another length.
+    /// [`TxError::Key`], never quoting the input. The two slices below are over fixed-size values:
+    /// an uncompressed SEC1 point is always 65 bytes and a keccak digest always 32.
     #[allow(clippy::indexing_slicing)]
     pub fn from_hex(hex: &str) -> Result<Self, TxError> {
         let t = hex.trim();
@@ -260,14 +165,8 @@ impl Signer {
     }
 
     /// Sign a 32-byte digest as `(r, s, v)` with `v` in `{27, 28}` — the shape `ecrecover` takes.
-    ///
-    /// Separate from the transaction path, which packs the same `yParity` into an RLP envelope
-    /// instead. Both go through `sign_prehash`, so there is one place a signature is produced and
-    /// two places one is packed.
-    ///
-    /// The caller supplies a finished digest and this hashes nothing. A signer that computes its
-    /// own preimage is a signer that can be talked into signing a different structure than the one
-    /// that was reviewed.
+    /// The caller supplies a finished digest and this hashes nothing, because a signer computing
+    /// its own preimage can be talked into signing a structure other than the one reviewed.
     ///
     /// # Errors
     /// [`TxError::Sign`] if the curve rejects the digest.
@@ -281,9 +180,7 @@ impl Signer {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Envelope
-// ---------------------------------------------------------------------------
+// --- Envelope ---
 
 /// An EIP-1559 (type 2) transaction, with an empty access list.
 #[derive(Debug, Clone)]
@@ -310,8 +207,8 @@ impl Eip1559 {
     /// `rlp([chainId, nonce, maxPriorityFee, maxFee, gas, to, value, data, accessList, ...sig])`,
     /// prefixed with the `0x02` type byte.
     ///
-    /// Field order is the specification's and is not negotiable — a transposition produces a
-    /// perfectly well-formed transaction that pays the wrong fee or calls the wrong address.
+    /// Field order is the specification's: a transposition produces a perfectly well-formed
+    /// transaction that pays the wrong fee or calls the wrong address.
     fn envelope(&self, sig: Option<(bool, U256, U256)>) -> Vec<u8> {
         let mut fields = Vec::with_capacity(256);
         self.chain_id.encode(&mut fields);
@@ -362,9 +259,7 @@ impl Eip1559 {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Intents
-// ---------------------------------------------------------------------------
+// --- Intents ---
 
 /// The only two things the updater key is allowed to do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -379,9 +274,9 @@ pub enum Intent {
     },
     /// Post a fresh capacity epoch.
     ///
-    /// Both amounts are **base** units on both sides — `PropCurve` amendment 1 moved ask
-    /// capacity off the quote denomination, and the bit positions did not move with it, so this
-    /// is the one place a wrong unit would encode cleanly and settle wrongly.
+    /// Both amounts are **base** units on both sides: `PropCurve` amendment 1 moved ask capacity
+    /// off the quote denomination and the bit positions did not move with it, so a wrong unit here
+    /// encodes cleanly and settles wrongly.
     RefreshCapacity {
         /// Pair id.
         pair_id: u16,
@@ -412,11 +307,9 @@ impl Intent {
 
     /// Whether this intent takes the pair's depth to zero — the shape `withdraw_pair` sends.
     ///
-    /// Deliberately not derived from [`Self::label`]. That is the calldata's name and both a
-    /// routine epoch and a withdrawal are `refreshCapacity` on chain, but the two want opposite
-    /// answers from [`Sender::withdrawal_in_flight`]: a pair with a *non-zero* epoch still in the
-    /// air is precisely a pair that has not been withdrawn yet and must be. The distinction lives
-    /// in the amounts, so it is read from the amounts.
+    /// Read from the amounts, never from [`Self::label`]: a routine epoch and a withdrawal are the
+    /// same call on chain, and they want opposite answers from [`Sender::withdrawal_in_flight`],
+    /// since a pair with a non-zero epoch in the air is precisely one still to be withdrawn.
     #[must_use]
     pub const fn is_withdrawal(self) -> bool {
         matches!(self, Self::RefreshCapacity { bid: 0, ask: 0, .. })
@@ -450,9 +343,7 @@ impl Intent {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Sender
-// ---------------------------------------------------------------------------
+// --- Sender ---
 
 /// One transaction awaiting confirmation.
 #[derive(Debug, Clone, Copy)]
@@ -467,8 +358,8 @@ pub struct Pending {
     pub submitted_at: Instant,
     /// Whether it was a withdrawal — a zero capacity epoch, per [`Intent::is_withdrawal`].
     ///
-    /// Recorded here rather than re-derived later because `kind` cannot answer it: a withdrawal
-    /// and a routine epoch refresh are the same call. See [`Sender::withdrawal_in_flight`].
+    /// Recorded rather than re-derived: `kind` cannot answer it, since a withdrawal and a routine
+    /// epoch refresh are the same call. See [`Sender::withdrawal_in_flight`].
     pub withdrawal: bool,
 }
 
@@ -510,9 +401,8 @@ pub enum Settled {
         /// Block it landed in.
         block: u64,
     },
-    /// Included and reverted. For `updateQuote` that means the row failed `validateLadder` on
-    /// chain after passing every off-chain check — a `dubu-core` divergence, and the loudest
-    /// thing this bot can discover.
+    /// Included and reverted. For `updateQuote` that means the row failed `validateLadder` on chain
+    /// after passing every off-chain check, which is a `dubu-core` divergence.
     Reverted {
         /// Block it landed in.
         block: u64,
@@ -526,25 +416,22 @@ pub enum Settled {
 
 /// The account's nonce sequence, held in this process.
 ///
-/// See the module docs for why it is held rather than read: the node's `pending` count is derived
-/// from a pool that silently truncates this account at 16 slots, so at ~37 in flight it answers low
-/// by however many it dropped and a per-send read would hand out a used nonce every time.
-///
-/// Two pieces, because a refused broadcast leaves a hole and a hole must be filled rather than
-/// skipped. Everything above a gap in the sequence is unexecutable — nonce ordering is absolute for
-/// one sender — so a nonce that provably never reached a pool has to come back and be handed out
-/// again, or the account wedges at the gap until something times out.
+/// Held rather than read: the node's `pending` count comes from a pool that truncates this account
+/// at 16 slots, so a per-send read hands out a used nonce — asking per send produced 3,391 of 4,519
+/// failed sends in one episode, a `nonce too low` loop that re-read, signed the same used nonce and
+/// was refused again. Two pieces, because a refused broadcast leaves a hole that must be filled
+/// rather than skipped: nonce ordering is absolute for one sender, so everything above a gap is
+/// unexecutable and the account wedges there until something times out.
 #[derive(Debug, Default)]
 struct Nonces {
-    /// The lowest nonce never yet handed out. `None` until seeded, which is the only state in which
-    /// a reservation is allowed to ask the node.
+    /// The lowest nonce never yet handed out. `None` until seeded, the only state in which a
+    /// reservation may ask the node.
     next: Option<u64>,
     /// Nonces reserved and then *provably* refused, lowest first. Handed out again before `next`.
     ///
-    /// Only ever holds values the upstream demonstrably never accepted — a local limiter refusal, or
-    /// a `-32003`. An unknown outcome must never land here: reusing a nonce that is actually sitting
-    /// in the sequencer signs a second transaction at the same nonce, which is the duplication this
-    /// whole structure exists to prevent.
+    /// Only values the upstream demonstrably never accepted: a local limiter refusal, or a
+    /// `-32003`. An unknown outcome must never land here, because reusing a nonce that is in fact
+    /// sitting in the sequencer signs a second transaction at the same nonce.
     free: BTreeSet<u64>,
 }
 
@@ -556,7 +443,7 @@ impl Nonces {
 
     /// Take the next nonce. `None` until seeded.
     ///
-    /// Synchronous by construction, and every caller must keep it that way. This is the
+    /// Synchronous by construction and every caller must keep it that way: this is the
     /// read-modify-write that concurrency would break.
     fn reserve(&mut self) -> Option<u64> {
         if let Some(n) = self.free.pop_first() {
@@ -569,8 +456,8 @@ impl Nonces {
 
     /// Give a reserved nonce back, for a broadcast the upstream provably refused.
     fn release(&mut self, n: u64) {
-        // Only a nonce this book actually handed out. A value at or above `next` was never reserved,
-        // and admitting one would let a caller mistake shrink the sequence.
+        // Only a nonce this book handed out: a value at or above `next` was never reserved, and
+        // admitting one would let a caller mistake shrink the sequence.
         if self.next.is_some_and(|next| n < next) {
             self.free.insert(n);
         }
@@ -579,8 +466,8 @@ impl Nonces {
     /// Forget everything and re-read on the next reservation. See [`Sender::resync_nonce`].
     fn resync(&mut self) {
         self.next = None;
-        // The holes go too. They are positions in a sequence this book is about to stop believing
-        // in, and carrying them across would hand out nonces below whatever the node reports.
+        // The holes go too: they index a sequence this book is about to stop believing in, and
+        // carrying them across would hand out nonces below whatever the node reports.
         self.free.clear();
     }
 
@@ -595,10 +482,9 @@ impl Nonces {
     }
 }
 
-/// A signed transaction whose nonce is already taken, waiting only for the wire.
-///
-/// Produced by [`Sender::reserve_batch`] with no await in sight, which is what makes the broadcast
-/// that follows safe to run concurrently.
+/// A signed transaction whose nonce is already taken, waiting only for the wire. Produced by
+/// [`Sender::reserve_batch`] with no await in it, which is what makes the concurrent broadcast
+/// safe.
 #[derive(Debug, Clone)]
 struct Reserved {
     intent: Intent,
@@ -620,8 +506,8 @@ struct Backpressure {
 
 /// A backpressure episode changing state. Reported once, so the caller logs once.
 ///
-/// Carried out of [`Sender::send_batch`] rather than logged here, because this module deliberately
-/// emits nothing: the same property that lets [`Sender::sweep_timeouts`] be tested without a node.
+/// Carried out of [`Sender::send_batch`] rather than logged here: this module emits nothing, which
+/// is what lets it be tested without a node.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Episode {
     /// The upstream pool started refusing. First occurrence in this episode.
@@ -646,8 +532,8 @@ pub struct Batch {
     /// Per-intent outcomes, in the order the nonces were reserved.
     ///
     /// `-32003` refusals are deliberately **absent**: they are backpressure rather than
-    /// per-transaction failures, and they are counted into [`Self::held_backpressure`] and the
-    /// episode instead so that a wedged upstream produces one line rather than one per send.
+    /// per-transaction failures, so they count into [`Self::held_backpressure`] and the episode,
+    /// and a wedged upstream produces one line rather than one per send.
     pub sent: Vec<(Intent, Result<Sent, TxError>)>,
     /// Intents not offered because the account is at its in-flight ceiling.
     pub held_at_capacity: usize,
@@ -671,24 +557,17 @@ impl Batch {
 
 /// The most transactions this account may have unconfirmed at once, across every pair.
 ///
-/// GIWA's sequencer refuses new transactions from one account past **256 in flight** with
-/// `-32003 txpool is full`, and half of that stays as stall buffer: a burst that arrives while
-/// inclusion is briefly behind must have somewhere to go other than into the refusal path.
-///
-/// This is a backstop, not the pacer. The per-pair [`crate::config::TxConfig::in_flight_max`] is
-/// what actually binds in steady state, and it is sized from the cadence — see its documentation.
-/// The number that matters about this one is that it is a *global* ceiling: the resources a send
-/// consumes are the account's single nonce sequence and the sequencer's per-account limit, neither
-/// of which is divisible per pair.
+/// GIWA's sequencer refuses one account past 256 in flight with `-32003 txpool is full`; half is
+/// kept as stall buffer. A backstop rather than the pacer — the per-pair
+/// [`crate::config::TxConfig::in_flight_max`] binds in steady state — but stated per account,
+/// because that is the scope of both the nonce sequence and the sequencer's own limit.
 pub const IN_FLIGHT_TOTAL_MAX: usize = 128;
 
 /// How long the send phase stands down after the upstream answers `-32003`.
 ///
-/// Sized against the two measured numbers. Inclusion advances about once per block, so a second
-/// gives the upstream a full block to drain — anything much shorter re-offers the same transactions
-/// to the same full pool five times a second, which is the flood this exists to avoid. And it has to
-/// be short against the grace period: at 19 tx/s the account wedges roughly 13s after inclusion
-/// stops, so a pause measured in seconds would spend most of the runway waiting.
+/// Bracketed by two measurements: inclusion advances about once per block, so a second gives the
+/// upstream a full block to drain where anything shorter re-offers the same transactions five times
+/// a second, and it must stay short against the grace period, roughly 13s at 19 tx/s.
 const BACKPRESSURE_PAUSE: Duration = Duration::from_secs(1);
 
 /// Builds, signs and submits. Owns the nonce and the pending set.
@@ -735,10 +614,8 @@ impl Sender {
             max_fee,
             max_priority_fee,
             transmit_allowed: cfg.transmit_allowed,
-            // Unseeded. `Sender::seed_nonce` fills it once at startup; until then the first
-            // reservation reads the node, which is the one moment in this process's life where that
-            // read is both necessary and trustworthy — nothing is in flight, so the local pool has
-            // nothing to have truncated.
+            // Unseeded. `Sender::seed_nonce` fills it at startup, the one moment reading the node
+            // is trustworthy: nothing is in flight, so the local pool has truncated nothing.
             nonces: Nonces::default(),
             pending: BTreeMap::new(),
             pending_timeout: Duration::from_secs(cfg.pending_timeout_secs),
@@ -761,36 +638,17 @@ impl Sender {
         self.transmit_allowed
     }
 
-    /// Whether this pair has an unconfirmed transaction.
-    #[must_use]
     /// True when this pair already has as many transactions outstanding as it is allowed.
     ///
-    /// This was one-at-a-time, on the reasoning that two rows in flight could be reordered by a
-    /// fee-sorting sequencer and the older one could win. That reasoning does not hold for a
-    /// single sender: nonce ordering is absolute, so `k + 1` cannot execute before `k` whatever
-    /// the fees. What a second in-flight transaction genuinely costs is head-of-line blocking —
-    /// if `k` never lands, everything behind it is stuck — and the answer to that is a bound, not
-    /// a ban.
-    ///
-    /// The bound matters because the transactions here are idempotent overwrites rather than
-    /// orders. `updateQuote` replaces the row without reading it, so a dropped one needs no
-    /// retry: the next cycle computes a fresh row from the current reference and sends that. A
-    /// pipeline of quotes is therefore safe in a way a pipeline of orders would not be.
-    ///
-    /// # Two ceilings, and why the second one is global
-    ///
-    /// The per-pair bound stays: it is what stops one pair's stall from occupying the whole queue,
-    /// and it is what `tx.in_flight_max` means in a config file somebody reviews.
-    ///
-    /// It is not sufficient on its own, because nothing a send consumes is divisible per pair. There
-    /// is one nonce sequence for the account, and the sequencer's refusal threshold — 256 in flight
-    /// from one address — is per account too. A per-pair cap of *k* over *n* pairs implies a global
-    /// ceiling of *k·n* that nobody wrote down and that changes when a pair is added, which is
-    /// exactly the shape of limit that is discovered in production. So the account's own ceiling is
-    /// stated directly, as [`IN_FLIGHT_TOTAL_MAX`].
+    /// Two ceilings: the per-pair one stops a single pair's stall from occupying the whole queue,
+    /// but on its own it implies a global ceiling of *k·n* that moves whenever a pair is added, so
+    /// the account's own limit is stated directly as [`IN_FLIGHT_TOTAL_MAX`].
+    #[must_use]
     pub fn at_capacity(&self, pair_id: u16) -> bool {
-        self.in_flight(pair_id) >= self.in_flight_max
-            || self.in_flight_total() >= IN_FLIGHT_TOTAL_MAX
+        if self.in_flight(pair_id) >= self.in_flight_max {
+            return true;
+        }
+        self.in_flight_total() >= IN_FLIGHT_TOTAL_MAX
     }
 
     /// How many transactions this pair has outstanding.
@@ -803,9 +661,9 @@ impl Sender {
 
     /// How many transactions this **account** has outstanding, across every pair.
     ///
-    /// The quantity the sequencer's 256-per-account limit is measured in, and — because nonce
-    /// ordering is absolute — also the depth a jump withdrawal has to queue behind. Both of those
-    /// are properties of the key, and the key is shared by the whole book.
+    /// What the sequencer's 256-per-account limit is measured in, and — because nonce ordering is
+    /// absolute — the depth a jump withdrawal must queue behind. Both are properties of the key,
+    /// which the whole book shares.
     #[must_use]
     pub fn in_flight_total(&self) -> usize {
         self.pending
@@ -817,19 +675,11 @@ impl Sender {
 
     /// Whether this pair already has an unconfirmed **withdrawal** in the air.
     ///
-    /// [`Self::at_capacity`] is the wrong question for the jump re-assert, and asking it cost
-    /// about 740 transactions in 16 hours. `in_flight_max` is 2, so the fast lane's own withdrawal
-    /// leaves a slot open; the re-assert then fires ~1.4s later against a ~2s inclusion latency,
-    /// reads a chain snapshot that cannot yet show the zero, and sends the same withdrawal again.
-    /// Measured over 16.2 hours: 150-154 withdrawal transactions per pair against 73-75 actual
-    /// episodes, every one of them at the 100x tip `jump.withdraw_priority_fee_wei` pays to win a
-    /// fee auction that the first transaction had already entered.
-    ///
-    /// Built on the same bookkeeping as [`Self::in_flight`] rather than a second per-pair flag:
-    /// `nonce >= landed_nonce` is what "still in the air" means for a single sender, and a
-    /// parallel flag is one [`Self::sweep_timeouts`] and [`Self::observe_landed`] would each have
-    /// to remember to clear — a withdrawal that timed out with the flag still set would suppress
-    /// the very re-assert that exists to notice it.
+    /// [`Self::at_capacity`] is the wrong question for the jump re-assert: `in_flight_max` is 2, so
+    /// the fast lane's own withdrawal leaves a slot open and the re-assert re-sends at the 100x
+    /// `jump.withdraw_priority_fee_wei` tip against a snapshot too young to show the zero. Derived
+    /// from [`Self::in_flight`]'s bookkeeping rather than a parallel flag, which
+    /// [`Self::sweep_timeouts`] and [`Self::observe_landed`] would each have to clear.
     #[must_use]
     pub fn withdrawal_in_flight(&self, pair_id: u16) -> bool {
         self.pending.get(&pair_id).is_some_and(|v| {
@@ -840,15 +690,10 @@ impl Sender {
 
     /// Tell the gate what the chain's confirmed nonce is.
     ///
-    /// Everything below this has landed -- nonce ordering is absolute for one sender -- so it no
-    /// longer occupies an in-flight slot, whatever the receipt poller has managed to ask about.
-    /// The transaction stays in `pending` until a receipt classifies it, because whether it
-    /// succeeded or reverted is a different question from whether it is still in the air, and
-    /// conflating the two is what made the gate hold slots for transactions that were already on
-    /// chain 2s earlier.
-    ///
-    /// Monotone: a view can arrive out of order, and a nonce that went backwards would re-block
-    /// sends that are already settled.
+    /// Everything below it has landed, so it no longer occupies an in-flight slot whatever the
+    /// receipt poller has asked about; it stays in `pending` until a receipt says whether it
+    /// *succeeded*. Monotone, because a view can arrive out of order and a nonce that went
+    /// backwards would re-block settled sends.
     pub fn observe_landed(&mut self, confirmed_nonce: u64) {
         self.landed_nonce = self.landed_nonce.max(confirmed_nonce);
     }
@@ -863,12 +708,9 @@ impl Sender {
 
     /// Force the next reservation to re-read the nonce from the node.
     ///
-    /// There are exactly two callers, and the module docs say why there may not be a third:
-    /// [`Self::sweep_timeouts`] abandoning an intent, and a `nonce too low` proving the chain is
-    /// ahead of us. Both are recovery paths where the local counter has already been shown to be
-    /// wrong, so re-reading is the only way forward. On the hot path the node's answer is *less*
-    /// trustworthy than ours — it is derived from a pool that truncates this account at 16 slots —
-    /// and a read there would hand out a nonce that has already been used.
+    /// Exactly two callers and there may not be a third: [`Self::sweep_timeouts`] abandoning an
+    /// intent, and a `nonce too low`. Both are recovery paths where the local counter has already
+    /// been shown wrong; elsewhere the node's answer is the *less* trustworthy of the two.
     pub fn resync_nonce(&mut self) {
         self.nonces.resync();
     }
@@ -891,20 +733,14 @@ impl Sender {
         self.staged_episode.take()
     }
 
-    /// Read the account's nonce once, so that the first send is not the thing that discovers it.
+    /// Read the account's nonce once, so the first send is not what discovers it.
     ///
-    /// This is the *only* unconditional `eth_getTransactionCount` in the process, and startup is the
-    /// one moment where the answer can be trusted without qualification: nothing of ours is in
-    /// flight, so the local pool has dropped nothing and its `pending` count is the chain's.
-    ///
-    /// Worth doing on its own terms even before concurrency. The floor that used to guard the first
-    /// send was initialised to zero, so the first send after every process start was unfloored — and
-    /// a first send at a nonce the chain has long passed is the head of the `nonce too low` loop that
-    /// accounted for 3,391 of 4,519 failed sends in one historical episode.
+    /// The *only* unconditional `eth_getTransactionCount` in the process: at startup nothing of
+    /// ours is in flight, so the local pool has truncated nothing and its count is the chain's.
     ///
     /// # Errors
-    /// [`TxError::NoKey`] with no signer, or [`TxError::Rpc`] if the read fails. Neither is fatal to
-    /// the caller: an unseeded sequence simply means the first reservation reads it instead.
+    /// [`TxError::NoKey`] with no signer, or [`TxError::Rpc`] if the read fails. Neither is fatal:
+    /// an unseeded sequence means the first reservation reads it instead.
     pub async fn seed_nonce(&mut self, rpc: &Rpc) -> Result<u64, TxError> {
         let signer = self.signer.as_ref().ok_or(TxError::NoKey)?;
         let n = rpc
@@ -952,32 +788,22 @@ impl Sender {
 
     /// Submit an intent, or describe what would have been submitted.
     ///
-    /// The nonce comes from `eth_getTransactionCount(addr, "pending")` on the **ordinary** RPC,
-    /// not the flashblocks one. A nonce read from a preconfirmed state that later reorganises
-    /// produces a transaction that can never be included.
+    /// The nonce is seeded and re-read on the **ordinary** RPC, never the flashblocks one: a nonce
+    /// read from a preconfirmed state that later reorganises can never be included.
     ///
     /// # Errors
-    /// [`TxError`]. On any failure past the point where a nonce was consumed the local nonce is
-    /// dropped, so the next attempt re-reads it rather than building on a guess.
+    /// [`TxError`]. Past the point where a nonce was consumed the local nonce is dropped, so the
+    /// next attempt re-reads it rather than building on a guess.
     pub async fn send(&mut self, rpc: &Rpc, intent: Intent) -> Result<Sent, TxError> {
         self.send_with_fees(rpc, intent, None).await
     }
 
     /// Submit an intent at fees other than the configured ones.
     ///
-    /// # Why there is a second fee at all, when [`crate::tx`] argues against an escalator
-    ///
-    /// That argument is about *quote* traffic, and it holds: at 0.001 gwei the spread between a
-    /// minimal tip and an absurd one is worth less than a rounding error on one quote, so a
-    /// controller buys nothing. A **jump withdrawal** is the one transaction on this bot where the
-    /// fee buys something concrete. GIWA's sequencer orders by highest fee first, and the
-    /// counterparty is by construction someone willing to outbid a quoting bot that pays a flat
-    /// near-zero tip. Detecting 200 ms sooner does not win a fee auction; paying more does, and it
-    /// is the difference between the withdrawal landing ahead of the pick-off in the same block
-    /// and landing behind it.
-    ///
-    /// This is still not an escalator: one flat number from config, used for one kind of
-    /// transaction, never bumped and never retried at a higher price.
+    /// A **jump withdrawal** is the one transaction where the fee buys something: the sequencer
+    /// orders by highest fee first and the counterparty will by construction outbid a flat
+    /// near-zero tip, so the tip decides whether the withdrawal lands ahead of the pick-off in the
+    /// same block. Still one flat config number, never bumped and never retried higher.
     ///
     /// # Errors
     /// [`TxError`], exactly as [`Sender::send`].
@@ -1002,10 +828,8 @@ impl Sender {
         self.settle_broadcast(&r, out, Instant::now())
     }
 
-    /// Describe what would have gone out, without sending it.
-    ///
-    /// Still signs when a key happens to be loaded, so that the encode-and-sign path is exercised
-    /// rather than merely assumed to work on the day it is switched on.
+    /// Describe what would have gone out, without sending it. Still signs when a key is loaded, so
+    /// the encode-and-sign path is exercised rather than assumed on the day transmission is on.
     fn dry_run(&self, intent: Intent, fees: Option<Fees>) -> Result<Sent, TxError> {
         let would_be_nonce = self.nonces.peek();
         let would_be_hash = match (&self.signer, would_be_nonce) {
@@ -1021,30 +845,18 @@ impl Sender {
 
     /// Broadcast a whole cycle's intents at once: nonces assigned synchronously, sends concurrent.
     ///
-    /// This is the send phase. See the module docs for the split and for why it is the only shape
-    /// that is safe; what follows is what happens around it.
-    ///
-    /// **Order.** `intents` is walked in order and the nonces come out in that order, so the
-    /// arbitration `main.rs` performs between a capacity refresh and a quote row still decides which
-    /// one executes first. Nothing else about the batch is ordered: the broadcasts complete in
-    /// whatever order the network returns them, and the outcomes are folded back in reservation order
-    /// regardless, so the pending queue for a pair stays oldest-first.
-    ///
-    /// **The in-flight ceiling.** Trimmed to [`IN_FLIGHT_TOTAL_MAX`] before anything is signed. The
-    /// per-pair gate in [`crate::policy`] has usually already done this work via [`Self::at_capacity`];
-    /// this is the account-level backstop, and it is here rather than only in the policy because the
-    /// sequencer's limit is not something a per-pair decision can see.
-    ///
-    /// **Backpressure.** A `-32003` pauses the phase for [`BACKPRESSURE_PAUSE`] rather than being
-    /// reported per transaction. Withholding quotes is the correct response to a full upstream: the
-    /// transactions are idempotent overwrites, so nothing is lost by not sending them, and the next
-    /// cycle computes fresh rows anyway. What *is* lost by sending them is the log — at 27 tx/s a
-    /// per-occurrence error is about 1600 lines a minute, which buries the one line that says the
-    /// account is wedging.
+    /// `intents` is walked in order and the nonces come out in that order, so `main.rs`'s
+    /// arbitration between a capacity refresh and a quote row still decides which executes first;
+    /// broadcasts complete in network order but outcomes fold back in reservation order, keeping
+    /// the pending queue oldest-first. The batch is trimmed to [`IN_FLIGHT_TOTAL_MAX`] before
+    /// anything is signed, since the sequencer's per-account limit is invisible to a per-pair gate.
+    /// A `-32003` pauses the phase for [`BACKPRESSURE_PAUSE`] rather than being reported per
+    /// transaction: nothing is lost by withholding an idempotent overwrite, whereas at 27 tx/s a
+    /// per-occurrence error is ~1600 lines a minute.
     ///
     /// # Errors
-    /// [`TxError`] only for the failures that stop the whole phase: no key, or a nonce that could not
-    /// be established. Per-intent failures are inside [`Batch::sent`].
+    /// [`TxError`] only for the failures that stop the whole phase: no key, or a nonce that could
+    /// not be established. Per-intent failures are inside [`Batch::sent`].
     pub async fn send_batch(
         &mut self,
         rpc: &Rpc,
@@ -1063,9 +875,8 @@ impl Sender {
         }
 
         let now = Instant::now();
-        // Still inside the pause. Nothing is signed and nothing is offered: a pool that refused a
-        // transaction 200ms ago is a pool that will refuse this one, and asking again is how one
-        // wedged upstream becomes thousands of log lines.
+        // Inside the pause nothing is signed and nothing is offered: a pool that refused a
+        // transaction 200ms ago will refuse this one.
         if let Some(mut bp) = self.backpressure {
             if now.saturating_duration_since(bp.last_refusal) < BACKPRESSURE_PAUSE {
                 bp.held = bp.held.saturating_add(intents.len() as u64);
@@ -1091,9 +902,8 @@ impl Sender {
             "one reservation per offered intent"
         );
 
-        // The whole point. Five `eth_sendRawTransaction` calls at a fixed 264ms France-to-Korea RTT
-        // cost 264ms together instead of 1.32s in sequence. The raw bytes are hex-encoded up front so
-        // each future owns its own payload and borrows nothing but the client.
+        // The raw bytes are hex-encoded up front so each future owns its payload and borrows
+        // nothing but the client.
         let mut flight: FuturesUnordered<_> = reserved
             .iter()
             .enumerate()
@@ -1108,9 +918,9 @@ impl Sender {
         }
         drop(flight);
 
-        // Folded back in reservation order, not completion order. `Sender::pending` is documented
-        // oldest-first per pair and `sweep_timeouts` acts on the head of it, so a pair carrying both
-        // a refresh and a row must record them in the order their nonces execute.
+        // Reservation order, not completion order: `Sender::pending` is oldest-first per pair and
+        // `sweep_timeouts` acts on its head, so a pair carrying both a refresh and a row must
+        // record them in the order their nonces execute.
         let settled_at = Instant::now();
         let mut batch = Batch {
             sent: Vec::with_capacity(reserved.len()),
@@ -1137,9 +947,9 @@ impl Sender {
 
     /// Assign nonces and sign, in the order the intents were pushed.
     ///
-    /// **There is no `.await` in this function and there must never be one.** That is the entire
-    /// reason it exists as a separate pass: the nonce is a read-modify-write, and an await inside it
-    /// is what would let two concurrent sends both read `n` and both sign `n`.
+    /// **There is no `.await` in this function and there must never be one** — that is why it is a
+    /// separate pass. The nonce is a read-modify-write, and an await inside it is what would let
+    /// two concurrent sends both read `n` and both sign `n`.
     fn reserve_batch(
         &mut self,
         intents: &[Intent],
@@ -1154,13 +964,12 @@ impl Sender {
 
         let mut nonces: Vec<u64> = Vec::with_capacity(intents.len());
         for _ in intents {
-            // Checked seeded above, and nothing between here and there can unseed it.
             let Some(n) = self.nonces.reserve() else {
                 break;
             };
-            // The invariant the RefreshCapacity-before-UpdateQuote argument rests on. A reused hole
-            // is always below `next` and holes come out lowest-first, so the sequence a batch takes
-            // is strictly increasing even when it is not contiguous.
+            // The invariant the RefreshCapacity-before-UpdateQuote argument rests on: a reused hole
+            // is below `next` and holes come out lowest-first, so a batch's nonces are strictly
+            // increasing even when they are not contiguous.
             if let Some(prev) = nonces.last() {
                 assert!(
                     n > *prev,
@@ -1196,9 +1005,8 @@ impl Sender {
         };
         match signed {
             Ok(v) => Ok(v),
-            // Signing a valid key cannot fail in practice, but a nonce reserved and then never used
-            // is a hole in the sequence, and a hole stops every nonce above it from executing. So it
-            // goes back rather than being left to a timeout that has nothing to time out.
+            // A nonce reserved and never used is a hole, and a hole stops every nonce above it from
+            // executing, so it goes back rather than waiting on a timeout with nothing to time out.
             Err(e) => {
                 for n in nonces {
                     self.nonces.release(n);
@@ -1210,23 +1018,13 @@ impl Sender {
 
     /// Fold one broadcast's outcome into the nonce book, the pending set, and the episode counter.
     ///
-    /// The classification is the delicate part, and it is a claim about whether the nonce was
-    /// consumed rather than about whether the send succeeded:
-    ///
-    /// * **Accepted** — tracked, nonce spent. A hash the node disagrees with is *still* accepted: it
-    ///   took the transaction, so the nonce is gone whatever it filed it under. Tracking it anyway is
-    ///   a change from the previous behaviour, which returned the error and left a possibly-live
-    ///   nonce with nothing to time it out.
-    /// * **Provably refused** — the local limiter never opened a socket, or the sequencer answered
-    ///   `-32003`. The nonce is untouched and goes back to [`Nonces::free`] to be handed out again,
-    ///   which is what keeps the sequence gap-free without asking the node anything.
-    /// * **`nonce too low`** — the chain has passed this nonce. The counter is behind, and this is one
-    ///   of the two conditions that may re-read it.
-    /// * **`already known`** — the node has these exact bytes already, so the transaction is in flight
-    ///   under the hash we signed. Treated as an acceptance; see [`RpcError::is_already_known`].
-    /// * **Anything else** — unknown fate. The transaction may be sitting in the sequencer, so the
-    ///   nonce must *not* be reused; it is recorded under the hash we signed and
-    ///   [`Self::sweep_timeouts`] is what eventually resolves it.
+    /// Every branch is a claim about whether the *nonce was consumed*, not about whether the send
+    /// succeeded. Accepted or `already known` is tracked and the nonce spent, even when the node
+    /// returns a hash we disagree with, because an untracked live nonce has nothing to time it out.
+    /// A provable refusal (no socket opened, or a `-32003`) leaves the nonce untouched, so it
+    /// returns to [`Nonces::free`] and the sequence stays gap-free. Anything else is unknown fate,
+    /// possibly sitting in the sequencer, so its nonce must *not* be reused and
+    /// [`Self::sweep_timeouts`] resolves it.
     fn settle_broadcast(
         &mut self,
         r: &Reserved,
@@ -1240,8 +1038,7 @@ impl Sender {
                 self.track(r, now);
                 self.close_episode(now);
                 if mismatch {
-                    // Not fatal, but the local hash and the node's disagree, so every receipt lookup
-                    // after this would be against the wrong one.
+                    // Not fatal, but every receipt lookup after this would use the wrong hash.
                     return Err(TxError::Rejected(format!(
                         "node returned hash {returned}, locally computed {}",
                         r.hash
@@ -1256,14 +1053,9 @@ impl Sender {
         };
 
         if e.is_already_known() {
-            // Accepted, not refused. The node has these exact bytes, so the transaction is in flight
-            // under the hash we signed and the nonce is spent — the same state as an `Ok`, reached by
-            // a different reply. Tracking it and returning success is what makes it true rather than
-            // merely quiet: the pending entry is what a receipt lookup and the timeout sweep need,
-            // and an operator alert on a transaction that is on its way is noise that trains people
-            // to ignore the channel. Observed only on the one pair that spends ~30% of its time
-            // withdrawn, where the ladder is byte-identical between pushes and so a duplicate is
-            // possible at all.
+            // The node holds these exact bytes, so the transaction is in flight under the hash we
+            // signed and the nonce is spent: the same state as an `Ok`, and tracked for the same
+            // reason. Reachable where a ladder is byte-identical between pushes.
             self.track(r, now);
             self.close_episode(now);
             return Ok(Sent::Broadcast {
@@ -1312,8 +1104,8 @@ impl Sender {
             bp.refusals = bp.refusals.saturating_add(1);
             (first, bp.refusals)
         };
-        // Refreshed while the `Opened` report is still undrained, so the one line the caller logs
-        // carries the whole batch's refusals rather than only the first of them.
+        // Refreshed while the `Opened` report is undrained, so the one line the caller logs carries
+        // the whole batch's refusals rather than only the first.
         if first || matches!(self.staged_episode, Some(Episode::Opened { .. })) {
             self.staged_episode = Some(Episode::Opened { refusals });
         }
@@ -1342,46 +1134,21 @@ impl Sender {
 
     /// Check every pending transaction once. Returns what settled.
     ///
-    /// One request per pending transaction, so at most one per pair, and only while something
-    /// is actually outstanding.
-    ///
-    /// # Errors
-    /// Never returns early on an RPC failure for one pair — a rate-limited receipt lookup must
-    /// not prevent the others from being checked, and a pending transaction that cannot be
-    /// looked at simply stays pending until it times out.
+    /// Never returns early on a failed lookup: a rate-limited receipt must not stop the others
+    /// being checked, and an unreadable one stays pending until it times out.
     pub async fn poll_pending(&mut self, rpc: &Rpc) -> Vec<(u16, Pending, Settled)> {
         let mut settled = Vec::new();
         let now = Instant::now();
-        // A transaction younger than this has not had time to land, so asking for its receipt is
-        // a round trip that can only return null. It did not matter while the cycle ran once a
-        // second; at the quote cadence the same transaction would be asked about twice before it
-        // could possibly be there, and the receipt call competes with quote traffic for the same
-        // rate limit.
-        //
-        // Sized under the measured 296ms best-case inclusion so a fast landing is still seen on
-        // the first poll after it happens.
+        // Younger than this cannot have landed, so the receipt call can only return null while
+        // competing with quote traffic for the same rate limit. Under the measured 296ms best-case
+        // inclusion, so a fast landing is still seen on the first poll after it happens.
         const MIN_AGE: Duration = Duration::from_millis(250);
 
-        // Only transactions the chain has already accounted for.
-        //
-        // A receipt used to be how the in-flight gate learned a send had landed, so every pending
-        // transaction was asked about on every cycle until one appeared -- and most of those asks
-        // returned null, because they were made before the transaction could be there. Measured at
-        // the quote cadence that was 8.19 requests a second, nearly twice the send rate itself and
-        // the single largest consumer on the write path.
-        //
-        // The gate reads `landed_nonce` now (see `observe_landed`), which comes free with a read the
-        // reader was making anyway. So a receipt is no longer needed to decide whether to keep
-        // sending -- only to decide whether what landed *succeeded*, and that question is worth
-        // asking exactly once, after the nonce says there is an answer to get.
-        //
-        // What this keeps: a revert still surfaces. `updateQuote` passing every off-chain check and
-        // then reverting means dubu-core has diverged from the contract, which must never pass
-        // silently, and it is why this is a narrowed filter rather than a deleted call.
-        //
-        // What this gives up: a transaction that lands but whose nonce we have not observed yet is
-        // not classified this cycle. It is classified on the next one, and the timeout below is
-        // unchanged, so nothing is left pending forever.
+        // Only transactions the chain has accounted for: the gate reads `landed_nonce`, so a
+        // receipt only answers whether what landed *succeeded*, and asking every cycle until one
+        // appeared cost 8.19 requests a second, twice the send rate. Asked at all because a revert
+        // must surface — `updateQuote` reverting after passing every off-chain check means
+        // dubu-core has diverged from the contract.
         let landed = self.landed_nonce;
         let entries: Vec<(u16, Pending)> = self
             .pending
@@ -1414,9 +1181,8 @@ impl Sender {
                     ));
                     self.forget(pair_id, p.hash);
                 }
-                // Either no receipt yet, or the lookup failed. Both mean "ask again next cycle";
-                // the timeout sweep below is what eventually gives up, and it runs over every
-                // pending transaction rather than only the ones reached here.
+                // No receipt yet, or the lookup failed: both mean ask again next cycle. The sweep
+                // below is what gives up, over every pending transaction rather than these.
                 _ => {}
             }
         }
@@ -1427,13 +1193,9 @@ impl Sender {
 
     /// Give up on transactions that have outlived [`Self::pending_timeout`].
     ///
-    /// Separate from the receipt loop, and not an accident of layout. That loop deliberately skips
-    /// anything `landed_nonce` has not passed, because asking about a transaction the chain has not
-    /// accounted for was 8.19 null answers a second. But a genuinely stuck transaction is
-    /// *precisely* one the nonce never passes, so a timeout living inside that loop would have made
-    /// the one case it exists for the one case it can never reach.
-    ///
-    /// Pure: no RPC, so the behaviour is testable without a node.
+    /// Outside the receipt loop by necessity: that loop skips anything `landed_nonce` has not
+    /// passed, and a stuck transaction is precisely one the nonce never passes. Pure, so the
+    /// behaviour is testable without a node.
     fn sweep_timeouts(&mut self, now: Instant) -> Vec<(u16, Pending, Settled)> {
         let mut settled = Vec::new();
         let stuck: Vec<(u16, Pending)> = self
@@ -1459,12 +1221,11 @@ impl Sender {
                     waited_secs: waited.as_secs(),
                 },
             ));
-            // Everything behind a timed-out transaction is dropped with it, not just the one that
-            // expired. If nonce `k` never lands there is a gap, and every nonce after it is
-            // unexecutable however healthy its own transaction looks.
+            // Everything behind a timed-out transaction goes with it: a nonce that never lands is a
+            // gap, and every nonce after it is unexecutable however healthy its transaction looks.
             self.pending.remove(&pair_id);
-            // The abandoned nonce may or may not have been consumed. Re-reading is the only way to
-            // find out, and guessing produces a stuck queue.
+            // The abandoned nonce may or may not have been consumed, and re-reading is the only way
+            // to find out. Guessing produces a stuck queue.
             self.resync_nonce();
         }
         settled
@@ -1473,13 +1234,8 @@ impl Sender {
 
 #[cfg(test)]
 mod tests {
-    /// A transaction the nonce never passes must still time out.
-    ///
-    /// The receipt loop only looks at transactions below `landed_nonce`, which is the whole point --
-    /// asking about a transaction before the chain has accounted for it was 8.19 requests a second
-    /// of null answers. But a genuinely stuck transaction is *precisely* one the nonce never
-    /// passes, so leaving the timeout inside that loop made the one case it exists for the one case
-    /// it could never reach: the queue would have blocked forever behind it.
+    /// The receipt loop only looks below `landed_nonce`, and a stuck transaction is precisely one
+    /// the nonce never passes, so the sweep has to be what reaches it.
     #[test]
     fn a_stuck_transaction_times_out_even_though_the_nonce_never_passes_it() {
         let mut s = Sender::new(
@@ -1517,12 +1273,8 @@ mod tests {
         assert_eq!(s.in_flight(7), 0, "and the queue must be cleared behind it");
     }
 
-    /// The gate must reopen on the chain's nonce, not on a receipt arriving.
-    ///
-    /// This is the regression that cost 14.7% of quote cycles: a transaction landed in ~570ms, the
-    /// receipt call reporting it lost to quote traffic at the rate limiter and came back 2.5s
-    /// later, and for those two seconds the gate refused to re-quote over a queue that was already
-    /// empty.
+    /// The gate reopens on the chain's nonce, not on a receipt: a receipt lost to quote traffic at
+    /// the rate limiter reports a landing ~2s late, over an already-empty queue.
     #[test]
     fn the_gate_reopens_on_the_confirmed_nonce() {
         let mut s = Sender::new(
@@ -1556,12 +1308,8 @@ mod tests {
         assert_eq!(s.pending(1).map(|p| p.nonce), Some(10));
     }
 
-    /// A withdrawal is a zero epoch, and nothing else is — including the routine refresh that
-    /// encodes to the identical call.
-    ///
-    /// The distinction is the whole fix: if a non-zero `refreshCapacity` counted as a withdrawal,
-    /// the re-assert would stand down on a pair whose epoch is about to be armed, which is the
-    /// opposite of what it is for.
+    /// A withdrawal is a zero epoch and nothing else is, including the routine refresh that encodes
+    /// identically: counting one would stand the re-assert down on a pair about to be armed.
     #[test]
     fn only_a_zero_epoch_is_a_withdrawal() {
         assert!(Intent::RefreshCapacity {
@@ -1589,13 +1337,8 @@ mod tests {
         .is_withdrawal());
     }
 
-    /// The guard that stopped the jump re-assert from sending every withdrawal twice.
-    ///
-    /// Measured over 16.2 hours before it existed: 150-154 withdrawal transactions per pair
-    /// against 73-75 real episodes, or about 740 wasted sends, each at the 100x withdrawal tip.
-    /// The cause is entirely visible here — `in_flight_max` is 2, so one withdrawal in the air
-    /// leaves `at_capacity` false and the re-assert takes the free slot ~1.4s into a ~2s
-    /// inclusion.
+    /// The guard against re-asserting every withdrawal: `in_flight_max` is 2, so one in the air
+    /// leaves `at_capacity` false and the re-assert takes the free slot at the 100x tip.
     #[test]
     fn a_withdrawal_already_in_the_air_is_not_sent_again() {
         let mut s = Sender::new(
@@ -1624,8 +1367,7 @@ mod tests {
         );
         assert!(s.withdrawal_in_flight(1));
 
-        // The chain has accounted for it, so the pair is answerable again — by the same rule
-        // `in_flight` uses, and without waiting for a receipt.
+        // The chain has accounted for it, so the pair is answerable again without a receipt.
         s.observe_landed(11);
         assert!(!s.withdrawal_in_flight(1));
         assert_eq!(s.in_flight(1), 0);
@@ -1664,9 +1406,8 @@ mod tests {
         );
         assert!(!s.withdrawal_in_flight(4));
 
-        // And a timed-out withdrawal releases the guard, because the queue goes with it. A flag
-        // kept outside `pending` is the version of this that would have suppressed the re-assert
-        // for the one case it exists to catch.
+        // A timed-out withdrawal releases the guard, because the queue goes with it. A flag kept
+        // outside `pending` would suppress the re-assert for the one case it exists to catch.
         s.pending_timeout = Duration::from_millis(1);
         s.pending.insert(
             5,
@@ -1718,10 +1459,9 @@ mod tests {
 
     use super::*;
 
-    /// Anvil's first development account. **Published in Foundry's own documentation and in
-    /// every Anvil startup banner** — it is a test fixture, not a secret, and it holds nothing
-    /// on any network anyone cares about. It is here so the signature below can be checked
-    /// against `cast` by anyone reading this file.
+    /// Anvil's first development account: published in Foundry's docs and in every Anvil startup
+    /// banner, so a fixture rather than a secret. Hard-coded so the vector below is reproducible
+    /// against `cast`.
     const ANVIL_KEY_0: &str = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
     const ANVIL_ADDR_0: &str = "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266";
 
@@ -1751,8 +1491,7 @@ mod tests {
 
     #[test]
     fn a_key_error_never_quotes_the_key_material() {
-        // 33 bytes: wrong length, but every byte of it is plausible key material, and the point
-        // of the test is that none of it reaches a log line.
+        // 33 bytes: wrong length, but plausible key material, none of which may reach a log line.
         let material = "11".repeat(33);
         let e = Signer::from_hex(&format!("0x{material}")).unwrap_err();
         let msg = format!("{e}");
@@ -1798,9 +1537,7 @@ mod tests {
         //     --priority-gas-price 5000000 --gas-price 50000000 --gas-limit 400000 \
         //     0xA629071E606F425dB93310c3ecc35E00Fbe16358 0xdeadbeef
         //
-        // This is the check that the nine RLP fields are in the right order with the right
-        // encodings. A transposition here produces a valid transaction that does the wrong
-        // thing, which no amount of round-tripping against ourselves would catch.
+        // A transposition of the nine RLP fields still produces a valid transaction.
         let signer = Signer::from_hex(ANVIL_KEY_0).unwrap();
         let (hash, raw) = vector_tx().sign(&signer).unwrap();
         let expected_raw = include_str!("../testdata/eip1559_vector.hex").trim();
@@ -1868,8 +1605,8 @@ mod tests {
 
     #[test]
     fn a_capacity_above_the_uint96_field_saturates_rather_than_wrapping() {
-        // Wrapping would encode a tiny capacity that looks deliberate. The config validator
-        // already refuses this, so saturating here is the second line rather than the first.
+        // Wrapping would encode a tiny capacity that looks deliberate. The config validator already
+        // refuses this, so saturating here is the second line rather than the first.
         let data = Intent::RefreshCapacity {
             pair_id: 1,
             bid: u128::MAX,
@@ -1991,8 +1728,7 @@ mod tests {
         assert_eq!(s.in_flight(1), 2);
     }
 
-    /// Everything behind a gap is unexecutable, so a timeout on the oldest takes the queue with
-    /// it rather than leaving transactions that can never settle.
+    /// Everything behind a gap is unexecutable, so a timeout on the oldest takes the queue with it.
     #[test]
     fn a_timeout_drops_the_whole_queue_for_that_pair() {
         let mut s = Sender::new(
@@ -2017,8 +1753,7 @@ mod tests {
 
     #[test]
     fn a_failed_send_drops_the_local_nonce() {
-        // Building the next transaction on a nonce that may or may not have been consumed is
-        // how a queue gets stuck behind a gap.
+        // Building on a nonce that may or may not have been consumed is how a queue wedges.
         let mut s = Sender::new(
             None,
             91_342,
@@ -2033,17 +1768,8 @@ mod tests {
         assert_eq!(s.next_nonce(), None);
     }
 
-    /// A re-read may reach a node that has not seen what we already broadcast.
-    ///
-    /// The failure this guards: the transmit pool has nine endpoints and pins to one. When that
-    /// one is serving a rate-limit penalty the nonce question goes to another, which answers from
-    /// its own pending pool — a count from before the transactions the first node is holding. The
-    /// sender then signs a nonce it has already used, the node refuses it as `nonce too low`, the
-    /// refusal drops the nonce, and it asks again. 3,391 of 4,519 failed sends were this loop.
-    ///
-    /// The defence used to be a floor: whatever the node answered was raised to the highest nonce
-    /// already broadcast. It is now structural, and stronger for it — the sequence lives in this
-    /// process, so on the hot path there is no answer to raise because nothing is asked.
+    /// A re-read may reach a node that has not seen what we broadcast: while the pinned endpoint
+    /// serves a rate-limit penalty, the nonce question goes to one whose pool is older.
     #[test]
     fn a_lagging_node_is_never_consulted_about_a_nonce_already_handed_out() {
         let mut s = Sender::new(
@@ -2063,12 +1789,8 @@ mod tests {
         assert_eq!(s.next_nonce(), Some(215_412));
     }
 
-    /// A refused nonce comes back and is handed out again, lowest first.
-    ///
-    /// The property the whole two-piece [`Nonces`] exists for. Nonce ordering is absolute for one
-    /// sender, so a hole left by a refusal makes every nonce above it unexecutable until something
-    /// times out — filling it is not tidiness, it is the difference between the next cycle quoting
-    /// and the account wedging at the gap.
+    /// A refused nonce comes back and goes out again, lowest first: a hole makes every nonce above
+    /// it unexecutable, so filling it is the difference between quoting and wedging at the gap.
     #[test]
     fn a_refused_nonce_is_reused_rather_than_leaving_a_gap() {
         let mut n = Nonces::default();
@@ -2090,12 +1812,8 @@ mod tests {
         assert_eq!(n.reserve(), Some(704));
     }
 
-    /// A fresh sender has no opinion about the nonce at all, and that is the point.
-    ///
-    /// The floor this replaces was initialised to `0`, which does not mean "unknown" — it means
-    /// zero. So the first send of every process was floored at a nonce the chain passed long ago,
-    /// which is the head of the `nonce too low` loop above. [`Sender::seed_nonce`] is what gives it
-    /// an opinion, once, at startup.
+    /// A fresh sender has no opinion about the nonce: a default of `0` does not mean "unknown", it
+    /// means a nonce the chain passed long ago, which is the head of the `nonce too low` loop.
     #[test]
     fn a_fresh_sender_has_no_nonce_until_something_seeds_it() {
         let s = Sender::new(
@@ -2113,9 +1831,8 @@ mod tests {
         );
     }
 
-    /// A request the limiter refused before opening a socket cannot have consumed a nonce, so it
-    /// must not trigger the re-read that a genuinely-sent failure does. Keeping the nonce here is
-    /// what stops one rate-limit penalty from becoming a run of `nonce too low`.
+    /// A request refused before a socket opened cannot have consumed a nonce, so it must not
+    /// trigger the re-read that turns one rate-limit penalty into a run of `nonce too low`.
     #[test]
     fn a_send_that_never_left_is_distinguishable_from_one_that_did() {
         let never = RpcError::BackingOff {

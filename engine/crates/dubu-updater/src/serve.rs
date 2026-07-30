@@ -5,26 +5,18 @@
 //!                                   └──> maker::MakerKey (sign)
 //! ```
 //!
-//! # Where it may listen
+//! [`ServeConfig::bind`] defaults to loopback, and that default is the intended deployment: this
+//! endpoint signs orders against a live key, so what faces the internet should be a tunnel or a
+//! TLS-terminating, rate-limited proxy. Binding `0.0.0.0` is a decision an operator types out.
 //!
-//! [`ServeConfig::bind`] defaults to loopback, and that default is the intended deployment. This
-//! endpoint signs orders against a live key; the thing that should be reachable from the internet
-//! is a tunnel or a reverse proxy that terminates TLS and can be rate-limited, not this. Binding it
-//! to `0.0.0.0` is a decision an operator has to type out.
+//! There is no authentication. A quote is not a secret; asking repeatedly buys only inventory
+//! exhaustion, and the answers to that are the reservation book and a rate limit at the proxy, not
+//! a shared secret every aggregator replica would have to carry.
 //!
-//! There is no authentication, and that is not an oversight either. A quote is not a secret — it
-//! commits the maker to a price for thirty seconds and reserves inventory, which is exactly what a
-//! taker is supposed to be able to ask for. What an attacker gets by asking repeatedly is
-//! inventory exhaustion, and the answer to that is the reservation book plus a rate limit at the
-//! proxy, not a shared secret that every aggregator replica would have to carry.
-//!
-//! # The state it reads
-//!
-//! [`Shared`] is written by the quote cycle and read here. The cycle owns the truth; this holds a
-//! snapshot of it, and a snapshot with no fair value means the venues have not agreed recently and
-//! the answer is a refusal rather than a stale price. That is the same rule the ladder follows —
-//! carrying the last good reference through an outage is how a maker quotes into a market that
-//! has moved.
+//! [`Shared`] is written by the quote cycle and read here; the cycle owns the truth. A snapshot
+//! with no fair value means the venues have not agreed recently, and the answer is a refusal rather
+//! than a stale price — carrying the last good reference through an outage is how a maker quotes
+//! into a market that has moved.
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
@@ -41,18 +33,16 @@ use dubu_core::pool::{self, Side};
 use serde::{Deserialize, Serialize};
 use tracing::{error, info, warn};
 
-use crate::maker::MakerKey;
+use crate::maker::{MakerKey, SignedOrder};
 use crate::quoting::{Book, MakerParams, MarketState, Refusal};
 
 /// Most grid points one request may price. The aggregator sends eleven.
 const AMOUNTS_MAX: usize = 32;
 
-/// The pool state one pair quotes from, as the cycle last observed it on chain.
-///
-/// Copied out of the chain snapshot rather than re-read per request, which is the point: the
-/// aggregator's own `getAmountOut` had to be a preconfirmed `eth_call`, and GIWA serves pending
-/// state and pending timestamp from different moments — the pool then computed an age that never
-/// existed and refused every quote as stale. See [`dubu_core::pool`].
+/// The pool state one pair quotes from, as the cycle last observed it on chain. Copied out of the
+/// chain snapshot rather than re-read per request: an `eth_call` against GIWA's pending tag reads
+/// state and timestamp from different moments, so the pool computes an age that never existed and
+/// refuses every quote as stale.
 #[derive(Debug, Clone, Copy)]
 pub struct PropState {
     /// Which market.
@@ -81,12 +71,8 @@ pub struct PropState {
     pub price_scale_exp: u8,
     /// Global halt or the pair's own flag.
     pub paused: bool,
-    /// When the cycle observed this.
-    ///
-    /// An `Instant`, and reported to the caller as an elapsed age rather than a wall-clock stamp,
-    /// for the reason recorded on [`Inner::chain_clock`]: nothing synchronises this host's clock
-    /// with the aggregator's, and the last thing that crossed the wire as an absolute timestamp
-    /// silently expired every order this maker signed.
+    /// When the cycle observed this. An `Instant`, reported as an elapsed age rather than a
+    /// wall-clock stamp, for the reason recorded on [`Inner::chain_clock`].
     pub observed_at: Instant,
 }
 
@@ -111,11 +97,9 @@ impl Default for ServeConfig {
     }
 }
 
-/// The cycle's latest view, shared with the endpoint.
-///
-/// One lock over the whole map rather than one per pair. The critical sections are a struct copy
-/// and the cycle writes at most once a second, so contention is not the constraint; having one
-/// place where "the state the maker is quoting from" lives is.
+/// The cycle's latest view, shared with the endpoint. One lock over the whole map rather than one
+/// per pair: the critical sections are a struct copy and the cycle writes at most once a second, so
+/// contention is not the constraint.
 #[derive(Debug, Default)]
 pub struct Shared {
     inner: Mutex<Inner>,
@@ -125,16 +109,12 @@ pub struct Shared {
 struct Inner {
     /// The chain's clock, as `(sealed head timestamp, when we received it)`.
     ///
-    /// Expiry cannot be stamped from this host's wall clock. It is a promise read by two other
-    /// machines -- the aggregator refuses anything with under a second left using *its* clock, and
-    /// the settler enforces it against `block.timestamp` -- and nothing synchronises the three.
-    /// Measured here: this host ran two seconds slow, so every signed order arrived already expired
-    /// and the RFQ leg simply never filled.
-    ///
-    /// The `Instant` is what makes this work. A monotonic clock measures *elapsed* time correctly
-    /// however wrong the wall clock's absolute offset is, so `head_secs + elapsed` is chain time to
-    /// within the head's own delivery latency -- tens of milliseconds -- and is immune to the skew
-    /// entirely.
+    /// Expiry may never be stamped from this host's wall clock: it is a promise read by two other
+    /// machines — the aggregator refuses anything with under a second left by *its* clock, the
+    /// settler enforces it against `block.timestamp` — and nothing synchronises the three, so a
+    /// host two seconds slow signs orders that arrive already expired. A monotonic `Instant`
+    /// measures *elapsed* time correctly however wrong the wall clock's offset is, so
+    /// `head_secs + elapsed` is chain time to within the head's own delivery latency.
     chain_clock: Option<(u64, Instant)>,
     markets: BTreeMap<u16, MarketState>,
     /// The prop pool's own quotes, keyed the same way. Separate from `markets` because the two
@@ -142,24 +122,18 @@ struct Inner {
     /// pool contract will pay — and a pair can be quotable on one and not the other.
     props: BTreeMap<u16, PropState>,
     book: Book,
-    /// Set once the cycle has published anything at all. Before that every request is refused —
-    /// a maker that quotes from an empty snapshot is quoting from zero.
+    /// Set once the cycle has published anything. Before that every request is refused: a maker
+    /// quoting from an empty snapshot is quoting from zero.
     seeded: bool,
 }
 
 impl Shared {
-    /// No markets, no reservations, and not yet seeded — every request refused until the cycle
-    /// publishes something.
+    /// No markets, no reservations, not yet seeded: nothing is quoted until the cycle publishes.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Replaces the state for one market. Called by the cycle, once per pair per cycle.
-    ///
-    /// Publishing per pair rather than as one batch: a pair whose venues have gone quiet should
-    /// stop being quotable without taking the others with it, and [`Self::retire`] is how that
-    /// happens.
     /// Record the chain's clock from a sealed head. See [`Inner::chain_clock`].
     pub fn publish_clock(&self, head_secs: u64, at: Instant) {
         if let Ok(mut g) = self.inner.lock() {
@@ -176,9 +150,8 @@ impl Shared {
 
     /// Replaces the state for one market. Called by the cycle, once per pair per cycle.
     ///
-    /// Publishing per pair rather than as one batch: a pair whose venues have gone quiet should
-    /// stop being quotable without taking the others with it, and [`Self::retire`] is how that
-    /// happens.
+    /// Per pair rather than as one batch: a pair whose venues have gone quiet must stop being
+    /// quotable without taking the others with it, and [`Self::retire`] is how that happens.
     pub fn publish(&self, state: MarketState) {
         if let Ok(mut g) = self.inner.lock() {
             g.markets.insert(state.pair_id, state);
@@ -210,8 +183,7 @@ impl Shared {
     }
 
     /// Base reserved against outstanding orders, for the cycle to subtract from the epoch it is
-    /// about to post. Without this the curve would re-offer inventory RFQ has already promised,
-    /// which is the same double-commitment the book exists to prevent, in the other direction.
+    /// about to post; without it the curve re-offers inventory RFQ has already promised.
     #[must_use]
     pub fn reserved(&self, pair_id: u16, sells_base: bool) -> u128 {
         self.inner
@@ -260,20 +232,12 @@ struct QuoteRequest {
 /// One signed order. Amounts are decimal strings — a `u128` does not survive JSON's number type,
 /// and a silently truncated amount is a signature over a trade nobody meant.
 ///
-/// # These names are not ours to choose
-///
-/// Every key here is a member of the EIP-712 struct the signature covers, and the member *names*
-/// are hashed into the type hash. `PmmSettle.ORDER_TYPEHASH` fixes them; the taker rebuilds the
-/// digest from this JSON and recovers a signer, so a key that does not match the type string
-/// rebuilds a different digest and recovers a stranger. Renaming a field here is changing a
-/// cross-service contract, whatever the Rust field is called.
-///
-/// That is not hypothetical. `fill_bps_min` reads correctly under "qualifiers last", and renaming
-/// it carried straight through `rename_all` onto the wire as `fillBpsMin`. The maker went on
-/// signing the right order over `minFillBps`; the aggregator read `minFillBps` as absent, defaulted
-/// it to zero, recovered `0x3ca7c4...` instead of the maker, and rejected every quote as
-/// `bad-signature` — pointing at the key, which was fine. `wire_names_match_the_signed_type_string`
-/// is the guard.
+/// **These key names are not ours to choose.** Each is a member of the EIP-712 struct the signature
+/// covers, and the member *names* are hashed into the type hash `PmmSettle.ORDER_TYPEHASH` fixes,
+/// so a key that does not match the type string has the taker rebuild a different digest and
+/// recover a stranger while the maker signs correctly throughout. The `#[serde(rename)]` on
+/// `fill_bps_min` is why the qualifier-last rename did not reach the wire, and
+/// `wire_names_match_the_signed_type_string` is the guard.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct OrderJson {
@@ -350,18 +314,16 @@ async fn health(State(ctx): State<Ctx>) -> Json<serde_json::Value> {
     }))
 }
 
-/// Prices, reserves and signs — or explains why it will not.
-///
-/// Every refusal is a 4xx with a reason, never a 200 with a zero amount. A zero-amount order is
-/// still a signed order, and a taker that routed into one would pay gas to discover a revert.
+/// Prices, reserves and signs — or explains why it will not. Every refusal is a 4xx with a reason,
+/// never a 200 with a zero amount: a zero-amount order is still a signed order, and a taker routed
+/// into one pays gas to discover a revert.
 async fn quote(
     State(ctx): State<Ctx>,
     Json(req): Json<QuoteRequest>,
 ) -> Result<Json<QuoteResponse>, (StatusCode, Json<ErrorResponse>)> {
-    // The domain is checked before anything is priced. A request naming a different chain or
-    // settlement contract is not a request this maker can answer — signing it anyway would produce
-    // an order valid somewhere we did not intend, which is the one mistake an EIP-712 domain
-    // exists to make impossible.
+    // Checked before anything is priced: signing for a chain or settlement contract we were not
+    // asked about produces an order valid somewhere we did not intend, which is the one mistake an
+    // EIP-712 domain exists to make impossible.
     if req.chain_id != ctx.chain_id || req.verifying_contract != ctx.pmm_settle {
         return Err(bad(
             StatusCode::BAD_REQUEST,
@@ -381,9 +343,8 @@ async fn quote(
         )
     })?;
 
-    // Chain time, never this host's wall clock. See `Inner::chain_clock` -- a signed expiry is
-    // read by machines whose clocks we do not control, and a skewed one here is invisible until
-    // every quote comes back refused as expired.
+    // Chain time, never this host's wall clock: a signed expiry is read by machines whose clocks
+    // we do not control. See `Inner::chain_clock`.
     let now_secs = ctx.shared.chain_now().unwrap_or_else(crate::now_unix);
 
     let (quote, nonce) = {
@@ -403,18 +364,7 @@ async fn quote(
             ));
         }
 
-        // Which market, and which way round. A pair the cycle has retired is simply absent, which
-        // is the same answer as one that was never configured — in both cases this maker has no
-        // price it is willing to stand behind.
-        let found = g.markets.values().find_map(|m| {
-            if m.quote == req.taker_asset && m.base == req.maker_asset {
-                Some((*m, true))
-            } else if m.base == req.taker_asset && m.quote == req.maker_asset {
-                Some((*m, false))
-            } else {
-                None
-            }
-        });
+        let found = quote_find_market(&g.markets, req.taker_asset, req.maker_asset);
         let Some((market, taker_buys_base)) = found else {
             return Err(bad(
                 StatusCode::NOT_FOUND,
@@ -454,7 +404,30 @@ async fn quote(
         "signed an RFQ order"
     );
 
-    Ok(Json(QuoteResponse {
+    Ok(Json(quote_response(&signed)))
+}
+
+/// The market for a token pair and which way round it was asked, or `None`. A retired pair is
+/// simply absent, the same answer as one that was never configured.
+fn quote_find_market(
+    markets: &BTreeMap<u16, MarketState>,
+    taker_asset: Address,
+    maker_asset: Address,
+) -> Option<(MarketState, bool)> {
+    markets.values().find_map(|m| {
+        if m.quote == taker_asset && m.base == maker_asset {
+            Some((*m, true))
+        } else if m.base == taker_asset && m.quote == maker_asset {
+            Some((*m, false))
+        } else {
+            None
+        }
+    })
+}
+
+/// Renders a signed order for the wire. See [`OrderJson`] on why the key names are not free.
+fn quote_response(signed: &SignedOrder) -> QuoteResponse {
+    QuoteResponse {
         order: OrderJson {
             maker: Address::from(signed.order.maker).to_string(),
             maker_asset: Address::from(signed.order.maker_asset).to_string(),
@@ -470,18 +443,14 @@ async fn quote(
         },
         signature: format!("0x{}", alloy_primitives::hex::encode(signed.signature)),
         digest: format!("{:#x}", signed.digest),
-    }))
+    }
 }
 
 /// Prices a grid of sizes against the prop pool, the way `getAmountOut` would.
 ///
-/// A zero for one size is a refusal of that size — out of domain, past the decayed room, more than
-/// the epoch's remaining room — which is the same signal the aggregator already reads from a failed
-/// `eth_call`, so the router needs no new case. A pair the pool will not quote at all is a 404
-/// instead, because a grid of zeros and a missing venue want different logs.
-///
-/// A side offering **no depth whatsoever** is neither of those, and it is a 503 `no-capacity`. See
-/// the check below for why it cannot stay a 200.
+/// A zero for one size refuses that size — out of domain, past the decayed or the epoch's remaining
+/// room — which is the signal the aggregator already reads from a failed `eth_call`. A pair the
+/// pool will not quote is a 404; a side offering no depth is a 503, for the reason at that check.
 async fn prop_amounts(
     State(ctx): State<Ctx>,
     Json(req): Json<AmountsRequest>,
@@ -509,7 +478,7 @@ async fn prop_amounts(
             )
         })?;
 
-    // Chain time, never this host's wall clock — the staleness window below is the pool's, and
+    // Chain time, never this host's wall clock: the staleness window below is the pool's, and
     // measuring it against a skewed clock is how the on-chain read failed in the first place.
     let now_secs = ctx.shared.chain_now().unwrap_or_else(crate::now_unix);
     let (state, side) = {
@@ -527,24 +496,13 @@ async fn prop_amounts(
                 "the quote cycle has not published a reference yet".into(),
             ));
         }
-        g.props
-            .values()
-            .find_map(|p| {
-                if p.base == req.token_in && p.quote == req.token_out {
-                    Some((*p, Side::Bid))
-                } else if p.quote == req.token_in && p.base == req.token_out {
-                    Some((*p, Side::Ask))
-                } else {
-                    None
-                }
-            })
-            .ok_or_else(|| {
-                bad(
-                    StatusCode::NOT_FOUND,
-                    "no-market",
-                    "no prop market for that pair right now".into(),
-                )
-            })?
+        prop_amounts_find_pair(&g.props, req.token_in, req.token_out).ok_or_else(|| {
+            bad(
+                StatusCode::NOT_FOUND,
+                "no-market",
+                "no prop market for that pair right now".into(),
+            )
+        })?
     };
 
     if let Some(why) = pool::refusal(
@@ -562,26 +520,14 @@ async fn prop_amounts(
 
     let age = now_secs.saturating_sub(state.updated_at);
 
-    // A side offering nothing at all is a 503, not a grid of zeros.
+    // A side offering nothing at all is a 503, not a grid of zeros: `pool::amount_out` returns
+    // `Ok(0)` for every size once `available` is zero, and the aggregator turns that into the same
+    // 404 as a venue refusing every size on price, so "re-pricing for 30 seconds" and "there is no
+    // market here" become one answer. `pool::refusal` above reads only `paused` and the staleness
+    // clock, so a withdrawal never reaches it. The aggregator matches on the status *and* the code.
     //
-    // `pool::amount_out` returns `Ok(0)` for every size once `available` is zero, and until this
-    // existed that came back as a 200 carrying zeros — which the aggregator, having no way to tell
-    // it from a venue that refused every size on price, turned into `no venue would fill that
-    // size`, a 404. So "this pool is re-pricing for 30 seconds and will be back" and "there is no
-    // market here" were the same answer, and a taker was told the second when the first was true.
-    //
-    // `pool::refusal` above cannot cover this: it reads `paused` and the staleness clock and says
-    // nothing about capacity, so a withdrawal never reaches it. The jump defence in `main.rs` is
-    // what makes that gap matter — with the RFQ leg now correctly retired for the whole cool-off,
-    // a withdrawn pair really is dark for ~30s rather than flickering for ~3, and the caller has
-    // to be able to act on the difference. 503 with a retry is that difference; the aggregator
-    // already matches on the status *and* the code.
-    //
-    // `available` rather than `capacity`, so this covers the ramp having run to zero as well as
-    // the epoch having been zeroed. Both are the same fact to a caller — no depth now, ask again —
-    // and the log below carries `capacity` so the two remain distinguishable to a reader.
-    //
-    // What is tradeable does not move: every size this would have priced was going to be zero.
+    // Tested on `available` rather than `capacity` so it covers a ramp run to zero as well as a
+    // zeroed epoch; the log carries `capacity` so the two stay distinguishable.
     let (capacity, _, available) = side_depth(&state, side, age);
     if available == 0 {
         warn!(
@@ -605,6 +551,24 @@ async fn prop_amounts(
     Ok(Json(price_grid(&state, side, age, &amounts_in)))
 }
 
+/// The prop state for a token pair and which side answers it, or `None`. `token_in` being the base
+/// is the pool buying, so it is the bid.
+fn prop_amounts_find_pair(
+    props: &BTreeMap<u16, PropState>,
+    token_in: Address,
+    token_out: Address,
+) -> Option<(PropState, Side)> {
+    props.values().find_map(|p| {
+        if p.base == token_in && p.quote == token_out {
+            Some((*p, Side::Bid))
+        } else if p.quote == token_in && p.base == token_out {
+            Some((*p, Side::Ask))
+        } else {
+            None
+        }
+    })
+}
+
 /// Which way round this side is, for logs and for the wire.
 const fn side_label(side: Side) -> &'static str {
     match side {
@@ -613,11 +577,10 @@ const fn side_label(side: Side) -> &'static str {
     }
 }
 
-/// One side's epoch, what it has traded, and what the ramp leaves of it.
-///
-/// One place rather than two, because the no-capacity refusal above and [`price_grid`] below have
-/// to agree about what "no depth" means. A 503 computed from a different `available` than the grid
-/// it replaces would refuse sizes the pool would in fact have taken.
+/// One side's epoch, what it has traded, and what the ramp leaves of it. One place rather than two,
+/// because the no-capacity refusal and [`price_grid`] must agree on what "no depth" means: a 503
+/// computed from a different `available` than the grid it replaces would refuse sizes the pool
+/// would in fact have taken.
 fn side_depth(state: &PropState, side: Side, age: u64) -> (u128, u128, u128) {
     let (capacity, used) = match side {
         Side::Bid => (state.bid_capacity, state.bid_used),
@@ -704,7 +667,7 @@ fn bad(code: StatusCode, error: &'static str, detail: String) -> (StatusCode, Js
 ///
 /// # Errors
 ///
-/// The bind failing, which is fatal at startup and not something to retry into: a maker that
+/// The bind failing, which is fatal at startup rather than something to retry into: a maker that
 /// cannot be reached is a maker whose quotes silently never appear.
 pub async fn run(
     cfg: &ServeConfig,
@@ -714,10 +677,9 @@ pub async fn run(
     chain_id: u64,
     pmm_settle: Address,
 ) -> std::io::Result<()> {
-    // `${VAR}` is expanded here so a platform that hands out its port in the environment can be
-    // written as `0.0.0.0:${PORT}`. Render does exactly that, and without this the config would
-    // have to hard-code a port the platform did not choose -- or, worse, keep the loopback default
-    // and deploy a maker that starts cleanly, logs nothing wrong, and is reachable by nobody.
+    // `${VAR}` is expanded so a platform that hands out its port in the environment can be written
+    // as `0.0.0.0:${PORT}`. Render does exactly that, and without it the maker starts cleanly on
+    // the loopback default, logs nothing wrong, and is reachable by nobody.
     let bind = crate::config::expand_env("rfq.serve.bind", &cfg.bind)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string()))?;
     let addr: SocketAddr = bind.parse().map_err(|e| {
@@ -757,12 +719,7 @@ pub async fn run(
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
-    /// Expiry must come from the chain, not from this host.
-    ///
-    /// The regression: this machine ran two seconds slow, the maker stamped expiry from its own
-    /// wall clock, and the aggregator -- refusing anything with under a second left, using a clock
-    /// that was right -- rejected every order as expired. Nothing looked broken. The maker was
-    /// healthy, the tunnel answered in 92ms, the price was correct, and the leg never filled.
+    /// A host running slow otherwise stamps orders the aggregator rejects as already expired.
     #[test]
     fn chain_now_counts_from_the_head_and_ignores_the_host_clock() {
         let s = Shared::new();
@@ -772,8 +729,7 @@ mod tests {
         s.publish_clock(1_000, Instant::now());
         assert_eq!(s.chain_now(), Some(1_000));
 
-        // The same head, two seconds of monotonic time later. The host's wall clock is not
-        // consulted at any point, so its offset -- whatever it is -- cannot enter this.
+        // The same head, two seconds of monotonic time later; the wall clock is never consulted.
         s.publish_clock(1_000, Instant::now() - Duration::from_secs(2));
         assert_eq!(s.chain_now(), Some(1_002));
     }
@@ -901,13 +857,9 @@ mod tests {
     }
 
     /// Every key of the signed order must be a member of the type string the signature commits to.
-    ///
-    /// The regression this exists for: `min_fill_bps` was renamed to `fill_bps_min` to put the
-    /// qualifier last, `rename_all` carried that onto the wire, and the aggregator — which builds
-    /// the digest from these keys — read the member as absent, defaulted it to zero, and recovered
-    /// a stranger. Every RFQ quote came back `bad-signature` while the maker was signing correctly
-    /// the whole time. Nothing in the maker could have caught it: the order was right, the
-    /// signature was right, and only the envelope disagreed.
+    /// A qualifier-last rename that reaches the wire has the aggregator read the member as absent,
+    /// default it to zero and recover a stranger — with the order, the signature and the key all
+    /// correct, so nothing inside the maker can catch it.
     #[tokio::test]
     async fn wire_names_match_the_signed_type_string() {
         let (_, body) = post_quote(seeded(), buy_request("2000000000")).await;
@@ -924,8 +876,6 @@ mod tests {
         }
     }
 
-    /// The amounts are decimal strings, not JSON numbers. A `u128` past 2^53 loses precision as a
-    /// double, and a truncated amount is a signature over a trade nobody meant.
     #[tokio::test]
     async fn amounts_cross_the_wire_as_strings() {
         let (_, body) = post_quote(seeded(), buy_request("2000000000")).await;
@@ -934,8 +884,6 @@ mod tests {
         }
     }
 
-    /// Signing an order for a domain we were not asked about would produce something valid
-    /// somewhere we did not intend, which is the one thing an EIP-712 domain exists to prevent.
     #[tokio::test]
     async fn a_request_for_another_domain_is_refused() {
         let mut wrong_chain = buy_request("2000000000");
@@ -953,7 +901,6 @@ mod tests {
         );
     }
 
-    /// Quoting from an empty snapshot is quoting from zero.
     #[tokio::test]
     async fn nothing_is_quoted_before_the_cycle_has_published() {
         let (status, body) = post_quote(Arc::new(Shared::new()), buy_request("2000000000")).await;
@@ -961,8 +908,6 @@ mod tests {
         assert_eq!(body["error"], "not-ready");
     }
 
-    /// A retired pair answers the same way as one that was never configured: no price this maker
-    /// will stand behind.
     #[tokio::test]
     async fn a_retired_market_stops_being_quotable() {
         let shared = seeded();
@@ -985,8 +930,6 @@ mod tests {
         assert_eq!(post_quote(seeded(), req).await.0, StatusCode::NOT_FOUND);
     }
 
-    /// A refusal is a 4xx with a reason, never a 200 carrying a zero amount — a zero-amount order
-    /// is still a signed order, and routing into one costs gas to discover a revert.
     #[tokio::test]
     async fn an_oversized_request_is_refused_rather_than_answered_with_zero() {
         let (status, body) = post_quote(seeded(), buy_request("999999999999999")).await;
@@ -1001,8 +944,6 @@ mod tests {
         assert_eq!(body["error"], "bad-amount");
     }
 
-    /// The reservation is visible to the cycle, which is how the curve avoids re-offering
-    /// inventory RFQ has already promised.
     #[tokio::test]
     async fn a_served_quote_reserves_inventory_the_cycle_can_see() {
         let shared = seeded();
@@ -1015,7 +956,7 @@ mod tests {
         assert_eq!(shared.open_orders(), 1);
     }
 
-    // --- the prop pool's own quote ---------------------------------------------------------
+    // --- the prop pool's own quote ---
 
     /// Chain second the prop tests pin their clock to.
     const CHAIN_NOW: u64 = 1_000_000;
@@ -1044,8 +985,7 @@ mod tests {
         }
     }
 
-    /// A shared state whose chain clock is pinned, so staleness is a property of the fixture
-    /// rather than of how long the test took to run.
+    /// Pins the chain clock, so staleness is a property of the fixture and not of the test's speed.
     fn prop_seeded(state: PropState) -> Arc<Shared> {
         let s = Arc::new(Shared::new());
         s.publish_clock(CHAIN_NOW, Instant::now());
@@ -1091,7 +1031,11 @@ mod tests {
         let shared = prop_seeded(prop_state(CHAIN_NOW - 1));
         let (status, body) = post_amounts(
             shared,
-            grid(BASE, QUOTE, &["0", "1000000000000000000", "2000000000000000000"]),
+            grid(
+                BASE,
+                QUOTE,
+                &["0", "1000000000000000000", "2000000000000000000"],
+            ),
         )
         .await;
 
@@ -1123,9 +1067,7 @@ mod tests {
         assert_eq!(ask["side"], "ask");
     }
 
-    /// The whole reason this endpoint exists is that the chain refused every quote as stale. It
-    /// must still refuse a genuinely stale one — moving the read off chain is not a licence to
-    /// quote a ladder the pool would no longer honour.
+    /// Moving the read off chain is not a licence to quote a ladder the pool would not honour.
     #[tokio::test]
     async fn a_ladder_past_the_staleness_window_is_still_refused() {
         let fresh = post_amounts(
@@ -1156,13 +1098,7 @@ mod tests {
         assert_eq!(status, StatusCode::NOT_FOUND);
     }
 
-    /// A jump withdrawal posts a zero epoch, and that must be sayable.
-    ///
-    /// This asserted a 200 carrying zeros until the aggregator's side of it was traced: zeros are
-    /// indistinguishable from a venue refusing every size on price, so the router turned a pair
-    /// that was re-pricing for thirty seconds into `no venue would fill that size` — a 404. The
-    /// taker was told there is no market here when the truth was "come back in a moment", and the
-    /// engine logged nothing either way, which is what made it cost an investigation.
+    /// Zeros read to the aggregator as no market at all, when the truth is "come back in a moment".
     #[tokio::test]
     async fn a_withdrawn_epoch_is_a_503_rather_than_a_silent_zero() {
         let mut state = prop_state(CHAIN_NOW - 1);
@@ -1181,8 +1117,7 @@ mod tests {
         );
     }
 
-    /// Only the side that was actually withdrawn. A zero bid epoch says nothing about the ask,
-    /// and refusing both would take down depth the pool is still offering.
+    /// A zero bid epoch says nothing about the ask; refusing both takes down live depth.
     #[tokio::test]
     async fn the_other_side_of_a_withdrawn_pair_still_quotes() {
         let mut state = prop_state(CHAIN_NOW - 1);
@@ -1201,8 +1136,7 @@ mod tests {
         assert_ne!(body["amountsOut"][0], "0");
     }
 
-    /// The test is `available`, not `capacity`: a ramp that has run to zero leaves the pool
-    /// offering nothing just as surely as a withdrawal does, and a caller wants the same answer.
+    /// A ramp run to zero leaves the pool offering nothing just as surely as a withdrawal does.
     #[tokio::test]
     async fn a_fully_decayed_epoch_is_also_a_503() {
         let mut state = prop_state(CHAIN_NOW - 30);
@@ -1217,8 +1151,7 @@ mod tests {
         assert_eq!(body["error"], "no-capacity");
     }
 
-    /// Nothing that had depth loses it. A side that can still fill *something* keeps answering a
-    /// grid, zeros and all — those zeros are a refusal of that size, which is a different claim.
+    /// A zero refuses a size, which is a different claim from having no depth.
     #[tokio::test]
     async fn a_side_with_depth_left_is_untouched_by_the_no_capacity_check() {
         let mut state = prop_state(CHAIN_NOW - 1);
@@ -1267,8 +1200,6 @@ mod tests {
         assert_eq!(body["error"], "no-market");
     }
 
-    /// Amounts cross the wire as strings for the same reason the RFQ order's do: a `u128` past
-    /// 2^53 is not a JSON number, and a truncated one is a route into a size nobody quoted.
     #[tokio::test]
     async fn prop_amounts_cross_the_wire_as_strings() {
         let (_, body) = post_amounts(
@@ -1282,8 +1213,11 @@ mod tests {
     #[tokio::test]
     async fn a_grid_larger_than_the_endpoint_will_price_is_refused() {
         let many = vec!["1"; AMOUNTS_MAX + 1];
-        let (status, _) =
-            post_amounts(prop_seeded(prop_state(CHAIN_NOW - 1)), grid(BASE, QUOTE, &many)).await;
+        let (status, _) = post_amounts(
+            prop_seeded(prop_state(CHAIN_NOW - 1)),
+            grid(BASE, QUOTE, &many),
+        )
+        .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
 
         let (empty, _) = post_amounts(

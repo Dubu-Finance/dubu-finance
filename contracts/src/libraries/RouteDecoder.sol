@@ -6,9 +6,8 @@ pragma solidity ^0.8.28;
 ///
 /// The second (and last) idea borrowed from OKX DEX-Router-EVM-V1. On an L2 the dominant cost of a
 /// swap is calldata posted to L1 DA — archi_v2.md §4.3 measures a non-zero calldata byte at 16 gas
-/// against ~5 gas for a mul/div, so trading arithmetic for bytes wins. Packing the three fields
-/// that describe *where* and *how much* into a single word costs 32 bytes per leg instead of the
-/// 96 an ABI-encoded `(address,uint16,bool)` struct would burn.
+/// against ~5 gas for a mul/div — so packing *where* and *how much* into one word costs 32 bytes
+/// per leg instead of the 96 an ABI-encoded `(address,uint16,bool)` struct would burn.
 ///
 /// ```text
 ///   bit  255      reverse       call sellQuote instead of sellBase
@@ -19,25 +18,18 @@ pragma solidity ^0.8.28;
 /// ```
 ///
 /// Bits 255, 175..160 and 159..0 are the borrowed layout, unchanged, so an off-chain encoder
-/// written against OKX's `rawData` convention keeps working.
+/// written against OKX's `rawData` convention keeps working. Bit 254 is ours, replacing the
+/// parallel `assetTo[]` array that costs another 32 calldata bytes per leg for one bit. Both v1
+/// adapters want the tokens at the *pool* (a UniV2 pair and `IPropPool.swapWithContractBalance`
+/// each settle against their own balance delta), so `fundAdapter = 0` is the common path.
 ///
-/// Bit 254 is ours. OKX carries the funding destination in a parallel `assetTo[]` array, which is
-/// another 32 calldata bytes per leg for one bit of information. Both adapters shipped in v1 want
-/// the tokens at the *pool* (a UniV2 pair and `IPropPool.swapWithContractBalance` each settle
-/// against their own balance delta), so `fundAdapter = 0` is the common path and the flag exists
-/// only so a future venue that needs the adapter to hold the funds does not force a struct change.
-///
-/// Bits 253..176 are checked to be zero rather than ignored. If a later router version gives them
-/// meaning, a step encoded for that version must fail loudly here instead of being silently
-/// reinterpreted by this one. Silent reinterpretation of an unrecognised encoding is exactly the
-/// class of bug that makes aggregator calldata unauditable.
+/// Bits 253..176 are checked to be zero rather than ignored, so that a step encoded for a later
+/// router version fails loudly here instead of being silently reinterpreted by this one.
 ///
 /// @dev Pure, storage-free, and mirrored by the Rust path finder. Keep it that way so the two can
 ///      be differential-tested against each other, same discipline as PropCurve.
 library RouteDecoder {
-    // ---------------------------------------------------------------------
-    // Errors
-    // ---------------------------------------------------------------------
+    // --- Errors ---
 
     error PoolAddressZero();
     error ReservedBitsSet(uint256 rawData);
@@ -45,9 +37,7 @@ library RouteDecoder {
     error WeightOutOfRange(uint256 weight);
     error WeightSumExceeded(uint256 totalWeight);
 
-    // ---------------------------------------------------------------------
-    // Layout
-    // ---------------------------------------------------------------------
+    // --- Layout ---
 
     /// @notice Weights are basis points of the hop's available input.
     uint256 internal constant WEIGHT_DENOMINATOR = 10_000;
@@ -60,9 +50,7 @@ library RouteDecoder {
     /// @dev bits 253..176 — everything between the two flags and the weight field.
     uint256 private constant _RESERVED_MASK = ((1 << 78) - 1) << 176;
 
-    // ---------------------------------------------------------------------
-    // Decode
-    // ---------------------------------------------------------------------
+    // --- Decode ---
 
     /// @notice The venue this leg trades against.
     /// @dev The `uint160` cast cannot truncate: `_POOL_MASK` has already cleared everything above
@@ -87,12 +75,10 @@ library RouteDecoder {
         return rawData & _FUND_ADAPTER_FLAG != 0;
     }
 
-    // ---------------------------------------------------------------------
-    // Encode (off-chain parity / tests)
-    // ---------------------------------------------------------------------
+    // --- Encode (off-chain parity / tests) ---
 
-    /// @notice Inverse of the decoders. Exists so the Solidity tests and the Rust encoder can be
-    ///         checked against one definition of the layout instead of two.
+    /// @notice Inverse of the decoders, so the Solidity tests and the Rust encoder check against
+    ///         one definition of the layout instead of two.
     function encode(address venue, uint256 weightBps, bool reverse, bool fundAdapter)
         internal
         pure
@@ -107,9 +93,7 @@ library RouteDecoder {
         if (fundAdapter) rawData |= _FUND_ADAPTER_FLAG;
     }
 
-    // ---------------------------------------------------------------------
-    // Validation
-    // ---------------------------------------------------------------------
+    // --- Validation ---
 
     /// @notice Per-step sanity: known encoding, real pool, usable weight.
     function validateStep(uint256 rawData) internal pure {
@@ -126,53 +110,37 @@ library RouteDecoder {
     /// @notice The fork-weight invariant: the legs of one hop may claim **at most** the whole
     ///         input, never more.
     ///
-    /// @dev Why at-most and not exactly-10_000 — three reasons, in descending order of importance:
+    /// @dev At-most rather than exactly-10_000, for three reasons:
     ///
-    ///  1. **Over-allocation is the only direction that is actually dangerous, and this rejects
-    ///     it.** Weights summing above 10_000 would have the hop try to spend more than it holds.
-    ///     Against a normal adapter that reverts on the last leg for insufficient balance, which
-    ///     is merely a bad user experience. Against balance-reading adapters — which is *all* of
-    ///     them, by construction of `IAdapter` — it is worse: the surplus would be drawn from
-    ///     whatever else the router happens to be holding, i.e. another batch's funds, mid-route.
-    ///     Under-allocation cannot overspend, so it needs no defence.
+    ///  1. Over-allocation is the dangerous direction and this rejects it. Every adapter reads its
+    ///     own balance by construction of `IAdapter`, so a hop trying to spend more than it holds
+    ///     draws the surplus from whatever else the router is holding — another batch's funds,
+    ///     mid-route. Under-allocation cannot overspend.
+    ///  2. Each leg gets `floor(available * w / 10_000)`, and those floors sum to strictly less
+    ///     than `available` in general. A remainder exists whatever the weights sum to, so exact
+    ///     equality would advertise a precision the arithmetic does not deliver.
+    ///  3. Partial routing is legitimate: the prop AMM's per-epoch remaining capacity caps how much
+    ///     a leg can absorb, so a planner sending 70% of a hop through the venues it found should
+    ///     say so with weights summing to 7_000 rather than invent a filler leg.
     ///
-    ///  2. **"Exactly 10_000" would be a false comfort.** Each leg gets `floor(available * w /
-    ///     10_000)`; those floors sum to at most `available` and generically to strictly less.
-    ///     A remainder therefore exists no matter what the declared weights sum to, so the caller
-    ///     still needs a remainder rule. Demanding exact equality would advertise a precision the
-    ///     arithmetic does not deliver.
+    /// The remainder rule lives in `Router` and is two-branched:
     ///
-    ///  3. **Deliberate partial routing is legitimate.** The prop AMM's per-epoch remaining
-    ///     capacity (archi_v2.md §4.4) caps how much a leg can absorb; a planner that wants to
-    ///     send only 70% of a hop through the venues it found — because the other 30% would cross
-    ///     into a worse ladder rung, or simply revert on `AmountExceedsCapacity` — should say so
-    ///     with weights summing to 7_000, not be forced to invent a filler leg.
+    ///  * `totalWeight == WEIGHT_DENOMINATOR`: the **last** leg receives
+    ///    `available - sum(previous floors)`, absorbing the rounding dust so nothing is stranded.
+    ///    Which leg absorbs it is arbitrary; last needs no extra pass.
+    ///  * `totalWeight < WEIGHT_DENOMINATOR`: every leg takes its own floor share and the withheld
+    ///    portion stays with the router. Topping the last leg up would silently repair a mistyped
+    ///    weight and change the route the caller signed off on.
     ///
-    /// How the remainder is handled, precisely — this rule lives in `Router`, and it is
-    /// two-branched on purpose:
-    ///
-    ///  * `totalWeight == WEIGHT_DENOMINATOR`: the caller asked for the whole input to be routed,
-    ///    so the **last** leg receives `available - sum(previous floors)` instead of its own floor
-    ///    share. Rounding dust is absorbed by the last leg and nothing is stranded. Which leg
-    ///    absorbs it is arbitrary; last is chosen because it needs no extra pass.
-    ///
-    ///  * `totalWeight < WEIGHT_DENOMINATOR`: every leg, including the last, takes its own floor
-    ///    share, and the withheld portion stays with the router. Topping the last leg up here
-    ///    would silently repair a mistyped weight and change the route the caller signed off on,
-    ///    which is a worse failure mode than leaving the tokens behind.
-    ///
-    /// The withheld portion of the **route's input token** is swept back to the payer when the
-    /// swap finishes. Withholding on an *intermediate* hop instead strands that intermediate token
-    /// in the router, where the next caller's balance read will pick it up — the router is
-    /// ownerless and has no rescue function by design. Plans should only under-allocate on a
-    /// batch's first hop.
+    /// The withheld portion of the **route's input token** is swept back to the payer when the swap
+    /// finishes. Withholding on an *intermediate* hop instead strands that intermediate token in
+    /// the router, where the next caller's balance read picks it up, and the router is ownerless
+    /// with no rescue function. Plans should only under-allocate on a batch's first hop.
     function validateWeightSum(uint256 totalWeight) internal pure {
         if (totalWeight > WEIGHT_DENOMINATOR) revert WeightSumExceeded(totalWeight);
     }
 
-    // ---------------------------------------------------------------------
-    // Allocation
-    // ---------------------------------------------------------------------
+    // --- Allocation ---
 
     /// @notice A leg's floor share of `available`.
     /// @dev Rounds down, so the sum over a hop never exceeds `available` — see `validateWeightSum`

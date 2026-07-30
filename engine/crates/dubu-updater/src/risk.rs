@@ -1,58 +1,30 @@
 //! Two latching killswitches, and the NAV decomposition they are measured on.
 //!
-//! # The decomposition, which is the whole design
-//!
-//! NAV moves for two unrelated reasons, and conflating them makes both killswitches useless:
-//! **revaluation**, the market moving under the inventory -- for an *unhedged* book a genuine gain
-//! or loss, unbounded and symmetric, and unrelated to whether the quoting is any good -- and
-//! **trade PnL**, what the fills themselves added or destroyed, which is the number that says
-//! whether takers are picking us off.
-//!
-//! Between two observations they separate exactly, with no event decoding, because inventory only
-//! changes when a trade happens:
-//!
 //! ```text
 //! NAV          = quoteBalance + SUM_i value(baseBalance_i, fair_i)
 //! revaluation  = SUM_i [ value(basePrev_i, fairNow_i) - value(basePrev_i, fairPrev_i) ]
 //! tradePnl     = (NAV_now - NAV_prev) - revaluation
 //! ```
 //!
-//! The property that makes this trustworthy: **with no trades, `tradePnl` is exactly zero.** Not
-//! approximately — the balances are identical, so the two sums cancel term for term over the same
-//! integer valuation. That is what lets a cumulative gross budget run for days without drifting
-//! into a trip, and why there is no noise floor knob: there is no noise to floor.
+//! Inventory only moves on a trade, so the two separate exactly with no event decoding: with no
+//! trades `tradePnl` is exactly zero rather than approximately, because the balances are identical
+//! and the sums cancel term for term over the same integer valuation. That is what lets a
+//! cumulative budget run for days without drifting into a trip, and why there is no noise-floor
+//! knob. `value` is [`amount_out_bid`] against a flat ladder at the fair.
 //!
-//! `value` is [`amount_out_bid`] against a flat ladder at the fair value — the chain's own integer
-//! valuation, floored, rather than a division written here.
+//! The loss budget is gross per archi_v2 §5.4: a later recovery does not hand it back, because a
+//! book that loses 1000 and makes 1000 has been picked off twice. Both switches latch, written
+//! atomically — temp file, then rename — after every change and read at startup, so a halted book
+//! stays down across the restart an operator reaches for first.
 //!
-//! # The two switches
+//! What deliberately does **not** survive a restart is the previous-observation state, `prev` and
+//! `window`: trades may have happened while the process was down, so attributing the balance change
+//! across that gap would be an invention. The first observation after a restart re-seeds and
+//! attributes nothing; the cumulative totals and the latch do persist.
 //!
-//! | switch | measured on | catches |
-//! |---|---|---|
-//! | **bleed** | peak-to-current **total NAV** drawdown inside a short window | a fast adverse move on inventory, or a burst of bad fills — the "stop now, work out why later" case |
-//! | **loss budget** | cumulative gross **trade PnL** loss, all-time | systematic adverse selection: being picked off a little, repeatedly, while the market goes nowhere |
-//!
-//! Gross, per archi_v2 §5.4: every negative step is added and a later recovery does **not**
-//! hand the budget back. A book that loses 1000 and makes 1000 has been picked off twice, not
-//! zero times.
-//!
-//! # Latching and restart
-//!
-//! Both latch, written atomically — temp file, then rename — after every change and read at
-//! startup, so a halted book **stays down** across a restart. Restarting is the most natural thing
-//! an operator does when something looks wrong, and a killswitch that silently resumed quoting
-//! would be decoration.
-//!
-//! What deliberately does **not** survive is the previous-observation state: the last balances and
-//! fair values. Trades may have happened while the process was down, so attributing the balance
-//! change across that gap would be an invention — the first observation after a restart re-seeds
-//! and attributes nothing. The *cumulative* total and the latch persist, which is what matters.
-//!
-//! # Known gap
-//!
-//! A manager deposit or an owner withdrawal moves balances with no trade, so it lands in
-//! `tradePnl` — a withdrawal looks like a loss. Attributing it properly needs the pool's `Swap`
-//! and `ReserveSynced` events. Not built; see the README.
+//! Known gap: a manager deposit or an owner withdrawal moves balances with no trade, so it lands in
+//! `tradePnl` and reads as a loss. Attributing it needs the pool's `Swap` and `ReserveSynced`
+//! events; not built, see the README.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -71,10 +43,8 @@ pub enum RiskError {
         /// Underlying failure.
         source: std::io::Error,
     },
-    /// The state file exists and is not parseable.
-    ///
-    /// Deliberately fatal rather than "start fresh": an unreadable latch is indistinguishable
-    /// from a latch that was set, and starting fresh would resume a halted book.
+    /// The state file exists and is not parseable. Fatal rather than "start fresh": an unreadable
+    /// latch is indistinguishable from a set one, so starting fresh resumes a halted book.
     #[error(
         "killswitch state at `{path}` is unreadable ({source}); refusing to start, because \
              a corrupt latch cannot be distinguished from a set one"
@@ -103,14 +73,9 @@ pub struct Position {
     pub price_scale_exp: u8,
 }
 
-/// Value a base balance in quote units, at a flat ladder on the fair value.
-///
-/// Uses the chain's own quote path so the mark and a real fill agree on what the inventory is
-/// worth, rather than differing by whatever a hand-written division rounds differently.
-///
-/// Public because [`crate::skew`] needs the *same* valuation to measure inventory imbalance against
-/// target: two that disagree by a rounding step would have the killswitch and the skew arguing
-/// about how much the pool holds, which is invisible until it matters.
+/// Value a base balance in quote units, at a flat ladder on the fair value. Public because
+/// [`crate::skew`] must measure imbalance with the *same* valuation: two that disagree by a
+/// rounding step have the killswitch and the skew arguing about how much the pool holds.
 ///
 /// # Errors
 /// [`dubu_core::CurveError`] only from the shared domain.
@@ -135,11 +100,9 @@ pub fn value(
     )
 }
 
-/// What every liveness halt's persisted reason string begins with.
-///
-/// One place, written by [`Halt`]'s `Display` and read back by [`KillSwitch::is_liveness_only`].
-/// Those are the only two spellings of it, which is what makes matching on a prefix survivable —
-/// see `is_liveness_only` for why the reason string is what gets matched at all.
+/// What every liveness halt's persisted reason string begins with. Written by [`Halt`]'s `Display`
+/// and read back by [`KillSwitch::is_liveness_only`]; one literal is what makes matching on a
+/// prefix survivable.
 const LIVENESS_PREFIX: &str = "liveness: ";
 
 /// A killswitch trip.
@@ -207,11 +170,8 @@ impl std::fmt::Display for Halt {
     }
 }
 
-/// Serialise a `u128` as a decimal string.
-///
-/// JSON numbers are `f64` to most readers, and this file is read with `jq` during an incident. A
-/// total past 2^53 silently becoming approximate is not acceptable in the file that records why
-/// the book is down.
+/// Serialise a `u128` as a decimal string: JSON numbers are `f64` to most readers, including `jq`,
+/// so a total past 2^53 would read back approximate.
 mod u128_string {
     use serde::{Deserialize, Deserializer, Serializer};
 
@@ -225,7 +185,6 @@ mod u128_string {
     }
 }
 
-/// One NAV sample inside the bleed window.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 struct NavPoint {
     at: u64,
@@ -268,8 +227,8 @@ impl RiskState {
             cumulative_trade_gain: 0,
             observations: 0,
         };
-        // A missing state file starts here, so a fresh state that read as halted would keep a
-        // healthy book down and one carrying loss would start it part-way through its budget.
+        // A missing state file starts here: halted would keep a healthy book down, and a non-zero
+        // total would start it part-way through its budget.
         assert!(!state.halted);
         assert!(state.cumulative_trade_loss == 0);
         assert!(state.observations == 0);
@@ -285,10 +244,9 @@ pub struct KillSwitch {
     bleed_window_secs: u64,
     bleed_limit: u128,
     loss_budget: u128,
-    /// Measure but do not latch. See [`Observation::would_halt`] for what a trip does instead, and
-    /// `RiskConfig::shadow` for why the mode exists. Never persisted: shadow is an operator's
-    /// decision about the current run, and a mode that survived a restart in the state file would
-    /// be a disabled killswitch that nobody remembers disabling.
+    /// Measure but do not latch; see [`Observation::would_halt`]. Never persisted: a mode that
+    /// survived a restart in the state file would be a disabled killswitch that nobody remembers
+    /// disabling.
     shadow: bool,
     /// In-memory only; see the module docs on what must not survive a restart.
     prev: Option<(u128, BTreeMap<u16, Position>)>,
@@ -311,13 +269,9 @@ pub struct Observation {
     pub cumulative_trade_loss: u128,
     /// Set when this observation only seeded the baseline and attributed nothing.
     pub seeded: bool,
-    /// The verdict this observation reached, **whether or not it was enforced**.
-    ///
-    /// In enforcing mode this matches the `Option<Halt>` [`KillSwitch::observe`] returns. In shadow
-    /// mode the returned option is `None` and the verdict appears only here, which is the whole
-    /// distinction: a caller that stops quoting on a trip reads the return value, and a caller that
-    /// merely reports one reads this. Acting on this field is how shadow mode would silently become
-    /// enforcement again.
+    /// The verdict this observation reached, **whether or not it was enforced**. In shadow mode
+    /// [`KillSwitch::observe`] returns `None` and the verdict appears only here, so acting on this
+    /// field rather than on the return value re-enables enforcement.
     pub would_halt: Option<Halt>,
 }
 
@@ -325,8 +279,8 @@ impl KillSwitch {
     /// Load the latch, or start a clean one if the file does not exist.
     ///
     /// # Errors
-    /// [`RiskError::Io`] if the file exists and cannot be read, [`RiskError::Corrupt`] if it
-    /// exists and does not parse. Neither is recoverable by starting fresh — see the variant.
+    /// [`RiskError::Io`] if the file exists and cannot be read, [`RiskError::Corrupt`] if it does
+    /// not parse. Neither is recoverable by starting fresh.
     pub fn load(
         path: &Path,
         bleed_window_secs: u64,
@@ -334,8 +288,8 @@ impl KillSwitch {
         loss_budget: u128,
         shadow: bool,
     ) -> Result<Self, RiskError> {
-        // The config validator refuses all three; restated here because a zero window has no peak
-        // to draw down from and a zero limit or budget trips on the first observation.
+        // Paired with the config validator: a zero window has no peak to draw down from, and a zero
+        // limit or budget trips on the first observation.
         assert!(bleed_window_secs > 0);
         assert!(bleed_limit > 0);
         assert!(loss_budget > 0);
@@ -362,8 +316,7 @@ impl KillSwitch {
             prev: None,
             window: Vec::new(),
         };
-        // What must NOT survive a restart, asserted where it is constructed: trades may have
-        // happened while the process was down, so the first observation has to re-seed.
+        // What must NOT survive a restart, asserted where it is constructed; see the module docs.
         assert!(switch.prev.is_none());
         assert!(switch.window.is_empty());
         Ok(switch)
@@ -381,44 +334,32 @@ impl KillSwitch {
         self.state.halt_reason.as_deref()
     }
 
-    /// Whether the latch is set and was set by a liveness halt, with nothing else behind it.
-    ///
-    /// Chain liveness is the one halt cause that heals on its own — the chain comes back, and
-    /// nothing about the book has changed. `Bleed` and `LossBudget` are the book losing money, and
-    /// want a human's eyes before it quotes again. Only the caller in `main.rs` acts on this
-    /// distinction, and only at startup; see there.
-    ///
-    /// The persisted reason string is the discriminator, which looks fragile and is the deliberate
-    /// choice. [`RiskState`] is versioned and `deny_unknown_fields`, so a `halt_kind` field would
-    /// be a schema migration in both directions: an older binary reading a file written by a newer
-    /// one would fail to parse the latch and then, per [`RiskError::Corrupt`], refuse to start at
-    /// all. A rollback that cannot read the killswitch is a worse outcome than a prefix match, and
-    /// [`LIVENESS_PREFIX`] keeps the literal in one place rather than two.
+    /// Whether the latch is set and was set by a liveness halt, with nothing else behind it. Chain
+    /// liveness is the one cause that heals on its own; `Bleed` and `LossBudget` want a human's
+    /// eyes first. The persisted reason string is the discriminator rather than a `halt_kind` field
+    /// because [`RiskState`] is versioned and `deny_unknown_fields`: a new field makes a rollback
+    /// fail to parse the latch and then, per [`RiskError::Corrupt`], refuse to start at all.
     #[must_use]
     pub fn is_liveness_only(&self) -> bool {
-        self.state.halted
-            && self
+        if self.state.halted {
+            return self
                 .state
                 .halt_reason
                 .as_deref()
-                .is_some_and(|r| r.starts_with(LIVENESS_PREFIX))
+                .is_some_and(|r| r.starts_with(LIVENESS_PREFIX));
+        }
+        false
     }
 
-    /// Clear the latch, keeping everything the switches have measured.
-    ///
-    /// The inverse of [`Self::halt`] for exactly one cause, and it is not a general "clear the
-    /// killswitch": the caller must have established both that the halt is liveness-only and that
-    /// the condition behind it is gone. There is no path here for a bleed or an exhausted budget.
-    ///
-    /// `cumulative_trade_loss`, `cumulative_trade_gain` and `observations` deliberately survive.
-    /// The loss budget is all-time and gross, so resuming with fresh totals would hand back budget
-    /// the book has already spent — and worse, it would make waiting for a chain outage a way to
-    /// launder an exhausted one.
+    /// Clear the latch, keeping everything the switches have measured. Not a general "clear the
+    /// killswitch": the caller must have established that the halt is liveness-only and that the
+    /// condition behind it is gone, and there is no path here for a bleed or an exhausted budget.
+    /// The totals survive because the loss budget is all-time and gross — resuming with fresh ones
+    /// makes waiting for an outage a way to launder one.
     ///
     /// # Errors
-    /// [`RiskError::Io`] if the cleared state cannot be written. Loud for the mirror of the reason
-    /// `halt` is: a resume that did not reach disk is one the next restart silently undoes, and
-    /// the caller would have gone on to quote against a file that still says the book is down.
+    /// [`RiskError::Io`] if the cleared state cannot be written. Loud, because a resume that did
+    /// not reach disk is one the next restart silently undoes.
     pub fn resume(&mut self) -> Result<(), RiskError> {
         let spent = (
             self.state.cumulative_trade_loss,
@@ -428,21 +369,14 @@ impl KillSwitch {
         self.state.halted = false;
         self.state.halt_reason = None;
         self.state.halted_at = None;
-        // All three or none, mirroring `halt`: a cleared latch still carrying a reason and a
-        // timestamp has an operator reading a halt that is not in force.
+        // All three or none: a cleared latch still carrying a reason reads as a halt in force.
         assert!(!self.state.halted);
         assert!(self.state.halt_reason.is_none());
         assert!(self.state.halted_at.is_none());
-        // Asserted rather than merely intended, because the tempting edit here is to zero the
-        // totals along with the latch and that is the one thing a resume must never do.
-        assert!(
-            spent
-                == (
-                    self.state.cumulative_trade_loss,
-                    self.state.cumulative_trade_gain,
-                    self.state.observations,
-                )
-        );
+        // Zeroing the totals along with the latch is the one thing a resume must never do.
+        assert!(spent.0 == self.state.cumulative_trade_loss);
+        assert!(spent.1 == self.state.cumulative_trade_gain);
+        assert!(spent.2 == self.state.observations);
         self.persist()
     }
 
@@ -452,12 +386,12 @@ impl KillSwitch {
         &self.state
     }
 
-    /// Set the latch for a reason the measured switches do not cover — a chain outage, an
-    /// operator instruction.
+    /// Set the latch for a reason the measured switches do not cover — a chain outage, an operator
+    /// instruction.
     ///
     /// # Errors
-    /// [`RiskError::Io`] if the latch cannot be written. That failure is deliberately loud: an
-    /// unwritten latch is one that will not survive the restart.
+    /// [`RiskError::Io`] if the latch cannot be written. Loud, because an unwritten latch will not
+    /// survive the restart.
     pub fn halt(&mut self, halt: &Halt, now: u64) -> Result<(), RiskError> {
         if self.state.halted {
             return Ok(());
@@ -465,18 +399,16 @@ impl KillSwitch {
         self.state.halted = true;
         self.state.halt_reason = Some(halt.to_string());
         self.state.halted_at = Some(now);
-        // All three or none: a latch an operator cannot read the reason for after a restart is one
-        // they will clear blind.
+        // All three or none: a latch whose reason did not survive the restart is one an operator
+        // clears blind.
         assert!(self.state.halted);
         assert!(self.state.halt_reason.is_some());
         assert!(self.state.halted_at == Some(now));
         self.persist()
     }
 
-    /// Feed one mark through both switches.
-    ///
-    /// Returns the trip, if this observation caused one. A no-op once halted: the latch does not
-    /// need re-deciding and its numbers should not keep moving after the fact.
+    /// Feed one mark through both switches, returning the trip if this observation caused one. A
+    /// no-op once halted: a latched switch stops deciding and its numbers must stop moving.
     ///
     /// # Errors
     /// [`RiskError::Mark`] if a balance cannot be valued, [`RiskError::Io`] if a trip cannot be
@@ -487,8 +419,7 @@ impl KillSwitch {
         positions: &[Position],
         now: u64,
     ) -> Result<(Observation, Option<Halt>), RiskError> {
-        // A NAV marked on nothing is not a NAV, and a drawdown measured against it is not a
-        // drawdown. The caller skips groups with no positions rather than marking an empty book.
+        // The caller skips empty groups: a drawdown against an empty book is not a drawdown.
         assert!(!positions.is_empty());
         let by_pair: BTreeMap<u16, Position> = positions.iter().map(|p| (p.pair_id, *p)).collect();
         // A repeated pair id would silently drop a position from every sum below.
@@ -508,8 +439,7 @@ impl KillSwitch {
                 (reval, delta - reval, false)
             }
         };
-        // A seed attributes nothing: trades may have happened before it, and inventing an
-        // attribution across that gap is what would poison the cumulative budget.
+        // A seed attributes nothing; inventing an attribution across the gap poisons the budget.
         if seeded {
             assert!(revaluation == 0);
             assert!(trade_pnl == 0);
@@ -543,9 +473,8 @@ impl KillSwitch {
         obs.would_halt = verdict.clone();
 
         if self.shadow {
-            // The measurement still happens -- the window filled, the drawdown was computed, the
-            // gross loss accumulated -- and only the latch is withheld. Persisting the totals here
-            // is what makes a shadow run worth anything after a restart.
+            // Everything but the latch still happens: persisting the totals is what leaves a shadow
+            // run with data to size a limit from.
             self.persist()?;
             assert!(
                 !self.state.halted,
@@ -556,34 +485,28 @@ impl KillSwitch {
 
         if let Some(h) = &verdict {
             self.halt(h, now)?;
-            assert!(self.state.halted, "a trip that did not latch is decoration");
+            assert!(self.state.halted, "a trip must leave the latch set");
         } else {
-            // Persist the running totals even without a trip, or a restart hands back whatever
-            // budget was consumed since the last one.
+            // Without this a restart hands back whatever budget was consumed since the last trip.
             self.persist()?;
         }
         Ok((obs, verdict))
     }
 
-    /// Push this NAV into the bleed window, drop what has aged out, and return the peak-to-current
-    /// drawdown inside it.
     fn record_drawdown(&mut self, now: u64, nav: u128) -> u128 {
         self.window.push(NavPoint { at: now, nav });
         let cutoff = now.saturating_sub(self.bleed_window_secs);
         self.window.retain(|p| p.at >= cutoff);
-        // The point just pushed is stamped `now` and the cutoff is at or before it, so it always
-        // survives its own retain -- which is what makes the peak below at least this NAV.
+        // The point just pushed is stamped `now` and the cutoff is at or before it, so it survives
+        // its own retain — which is what makes the peak at least this NAV.
         assert!(!self.window.is_empty());
         let peak = self.window.iter().map(|p| p.nav).max().unwrap_or(nav);
         assert!(peak >= nav);
         peak.saturating_sub(nav)
     }
 
-    /// Fold one attributed step into the running totals.
-    ///
-    /// Gross, per archi_v2 §5.4: every negative step is added and a later recovery does **not** hand
-    /// the budget back. A book that loses 1000 and makes 1000 has been picked off twice, not zero
-    /// times.
+    /// Fold one attributed step into the running totals, gross: only a loss consumes the budget and
+    /// a later gain does not hand it back.
     fn accumulate(&mut self, trade_pnl: i128) {
         let before = self.state.cumulative_trade_loss;
         if trade_pnl < 0 {
@@ -599,15 +522,12 @@ impl KillSwitch {
         }
         self.state.observations += 1;
         assert!(self.state.cumulative_trade_loss >= before);
-        // Gross means gross: the only thing that may consume the budget is a loss.
         if trade_pnl >= 0 {
             assert!(self.state.cumulative_trade_loss == before);
         }
     }
 
-    /// Which switch, if either, this observation tripped.
-    ///
-    /// Bleed first: it is the faster-moving switch and the more urgent verdict.
+    /// Which switch, if either, this observation tripped. Bleed first: faster-moving, more urgent.
     fn verdict(&self, drawdown: u128) -> Option<Halt> {
         if drawdown >= self.bleed_limit {
             return Some(Halt::Bleed {
@@ -625,10 +545,9 @@ impl KillSwitch {
         None
     }
 
-    /// Write the state atomically: temp file in the same directory, then rename.
-    ///
-    /// Same directory because `rename` is only atomic within a filesystem. A half-written latch
-    /// is the one file in this system that must not exist.
+    /// Write the state atomically: temp file in the same directory, then rename. Same directory
+    /// because `rename` is only atomic within one filesystem, and a half-written latch cannot be
+    /// distinguished from a corrupt one, which refuses to start.
     fn persist(&self) -> Result<(), RiskError> {
         let io = |source| RiskError::Io {
             path: self.path.clone(),
@@ -645,8 +564,7 @@ impl KillSwitch {
         })?;
         assert!(!text.is_empty());
         let tmp = self.path.with_extension("json.tmp");
-        // Writing the scratch file over the latch and then renaming it to itself would destroy the
-        // one file that must never be half-written.
+        // A scratch path equal to the latch would write over it and rename it to itself.
         assert!(tmp != self.path);
         std::fs::write(&tmp, text).map_err(io)?;
         std::fs::rename(&tmp, &self.path).map_err(io)?;
@@ -657,7 +575,7 @@ impl KillSwitch {
 /// NAV: the quote balance plus every base balance marked at its own fair value.
 ///
 /// # Errors
-/// [`RiskError::Mark`] if a balance cannot be valued.
+/// [`RiskError::Mark`] on a balance that cannot be valued.
 fn nav_of(quote_balance: u128, positions: &BTreeMap<u16, Position>) -> Result<u128, RiskError> {
     let mut nav = quote_balance;
     for p in positions.values() {
@@ -671,27 +589,26 @@ fn nav_of(quote_balance: u128, positions: &BTreeMap<u16, Position>) -> Result<u1
 }
 
 /// Value change attributable to price moves on the balances held at the PREVIOUS observation.
-///
-/// Marking the old balances at both fair values is what leaves the residual as the fills' doing.
+/// Marking the old balances at both fair values is what leaves the residual as the fills' doing;
+/// marking the *current* balances folds the fills into revaluation and leaves nothing to attribute.
 ///
 /// # Errors
-/// [`RiskError::Mark`] if a balance cannot be valued.
+/// [`RiskError::Mark`] on a balance that cannot be valued.
 fn revaluation_of(
     prev_positions: &BTreeMap<u16, Position>,
     now_positions: &BTreeMap<u16, Position>,
 ) -> Result<i128, RiskError> {
     let mut reval = 0i128;
     for (id, prev) in prev_positions {
-        // A pair that vanished from the config between observations cannot be revalued; treat its
-        // old fair as still current, which contributes zero.
+        // A pair that vanished from the config between observations cannot be revalued: its old
+        // fair is treated as still current, which contributes zero.
         let fair_now = now_positions.get(id).map_or(prev.fair, |p| p.fair);
         let then =
             value(prev.base_balance, prev.fair, prev.price_scale_exp).map_err(RiskError::Mark)?;
         let now_v =
             value(prev.base_balance, fair_now, prev.price_scale_exp).map_err(RiskError::Mark)?;
-        // The property the whole decomposition rests on: the same balance at the same fair over
-        // the same integer valuation must cancel term for term, so a quiet market contributes
-        // nothing and `trade_pnl` is exactly zero rather than approximately.
+        // The same balance at the same fair must cancel term for term, or a quiet market feeds
+        // `trade_pnl` and the cumulative budget drifts into a trip on its own.
         if fair_now == prev.fair {
             assert_eq!(now_v, then);
         }
@@ -738,10 +655,9 @@ mod tests {
         KillSwitch::load(&scratch(name), 300, BLEED, BUDGET, false).unwrap()
     }
 
-    /// A switch with the bleed limit disabled, for the tests that are about attribution or the
-    /// cumulative budget. The two switches genuinely overlap — any single-step loss large
-    /// enough to exhaust the budget also breaches a comparable bleed limit — so isolating one
-    /// means turning the other off rather than hoping it stays quiet.
+    /// A switch with the bleed limit disabled. The two overlap — a single-step loss large enough to
+    /// exhaust the budget also breaches a comparable bleed limit — so isolating one means turning
+    /// the other off.
     fn ks_budget_only(name: &str) -> KillSwitch {
         KillSwitch::load(&scratch(name), 300, u128::MAX, BUDGET, false).unwrap()
     }
@@ -756,8 +672,7 @@ mod tests {
 
     #[test]
     fn a_quiet_book_attributes_exactly_zero_trade_pnl() {
-        // The property the whole design rests on. The market moves 20%, no fill happens, and
-        // the cumulative budget must not move by a single unit.
+        // The market moves 20% either way with no fill.
         let mut k = ks_budget_only("quiet");
         let quote = 1_000_000_000_000u128;
         k.observe(quote, &[pos(4_445 * ETH, FAIR)], 1_000).unwrap();
@@ -809,8 +724,7 @@ mod tests {
         assert_eq!(obs.trade_pnl, -56_180_000);
         assert_eq!(k.state().cumulative_trade_loss, 56_180_000);
 
-        // Sell it back at 2000: a 56.18 gain. The budget must NOT be handed back — a book that
-        // loses 56 and makes 56 has been picked off once, not zero times.
+        // Sell it back at 2000: a 56.18 gain, and the budget must not be handed back.
         let (obs, _) = k.observe(10_000_000_000, &[pos(0, FAIR)], 1_002).unwrap();
         assert_eq!(obs.trade_pnl, 56_180_000);
         assert_eq!(
@@ -823,11 +737,8 @@ mod tests {
 
     #[test]
     fn the_loss_budget_catches_what_the_bleed_switch_is_too_short_to_see() {
-        // This is the case that justifies having two switches. Ten losses of 1000 mUSDC, each
-        // well inside the 2000 bleed limit, and each spaced far enough apart that the previous
-        // peak has aged out of the 300s window — so the bleed switch sees a drawdown of zero
-        // every single time. Being picked off for a little, repeatedly, is invisible to a
-        // short-window drawdown limit and is exactly what the cumulative budget is for.
+        // Ten losses of 1000 mUSDC, each inside the 2000 bleed limit and each spaced far enough
+        // apart that the previous peak has aged out of the 300s window.
         let mut k = KillSwitch::load(&scratch("budget"), 300, BLEED, BUDGET, false).unwrap();
         let mut quote = 1_000_000_000_000u128;
         k.observe(quote, &[pos(0, FAIR)], 1_000).unwrap();
@@ -859,8 +770,7 @@ mod tests {
 
     #[test]
     fn the_bleed_switch_trips_on_a_market_move_with_no_fills_at_all() {
-        // The deliberate difference from the loss budget: this book is unhedged, so a fast
-        // adverse move on inventory IS a loss, whether or not anyone traded with us.
+        // An unhedged book takes a fast adverse move as a loss whether or not anyone traded.
         let mut k = ks("bleed");
         let quote = 0u128;
         // 10 mWETH: a 2000-unit drawdown needs the price to fall ~200 a coin.
@@ -882,13 +792,11 @@ mod tests {
 
     #[test]
     fn the_bleed_window_forgets_a_peak_that_has_aged_out() {
-        // Otherwise the switch is a permanent all-time-high drawdown limit and trips on any
-        // slow drift, which is not what a short-window bleed limit means.
+        // Otherwise the switch is an all-time-high drawdown limit and trips on any slow drift.
         let mut k = KillSwitch::load(&scratch("window"), 300, BLEED, BUDGET, false).unwrap();
         k.observe(0, &[pos(10 * ETH, FAIR)], 1_000).unwrap();
 
-        // 400 seconds later the old peak is outside the window, so the same price is not a
-        // drawdown at all.
+        // 400s later the old peak is outside the window, so the same price is not a drawdown.
         let low = FAIR - 200_000_000_000_000;
         let (obs, halt) = k.observe(0, &[pos(10 * ETH, low)], 1_400).unwrap();
         assert_eq!(obs.drawdown, 0);
@@ -898,7 +806,6 @@ mod tests {
 
     #[test]
     fn the_latch_survives_a_restart_and_the_book_stays_down() {
-        // The requirement in one test: a restart must not silently resume a halted book.
         let path = scratch("restart");
         let mut k = KillSwitch::load(&path, 300, BLEED, BUDGET, false).unwrap();
         k.observe(0, &[pos(10 * ETH, FAIR)], 1_000).unwrap();
@@ -916,8 +823,8 @@ mod tests {
 
     #[test]
     fn the_cumulative_budget_survives_a_restart_too() {
-        // A restart that reset the running total would make the budget a per-process limit,
-        // which an operator restarting after every trip would never reach.
+        // A reset total makes the budget a per-process limit, which restarting after every trip
+        // would never reach.
         let path = scratch("cumulative");
         let mut k = KillSwitch::load(&path, 300, u128::MAX, BUDGET, false).unwrap();
         k.observe(1_000_000_000_000, &[pos(0, FAIR)], 1_000)
@@ -931,8 +838,7 @@ mod tests {
         assert_eq!(k.state().cumulative_trade_loss, 3_000_000_000);
         assert!(!k.is_halted());
 
-        // And the first post-restart observation only re-seeds: trades may have happened while
-        // the process was down, so attributing the balance gap to trade PnL would be invented.
+        // And the first post-restart observation only re-seeds; see the module docs.
         let (obs, _) = k.observe(1, &[pos(0, FAIR)], 2_000).unwrap();
         assert!(obs.seeded);
         assert_eq!(obs.trade_pnl, 0);
@@ -993,9 +899,8 @@ mod tests {
 
     #[test]
     fn a_liveness_latch_is_still_recognisable_as_one_after_a_reload() {
-        // The startup recovery in `main.rs` runs against a file some previous process wrote, so
-        // there is no in-memory `Halt` left to ask by then — recognising the cause has to survive
-        // the round trip through JSON, which is the whole reason the reason string carries it.
+        // The startup recovery runs against a file a previous process wrote, so there is no
+        // in-memory `Halt` left to ask: the cause has to survive the JSON round trip.
         let path = scratch("liveness-only");
         let mut k = KillSwitch::load(&path, 300, BLEED, BUDGET, false).unwrap();
         k.halt(
@@ -1015,8 +920,7 @@ mod tests {
 
     #[test]
     fn neither_measured_switch_latches_as_liveness_only() {
-        // The distinction has to hold in this direction or the recovery becomes a killswitch that
-        // any restart clears. A bleed and an exhausted budget are the book losing money.
+        // In this direction too, or the recovery becomes a killswitch any restart clears.
         let mut k = ks("bleed-not-liveness");
         k.observe(0, &[pos(10 * ETH, FAIR)], 1_000).unwrap();
         k.observe(0, &[pos(10 * ETH, FAIR - 200_000_000_000_000)], 1_100)
@@ -1036,8 +940,7 @@ mod tests {
         assert!(k.is_halted());
         assert!(!k.is_liveness_only());
 
-        // And an unlatched switch is not liveness-only either, or the recovery path would fire on
-        // a book that was never down.
+        // Nor is an unlatched switch, or the recovery fires on a book that was never down.
         let k = ks("never-latched");
         assert!(!k.is_halted());
         assert!(!k.is_liveness_only());
@@ -1049,8 +952,7 @@ mod tests {
         let mut k = KillSwitch::load(&path, 300, u128::MAX, BUDGET, false).unwrap();
         let quote = 1_000_000_000_000u128;
         k.observe(quote, &[pos(0, FAIR)], 1_000).unwrap();
-        // A 3000 loss, then a 2000 gain, so both cumulative totals are non-zero and a resume that
-        // reset either of them cannot pass by accident.
+        // A 3000 loss then a 2000 gain, so a resume that reset either total cannot pass by luck.
         k.observe(quote - 3_000_000_000, &[pos(0, FAIR)], 1_001)
             .unwrap();
         k.observe(quote - 1_000_000_000, &[pos(0, FAIR)], 1_002)
@@ -1074,8 +976,7 @@ mod tests {
         assert!(k.state().halted_at.is_none());
         drop(k);
 
-        // Across the reload, because a resume that only cleared memory would be undone by the very
-        // next restart — and it is the restarts that this whole path exists to survive.
+        // Across the reload: a resume that only cleared memory is undone by the next restart.
         let k = KillSwitch::load(&path, 300, u128::MAX, BUDGET, false).unwrap();
         assert!(!k.is_halted());
         assert!(k.halt_reason().is_none());
@@ -1093,13 +994,12 @@ mod tests {
         KillSwitch::load(&scratch(name), 300, BLEED, BUDGET, true).unwrap()
     }
 
-    /// Drive a drawdown past `BLEED` and hand back what the last observation concluded.
-    ///
-    /// Held in mUSDC's 6 decimals throughout: the peak is 1,000,000 mUSDC and the second mark is
-    /// 3,000 below it, against a `BLEED` of 2,000 and inside the 300s window. The base balance is
-    /// zero on both marks so NAV is the quote leg alone and the drawdown is exactly the difference.
+    /// Drive a drawdown past `BLEED` and hand back what the last observation concluded. mUSDC's 6
+    /// decimals throughout: a 1,000,000 peak and a mark 3,000 below it, inside the 300s window.
+    /// Zero base on both marks, so NAV is the quote leg alone and the drawdown is the difference.
     fn breach(k: &mut KillSwitch) -> (Observation, Option<Halt>) {
-        k.observe(1_000_000_000_000, &[pos(0, FAIR)], 1_000).unwrap();
+        k.observe(1_000_000_000_000, &[pos(0, FAIR)], 1_000)
+            .unwrap();
         k.observe(997_000_000_000, &[pos(0, FAIR)], 1_100).unwrap()
     }
 
@@ -1107,8 +1007,6 @@ mod tests {
     fn a_shadow_trip_is_reported_and_the_book_keeps_quoting() {
         let mut k = ks_shadow("shadow-trip");
         let (obs, halt) = breach(&mut k);
-        // The verdict was reached in full -- this is a real trip by every measure the enforcing
-        // switch uses.
         assert_eq!(
             obs.would_halt,
             Some(Halt::Bleed {
@@ -1117,8 +1015,7 @@ mod tests {
                 window_secs: 300
             })
         );
-        // And none of it was enforced. The returned option is what a caller acts on, and it is the
-        // one thing that must stay empty.
+        // The returned option is what a caller acts on, and none of it is enforced.
         assert!(halt.is_none(), "shadow mode returned an enforceable halt");
         assert!(!k.is_halted(), "shadow mode latched the book");
         assert!(k.halt_reason().is_none());
@@ -1127,8 +1024,7 @@ mod tests {
 
     #[test]
     fn the_same_breach_latches_once_shadow_is_off() {
-        // The control for the test above: same limits, same path shape, same numbers. Without it
-        // a shadow switch that never trips at all would pass.
+        // The control for the test above; without it a switch that never trips would pass.
         let mut k = ks("shadow-control");
         let (obs, halt) = breach(&mut k);
         assert_eq!(obs.would_halt, halt, "enforcing: the two agree exactly");
@@ -1138,8 +1034,7 @@ mod tests {
 
     #[test]
     fn a_shadow_run_still_accumulates_and_still_persists() {
-        // The entire point of the mode is the data it leaves behind. A shadow run that measured
-        // nothing, or measured it only in memory, would collect nothing to size a limit from.
+        // The mode exists for the data it leaves behind; measuring only in memory collects nothing.
         let path = scratch("shadow-persist");
         let mut k = KillSwitch::load(&path, 300, BLEED, BUDGET, true).unwrap();
         let mut quote = 1_000_000_000_000u128;
@@ -1160,8 +1055,7 @@ mod tests {
 
     #[test]
     fn shadow_is_a_property_of_the_run_and_never_of_the_state_file() {
-        // A mode that persisted would be a killswitch somebody disabled once and nobody can see is
-        // disabled. Turning it off has to be enough to restore enforcement.
+        // A persisted mode is a killswitch somebody disabled once and nobody can see is disabled.
         let path = scratch("shadow-not-sticky");
         let mut shadowed = KillSwitch::load(&path, 300, BLEED, BUDGET, true).unwrap();
         breach(&mut shadowed);
@@ -1170,21 +1064,26 @@ mod tests {
 
         let mut enforcing = KillSwitch::load(&path, 300, BLEED, BUDGET, false).unwrap();
         let (_, halt) = breach(&mut enforcing);
-        assert!(halt.is_some(), "a restart without shadow must enforce again");
+        assert!(
+            halt.is_some(),
+            "a restart without shadow must enforce again"
+        );
         assert!(enforcing.is_halted());
     }
 
     #[test]
     fn an_already_latched_group_reports_no_verdict_even_in_shadow() {
-        // A group halted before the process started stays halted -- shadow mode is not a way to
-        // clear a latch, and `observe` returns early on one. Clearing is `resume`, deliberately.
+        // Shadow mode is not a way to clear a latch; `resume` is the only one.
         let path = scratch("shadow-prelatched");
         let mut k = KillSwitch::load(&path, 300, BLEED, BUDGET, false).unwrap();
         breach(&mut k);
         assert!(k.is_halted());
 
         let mut k = KillSwitch::load(&path, 300, BLEED, BUDGET, true).unwrap();
-        assert!(k.is_halted(), "shadow mode cleared a latch it found on disk");
+        assert!(
+            k.is_halted(),
+            "shadow mode cleared a latch it found on disk"
+        );
         let (obs, halt) = breach(&mut k);
         assert!(halt.is_none());
         assert!(

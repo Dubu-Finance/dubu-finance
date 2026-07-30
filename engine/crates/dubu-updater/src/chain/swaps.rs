@@ -1,51 +1,19 @@
-//! Reading our own fills off the chain.
+//! Reading our own fills off the chain. [`crate::markout`] is the accounting; this is its tap.
 //!
-//! [`crate::markout`] is the accounting; this is the tap that feeds it. Every `swap` on
-//! `PropPool` emits a `Swap` log, and that log is the only record of who traded against us and on
-//! what terms. There is no order flow to subscribe to on a chain with no public mempool — the fill
-//! *is* the first observation.
+//! Polled rather than subscribed: `eth_getLogs` over an explicit block range is replayable, so a
+//! failed poll leaves the cursor put and the next poll re-reads the range, where a missed websocket
+//! frame is a silently missing fill. Markout's horizons are anchored to the fill's *block*
+//! timestamp, so a fill discovered a cycle late marks identically to one discovered instantly. The
+//! cursor tracks the unsafe head, because waiting for finality would put fills minutes behind their
+//! own sixty-second horizon; the reorg exposure that buys is bounded by [`OVERLAP_BLOCKS`] of
+//! re-read range deduplicated on `(transactionHash, logIndex)`, and by
+//! [`crate::markout::Score::is_actionable`] requiring both a fill count and a notional floor. Not
+//! handled: a log removed after we counted it, since a reorg between two polls leaves no marker.
 //!
-//! # Why polling rather than a subscription
-//!
-//! `chain::heads` already holds a `newHeads` subscription over Nodit's websocket, and it would be
-//! natural to add a `logs` subscription beside it. Deliberately not done:
-//!
-//! - A missed websocket frame is a silently missing fill. `eth_getLogs` over an explicit block
-//!   range is replayable — if a poll fails, the cursor does not advance and the next poll re-reads
-//!   the same range. A dropped subscription frame leaves no evidence it existed.
-//! - The public GIWA RPC has no `eth_subscribe` at all, so a subscription-only path would make
-//!   markout depend on the one endpoint we are not guaranteed to have.
-//!
-//! Markout's shortest horizon is one second and its longest is sixty. A poll that runs once per
-//! cycle is far inside that: a fill discovered a second late is still marked against the same
-//! references as one discovered instantly, because the marks are anchored to the fill's block
-//! timestamp, not to when we noticed it.
-//!
-//! # Reorgs
-//!
-//! The cursor tracks the unsafe head, not `safe` or `finalized`. Waiting for finality would put
-//! fills minutes behind their own sixty-second horizon, which defeats the measurement. The
-//! exposure that buys is a fill from a block that later reorgs out — a phantom.
-//!
-//! Two things bound it. Each poll re-reads [`OVERLAP_BLOCKS`] of already-scanned range and
-//! deduplicates on `(transactionHash, logIndex)`, so a log that arrives late or moves block is
-//! seen exactly once. And a phantom cannot act alone: [`crate::markout::Score::is_actionable`]
-//! requires both a fill count and a notional floor before a score influences anything, and a
-//! settled score is already sixty seconds — some thirty L2 blocks — deep.
-//!
-//! What is *not* handled is a log that is removed after we counted it. `removed: true` entries are
-//! dropped on sight, but a reorg that happens between two polls leaves no such marker. That is
-//! recorded here rather than papered over.
-//!
-//! # Falling behind
-//!
-//! If the cursor drops further behind the head than [`MAX_LOOKBACK_BLOCKS`], the watcher jumps
-//! forward and counts a gap instead of grinding through the backlog. Two reasons: a long backlog
-//! would be marked against reference history we no longer retain (see
-//! `markout::REF_RETENTION_SECS`), so the fills would settle unmarked anyway; and quoting must not
-//! stall behind a measurement. The gap is counted and logged loudly — the same discipline as
-//! `markout`'s `unmarked` counter. A markout total that quietly omits the fills from an outage
-//! reads as complete when it is not.
+//! Past [`MAX_LOOKBACK_BLOCKS`] behind the head the watcher jumps forward and counts a gap rather
+//! than grinding through the backlog: those fills would be marked against reference history
+//! `markout::REF_RETENTION_SECS` has already retired, and quoting must not stall behind a
+//! measurement.
 
 use std::collections::{HashSet, VecDeque};
 
@@ -70,60 +38,36 @@ sol! {
 
 /// Blocks re-read on every poll, below the cursor.
 ///
-/// Covers a log that arrives late or lands in a different block after a sequencer reorg. GIWA
-/// blocks are ONE second, so this is two seconds of overlap, and the dedup ring throws the repeats
-/// away without them ever reaching `markout`.
-///
-/// It was 10, on a comment that said blocks were two seconds — they are not, so the overlap was
-/// half what it claimed. Ten was also enough to break the scan outright: a poll asks for
-/// `cursor - OVERLAP ..= head`, so ten blocks of overlap makes an eleven-block request to learn
-/// about one new block, and the Nodit free tier caps `eth_getLogs` at exactly ten. Every poll that
-/// ran while the read pool had failed over to Nodit returned `-32604`, the cursor never advanced,
-/// and no fill was ever seen. Two costs one block of request width and keeps the whole thing inside
-/// the tightest cap we know of.
-///
-/// The overlap is now the *only* reorg defence that matters here, because the hedge no longer reads
-/// this path at all — see `hedge::Bands`. What is left downstream is `markout`, where a missed fill
-/// is a hole in a score rather than an unhedged position, and holes are counted rather than hidden.
+/// Covers a log that arrives late or moves block after a sequencer reorg; the dedup ring discards
+/// the repeats before `markout` sees them. GIWA blocks are one second, so this is two seconds of
+/// overlap, kept small because a poll requests `cursor - OVERLAP ..= head` and so spends it out of
+/// the [`GETLOGS_RANGE_CAP_MIN`] budget.
 pub const OVERLAP_BLOCKS: u64 = 2;
 
 /// Largest span requested in one `eth_getLogs` call.
 ///
-/// Public RPCs cap the range and the cap is not advertised; exceeding it returns an error rather
-/// than a truncated result, so a poll that spans more than this is split into several calls.
-///
-/// **Ten, because that is the cap [`OVERLAP_BLOCKS`] is already written around.** Five hundred was
-/// not a second opinion about the limit, it was the same limit forgotten a few lines down, and the
-/// read pool is what hid it: the rotation lands either on a public endpoint, which answers a wide
-/// range, or on Nodit, which returns `-32604`. So the scan half-worked, and half-working looks
-/// healthy.
-///
-/// It stopped working entirely the first time the gap outgrew what one lucky call could cover — an
-/// engine restart left the cursor 792 blocks behind the head — and then could not recover, because
-/// the cursor only advances over ranges that were read. Every poll re-requested the whole gap,
-/// every poll was refused, and markout went blind for half an hour behind nothing louder than a
-/// warning.
+/// Endpoints cap the range without advertising it and answer an over-wide request with an error
+/// rather than a truncated result, so a wider poll is split into several calls. Ten is
+/// [`GETLOGS_RANGE_CAP_MIN`]; anything above it fails only when the read pool rotates onto the
+/// tightest endpoint, which reads as a scan that half-works.
 pub const MAX_RANGE_BLOCKS: u64 = 10;
 
 /// Chunks one poll will request before leaving the rest to the next one.
 ///
-/// Ten-block chunks turn a six-hundred-block gap into sixty sequential round trips, which would
-/// stall a 330 ms cycle for seconds — trading a scan that never catches up for a quote loop that
-/// stops quoting. The cursor persists between polls, so a bounded number of chunks drains the gap
-/// over a few cycles instead, and the read pool sees a trickle rather than a burst it rate-limits.
+/// Ten-block chunks turn a six-hundred-block gap into sixty sequential round trips, stalling a
+/// 330ms cycle for seconds. The cursor persists between polls, so a bounded budget drains the gap
+/// over several cycles and the read pool sees a trickle rather than a burst it rate-limits.
 pub const CHUNKS_PER_POLL_MAX: u32 = 8;
 
 /// The tightest `eth_getLogs` range cap any endpoint in the read pool imposes.
 ///
-/// Nodit's free tier, measured: eleven blocks returns `-32604`, ten does not. Public because it is
-/// a fact about the environment rather than a knob — anything else that batches a range read has
-/// to respect the same ceiling, and the last time it was written down only in prose the range
-/// constant drifted to fifty times it.
+/// Nodit's free tier, measured: eleven blocks returns `-32604`, ten does not. A fact about the
+/// environment rather than a knob, so anything else batching a range read respects the same
+/// ceiling.
 pub const GETLOGS_RANGE_CAP_MIN: u64 = 10;
 
-// Compile-time, not a test, because the two constants disagreeing is the entire defect and a
-// failing test is a weaker signal than a failing build. `MAX_RANGE_BLOCKS` was five hundred against
-// a cap of ten for as long as the rotation kept landing on an endpoint that tolerated it.
+// Compile-time rather than a test: the two constants disagreeing is the whole defect, and it is
+// invisible at runtime until the read pool rotates onto the tightest endpoint.
 const _: () = assert!(
     MAX_RANGE_BLOCKS <= GETLOGS_RANGE_CAP_MIN,
     "a chunk wider than the tightest cap fails whenever the read pool rotates onto that endpoint"
@@ -144,10 +88,7 @@ pub struct RangePlan {
 
 /// Where to start reading, given the cursor and the head.
 ///
-/// Pure, and separated for one reason: this is the arithmetic that wedged the scan, and it was
-/// unreachable from a test because [`SwapWatch::poll`] needs a live [`Rpc`] to get to it. The bug
-/// was three lines of integer arithmetic guarded by two constants that disagreed with each other,
-/// which is exactly the shape that should never have needed a node to exercise.
+/// Split out of [`SwapWatch::poll`] so the range arithmetic is testable without a live [`Rpc`].
 #[must_use]
 pub const fn plan_ranges(cursor: u64, head: u64) -> RangePlan {
     let from = cursor.saturating_sub(OVERLAP_BLOCKS);
@@ -223,9 +164,9 @@ pub struct Polled {
     pub unread_chunks: u64,
     /// Blocks still between the cursor and the head when the poll ran out of its chunk budget.
     ///
-    /// Zero on a poll that caught up. Non-zero is the scan draining a gap, which is normal after a
-    /// restart and a fault if it does not fall. A cursor quietly behind reads exactly like a chain
-    /// with nothing happening on it, and that is how half an hour of blindness went unnoticed.
+    /// Zero on a poll that caught up; non-zero is the scan draining a gap, which is normal after a
+    /// restart and a fault if it does not fall. Reported because a cursor quietly behind reads
+    /// exactly like a chain with nothing happening on it.
     pub behind_blocks: u64,
 }
 
@@ -244,9 +185,9 @@ pub struct SwapWatch {
 
 /// Where a log query ends.
 ///
-/// `Pending` is the flashblocks tag: it returns logs from preconfirmed transactions, which land
-/// ~200ms after submission where a sealed block is a second away. It is only ever used on the path
-/// that does not advance the cursor -- see [`SwapWatch::poll`].
+/// `Pending` is the flashblocks tag: preconfirmed logs, ~200ms after submission against a second
+/// for a sealed block. Only ever used on the path that does not advance the cursor; see
+/// [`SwapWatch::poll`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BlockBound {
     Number(u64),
@@ -298,12 +239,10 @@ impl SwapWatch {
 
     /// Read every `Swap` between the cursor and `head`.
     ///
-    /// The first call starts at `head` rather than at the pool's deployment. The updater measures
-    /// the flow it is quoting against, and history predating the process was quoted by a different
-    /// configuration; backfilling it would mix two experiments. A backfill is a separate tool.
-    ///
-    /// The cursor only advances over ranges that were read successfully, so a failed call is
-    /// re-read rather than skipped.
+    /// The first call starts at `head`, not at the pool's deployment: history predating the process
+    /// was quoted by a different configuration, so backfilling it would mix two experiments. The
+    /// cursor only advances over ranges that were read, so a failed call is re-read rather than
+    /// skipped.
     pub async fn poll(&mut self, rpc: &Rpc, head: u64) -> Result<Polled, RpcError> {
         let Some(cursor) = self.cursor else {
             self.cursor = Some(head);
@@ -325,41 +264,28 @@ impl SwapWatch {
         while from <= head && chunks < CHUNKS_PER_POLL_MAX {
             let to = head.min(from + MAX_RANGE_BLOCKS - 1);
 
-            // A failed chunk ends the poll but does not throw away the ones before it.
-            //
-            // `absorb` has already marked those fills seen, so returning `Err` here would discard
-            // the only copy there will ever be: the next poll re-reads the range and `remember`
-            // rejects every one of them as a duplicate. The cursor stays put for the failed range,
-            // which is what makes stopping here safe.
+            // A failed chunk ends the poll and keeps the chunks before it: `absorb` has already
+            // marked those fills seen, so returning `Err` would discard the only copy of them the
+            // dedup ring will ever admit. Safe because the cursor stays put for the failed range.
             let Ok(logs) = self.fetch(rpc, from, BlockBound::Number(to)).await else {
                 out.unread_chunks += 1;
                 return Ok(out);
             };
             self.absorb(&logs, &mut out);
-            // Only now: the range is in hand, so re-reading it is unnecessary. Leaving the cursor
-            // where it was makes the next poll repeat this range.
+            // Only after the range is in hand, so a failure repeats it rather than skipping it.
             self.cursor = Some(to);
             from = to + 1;
             chunks += 1;
         }
-        // The gap outlasted this poll's budget. Say so rather than letting a cursor that is quietly
-        // behind read as a chain with nothing on it.
         if from <= head {
             out.behind_blocks = head.saturating_sub(from).saturating_add(1);
         }
 
-        // Preconfirmed fills, on a path that deliberately does NOT move the cursor.
-        //
-        // A fill is the only thing that tells us an informed counterparty just traded against us,
-        // and until this existed it arrived once per sealed block -- while quotes went out every
-        // 415ms. Two or three more quotes at essentially the same price left before the fill was
-        // even visible, which is two or three more bites for whoever knew something we did not.
-        //
-        // The cursor stays on sealed blocks because a preconfirmed block's contents are not final:
-        // advancing past one means never re-reading it if it changes, which would turn a fast path
-        // into a source of permanently missed fills. So this reads ahead of the cursor and lets the
-        // sealed pass cover the same range again. The duplicate that produces is exactly what
-        // `seen` is for, and it is counted rather than hidden.
+        // Preconfirmed fills, ahead of the cursor and deliberately not advancing it: a fill is the
+        // only signal that an informed counterparty traded against us, and one per sealed block is
+        // two or three quotes late at a 415ms cadence. The cursor stays on sealed blocks because a
+        // preconfirmed block's contents are not final; the sealed pass re-covers this range and
+        // `seen` absorbs the duplicate.
         let preconf = self
             .fetch(rpc, head.saturating_add(1), BlockBound::Pending)
             .await?;
@@ -369,24 +295,16 @@ impl SwapWatch {
         Ok(out)
     }
 
-    /// Gives every fill the timestamp of the block it landed in.
+    /// Gives every fill the timestamp of the block it landed in — the field every markout horizon
+    /// is measured from.
     ///
-    /// Every markout horizon is measured from the fill's block timestamp, so this is the field the
-    /// whole measurement hangs on. Two ways to get it, and one way not to:
-    ///
-    /// - Recent `op-geth` includes `blockTimestamp` on each log. When it is there, it is free.
-    /// - Otherwise one `eth_getBlockByNumber` per distinct block that produced a *new* fill. Not
-    ///   per log and not per block scanned: dedup has already run, so a poll over five hundred
-    ///   quiet blocks costs nothing extra, and a busy block costs one call however many fills it
-    ///   held. No cache, because dedup means a block is only ever resolved once anyway.
-    /// - Never by extrapolating from the head's timestamp and a block delta. Two seconds a block
-    ///   is a target, not a guarantee, and a drifting estimate would push fills across
-    ///   `reference_at`'s tolerance and mark them against the wrong price. A markout computed
-    ///   against the wrong reference is worse than a missing one, because it looks like data.
-    ///
-    /// A block whose timestamp cannot be established drops its fills and counts them.
-    /// The one index is on the `Ok(i)` arm of a `binary_search_by_key` over the vector being
-    /// indexed, which is the position that search just returned.
+    /// Free when the node supplies `blockTimestamp`; otherwise one `eth_getBlockByNumber` per
+    /// distinct block that produced a *new* fill, so dedup already bounds the call count. Never
+    /// extrapolated from the head's timestamp and a block delta: block time is a target rather than
+    /// a guarantee, and drift would push fills past `reference_at`'s tolerance and mark them
+    /// against the wrong price. A block whose timestamp cannot be established drops its fills and
+    /// counts them. The one index is on the `Ok(i)` arm of a `binary_search_by_key` over the vector
+    /// being indexed.
     #[allow(clippy::indexing_slicing)]
     async fn resolve_timestamps(&self, rpc: &Rpc, out: &mut Polled) -> Result<(), RpcError> {
         let mut wanted: Vec<u64> = out
@@ -491,8 +409,8 @@ impl SwapWatch {
 ///
 /// `None` covers both a malformed response and an event the engine cannot represent: amounts are
 /// `uint256` on chain and `u128` here, and `PropCurve` narrows outputs to the same bound, so an
-/// amount that does not fit is a divergence between chain and engine rather than a value to
-/// truncate. Truncating would produce a plausible markout for a trade that did not happen.
+/// amount that does not fit is a chain/engine divergence rather than a value to truncate into a
+/// plausible markout for a trade that did not happen.
 fn decode(log: &serde_json::Value) -> Option<SwapLog> {
     let topics: Vec<B256> = log
         .get("topics")?
@@ -550,8 +468,7 @@ mod tests {
     use alloy_primitives::{address, b256, hex, U256};
     use alloy_sol_types::SolValue;
 
-    /// Walks the same loop `poll` runs, so the chunk widths and the budget are asserted rather
-    /// than assumed. Returns the ranges a single poll would request.
+    /// The ranges one poll would request, walking the same loop `poll` does.
     fn chunks_of(cursor: u64, head: u64) -> Vec<(u64, u64)> {
         let mut from = plan_ranges(cursor, head).first;
         let mut out = Vec::new();
@@ -575,9 +492,8 @@ mod tests {
         }
     }
 
-    /// The failure mode: an engine restart left the cursor 792 blocks back, every poll asked for
-    /// the whole gap, every poll was refused, and the cursor never moved. The scan must instead
-    /// take a bounded bite and leave the rest for the next poll.
+    /// A gap wider than one poll's budget must be drained in bounded bites: asking for the whole
+    /// gap is refused every time, and the cursor only advances over ranges that were read.
     #[test]
     fn a_gap_too_large_for_one_poll_is_drained_rather_than_retried_whole() {
         let head = 31_978_540;
@@ -594,7 +510,10 @@ mod tests {
         let mut polls = 0;
         while cursor < head {
             let taken = chunks_of(cursor, head);
-            assert!(!taken.is_empty(), "a poll behind the head must read something");
+            assert!(
+                !taken.is_empty(),
+                "a poll behind the head must read something"
+            );
             cursor = taken.last().expect("non-empty").1;
             polls += 1;
             assert!(polls < 100, "the gap is not draining");
@@ -624,8 +543,8 @@ mod tests {
         format!("0x{:0>64}", hex::encode(a.as_slice()))
     }
 
-    /// One `Swap` as an RPC would report it. Defaults are a plausible bid; each test overrides
-    /// only the field it is actually about.
+    /// One `Swap` as an RPC would report it. Defaults are a plausible bid; each test overrides only
+    /// the field it is about.
     struct Spec {
         pair_id: u16,
         sender: Address,
@@ -701,8 +620,8 @@ mod tests {
         assert_eq!(f.at_secs, 1_700_000_042);
     }
 
-    /// A node that omits `blockTimestamp` leaves the sentinel behind for `resolve_timestamps`,
-    /// rather than the decoder inventing a plausible one.
+    /// A node that omits `blockTimestamp` must leave the sentinel for `resolve_timestamps` rather
+    /// than have the decoder invent one.
     #[test]
     fn a_missing_block_timestamp_is_left_for_resolution() {
         let mut log = one(42, 5);
@@ -712,8 +631,8 @@ mod tests {
         assert_eq!(decode(&log).expect("still decodable").at_secs, 0);
     }
 
-    /// The engine is 128-bit and the event is 256-bit. A value that does not fit is a divergence,
-    /// not something to truncate into a plausible-looking fill.
+    /// The engine is 128-bit and the event 256-bit; a value that does not fit is a divergence
+    /// rather than something to truncate into a plausible-looking fill.
     #[test]
     fn refuses_an_amount_outside_the_engine_domain() {
         let too_big = U256::from(u128::MAX) + U256::from(1u64);
@@ -724,8 +643,7 @@ mod tests {
         assert!(decode(&log).is_none());
     }
 
-    /// The overlap re-reads blocks on purpose; the dedup ring is what stops that becoming
-    /// double-counted flow.
+    /// The overlap re-reads blocks on purpose, so the dedup ring is what stops double-counted flow.
     #[test]
     fn the_overlap_never_yields_the_same_fill_twice() {
         let mut w = SwapWatch::new(pool());
@@ -785,21 +703,14 @@ mod tests {
         assert_eq!(w.seen_set.len(), SEEN_CAPACITY);
     }
 
-    /// A log this decoder has never seen, captured verbatim from GIWA Sepolia.
+    /// A log captured verbatim from GIWA Sepolia, field names and casing included.
     ///
-    /// Every other test here builds its input with the same `sol!` types the decoder reads it
-    /// back with, so all of them would still pass if the event's ABI and the deployed contract's
-    /// had drifted apart. This one cannot: it is what the chain actually returned, field names,
-    /// casing, and all.
-    ///
-    /// Captured from `0xA629071E606F425dB93310c3ecc35E00Fbe16358`, which is the *previous*
-    /// `PropPool` — see `DEPLOYMENTS.md`. Not restamped with the current address, because the
-    /// point of the fixture is that a real node produced these exact bytes, and rewriting them to
-    /// look current would throw that away for cosmetics. The `Swap` event is unchanged between the
-    /// two deployments, which is what the fixture actually pins.
-    ///
-    /// It is also the routed case — `sender` is the router adapter and `receiver` is the taker —
-    /// which is a third of the fills in this sample and the reason `markout` scores the receiver.
+    /// Every other test builds its input with the same `sol!` types the decoder reads back, so all
+    /// would still pass if the event ABI and the deployed contract had drifted apart. The bytes are
+    /// from the *previous* `PropPool` (`0xA629...6358`, see `DEPLOYMENTS.md`) and deliberately not
+    /// restamped: what they pin is that a real node produced them, and the `Swap` event is
+    /// unchanged across the two deployments. Also the routed case — `sender` is the adapter,
+    /// `receiver` the taker — which is why `markout` scores the receiver.
     fn captured_from_chain() -> serde_json::Value {
         json!({
             "blockNumber": "0x1e4c3d3",
@@ -845,16 +756,15 @@ mod tests {
         assert_eq!(f.log_index, 45);
     }
 
-    /// GIWA supplies `blockTimestamp` on every log, so `resolve_timestamps` should have nothing to
-    /// do. If a node ever stops supplying it this test still passes and the fallback carries it —
-    /// the point is to record which path the live chain actually takes.
+    /// Records which path the live chain takes: GIWA supplies `blockTimestamp` on every log, so
+    /// `resolve_timestamps` is the fallback rather than the norm.
     #[test]
     fn the_live_chain_needs_no_timestamp_backfill() {
         assert_ne!(decode(&captured_from_chain()).expect("decodes").at_secs, 0);
     }
 
-    /// A log filter is only as good as its topic. If the event's shape ever changes, this fails
-    /// before the watcher starts silently returning nothing.
+    /// A filter is only as good as its topic: an event shape change must fail here rather than
+    /// leave the watcher silently returning nothing.
     #[test]
     fn the_signature_hash_matches_the_deployed_event() {
         assert_eq!(

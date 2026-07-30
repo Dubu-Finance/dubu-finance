@@ -1,40 +1,16 @@
 //! Configuration: parsed from TOML, unknown fields rejected, ranges checked at load.
 //!
-//! The rule this module exists to enforce is that **a bad config fails at startup, not at 3am**.
-//! Two mechanisms do that, and both are worth more than they look:
+//! A bad config has to fail at startup rather than at 3am. `deny_unknown_fields` turns a typo into
+//! a parse error instead of a knob that silently kept its default; [`Config::validate`] runs every
+//! range check that does not need the chain, and [`crate::chain::verify_against_chain`] runs the
+//! ones that do before the loop computes anything.
 //!
-//! 1. `#[serde(deny_unknown_fields)]` on every struct. A typo'd key is otherwise silently
-//!    ignored, and the knob you thought you turned stays at its default. `half_spred_bps = 50`
-//!    is a five-basis-point quote that its author believes is fifty.
-//! 2. [`Config::validate`], which runs every range check that does not need the chain. The
-//!    checks that *do* need the chain — that a pair exists, that the configured token decimals
-//!    match the deployed ERC-20s, that the heartbeat fits inside the pool's own `maxStaleSecs`
-//!    — run in [`crate::chain::verify_against_chain`] immediately after the first poll, before
-//!    the loop is allowed to compute anything.
+//! Every on-chain amount here is a decimal **string in human units**, scaled by the pair's decimals
+//! at load: TOML integers are `i64` and a thousand mWETH is `10^21`.
 //!
-//! # Amounts are decimal strings, and why
-//!
-//! TOML integers are `i64`. A thousand mWETH is `10^21`, which does not fit, so every on-chain
-//! amount in this file is a **string in human units** — `capacity = "1000"` means 1000 mWETH,
-//! scaled by that pair's `base_decimals` at load. That is also the readable form: nobody should
-//! be checking a risk limit by counting zeros.
-//!
-//! # Secrets
-//!
-//! There is no private key in this file and there is no field that could hold one. [`KeySource`]
-//! names either an environment variable or a path; the value is read at startup and never
-//! logged. See [`crate::tx`].
-//!
-//! The endpoint URLs are the second secret, and a less obvious one. Nodit puts the API key in
-//! the **path** — `https://giwa-sepolia.nodit.io/<KEY>` — so the URL *is* the credential. Two
-//! mechanisms keep it out of everything:
-//!
-//! 1. The config file holds `${NODIT_API_KEY}`, never a literal. [`EndpointUrl`] expands it from
-//!    the environment at load; an unset variable is a startup error naming the *variable*.
-//! 2. [`EndpointUrl`]'s `Display` and `Debug` are both **redacted** to `scheme://host/***`. The
-//!    real string is reachable only through [`EndpointUrl::expose`], which the transport calls
-//!    and nothing else does. That makes "never log the key" a property of the type rather than a
-//!    rule every future `info!` has to remember.
+//! No secret is a literal here. [`KeySource`] names an environment variable or a path, and the
+//! endpoint URLs are [`EndpointUrl`] — Nodit puts the API key in the path, so the URL *is* the
+//! credential — which expands `${VAR}` at load and redacts in both `Display` and `Debug`.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -73,25 +49,13 @@ fn invalid(msg: impl Into<String>) -> ConfigError {
     ConfigError::Invalid(msg.into())
 }
 
-// ---------------------------------------------------------------------------
-// Endpoint URLs, which are credentials
-// ---------------------------------------------------------------------------
+// --- Endpoint URLs, which are credentials ---
 
 /// A URL that may carry a credential, and therefore may never be printed.
 ///
-/// Nodit's endpoint is `https://giwa-sepolia.nodit.io/<KEY>`: the API key is a path segment, so
-/// the URL is not "a string that happens to contain a secret", it *is* the secret. This wrapper
-/// makes that structural instead of a convention:
-///
-/// * `Display` and `Debug` both emit the **redacted** form, so `url = %cfg.chain.rpc_url` in a
-///   `tracing` macro logs `https://giwa-sepolia.nodit.io/***` and there is no spelling of it
-///   that logs anything else.
-/// * The real string comes out of [`EndpointUrl::expose`] only, which is called by the reqwest
-///   client and the websocket connect and nowhere else. Grep for it to audit every use.
-///
-/// Redaction keeps the scheme and the host — those are the useful half of a log line, and they
-/// are not secret — and replaces any path, query or userinfo with `***`. Over-redacting a
-/// key-free path costs nothing; under-redacting one costs the key.
+/// `Display` and `Debug` both emit the redacted form, so no spelling of a `tracing` argument logs
+/// the key, and [`EndpointUrl::expose`] is the only way to the real string. Redaction keeps scheme
+/// and host: over-redacting a key-free path costs nothing, under-redacting one costs the key.
 #[derive(Clone, PartialEq, Eq)]
 pub struct EndpointUrl {
     raw: String,
@@ -102,16 +66,14 @@ impl EndpointUrl {
     /// Build from an already-resolved URL string, expanding any `${VAR}` references.
     ///
     /// # Errors
-    /// [`ConfigError::Invalid`] if a referenced variable is unset or empty. The message names
-    /// the **variable**, never the value.
+    /// [`ConfigError::Invalid`] if a variable is unset or empty, naming it and never its value.
     pub fn resolve(field: &str, template: &str) -> Result<Self, ConfigError> {
         let raw = expand_env(field, template)?;
         let redacted = redact_url(&raw);
         Ok(Self { raw, redacted })
     }
 
-    /// The real URL. **The only way to get it**, and the only callers are the HTTP client and
-    /// the websocket connect.
+    /// The real URL. The only way out of the wrapper; called by the transport and nowhere else.
     #[must_use]
     pub fn expose(&self) -> &str {
         &self.raw
@@ -138,15 +100,14 @@ impl EndpointUrl {
     }
 }
 
-/// Redacted, always. See the type docs — there is deliberately no un-redacted formatter.
+/// Redacted, always: there is deliberately no un-redacted formatter.
 impl std::fmt::Display for EndpointUrl {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.redacted)
     }
 }
 
-/// Redacted, always. `Debug` matters as much as `Display` here: `?url` in a tracing macro and
-/// `{:?}` on a struct that contains one both go through this.
+/// Redacted, always: `?url` and a `{:?}` of any struct holding one both come through here.
 impl std::fmt::Debug for EndpointUrl {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{:?}", self.redacted)
@@ -156,17 +117,15 @@ impl std::fmt::Debug for EndpointUrl {
 impl<'de> Deserialize<'de> for EndpointUrl {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         let s = String::deserialize(d)?;
-        // The field name is not available here, so the error carries the template shape rather
-        // than the field. `expand_env` puts the variable name in the message either way.
+        // The field name is not available here; `expand_env` names the variable either way.
         Self::resolve("<url>", &s).map_err(serde::de::Error::custom)
     }
 }
 
 /// Expand every `${VAR}` in `template` from the environment.
 ///
-/// An unset or empty variable is an error rather than an empty expansion: a URL with a blank key
-/// segment produces a 401 at the first request, which is a much worse place to discover a
-/// missing `.env` than startup.
+/// An unset or empty variable is an error rather than an empty expansion: a blank key segment 401s
+/// at the first request, which is a worse place to discover a missing `.env` than startup.
 pub(crate) fn expand_env(field: &str, template: &str) -> Result<String, ConfigError> {
     let mut out = String::with_capacity(template.len());
     let mut rest = template;
@@ -215,23 +174,12 @@ fn redact_url(url: &str) -> String {
     }
 }
 
-// ---------------------------------------------------------------------------
-// .env
-// ---------------------------------------------------------------------------
+// --- .env ---
 
-/// Load `KEY=VALUE` pairs from a dotenv-style file into the process environment.
-///
-/// Deliberately tiny and deliberately hand-rolled — the same reasoning as `tx.rs` encoding its
-/// own EIP-1559 envelope. Three rules, all of which matter:
-///
-/// * **A variable already set in the real environment always wins.** The file is a convenience
-///   for local runs, never an override of what an operator or a systemd unit set on purpose.
-/// * **Nothing from the file is ever logged**, including key *names* being fine but values
-///   never. The return value is a count, not the contents.
-/// * A missing file is not an error. Production sets real environment variables and has no
-///   `.env` at all.
-///
-/// Returns how many variables this file actually set.
+/// Load `KEY=VALUE` pairs from a dotenv-style file into the environment, returning how many were
+/// set. A variable already set in the real environment wins: the file is a convenience for local
+/// runs, never an override of what an operator set on purpose. The return is a count rather than
+/// the keys because nothing from the file may be logged; a missing file is not an error.
 pub fn load_dotenv(path: &Path) -> usize {
     let Ok(text) = std::fs::read_to_string(path) else {
         return 0;
@@ -264,9 +212,7 @@ pub fn load_dotenv(path: &Path) -> usize {
     set
 }
 
-// ---------------------------------------------------------------------------
-// Top level
-// ---------------------------------------------------------------------------
+// --- Top level ---
 
 /// The whole configuration.
 #[derive(Debug, Clone, Deserialize)]
@@ -280,48 +226,35 @@ pub struct Config {
     pub tx: TxConfig,
     /// Inventory skew: the volatility estimator and the Avellaneda–Stoikov knobs.
     pub skew: SkewConfig,
-    /// The volatility-scaled half-spread. Defaulted, so a config written before it existed still
-    /// loads — with the term **on**, because a constant half-spread is the defect it fixes.
+    /// The volatility-scaled half-spread. Defaulted **on**, so a config written before it existed
+    /// still loads with the term active: a constant half-spread is the defect it fixes.
     #[serde(default)]
     pub spread: SpreadConfig,
-    /// Jump detection and withdrawal. Defaulted and **on**, for the same reason.
+    /// Jump detection and withdrawal. Defaulted on, for the same reason.
     #[serde(default)]
     pub jump: JumpConfig,
     /// Killswitches.
     pub risk: RiskConfig,
-    /// The RFQ maker endpoint. **Absent means off**, and off is the default.
-    ///
-    /// Not defaulted-on the way [`SpreadConfig`] and [`JumpConfig`] are. Those change how the pool
-    /// prices; this one hands out signatures that move tokens. A config written before this
-    /// existed must not acquire a signing endpoint merely by being loaded.
+    /// The RFQ maker endpoint. Absent means off — opt-in rather than defaulted-on like `spread`
+    /// and `jump`, because those change how the pool prices and this signs tokens away.
     #[serde(default)]
     pub rfq: Option<RfqConfig>,
-    /// The hedge leg. Absent means inventory is neutralised nowhere, which is the assumption the
-    /// ladder's slope was priced under. See [`crate::hedge`].
-    ///
-    /// Opt-in for the same reason as `rfq`: it places orders on an exchange with a live key, and a
-    /// config written before it existed must not acquire that merely by being loaded.
+    /// The hedge leg. Opt-in for the same reason as `rfq`: it places orders with a live key.
     #[serde(default)]
     pub hedge: Option<HedgeConfig>,
     /// One entry per pair the bot quotes.
     pub pairs: Vec<PairConfig>,
 }
 
-/// The RFQ maker: its own key, the contract it signs for, and how it prices.
+/// The hedge leg: where to neutralise inventory, and how patiently. See [`crate::hedge`].
 ///
-/// The key is deliberately separate from [`TxConfig`]'s. See `maker`'s module docs — a leaked
-/// updater key posts a wrong ladder the killswitches will notice, and a leaked RFQ key signs away
-/// The hedge leg: where to neutralise inventory, and how patiently.
-///
-/// Absent means no hedging, which is the state the ladder was priced defensively for -- a 25 bp
-/// slope exists because inventory had nowhere to go. See [`crate::hedge`].
+/// Absent means no hedging, the state the ladder was priced defensively for: the 25 bp slope
+/// exists because inventory had nowhere to go.
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HedgeConfig {
-    /// REST base, e.g. `https://testnet.binancefuture.com`.
-    ///
-    /// Testnet on purpose while the pool trades mock tokens: hedging a fake position on the live
-    /// exchange would leave the only real leg in the system unbacked.
+    /// REST base, e.g. `https://testnet.binancefuture.com`. Testnet while the pool trades mock
+    /// tokens: hedging a fake position live would leave the only real leg in the system unbacked.
     pub base_url: String,
     /// Environment variable holding the venue API key. Never the key itself.
     pub key_env: String,
@@ -337,10 +270,9 @@ pub struct HedgeConfig {
     /// so a host that drifts starts failing every signed call at once.
     #[serde(default = "d_hedge_clock_resync_secs")]
     pub clock_resync_secs: u64,
-    /// Hyperliquid's read endpoint, for pairs on [`HedgeVenue::HyperliquidPaper`].
-    ///
-    /// Mainnet, and unauthenticated: the equity books are here and `allMids` needs no key. Weight 2
-    /// against a 1200/minute budget, returning every market in one response.
+    /// Hyperliquid's read endpoint, for pairs on [`HedgeVenue::HyperliquidPaper`]. Mainnet and
+    /// unauthenticated: the equity books are there, and `allMids` needs no key and costs weight 2
+    /// against a 1200/minute budget for every market at once.
     #[serde(default = "d_hyperliquid_url")]
     pub hyperliquid_url: String,
     /// One entry per pair to hedge. A pair with no entry is simply not hedged.
@@ -355,22 +287,15 @@ pub enum HedgeVenue {
     /// Binance USD-M futures, signed and live against whatever `base_url` points at.
     #[default]
     Binance,
-    /// Hyperliquid, read-only. The decision is taken and the book is written; no order is sent.
-    ///
-    /// Paper because the equity markets exist on **mainnet only** -- the testnet's HIP-3 list is
-    /// experiments, not equities -- and hedging a mock-token pool with real capital leaves the only
-    /// real position in the system unbacked. Everything is exercised except the fill.
+    /// Hyperliquid, read-only: the decision is taken and the book written, but no order is sent.
+    /// Paper because the equity markets are mainnet-only — see [`HedgeConfig::base_url`].
     HyperliquidPaper,
-    /// Binance spot, read-only, filled into the same paper book.
+    /// Binance spot, read-only, filled into the same paper book. Signs nothing, so no key and no
+    /// clock sync.
     ///
-    /// The crypto pairs' reference comes from Binance/OKX/Bybit **spot**, so a paper fill booked at
-    /// a Hyperliquid perp mid carries a basis against the very price the pool quotes off -- measured
-    /// 2026-07-29 at -4 to -6 bp across all five symbols, against an ETH half-spread of 1.75 bp.
-    /// Filling against the same market the reference is built from removes that by construction.
-    ///
-    /// Unlike [`Self::Binance`] this signs nothing and sends nothing: it reads the public order
-    /// book. No key, no clock sync, and no `-2019 Margin is insufficient` -- the account that
-    /// produced eighty of those held $5,000 against tens of millions of pool inventory.
+    /// The crypto reference is built from Binance/OKX/Bybit **spot**, so booking a paper fill at a
+    /// Hyperliquid perp mid carries a -4 to -6 bp basis against the price the pool quotes off,
+    /// against an ETH half-spread of 1.75 bp. Filling on the reference's own market removes it.
     BinancePaper,
 }
 
@@ -382,17 +307,13 @@ pub struct HedgePair {
     pub pair_id: u16,
     /// The venue's contract, e.g. `ETHUSDT`, or `xyz:TSLA` on Hyperliquid.
     pub symbol: String,
-    /// Where this pair is hedged. Defaults to the signed Binance leg.
-    ///
-    /// Per-pair rather than per-config because the venues do not overlap: Binance USD-M carries the
-    /// crypto pairs and no equities, Hyperliquid carries equities through HIP-3 and is read-only
-    /// here. A pool quoting both has to hedge each where it can be hedged.
+    /// Where this pair is hedged. Defaults to the signed Binance leg. Per-pair because the venues
+    /// do not overlap: Binance USD-M carries the crypto pairs, Hyperliquid the equities via HIP-3.
     #[serde(default)]
     pub venue: HedgeVenue,
     /// The HIP-3 builder book, for [`HedgeVenue::HyperliquidPaper`]. Empty is the main perp book.
-    ///
-    /// Not a routing detail. Builders attach their own oracles and disagree -- measured in one
-    /// second, `xyz:TSLA` 307.31 against `flx:TSLA` 395.50. Naming the dex is naming a fair value.
+    /// Naming the dex names a fair value, not a route: builders attach their own oracles and
+    /// disagree, measured in one second at `xyz:TSLA` 307.31 against `flx:TSLA` 395.50.
     #[serde(default)]
     pub dex: String,
     /// Decimals the venue accepts for quantity. Sending more is rejected outright.
@@ -401,17 +322,15 @@ pub struct HedgePair {
     pub qty_base_min: String,
     /// RMS net exposure this pair is willing to carry unhedged, in the pool's base units.
     ///
-    /// A RISK BUDGET, not a measurement, and the only input the band needs -- see
-    /// [`crate::hedge::derive_band`] for why the theoretically correct formula is unusable here and
-    /// why `h = sqrt(3) * carry` is the honest substitute. Exposure inside the band is carried on
-    /// purpose: removing it costs more in fees than holding it costs in risk.
+    /// A RISK BUDGET, not a measurement, and the only input the band `h = sqrt(3) * carry` needs
+    /// (see [`crate::hedge::derive_band`]). Exposure inside the band is carried deliberately:
+    /// removing it costs more in fees than holding it costs in risk.
     pub carry_base: String,
     /// Largest single order, in the pool's base units. Empty or `"0"` means no clip.
     ///
-    /// An EXECUTION limit, not a risk filter -- see [`crate::hedge::Band::order_max`]. Every unit of
-    /// exposure gets hedged either way; this only decides how much goes out per order, which is what
-    /// keeps a pool converging on a long-standing position from paying to move the book against
-    /// itself on the first cycle.
+    /// An EXECUTION limit, not a risk filter -- see [`crate::hedge::Band::order_max`]. Every unit
+    /// of exposure is hedged either way; this only bounds how much goes out per order, so a pool
+    /// converging on a long-standing position does not move the book against itself in one cycle.
     #[serde(default)]
     pub order_base_max: String,
     /// Don't send again within this many milliseconds. A crossing takes time to fill and to be
@@ -433,7 +352,11 @@ fn d_hedge_cooloff_ms() -> u64 {
     2_000
 }
 
-/// the maker's balance up to its standing allowance with nothing to notice in time.
+/// The RFQ maker: its own key, the contract it signs for, and how it prices.
+///
+/// The key is separate from [`TxConfig`]'s because the blast radii differ: a leaked updater key
+/// posts a wrong ladder the killswitches notice, a leaked RFQ key signs the maker's balance away
+/// up to its standing allowance with nothing to notice in time.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RfqConfig {
@@ -457,13 +380,12 @@ pub struct RfqConfig {
     pub sigma_coefficient_e2: u32,
     /// Ceiling on the half-spread.
     pub half_spread_e2_max: u32,
-    /// Largest notional a single order may commit, in whole quote tokens. A decimal string
-    /// because TOML integers are `i64` and this is a `u128` once scaled.
+    /// Largest notional a single order may commit, in whole quote tokens.
     pub notional_per_order_max: String,
     /// Decimals of the quote token these markets are denominated in.
     pub quote_decimals: u8,
     /// How long a signed order stays fillable, how long its inventory stays reserved, and the
-    /// window whose option value the spread charges for. See `quoting::MakerParams`.
+    /// window whose option value the spread charges for — one number for all three.
     pub ttl_secs: u64,
     /// Floor on a single fill, in bps of the maker leg.
     #[serde(default)]
@@ -471,15 +393,12 @@ pub struct RfqConfig {
 }
 
 impl RfqConfig {
-    /// Where the signing key lives.
+    /// Where the signing key lives. Unlike `tx`, a present `[rfq]` section must name a source
+    /// rather than defaulting to none.
     ///
     /// # Errors
-    ///
     /// [`ConfigError`] when neither or both are set, when the variable name is empty, or when it
-    /// looks like somebody pasted the key itself where the variable name goes. The same three
-    /// checks `tx` makes, for the same reasons — and here the key is the more dangerous of the
-    /// two, so the section is required to name a source rather than being allowed to default to
-    /// none.
+    /// looks like the key itself pasted where the variable name goes.
     pub fn key_source(&self) -> Result<KeySource, ConfigError> {
         let source =
             match (&self.private_key_env, &self.private_key_file) {
@@ -536,9 +455,8 @@ impl RfqConfig {
             half_spread_e2_max: self.half_spread_e2_max,
             notional_per_order_max: self.notional_units_max()?,
             ttl_secs: self.ttl_secs,
-            // Taken from the skew estimator rather than configured twice. Two numbers meaning
-            // "the window sigma is measured over" is two things to keep in step and two ways to
-            // misprice the TTL.
+            // Taken from the skew estimator rather than configured twice: two numbers meaning
+            // "the window sigma is measured over" is two ways to misprice the TTL.
             sigma_horizon_secs: vol_horizon_secs,
             fill_bps_min: self.fill_bps_min,
         })
@@ -549,8 +467,8 @@ impl Config {
     /// Read and validate a config file.
     ///
     /// # Errors
-    /// [`ConfigError`] for an unreadable file, a parse failure (including an unknown field), or
-    /// any failed range check.
+    /// [`ConfigError`] for an unreadable file, a parse failure (including an unknown field), or a
+    /// failed range check.
     pub fn load(path: &Path) -> Result<Self, ConfigError> {
         let text = std::fs::read_to_string(path).map_err(|source| ConfigError::Io {
             path: path.to_path_buf(),
@@ -564,8 +482,7 @@ impl Config {
     /// Every check that does not need the chain.
     ///
     /// # Errors
-    /// [`ConfigError::Invalid`] naming the field, or [`ConfigError::Units`] for an unparseable
-    /// amount.
+    /// [`ConfigError::Invalid`] naming the field, or [`ConfigError::Units`] for a bad amount.
     pub fn validate(&self) -> Result<(), ConfigError> {
         self.chain.validate()?;
         self.feed.validate()?;
@@ -588,22 +505,18 @@ impl Config {
                     p.pair_id
                 )));
             }
-            // Two pairs on one symbol is not obviously wrong, but it is never what was meant,
-            // and it doubles the quote traffic for one price.
+            // Two pairs on one symbol doubles the quote traffic for one price.
             if !seen_symbols.insert(p.symbol.clone()) {
                 return Err(invalid(format!(
                     "pairs: symbol `{}` appears twice",
                     p.symbol
                 )));
             }
-            // A cap below a pair's own half-spread would silently NARROW the configured spread —
-            // `spread::compute` refuses to do that, so the config would quietly mean something
-            // other than what it says. Caught here, naming both numbers.
             if f64::from(self.spread.half_spread_bps_max) < p.half_spread_bps {
                 return Err(invalid(format!(
                     "spread.half_spread_bps_max ({}) is below pairs[{}].half_spread_bps ({}); \
-                     the cap bounds the VOLATILITY TERM and can never narrow the configured spread, \
-                     so this combination would silently disable the term for that pair",
+                     the cap bounds the VOLATILITY TERM and can never narrow the configured \
+                     spread, so this combination would silently disable the term for that pair",
                     self.spread.half_spread_bps_max, p.pair_id, p.half_spread_bps
                 )));
             }
@@ -617,11 +530,8 @@ impl Config {
         self.pairs.iter().find(|p| p.pair_id == pair_id)
     }
 
-    /// Every venue at least one pair names, in a stable order.
-    ///
-    /// A venue is enabled by being *used*, not by a separate switch. Two places to turn a venue
-    /// on is two places for them to disagree, and the failure that produces — a venue configured
-    /// but quoting no symbol — is one that counts toward nothing and reads as healthy.
+    /// Every venue at least one pair names, in a stable order. Enabled by use rather than by a
+    /// separate switch: a switched-on venue with no symbol meets no quorum while reading healthy.
     #[must_use]
     pub fn venues(&self) -> Vec<VenueId> {
         VenueId::ALL
@@ -644,84 +554,57 @@ impl Config {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Chain
-// ---------------------------------------------------------------------------
+// --- Chain ---
 
 /// The three endpoints, the head-subscription watchdog, and the liveness thresholds.
 ///
-/// # Which endpoint does what, and why
+/// Three different freshness guarantees, not redundancy:
 ///
-/// | field | endpoint | used for | why that one |
-/// |---|---|---|---|
-/// | `ws_url` | Nodit WSS | `newHeads`, which **drives the loop** | the only one that answers `eth_subscribe`; 1s confirmed heads |
-/// | `flashblocks_rpc_url` | GIWA flashblocks | every state read, `pending` tag | ~200ms preconfirmed state — fresher than any confirmed head |
-/// | `rpc_url` | Nodit HTTPS | transactions, nonce, receipts, startup metadata | canonical, and no longer rate-limited |
-///
-/// The split is not redundancy, it is three different freshness guarantees. Heads say *when* to
-/// look, flashblocks says *what is true right now* including preconfirmed swaps that have
-/// already moved `bidUsed`, and the ordinary RPC says *what is final* — which is the only
-/// acceptable basis for a nonce.
-///
-/// All three are [`EndpointUrl`], so they are redacted in every log line. Write them in the TOML
-/// as `${NODIT_API_KEY}` templates; a literal key in a config file is the thing this type exists
-/// to prevent.
+/// * `ws_url` — Nodit WSS, the only endpoint answering `eth_subscribe`. Says *when* to look.
+/// * `flashblocks_rpc_url` — GIWA flashblocks under `pending`. Says what is true *now*, including
+///   swaps that have already moved `bidUsed`.
+/// * `rpc_url` — Nodit HTTPS. Says what is *final*, the only acceptable basis for a nonce.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ChainConfig {
-    /// Websocket RPC carrying the `newHeads` subscription that drives the quote loop. Must be a
-    /// `ws://` or `wss://` URL — pointing this at an HTTPS endpoint gets
-    /// `"notifications not supported"` from the node, which the subscription task logs by name.
+    /// Websocket RPC carrying the `newHeads` subscription that drives the quote loop. Must be
+    /// `ws(s)://`: an HTTPS endpoint answers `notifications not supported` and never subscribes.
     pub ws_url: EndpointUrl,
     /// Ordinary RPC. Transactions are submitted here, because this is the canonical view.
     pub rpc_url: EndpointUrl,
-    /// Flashblocks RPC. **Read only, and only under the `pending` tag** — its `latest` lags the
-    /// ordinary endpoint by about two blocks, so reading `latest` here is strictly worse than
-    /// reading `latest` there. See [`crate::chain`].
+    /// Flashblocks RPC. **Read only, and only under the `pending` tag**: its `latest` lags the
+    /// ordinary endpoint by about two blocks. See [`crate::chain`].
     pub flashblocks_rpc_url: EndpointUrl,
     /// Extra read endpoints, rotated alongside [`Self::flashblocks_rpc_url`].
     ///
-    /// Reads only, and the restriction is structural rather than a convention: a read is a
-    /// question about one block that any node can answer, whereas rotating the *transmit* path
-    /// would read a nonce from a node that has not seen the previous transaction. See
-    /// [`crate::chain::Selection`]. The transmit client stays pinned to [`Self::rpc_url`] however
-    /// many of these there are.
-    ///
-    /// Each is an [`EndpointUrl`], so each is a `${VAR}` template and each is redacted in logs.
-    /// Several keys against one provider multiply the request budget; several providers also buy
-    /// independence from one of them being down.
+    /// Reads only, structurally: a read is a question about one block that any node can answer,
+    /// whereas rotating the transmit path would read a nonce from a node that has not seen the
+    /// previous send. Several keys multiply the budget, several providers also buy independence.
     #[serde(default)]
     pub read_rpc_urls: Vec<EndpointUrl>,
-    /// Additional endpoints for the **write** path: nonce, submit, receipt.
+    /// Fallback endpoints for the **write** path — nonce, submit, receipt — after
+    /// [`Self::rpc_url`].
     ///
-    /// [`Self::rpc_url`] is tried first and these are the fallbacks. They exist because a quota is
-    /// a property of a key, not of a node: the read pool already rotates over several keys, so a
-    /// single-key write path was the one place left where one exhausted key stopped the bot
-    /// sending anything at all. Measured, that is exactly what happened -- 1,448 consecutive
-    /// `403 API usage quota has been exceeded` while the reader carried on fine.
-    ///
-    /// Selected with [`Selection::Pin`], not `Rotate`: consecutive calls on this path have to
-    /// reach the same node's view of our nonce, so it stays on one endpoint and moves only when
-    /// that endpoint is genuinely failing.
+    /// A quota is a property of a key, not of a node, so a single-key write path is the one place
+    /// where one exhausted key stops the bot sending at all. Selected with `Selection::Pin`
+    /// rather than `Rotate`: consecutive calls here must reach the same node's view of our nonce.
     #[serde(default)]
     pub write_rpc_urls: Vec<EndpointUrl>,
     /// EIP-155 chain id. 91342 for GIWA Sepolia.
     pub chain_id: u64,
     /// `PropPool` address.
     pub pool: Address,
-    /// Multicall3. Preinstalled at the canonical address in GIWA's genesis, which is what lets
-    /// a whole read cycle be one request.
+    /// Multicall3, preinstalled at the canonical address in GIWA's genesis, which is what lets a
+    /// whole read cycle be one request.
     pub multicall3: Address,
-    /// The chain's block cadence. GIWA is 1s, and measured heads arrive at 904-1050ms. This is
-    /// the unit the head watchdog is expressed in, so it is a fact about the chain rather than a
-    /// tuning knob.
+    /// The chain's block cadence. GIWA is 1s, with heads measured at 904-1050ms. A fact about the
+    /// chain rather than a tuning knob: it is the unit the head watchdog is expressed in.
     #[serde(default = "d_block_time_ms")]
     pub block_time_ms: u64,
-    /// **The head watchdog.** No head for this many block times means the subscription has gone
-    /// quiet, and a quiet subscription is more dangerous than a broken one — the bot would sit
-    /// believing the chain had stopped. Tripping it forces the fallback read immediately and
-    /// hands the liveness question to [`crate::chain::ChainHealth`], which decides from the
-    /// *block number* whether the chain stopped or only the socket did.
+    /// **The head watchdog.** No head for this many block times means a quiet subscription, which
+    /// is worse than a broken one because the bot sits believing the chain has stopped. Tripping
+    /// it forces the fallback read and hands the liveness question to
+    /// [`crate::chain::ChainHealth`], which decides from the *block number* which one stopped.
     #[serde(default = "d_head_stale_blocks")]
     pub head_stale_blocks: u32,
     /// First reconnect delay for the head subscription. Doubles per consecutive failure.
@@ -731,47 +614,34 @@ pub struct ChainConfig {
     /// Reconnect delay ceiling for the head subscription.
     #[serde(default = "d_ws_reconnect_max_ms")]
     pub ws_reconnect_max_ms: u64,
-    /// **Fallback only.** The loop is driven by `newHeads`; this timer is the floor underneath
-    /// it, so a subscription that dies or goes silent degrades into polling instead of stalling.
-    /// It is not the primary driver and sizing it like one is a misreading — at a healthy 1s
-    /// head cadence this timer essentially never fires.
+    /// **Fallback only**: the floor under the `newHeads` subscription, so a socket that dies or
+    /// goes silent degrades into polling instead of stalling. At a healthy 1s head cadence it
+    /// essentially never fires, so sizing it like a primary driver is a misreading.
     #[serde(default = "d_fallback_poll_interval_ms")]
     pub fallback_poll_interval_ms: u64,
-    /// How often the quote cycle runs, in milliseconds.
-    ///
-    /// The cycle used to be driven by `newHeads`, which made one second the floor on how often the
-    /// pool could re-price -- and the posted spread has to cover the reference's drift over exactly
-    /// that window, so the clock was setting the spread. It has its own timer now; heads are one
-    /// more thing that can wake it early, not the thing that paces it.
-    ///
-    /// Below the chain reader's own interval the cycle starts seeing the same view twice, which is
-    /// harmless (the reference, not the view, is what moves a quote) but buys nothing.
+    /// How often the quote cycle runs, in milliseconds. Heads wake it early but do not pace it:
+    /// the posted spread has to cover the reference's drift over exactly the re-pricing interval,
+    /// so pacing on heads would put a one-second floor under that window and let the chain's clock
+    /// set the spread. Below the chain reader's own interval the cycle sees the same view twice.
     #[serde(default = "d_quote_interval_ms")]
     pub quote_interval_ms: u64,
     /// Per-request HTTP timeout.
     #[serde(default = "d_request_timeout_ms")]
     pub request_timeout_ms: u64,
-    /// Runaway guard, requests per second, across *all* RPC use on one endpoint.
-    ///
-    /// This used to be a budget sized against a hostile public endpoint. It is not that any
-    /// more — the dedicated endpoint took 20 rapid `eth_blockNumber` calls without a single 429 —
-    /// and the default is now loose enough that normal operation never touches it. What it still
-    /// buys is a ceiling on a *bug*: a reconnect storm or a spinning loop cannot turn into an
-    /// unbounded request flood against the endpoint. Sized as a fuse, not as a budget.
+    /// Runaway guard, requests per second, across *all* RPC use on one endpoint. A fuse rather
+    /// than a budget: normal operation never touches it, and a reconnect storm cannot flood.
     #[serde(default = "d_requests_per_sec")]
     pub requests_per_sec: f64,
     /// Burst allowance before the sustained rate binds. A send needs four or five requests in
     /// quick succession (nonce, submit, receipt polls), so this must be comfortably above one.
     #[serde(default = "d_request_burst")]
     pub request_burst: f64,
-    /// First backoff after an HTTP 429. Doubles per consecutive 429, capped below.
-    ///
-    /// Kept, and not because 429s are expected: a dedicated endpoint is not an infinite one, and
-    /// a bot with no backoff at all turns any transient upstream failure into a flood.
-    #[serde(default = "d_rl_backoff_initial_ms")]
+    /// First backoff after an HTTP 429, doubling per consecutive 429 up to the ceiling below.
+    /// Without it a transient upstream failure becomes a flood.
+    #[serde(default = "d_rate_limit_backoff_initial_ms")]
     pub rate_limit_backoff_initial_ms: u64,
     /// Backoff ceiling.
-    #[serde(default = "d_rl_backoff_max_ms")]
+    #[serde(default = "d_rate_limit_backoff_max_ms")]
     pub rate_limit_backoff_max_ms: u64,
     /// After this long with no successful read **and no new block**, the chain view is
     /// `Degraded`: quoting continues with [`ChainConfig::degraded_extra_half_spread_bps`] added
@@ -786,9 +656,8 @@ pub struct ChainConfig {
     /// been failing long enough to count as degraded.
     #[serde(default = "d_view_stale_secs")]
     pub view_stale_secs: u64,
-    /// Half-spread widening, in bps, while the chain view is degraded. Quoting into a view you
-    /// cannot refresh is the adverse-selection case; widening is the cheap partial defence and
-    /// halting is the complete one.
+    /// Half-spread widening, in bps, while the chain view is degraded. Quoting into a view that
+    /// cannot be refreshed is the adverse-selection case; widening is the cheap partial defence.
     #[serde(default = "d_degraded_extra_bps")]
     pub degraded_extra_half_spread_bps: u16,
 }
@@ -820,10 +689,10 @@ fn d_requests_per_sec() -> f64 {
 fn d_request_burst() -> f64 {
     50.0
 }
-fn d_rl_backoff_initial_ms() -> u64 {
+fn d_rate_limit_backoff_initial_ms() -> u64 {
     2_000
 }
-fn d_rl_backoff_max_ms() -> u64 {
+fn d_rate_limit_backoff_max_ms() -> u64 {
     120_000
 }
 fn d_degraded_after_secs() -> u64 {
@@ -840,10 +709,8 @@ fn d_degraded_extra_bps() -> u16 {
 }
 
 impl ChainConfig {
-    /// How long without a `newHeads` delivery counts as a silent subscription.
-    ///
-    /// `block_time_ms * head_stale_blocks`. Expressed as a multiple rather than an absolute so
-    /// that it stays correct if the chain's cadence changes.
+    /// How long without a `newHeads` delivery counts as a silent subscription. A multiple of the
+    /// block time rather than an absolute, so it stays correct if the chain's cadence changes.
     #[must_use]
     pub const fn head_stale_after(&self) -> std::time::Duration {
         std::time::Duration::from_millis(
@@ -852,7 +719,16 @@ impl ChainConfig {
         )
     }
 
+    /// Every check that does not need the chain, in four groups run in the order written: a later
+    /// group may compare against a field an earlier one has already bounded.
     fn validate(&self) -> Result<(), ConfigError> {
+        self.validate_endpoints()?;
+        self.validate_cadence()?;
+        self.validate_budget()?;
+        self.validate_liveness()
+    }
+
+    fn validate_endpoints(&self) -> Result<(), ConfigError> {
         for (name, url) in [
             ("rpc_url", &self.rpc_url),
             ("flashblocks_rpc_url", &self.flashblocks_rpc_url),
@@ -863,9 +739,6 @@ impl ChainConfig {
                 )));
             }
         }
-        // A websocket URL is not optional and an http one will never subscribe: the endpoint
-        // answers `notifications not supported` and the loop would fall back to polling forever
-        // while looking configured. Caught here instead.
         if !self.ws_url.is_ws() {
             return Err(invalid(format!(
                 "chain.ws_url: must be a ws(s) URL, got `{}`; an http(s) endpoint answers \
@@ -882,14 +755,18 @@ impl ChainConfig {
         if self.multicall3.is_zero() {
             return Err(invalid("chain.multicall3: must not be the zero address"));
         }
+        Ok(())
+    }
+
+    fn validate_cadence(&self) -> Result<(), ConfigError> {
         if !(100..=60_000).contains(&self.block_time_ms) {
             return Err(invalid("chain.block_time_ms: must be 100..=60000"));
         }
-        // One missed head is ordinary jitter — the measured cadence is 904-1050ms, so a window
-        // of one block time would trip constantly and a watchdog that cries wolf gets ignored.
+        // One missed head is ordinary jitter at the measured 904-1050ms cadence.
         if self.head_stale_blocks < 2 {
             return Err(invalid(
-                "chain.head_stale_blocks: must be >= 2; a one-block window trips on ordinary jitter",
+                "chain.head_stale_blocks: must be >= 2; \
+                 a one-block window trips on ordinary jitter",
             ));
         }
         if !(250..=600_000).contains(&self.fallback_poll_interval_ms) {
@@ -898,9 +775,6 @@ impl ChainConfig {
                 self.fallback_poll_interval_ms
             )));
         }
-        // The fallback exists to catch a dead subscription, not to race a live one. Set below
-        // the block time it would fire between every pair of heads and quietly become the
-        // primary driver again, which is the design this endpoint made unnecessary.
         if self.fallback_poll_interval_ms < self.block_time_ms {
             return Err(invalid(format!(
                 "chain.fallback_poll_interval_ms ({}) is below chain.block_time_ms ({}); \
@@ -911,17 +785,23 @@ impl ChainConfig {
         if !(500..=120_000).contains(&self.request_timeout_ms) {
             return Err(invalid("chain.request_timeout_ms: must be 500..=120000"));
         }
-        if !(self.requests_per_sec.is_finite()
-            && self.requests_per_sec > 0.0
-            && self.requests_per_sec <= 1_000.0)
+        Ok(())
+    }
+
+    fn validate_budget(&self) -> Result<(), ConfigError> {
+        // `is_finite` is tested first because NaN compares false against both bounds and would
+        // otherwise pass every range check in this file.
+        if !self.requests_per_sec.is_finite()
+            || self.requests_per_sec <= 0.0
+            || self.requests_per_sec > 1_000.0
         {
             return Err(invalid(
                 "chain.requests_per_sec: must be a finite value in (0, 1000]",
             ));
         }
-        if !(self.request_burst.is_finite()
-            && self.request_burst >= 1.0
-            && self.request_burst <= 2_000.0)
+        if !self.request_burst.is_finite()
+            || self.request_burst < 1.0
+            || self.request_burst > 2_000.0
         {
             return Err(invalid(
                 "chain.request_burst: must be a finite value in [1, 2000]",
@@ -931,16 +811,22 @@ impl ChainConfig {
             || self.ws_reconnect_max_ms < self.ws_reconnect_initial_ms
         {
             return Err(invalid(
-                "chain.ws_reconnect_max_ms must be >= ws_reconnect_initial_ms, which must be non-zero",
+                "chain.ws_reconnect_max_ms must be >= ws_reconnect_initial_ms, \
+                 which must be non-zero",
             ));
         }
         if self.rate_limit_backoff_initial_ms == 0
             || self.rate_limit_backoff_max_ms < self.rate_limit_backoff_initial_ms
         {
             return Err(invalid(
-                "chain.rate_limit_backoff_max_ms must be >= rate_limit_backoff_initial_ms, which must be non-zero",
+                "chain.rate_limit_backoff_max_ms must be >= rate_limit_backoff_initial_ms, \
+                 which must be non-zero",
             ));
         }
+        Ok(())
+    }
+
+    fn validate_liveness(&self) -> Result<(), ConfigError> {
         if self.degraded_after_secs == 0 {
             return Err(invalid("chain.degraded_after_secs: must be non-zero"));
         }
@@ -951,10 +837,8 @@ impl ChainConfig {
                 self.halt_after_secs, self.degraded_after_secs
             )));
         }
-        // The watchdog has to have room to fire, be logged, and let the fallback prove whether
-        // the chain is actually down — all before the halt timer expires. A window at or beyond
-        // `halt_after_secs` means the bot withdraws quotes without the watchdog ever having said
-        // anything, and the operator is left diagnosing a halt with no signal explaining it.
+        // The watchdog needs room to fire and let the fallback prove whether the chain is down,
+        // all before the halt timer expires; at or beyond it the bot withdraws having said nothing.
         let watchdog_secs = self.head_stale_after().as_secs();
         if watchdog_secs >= self.halt_after_secs {
             return Err(invalid(format!(
@@ -975,16 +859,12 @@ impl ChainConfig {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Feed
-// ---------------------------------------------------------------------------
+// --- Feed ---
 
-/// Per-venue endpoint overrides. Every one is optional; the defaults are the public endpoints
-/// on [`VenueId::default_ws_url`].
+/// Per-venue endpoint overrides, all optional; the defaults are [`VenueId::default_ws_url`].
 ///
-/// There is no API key field and no secret field here, for any venue, because none of these
-/// streams has one. A venue is enabled by a pair naming a symbol for it under
-/// [`PairVenues`], not by appearing in this table.
+/// No key or secret field for any venue, because none of these public streams has one. A venue is
+/// enabled by a pair naming a symbol for it in [`PairVenues`], not by appearing here.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct VenueUrls {
@@ -1022,27 +902,20 @@ impl VenueUrls {
 
 /// Exchange market-data feeds, the quorum rule, and the MAD outlier filter.
 ///
-/// **Market data only.** There is no API key field, no secret field, and no order-entry code
-/// path anywhere in this crate, on any venue. The design is unhedged precisely because a Korean
-/// corporate real-name exchange account is not available, so there is no account to place an
-/// order against even if the code existed. See the crate README.
+/// **Market data only**: no key, no order entry. The leg that places orders is [`HedgeConfig`].
 ///
-/// # Why the quorum knobs live here and what they are worth
-///
-/// One exchange makes the ladder's own price bounds vacuous: they would be derived from the same
-/// number they are checking. Several venues give [`crate::fair_value::combine`] a cross-section,
-/// and these four fields are the entire policy for what to do with it — how many venues are
-/// enough, how far from the pack is too far, and how far apart the pack itself may be before
-/// there is no single price to quote at all.
+/// The four quorum fields are the whole policy over the cross-section
+/// [`crate::fair_value::combine`] sees: how many venues are enough, how far from the pack is too
+/// far, and how far apart the pack may be before there is no single price to quote at all. One
+/// exchange would leave the ladder's price bounds checking the number that produced them.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FeedConfig {
     /// Endpoint overrides. Omit the table entirely to use the public defaults.
     #[serde(default)]
     pub urls: VenueUrls,
-    /// A symbol with no accepted tick for this long is **stale on that venue**, and a stale venue
-    /// contributes nothing to the cross-section. Not a soft signal:
-    /// [`crate::feed::FeedSnapshot::live`] returns nothing past it.
+    /// A symbol with no accepted tick for this long is stale on that venue and contributes nothing
+    /// to the cross-section. Hard, not a weight: [`crate::feed::FeedSnapshot::live`] drops it.
     #[serde(default = "d_feed_stale_ms")]
     pub stale_after_ms: u64,
     /// First reconnect delay. Doubles per consecutive failure up to the ceiling.
@@ -1051,14 +924,14 @@ pub struct FeedConfig {
     /// Reconnect delay ceiling.
     #[serde(default = "d_reconnect_max_ms")]
     pub reconnect_max_ms: u64,
-    /// No frame at all — not even a keepalive answer — for this long forces a reconnect. The
-    /// venues here either push continuously or answer a ping every 20s, so a silent socket is a
-    /// dead socket well before the TCP stack notices.
+    /// No frame at all, not even a keepalive answer, for this long forces a reconnect. These venues
+    /// push continuously or answer a ping every 20s, so a silent socket is dead well before TCP
+    /// notices.
     #[serde(default = "d_read_timeout_ms")]
     pub read_timeout_ms: u64,
-    /// **The quorum.** Venues that must survive the MAD filter for a reference price to exist at
-    /// all. Below it the bot quotes nothing and says `no_quorum`. Must be at least 2: a single
-    /// venue is the single-source oracle this whole change exists to stop being.
+    /// **The quorum**: venues that must survive the MAD filter for a reference price to exist at
+    /// all. Below it the bot quotes nothing and says `no_quorum`. Must be at least 2, because one
+    /// venue is a single-source oracle.
     #[serde(default = "d_venues_min")]
     pub venues_min: u8,
     /// Multiplier on the median absolute deviation. A venue further than `mad_k * MAD` from the
@@ -1066,13 +939,12 @@ pub struct FeedConfig {
     #[serde(default = "d_mad_k")]
     pub mad_k: f64,
     /// Floor under the rejection threshold, in bps. Without it, venues agreeing to within a tick
-    /// drive the MAD to zero and everything but the median gets rejected. Measured on live
-    /// ETHUSDT/BTCUSDT the largest ordinary single-venue deviation was 1.6 bps, so 2 is above
-    /// ordinary disagreement and below anything that matters.
+    /// drive the MAD to zero and everything but the median is rejected. The largest ordinary
+    /// single-venue deviation on ETHUSDT/BTCUSDT measured 1.6 bps, so the default of 2 clears it.
     #[serde(default = "d_mad_floor_bps")]
     pub mad_floor_bps: f64,
-    /// **The regime gate.** Cross-venue MAD above this, in bps, means the venues do not agree —
-    /// not that one of them is wrong. The bot refuses to quote rather than averaging through a
+    /// **The regime gate.** Cross-venue MAD above this, in bps, means the venues disagree rather
+    /// than that one of them is wrong, so the bot refuses to quote instead of averaging through a
     /// split market. Must exceed `mad_floor_bps`.
     #[serde(default = "d_dispersion_bps_max")]
     pub dispersion_bps_max: f64,
@@ -1108,11 +980,10 @@ fn decibps(v: f64) -> u32 {
     (v * 10.0).round().max(0.0) as u32
 }
 
-/// Decimal basis points to hundredths of a basis point.
+/// Decimal basis points to hundredths of a basis point, the unit the ladder is built in.
 ///
-/// The unit the ladder is built in. Whole bps ran out of resolution once sigma was scaled to the
-/// quote's real exposure window: ETH's volatility term came to 0.61 bp against an `s0` of 1, so the
-/// floor is most of the price and a whole bp is a coarse thing to set it in.
+/// Whole bps ran out of resolution once sigma was scaled to the quote's real exposure window:
+/// ETH's volatility term is 0.61 bp against an `s0` of 1, so rounding would lose most of it.
 fn bps_e2(v: f64) -> u32 {
     (v * 100.0).round().max(0.0) as u32
 }
@@ -1124,11 +995,8 @@ impl FeedConfig {
         self.mad_params_with(None)
     }
 
-    /// The same, with a pair's [`PairConfig::venues_min`] override applied.
-    ///
-    /// Only the quorum is per-pair. The MAD multiplier and the dispersion ceiling are not: those
-    /// describe how much venues may disagree before the disagreement is the signal, and that is a
-    /// property of the filter rather than of the market.
+    /// The same, with a pair's [`PairConfig::venues_min`] override applied. Only the quorum is
+    /// per-pair: the multiplier and the dispersion ceiling are properties of the filter itself.
     #[must_use]
     pub fn mad_params_with(&self, over: Option<u8>) -> MadParams {
         MadParams {
@@ -1163,9 +1031,6 @@ impl FeedConfig {
                 self.read_timeout_ms, self.stale_after_ms
             )));
         }
-        // One venue is a single-source oracle: the ladder and the bounds that are supposed to
-        // check it would both come from the same number. That is the shape this change exists to
-        // remove, and allowing it back in through a config value would remove it right back.
         if self.venues_min < 2 {
             return Err(invalid(format!(
                 "feed.venues_min is {}, and must be at least 2; quoting off a single venue makes \
@@ -1194,8 +1059,6 @@ impl FeedConfig {
                 "feed.dispersion_bps_max: must be finite and non-zero",
             ));
         }
-        // Otherwise the regime gate fires before the outlier filter is ever consulted, and the
-        // bot stops quoting on the ordinary disagreement the floor was chosen to tolerate.
         if self.dispersion_bps_max <= self.mad_floor_bps {
             return Err(invalid(format!(
                 "feed.dispersion_bps_max ({}) must exceed feed.mad_floor_bps ({}); \
@@ -1207,16 +1070,13 @@ impl FeedConfig {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Inventory skew
-// ---------------------------------------------------------------------------
+// --- Inventory skew ---
 
 /// The volatility estimator and the Avellaneda–Stoikov knobs.
 ///
-/// Global rather than per-pair, with one exception: `target_base_share_pct` is a per-pair
-/// allocation decision and lives on [`PairConfig`]. Risk aversion and the horizon it is measured
-/// over are properties of the desk, not of the instrument, and two pairs disagreeing about how
-/// far ahead to look would be two different strategies sharing one killswitch.
+/// Global rather than per-pair: risk aversion and its horizon are properties of the desk, and two
+/// pairs disagreeing about how far ahead to look would be two strategies sharing one killswitch.
+/// `target_base_share_pct` is the exception and lives on [`PairConfig`].
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SkewConfig {
@@ -1231,59 +1091,53 @@ pub struct SkewConfig {
 
     /// The window the HALF-SPREAD is exposed for, in seconds. See [`crate::spread::rescale_sigma`].
     ///
-    /// Distinct from `vol_horizon_secs`, which is how long inventory is held and is the skew's
-    /// window. A quote's exposure is how long it can be hit at a price the market has left behind,
-    /// measured at p90 = 2 s and p99 = 3 s over 360 decisions on 2026-07-29. Sizing the spread off
-    /// the 300 s inventory window covered that 10x over and was most of ETH's 5.67 bp half-spread.
+    /// Deliberately distinct from `vol_horizon_secs`, which is how long inventory is held: a
+    /// quote's exposure is how long it can be hit at a price the market has left behind, measured
+    /// at p99 = 3s. Sizing the spread off the 300s inventory window instead over-covers by 100x.
     #[serde(default = "d_spread_horizon_secs")]
     pub spread_horizon_secs: u64,
     /// Samples closer together than this are skipped rather than divided by a tiny interval.
-    #[serde(default = "d_vol_min_sample_ms")]
+    #[serde(default = "d_vol_sample_ms_min")]
     pub vol_min_sample_ms: u64,
     /// A gap longer than this is an outage, not a return. The estimator re-anchors.
-    #[serde(default = "d_vol_max_sample_ms")]
+    #[serde(default = "d_vol_sample_ms_max")]
     pub vol_max_sample_ms: u64,
     /// Risk aversion `gamma`. `skew_bps = gamma * q * sigma_bps^2 / 10_000`, so with ETHUSDT's
     /// measured 300s `sigma` of about 10 bps, `gamma = 1000` and a 20% imbalance give 2 bp.
     #[serde(default = "d_gamma")]
     pub gamma: f64,
     /// Cap on a **positive** skew (book down, the pool is long and selling), in bps.
-    #[serde(default = "d_skew_max_positive_bps")]
+    #[serde(default = "d_skew_positive_bps_max")]
     pub positive_bps_max: u16,
     /// Cap on a **negative** skew (book up, the pool is short and buying), as a magnitude in bps.
-    /// Deliberately the tighter of the two; [`crate::skew::compute`] argues why at length.
-    #[serde(default = "d_skew_max_negative_bps")]
+    /// Deliberately the tighter of the two; [`crate::skew::compute`] has the argument.
+    #[serde(default = "d_skew_negative_bps_max")]
     pub negative_bps_max: u16,
 }
 
 fn d_vol_tau_ms() -> u64 {
     60_000
 }
-fn d_in_flight_max() -> usize {
-    2
+fn d_vol_horizon_secs() -> u64 {
+    300
 }
-
 /// The measured p99 of `quote_age_secs`. See [`crate::spread::rescale_sigma`].
 const fn d_spread_horizon_secs() -> u64 {
     3
 }
-
-fn d_vol_horizon_secs() -> u64 {
-    300
-}
-fn d_vol_min_sample_ms() -> u64 {
+fn d_vol_sample_ms_min() -> u64 {
     100
 }
-fn d_vol_max_sample_ms() -> u64 {
+fn d_vol_sample_ms_max() -> u64 {
     10_000
 }
 fn d_gamma() -> f64 {
     1_000.0
 }
-fn d_skew_max_positive_bps() -> u16 {
+fn d_skew_positive_bps_max() -> u16 {
     30
 }
-fn d_skew_max_negative_bps() -> u16 {
+fn d_skew_negative_bps_max() -> u16 {
     10
 }
 
@@ -1333,10 +1187,9 @@ impl SkewConfig {
                 return Err(invalid(format!("skew.{name}: must be <= {bps_max}")));
             }
         }
-        // The asymmetry runs one way for a reason. A negative skew lifts the pool's BID toward
-        // and past fair value, which is a free option written to whoever notices; a positive one
-        // lowers both sides, which is defensive. Capping the book-lifting direction more loosely
-        // than the book-lowering one inverts that and is never what was meant.
+        // A negative skew lifts the pool's bid toward and past fair value, a free option written
+        // to whoever notices; a positive one lowers both sides and is defensive. So the lifting
+        // direction takes the tighter cap, and a looser one here would invert the argument.
         if self.negative_bps_max > self.positive_bps_max {
             return Err(invalid(format!(
                 "skew.negative_bps_max ({}) exceeds skew.positive_bps_max ({}); \
@@ -1349,32 +1202,25 @@ impl SkewConfig {
     }
 }
 
-// ---------------------------------------------------------------------------
-// The volatility-scaled half-spread
-// ---------------------------------------------------------------------------
+// --- The volatility-scaled half-spread ---
 
 /// `half_spread = min(s0 + s1 * sigma, cap) + degraded_extra`.
 ///
-/// Global rather than per-pair, and that is the point: `s1` is dimensionless and multiplies each
-/// pair's own `sigma`, so one value is already correct across ETHUSDT at 10 bp and BTCUSDT at 3 bp.
-/// See [`crate::spread`] for the derivation of both numbers.
+/// Global rather than per-pair because `s1` is dimensionless and multiplies each pair's own
+/// `sigma`, so one value is already correct across ETHUSDT at 10 bp and BTCUSDT at 3 bp.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SpreadConfig {
-    /// `s1`, in bps of half-spread per bp of `sigma` at the estimator's horizon.
-    ///
-    /// Derived, not picked: the sweep's smallest measured-positive half-spread against a 100 bp
-    /// jump is 30 bp, and it should be reached when a 100 bp jump is a live possibility, which at
-    /// ETHUSDT's measured `sigma(300s)` of 10 bp means 5x that level. `5 + s1 * 50 = 30` gives
-    /// `s1 = 0.5`.
+    /// `s1`, in bps of half-spread per bp of `sigma` at the estimator's horizon. Derived rather
+    /// than picked: the sweep's smallest measured-positive half-spread against a 100 bp jump is
+    /// 30 bp and should be reached when such a jump is live, which at ETHUSDT's `sigma(300s)` of
+    /// 10 bp is 5x that level, so `5 + s1 * 50 = 30` gives `s1 = 0.5`.
     #[serde(default = "d_vol_coefficient")]
     pub vol_coefficient: f64,
-    /// The ceiling on `s0 + s1 * sigma`. Above it, widening has stopped being a defence — the
-    /// sweep's 60 bp row earns *less* than its 30 bp row — and [`crate::jump`] is what takes over.
-    ///
-    /// 30 bp is exactly UniV2's fee, which makes the rule statable: the pool never quotes worse
-    /// than the constant-fee AMM it is trying to beat, it simply does not quote 30 bp in a calm
-    /// market. The degraded-chain widening is added *after* this cap, deliberately.
+    /// The ceiling on `s0 + s1 * sigma`. Past it widening stops being a defence — the sweep's 60 bp
+    /// row earns *less* than its 30 bp row — and [`crate::jump`] takes over. 30 bp is UniV2's fee,
+    /// so the pool never quotes worse than the constant-fee AMM it is trying to beat. The
+    /// degraded-chain widening is deliberately added *after* this cap.
     #[serde(default = "d_half_spread_bps_max")]
     pub half_spread_bps_max: u16,
 }
@@ -1422,22 +1268,18 @@ impl SpreadConfig {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Jump detection
-// ---------------------------------------------------------------------------
+// --- Jump detection ---
 
-/// Jump detection and withdrawal. See [`crate::jump`] for why every one of these is what it is.
+/// Jump detection and withdrawal. See [`crate::jump`] for the derivations.
 ///
-/// There is no basis-point threshold in this table, and that is deliberate. Both bounds on the
-/// trip threshold come from the pair's own `half_spread_bps` and `width_bps` — the floor is the
-/// point at which the posted quote stops being on the right side of fair value, and the ceiling is
-/// `half_spread + width/2`, the point past which the pool pays the excess whatever the volatility
-/// estimate says. A tunable bp threshold would be one more number picked by feel, and it would be
-/// wrong on one of the two pairs whichever value it took.
+/// Deliberately no basis-point threshold here: both bounds on the trip threshold come from the
+/// pair's own `half_spread_bps` and `width_bps` — the floor is where the posted quote stops being
+/// on the right side of fair value, the ceiling `half_spread + width/2` is where the pool pays the
+/// excess regardless — so one tunable number would be wrong on some pair.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct JumpConfig {
-    /// Off restores the previous behaviour exactly: quote through everything.
+    /// Off means quote through everything.
     #[serde(default = "d_true")]
     pub enabled: bool,
     /// The sigma multiplier `k`. It only ever acts *between* the two derived bounds, so raising it
@@ -1452,21 +1294,17 @@ pub struct JumpConfig {
     /// `"book"` withdraws every pair when one trips; `"pair"` withdraws only the one that did.
     #[serde(default = "d_jump_scope")]
     pub scope: crate::jump::Scope,
-    /// How often the fast lane samples the reference, in milliseconds.
-    ///
-    /// **This is the reaction time, and it is the one place in this crate where latency genuinely
-    /// matters.** The quote loop wakes on `newHeads` at 1 Hz, which would put mean detection
-    /// latency at 500 ms; the fast lane runs inside the same task between wakes, reads only the
-    /// in-memory feed snapshots, and costs zero RPC unless something trips.
+    /// How often the fast lane samples the reference, in milliseconds — the detection latency,
+    /// against a mean of half a block if the quote loop's own wake did the check. The fast lane
+    /// runs between wakes off the in-memory feed snapshots and costs no RPC unless something trips.
     #[serde(default = "d_jump_scan_interval_ms")]
     pub scan_interval_ms: u64,
     /// `maxPriorityFeePerGas` for a jump withdrawal only, in gwei, as a decimal string.
     ///
-    /// GIWA's sequencer has no public mempool and orders by **highest fee first**, and `tx.rs`
-    /// deliberately pays a flat near-zero tip on ordinary quote traffic. That is the right call for
-    /// a quote and the wrong one for a withdrawal: the withdrawal is racing a searcher who is
-    /// willing to outbid a quoting bot, and being 200 ms earlier does not win a fee auction —
-    /// paying more does. At 0.001 gwei base and ~29k gas, 0.5 gwei costs about five cents.
+    /// GIWA's sequencer has no public mempool and orders by **highest fee first**, so the flat
+    /// near-zero tip `tx.rs` pays on quote traffic loses here: the withdrawal races a searcher
+    /// willing to outbid a quoting bot, and the auction is won by paying more, not by arriving
+    /// earlier. At 0.001 gwei base and ~29k gas, 0.5 gwei costs about five cents.
     #[serde(default = "d_withdraw_priority_fee_gwei")]
     pub withdraw_priority_fee_per_gas_gwei: String,
     /// `maxFeePerGas` for a jump withdrawal only, in gwei. Must be at least the tip above.
@@ -1511,7 +1349,7 @@ impl Default for JumpConfig {
 }
 
 impl JumpConfig {
-    /// The knobs [`crate::jump::Detector`] takes. `skew` supplies the sampling window, so the jump
+    /// The knobs [`crate::jump::Detector`] takes. `skew` supplies the sampling window so that the
     /// detector and the volatility estimator agree on what a hole in the reference is.
     #[must_use]
     pub fn params(&self, skew: &SkewConfig) -> crate::jump::Params {
@@ -1552,8 +1390,6 @@ impl JumpConfig {
         if !self.sigma_k.is_finite() || !(0.0..=1_000.0).contains(&self.sigma_k) {
             return Err(invalid("jump.sigma_k: must be a finite value in [0, 1000]"));
         }
-        // A cool-off shorter than a block is not a withdrawal, it is a flicker: the transaction
-        // that posts the zero epoch would not have confirmed before the resume was already due.
         let block_secs = chain.block_time_ms.div_ceil(1_000).max(1);
         if self.cooloff_secs < block_secs {
             return Err(invalid(format!(
@@ -1568,8 +1404,6 @@ impl JumpConfig {
         if !(20..=10_000).contains(&self.scan_interval_ms) {
             return Err(invalid("jump.scan_interval_ms: must be 20..=10000"));
         }
-        // The fast lane exists to beat the head cadence. Set above it, it is strictly worse than
-        // doing the check in the cycle and reads as a reaction time it does not deliver.
         if self.scan_interval_ms > chain.block_time_ms {
             return Err(invalid(format!(
                 "jump.scan_interval_ms ({}) exceeds chain.block_time_ms ({}); \
@@ -1595,9 +1429,7 @@ impl JumpConfig {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Transactions
-// ---------------------------------------------------------------------------
+// --- Transactions ---
 
 /// Where the signing key comes from. Never the config file itself.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1612,8 +1444,7 @@ pub enum KeySource {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TxConfig {
-    /// **Must be explicitly `true` to broadcast anything.** Absent means dry run. This is the
-    /// one default in the file that is a safety property rather than a convenience.
+    /// **Must be explicitly `true` to broadcast anything**; absent means dry run.
     #[serde(default)]
     pub transmit_allowed: bool,
     /// Name of the environment variable holding the updater's private key.
@@ -1623,9 +1454,9 @@ pub struct TxConfig {
     /// `private_key_env`.
     #[serde(default)]
     pub private_key_file: Option<PathBuf>,
-    /// Gas limit. `updateQuote` for one pair measured 28,747 gas and `refreshCapacity` is
-    /// cheaper; this is deliberately several times that, because gas is nearly free here and a
-    /// quote that fails to land is not.
+    /// Gas limit. `updateQuote` for one pair measured 28,747 gas and `refreshCapacity` is cheaper;
+    /// this is deliberately several times that, because gas is nearly free on GIWA and a quote that
+    /// fails to land is not.
     #[serde(default = "d_gas_limit")]
     pub gas_limit: u64,
     /// `maxFeePerGas`, in gwei, as a decimal string.
@@ -1641,14 +1472,10 @@ pub struct TxConfig {
     pub pending_timeout_secs: u64,
     /// How many transactions one pair may have outstanding at once.
     ///
-    /// Two by default. One was the old behaviour and it cost real quote freshness: measured on a
-    /// live run, 66 of ~300 cycles were held by `PushInFlight` because a transaction sent 440ms
-    /// earlier had not produced a receipt yet.
-    ///
-    /// Raising it is safe because nonce ordering is absolute for a single sender and because
-    /// `updateQuote` is an idempotent overwrite — see `tx::Sender::at_capacity`. What it is NOT
-    /// safe to make unbounded: a stall at the head blocks everything behind it, and each queued
-    /// transaction is a nonce that has to be recovered.
+    /// Two by default: at one, roughly a fifth of cycles were held by `PushInFlight` waiting on a
+    /// receipt still inside the measured inclusion latency (see [`crate::tx`]). Raising it is safe
+    /// because nonce ordering is absolute for one sender and `updateQuote` is an idempotent
+    /// overwrite; unbounded is not, since a stall at the head blocks every nonce behind it.
     #[serde(default = "d_in_flight_max")]
     pub in_flight_max: usize,
 }
@@ -1664,6 +1491,9 @@ fn d_max_priority_fee_gwei() -> String {
 }
 fn d_pending_timeout_secs() -> u64 {
     120
+}
+fn d_in_flight_max() -> usize {
+    2
 }
 
 impl TxConfig {
@@ -1712,7 +1542,6 @@ impl TxConfig {
                     "tx.private_key_env: must name an environment variable",
                 ));
             }
-            // A hex string here means someone pasted the key where the variable name goes.
             if name.starts_with("0x") || name.len() >= 64 {
                 return Err(invalid(
                     "tx.private_key_env looks like a key rather than a variable name; \
@@ -1730,7 +1559,8 @@ impl TxConfig {
         }
         if tip > max {
             return Err(invalid(format!(
-                "tx.max_priority_fee_per_gas_gwei ({tip} wei) exceeds tx.max_fee_per_gas_gwei ({max} wei)"
+                "tx.max_priority_fee_per_gas_gwei ({tip} wei) exceeds \
+                 tx.max_fee_per_gas_gwei ({max} wei)"
             )));
         }
         if !(5..=3_600).contains(&self.pending_timeout_secs) {
@@ -1740,9 +1570,7 @@ impl TxConfig {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Risk
-// ---------------------------------------------------------------------------
+// --- Risk ---
 
 /// The two killswitches. Both latch, and the latch survives a restart.
 #[derive(Debug, Clone, Deserialize)]
@@ -1764,16 +1592,13 @@ pub struct RiskConfig {
     pub loss_budget: String,
     /// Measure the switches but do not latch them.
     ///
-    /// Everything runs exactly as it would in enforcement — the window fills, the drawdown is
-    /// computed, the gross loss accumulates and is persisted — and a trip is logged as
-    /// `event = "halt_shadow"` instead of stopping the group. It exists because the limits cannot
-    /// be sized without data and the data cannot be collected while an unsized limit is latching
-    /// the book down: `bleed_limit` is one global 200000 that the equity group tripped on
-    /// 2026-07-29 with `cumulative_trade_loss = 0`, meaning no trade contributed and the whole
-    /// drawdown was revaluation across gaps in a sparse reference.
+    /// Everything runs as in enforcement — the window fills, the drawdown is computed, the gross
+    /// loss accumulates and is persisted — but a trip logs `event = "halt_shadow"` instead of
+    /// stopping the group. It exists because one global `bleed_limit` trips the sparse equity
+    /// group on revaluation across reference gaps, with no trade contributing to the drawdown.
     ///
-    /// **This disables the drawdown halt.** It is a measurement mode with an operator watching,
-    /// not a setting to leave on. Default is off, so a config that forgets the key enforces.
+    /// **This disables the drawdown halt**, so it wants an operator watching. Default off, so a
+    /// config that forgets the key enforces.
     #[serde(default)]
     pub shadow: bool,
 }
@@ -1824,31 +1649,25 @@ impl RiskConfig {
         if budget < bleed {
             return Err(invalid(format!(
                 "risk.loss_budget ({budget}) is below risk.bleed_limit ({bleed}); \
-                 the cumulative budget would always trip first and the bleed switch is then dead code"
+                 the cumulative budget would always trip first and the \
+                 bleed switch is then dead code"
             )));
         }
         Ok(())
     }
 }
 
-// ---------------------------------------------------------------------------
-// Pairs
-// ---------------------------------------------------------------------------
+// --- Pairs ---
 
 /// Which symbol each venue quotes for one pair.
 ///
-/// Every venue spells the same market differently — `ETHUSDT`, `ETH-USDT`, `ETH-USD` — so the
-/// mapping is configuration rather than a transformation guessed in code. Naming a venue here is
-/// also what **enables** it: a venue no pair names is never connected to.
+/// Every venue spells the same market differently, so the mapping is configuration rather than a
+/// transformation guessed in code. Naming a venue here also **enables** it, and unknown fields are
+/// a hard error, so `bybbit = "..."` fails at startup rather than leaving the bot a venue short.
 ///
-/// The field names are the venue labels and unknown ones are a hard error, so `bybbit = "..."`
-/// fails at startup instead of quietly leaving the bot one venue short of the quorum it thinks it
-/// has.
-///
-/// The choice of product is load-bearing and not interchangeable. `ETH-USD` is **not** a second
-/// observation of `ETHUSDT`: measured on 2026-07-27 the USDT/USD basis put Coinbase's USD books
-/// a persistent 8-9 bps above the three USDT venues, which against a 5 bp half-spread is a bias,
-/// not redundancy. See [`crate::feed::coinbase`].
+/// Products are not interchangeable: `ETH-USD` is **not** a second observation of `ETHUSDT`, since
+/// the USDT/USD basis holds Coinbase's USD books a persistent 8-9 bps above the three USDT venues
+/// — a bias, against a 5 bp half-spread, rather than redundancy.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PairVenues {
@@ -1864,11 +1683,8 @@ pub struct PairVenues {
     /// Coinbase product id, e.g. `ETH-USDT`.
     #[serde(default)]
     pub coinbase: Option<String>,
-    /// This pair on Hyperliquid, carrying the HIP-3 builder: `xyz:AAPL`.
-    ///
-    /// The prefix is not decoration. Builders attach their own oracles and disagree -- `xyz:TSLA`
-    /// 307.31 against `flx:TSLA` 395.50, measured in the same second -- so naming the book is
-    /// naming a fair value.
+    /// This pair on Hyperliquid, carrying the HIP-3 builder: `xyz:AAPL`. The prefix names a fair
+    /// value, not a route — see [`HedgePair::dex`].
     #[serde(default)]
     pub hyperliquid: Option<String>,
 }
@@ -1902,18 +1718,11 @@ impl PairVenues {
 
 /// One quoted pair.
 ///
-/// # The symbol is not the token
-///
-/// `symbol` is the **canonical** name for the **real** asset the pool's mock token tracks, not a
-/// market in the mock token. `mWETH` has no market anywhere; it is a mock ERC-20 we deployed, and
-/// nothing trades it. The bot prices pairId 1 off `ETHUSDT` because that is the asset the mock
-/// stands in for, which is what makes the demo live and what makes a later markout study mean
-/// anything. A reader who takes `symbol = "ETHUSDT"` to mean "mWETH trades at 1943" has misread
-/// it.
-///
-/// `symbol` is also the key every venue's ticks are recorded under, which is why each venue's own
-/// spelling is a separate field in [`PairVenues`]: without the translation each venue would sit
-/// in its own namespace and the cross-section would be permanently empty.
+/// `symbol` is the canonical name of the **real** asset the pool's mock token tracks, not a market
+/// in the mock token: nothing trades `mWETH`, so pairId 1 is priced off `ETHUSDT`. It is also the
+/// key every venue's ticks are recorded under, which is why each venue's own spelling is a separate
+/// field in [`PairVenues`]: without that translation each venue sits in its own namespace and the
+/// cross-section is permanently empty.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PairConfig {
@@ -1922,29 +1731,21 @@ pub struct PairConfig {
     /// Canonical symbol of the **real** asset this pair's mock base token tracks. See the struct
     /// docs — this is not a market in the mock token.
     pub symbol: String,
-    /// Venues that must agree before this pair has a reference, overriding [`FeedConfig::venues_min`].
+    /// Venues that must agree before this pair has a reference, overriding
+    /// [`FeedConfig::venues_min`].
     ///
-    /// Set this only where a second independent source does not exist, and know what it costs. The
-    /// cross-venue median is what catches a single venue publishing a wrong price with full
-    /// confidence; at a quorum of one there is nothing to catch it, and the pool quotes whatever
-    /// that venue says.
-    ///
-    /// The equity pairs are the case. Measured on 2026-07-29, four HIP-3 builders quote AAPL and
-    /// five quote TSLA, but every builder other than `xyz` carries ZERO open interest -- their
-    /// prints are stale oracle marks, not trades, and they sit 16% (AAPL) and 30% (TSLA) away.
-    /// Adding one as a second venue would satisfy the quorum with a dead book and drag the median
-    /// toward it, which is worse than a quorum of one because it LOOKS met. SKHY and SPCX have no
-    /// second builder at all.
+    /// Set it only where a second independent source does not exist: the cross-venue median is
+    /// what catches one venue publishing a wrong price confidently. The equity pairs are the case
+    /// — every HIP-3 builder other than `xyz` carries ZERO open interest, so its prints are stale
+    /// oracle marks 16% (AAPL) to 30% (TSLA) away, and admitting one meets the quorum with a dead
+    /// book that drags the median, which is worse than a quorum of one because it looks met.
     #[serde(default)]
     pub venues_min: Option<u8>,
 
-    /// Correlation group, for jump contagion. Pairs in the same group withdraw together.
-    ///
-    /// A claim about correlation, so it is stated rather than inferred. `jump.scope = "book"` used
-    /// to mean literally every pair, which was right when the book was BTC and ETH; listing
-    /// equities broke it, because SK Hynix moving says nothing about ETH and SKHY is the most
-    /// volatile market here. Leaving it unset puts a pair in the default group with every other
-    /// unset pair, which reproduces the old behaviour.
+    /// Correlation group, for jump contagion. Pairs in the same group withdraw together, so
+    /// `jump.scope = "book"` means the group rather than the whole book. A claim about
+    /// correlation, so it is stated rather than inferred: SK Hynix moving says nothing about ETH.
+    /// Unset groups a pair with every other unset pair.
     #[serde(default)]
     pub jump_group: String,
 
@@ -1956,43 +1757,38 @@ pub struct PairConfig {
     pub quote_decimals: u8,
     /// Half the bid/ask spread, in bps of the skewed fair value. Decimal: `0.5` is half a bp.
     ///
-    /// `s0` in `half_spread = min(s0 + s1 * sigma, cap)`. It is the FLOOR -- what an arbitrarily
-    /// small trade pays -- and is now most of the price on the crypto pairs, because scaling sigma
-    /// to the quote's exposure window took the volatility term down to well under a bp.
+    /// `s0` in `half_spread = min(s0 + s1 * sigma, cap)`, so it is the FLOOR — what an arbitrarily
+    /// small trade pays — and most of the price on the crypto pairs, since sigma at the quote's
+    /// exposure window leaves the volatility term well under a bp.
     pub half_spread_bps: f64,
     /// Ladder width, in bps of the near price. This is the concentration knob: the price decays
     /// this far across the whole posted depth. It is an *upper* bound — the inverse solver
     /// narrows it further whenever the price bounds bind.
     pub width_bps: u16,
-    /// How large a reference move `jump` refuses to absorb, in bps.
-    ///
-    /// Defaults to [`Self::half_spread_bps`], which is what it was derived from until `s0` stopped
-    /// being the posted spread. Set it explicitly: the posted half-spread is `s0 + s1 * sigma`, so
-    /// a low `s0` no longer implies a low absorption, and a floor below the reference's own tick
-    /// noise makes the detector fire on nothing. See `jump::Bounds::new`.
+    /// How large a reference move `jump` refuses to absorb, in bps. Set it explicitly rather than
+    /// leaning on the [`Self::half_spread_bps`] default: the posted half-spread is `s0 + s1 *
+    /// sigma`, so a low `s0` does not imply low absorption, and a floor below the reference's own
+    /// tick noise fires the detector on nothing. See `jump::Bounds::new`.
     #[serde(default)]
     pub jump_floor_bps: Option<u16>,
     /// Push at least this often, in milliseconds, measured from our own last send.
     ///
-    /// The chain-derived heartbeat cannot go below a second: it compares `quote_age_secs`, and the
-    /// pool stores `updatedAt` as a uint32 of seconds. This is measured locally, so it can hold the
-    /// posted quote near the interval the spread is actually priced for. Unset leaves only the
-    /// second-resolution heartbeat. See `policy::Trigger::Cadence`.
+    /// The chain-derived heartbeat cannot go below a second, because the pool stores `updatedAt`
+    /// as a uint32 of seconds and `quote_age_secs` is what it compares. This one is measured
+    /// locally, so it can hold the posted quote near the interval the spread is priced for. Unset
+    /// leaves only the second-resolution heartbeat. See `policy::Trigger::Cadence`.
     #[serde(default)]
     pub push_interval_ms_max: Option<u64>,
     /// **Target inventory, as a share of this pair's book, in percent.**
     ///
-    /// Configuration rather than a constant, and a *share* rather than an amount so that it stays
-    /// meaningful as the pool grows or shrinks. The book is this pair's base holdings valued at
-    /// the reference plus its share of the quote balance; see [`crate::skew::Inventory`] for what
-    /// "its share" means when two pairs draw bids from the same quote token.
-    ///
-    /// `50` is a balanced book. Lower means the pool would rather hold quote than base, which is
-    /// the sensible default for an asset it cannot hedge.
+    /// A *share* rather than an amount, so it stays meaningful as the pool grows or shrinks. The
+    /// book is this pair's base holdings valued at the reference plus its share of the quote
+    /// balance — see [`crate::skew::Inventory`] for what that share means when several pairs draw
+    /// bids from one quote token. `50` is balanced; lower prefers quote to base.
     pub target_base_share_pct: f64,
-    /// The trade size the half-spread is guaranteed over, in human base units. The solver picks
-    /// the widest ladder whose *average* price over `[0, capture]` hits the target, so this is
-    /// the size the quote is honest about rather than the size it is limited to.
+    /// The trade size the half-spread is guaranteed over, in human base units. The solver picks the
+    /// widest ladder whose *average* price over `[0, capture]` hits the target, so this is the size
+    /// the quote is honest about rather than the size it is limited to.
     pub capture: String,
     /// Base the pool will buy per epoch, in human base units.
     pub bid_capacity: String,
@@ -2001,14 +1797,20 @@ pub struct PairConfig {
     /// Re-post at least this often, in seconds, even with no price move. Must sit inside the
     /// pool's own `maxStaleSecs`, which is checked against the chain at startup.
     pub heartbeat_secs: u64,
-    /// Drift threshold, in bps, when the market has moved **against** the posted quote — our
-    /// bid is now above fair, or our ask below it. This is the pick-off direction; keep it
-    /// small. See [`crate::policy`]. Fractional bps are supported to one decimal place (e.g.
-    /// `0.5`); [`Self::adverse_drift_decibps`] is what `policy` actually compares against.
+    /// Drift threshold, in bps, when the market has moved **against** the posted quote: our bid is
+    /// now above fair, or our ask below it. **This must be the TIGHTER of the two thresholds**,
+    /// and `PairConfig::validate` refuses a config with them the other way round.
+    ///
+    /// That inverts the conventional arrangement, deliberately: the prop pool is the only maker of
+    /// consequence on GIWA, so there is nobody to lose the flow to. A basis point too conservative
+    /// costs a little volume; a basis point too generous after the market has moved is a free
+    /// option written to whoever notices first. See [`crate::policy`].
+    ///
+    /// Fractional to one decimal place; [`Self::adverse_drift_decibps`] is what `policy` compares.
     pub adverse_drift_bps: f64,
-    /// Drift threshold, in bps, when the posted quote has merely become conservative. Costs
-    /// volume, not money; keep it larger than `adverse_drift_bps` so a quiet market does not
-    /// churn gas. Same one-decimal-place precision as `adverse_drift_bps`.
+    /// Drift threshold, in bps, when the posted quote has merely become conservative, which costs
+    /// volume rather than money. **The LOOSER of the two** — see [`Self::adverse_drift_bps`] — and
+    /// large enough that a quiet market does not churn gas. Same precision.
     pub favourable_drift_bps: f64,
     /// Refresh the capacity epoch once remaining capacity has fallen this far, in percent,
     /// below the configured capacity.
@@ -2067,7 +1869,15 @@ impl PairConfig {
         bps_e2(self.half_spread_bps)
     }
 
+    /// Every per-pair check, in four groups run in the order written.
     fn validate(&self, venues_min: u8) -> Result<(), ConfigError> {
+        self.validate_identity(venues_min)?;
+        self.validate_pricing()?;
+        self.validate_sizes()?;
+        self.validate_triggers()
+    }
+
+    fn validate_identity(&self, venues_min: u8) -> Result<(), ConfigError> {
         let id = self.pair_id;
         if id == 0 {
             return Err(invalid(
@@ -2080,9 +1890,6 @@ impl PairConfig {
                 self.symbol
             )));
         }
-        // A pair that names fewer venues than the quorum needs can never quote. Refusing here
-        // rather than discovering it as a permanent `no_quorum` at run time is the difference
-        // between a startup error and a bot that looks healthy and quotes nothing.
         let venues = self.venues.count();
         let venues_min = self.venues_min.unwrap_or(venues_min);
         if venues_min == 0 {
@@ -2108,6 +1915,11 @@ impl PairConfig {
                 "pairs[{id}]: token decimals must be <= 30"
             )));
         }
+        Ok(())
+    }
+
+    fn validate_pricing(&self) -> Result<(), ConfigError> {
+        let id = self.pair_id;
         let bps_max = dubu_core::ladder::BPS_MAX;
         if u128::from(self.half_spread_bps_e2()) > dubu_core::ladder::BPS_E2_MAX {
             return Err(invalid(format!(
@@ -2127,14 +1939,17 @@ impl PairConfig {
                 self.target_base_share_pct
             )));
         }
-        // A zero half-spread quotes both sides at fair value and loses the spread to every
-        // taker. It is never a configuration, only a typo.
         if self.half_spread_bps_e2() == 0 {
             return Err(invalid(format!(
-                "pairs[{id}].half_spread_bps: must be non-zero; a zero spread quotes both sides at fair value"
+                "pairs[{id}].half_spread_bps: must be non-zero; \
+                 a zero spread quotes both sides at fair value"
             )));
         }
+        Ok(())
+    }
 
+    fn validate_sizes(&self) -> Result<(), ConfigError> {
+        let id = self.pair_id;
         let capture = self.capture_units()?;
         let bid_cap = self.bid_capacity_units()?;
         let ask_cap = self.ask_capacity_units()?;
@@ -2143,7 +1958,8 @@ impl PairConfig {
         }
         if bid_cap == 0 || ask_cap == 0 {
             return Err(invalid(format!(
-                "pairs[{id}]: bid_capacity and ask_capacity must be non-zero; zero capacity quotes nothing"
+                "pairs[{id}]: bid_capacity and ask_capacity must be non-zero; \
+                 zero capacity quotes nothing"
             )));
         }
         // `PropPool` holds capacity in a uint96.
@@ -2154,17 +1970,19 @@ impl PairConfig {
                 )));
             }
         }
-        // The solver clamps capture to capacity anyway, but a capture above capacity means the
-        // configured guarantee is not the one that will be posted, and silently honouring a
-        // smaller one is the kind of surprise this file exists to prevent.
         if capture > bid_cap.min(ask_cap) {
             return Err(invalid(format!(
                 "pairs[{id}].capture ({capture}) exceeds a capacity ({}); \
-                 the solver would clamp it and the posted guarantee would not be the configured one",
+                 the solver would clamp it and the posted guarantee \
+                 would not be the configured one",
                 bid_cap.min(ask_cap)
             )));
         }
+        Ok(())
+    }
 
+    fn validate_triggers(&self) -> Result<(), ConfigError> {
+        let id = self.pair_id;
         if self.heartbeat_secs == 0 {
             return Err(invalid(format!(
                 "pairs[{id}].heartbeat_secs: must be non-zero"
@@ -2180,6 +1998,9 @@ impl PairConfig {
                 "pairs[{id}]: drift thresholds must be non-zero"
             )));
         }
+        // Both fields exist for this asymmetry, and the direction is load-bearing: the pool is the
+        // only maker of consequence on GIWA, so a too-generous quote after an adverse move is a
+        // free option to whoever notices it while a too-conservative one only costs volume.
         if self.adverse_drift_bps > self.favourable_drift_bps {
             return Err(invalid(format!(
                 "pairs[{id}]: adverse_drift_bps ({}) must be <= favourable_drift_bps ({}); \
@@ -2261,14 +2082,11 @@ capacity_divergence_pct = 30
         assert_eq!(cfg.pairs[0].target_base_share_ppm(), 500_000);
     }
 
-    // -----------------------------------------------------------------------
-    // The volatility-scaled spread and the jump withdrawal
-    // -----------------------------------------------------------------------
+    // --- The volatility-scaled spread and the jump withdrawal ---
 
     #[test]
     fn both_defences_default_to_on_in_a_config_written_before_they_existed() {
-        // `good()` has no `[spread]` and no `[jump]` table. A constant half-spread and quoting
-        // through a jump are the defects these fix, so absence must not mean off.
+        // `good()` has no `[spread]` and no `[jump]` table, and absence must not mean off.
         let cfg = parse(good()).unwrap();
         assert!((cfg.spread.vol_coefficient - 0.5).abs() < 1e-9);
         assert_eq!(cfg.spread.half_spread_bps_max, 30);
@@ -2279,7 +2097,7 @@ capacity_divergence_pct = 30
         assert_eq!(cfg.jump.scope, crate::jump::Scope::Book);
         assert_eq!(cfg.jump.scan_interval_ms, 200);
         assert_eq!(cfg.jump.params(&cfg.skew).sigma_k_e2, 600);
-        // The withdrawal fee is 100x the ordinary tip, which is the point of it existing.
+        // The withdrawal fee is 100x the ordinary tip.
         assert_eq!(cfg.jump.withdraw_priority_fee_wei().unwrap(), 500_000_000);
         assert!(
             cfg.jump.withdraw_priority_fee_wei().unwrap() > cfg.tx.max_priority_fee_wei().unwrap()
@@ -2298,9 +2116,8 @@ capacity_divergence_pct = 30
 
     #[test]
     fn a_cap_below_a_pairs_own_half_spread_is_refused_rather_than_silently_narrowing_it() {
-        // `spread::compute` floors at `s0` and would never narrow the configured spread, so this
-        // config does not do damage — it does something other than what it says, which is what
-        // this file exists to catch.
+        // `spread::compute` floors at `s0`, so this config does no damage; it does something
+        // other than what it says.
         let s = format!("{}\n[spread]\nhalf_spread_bps_max = 3\n", good());
         assert!(
             matches!(parse(&s), Err(ConfigError::Invalid(m)) if m.contains("can never narrow"))
@@ -2309,8 +2126,7 @@ capacity_divergence_pct = 30
 
     #[test]
     fn a_cooloff_shorter_than_a_block_is_refused() {
-        // The withdrawal transaction would not have confirmed before the resume was already due,
-        // which is a flicker rather than a withdrawal.
+        // The withdrawal would not have confirmed before the resume was due: a flicker.
         let s = format!("{}\n[jump]\ncooloff_secs = 0\n", good());
         assert!(
             matches!(parse(&s), Err(ConfigError::Invalid(m)) if m.contains("below one block time"))
@@ -2319,8 +2135,7 @@ capacity_divergence_pct = 30
 
     #[test]
     fn a_fast_lane_slower_than_the_block_time_is_refused() {
-        // The fast lane exists to beat the head cadence. Set above it, it detects nothing sooner
-        // than the ordinary cycle would and only looks like it does.
+        // Above the head cadence the fast lane detects nothing sooner than the cycle would.
         let s = format!("{}\n[jump]\nscan_interval_ms = 2000\n", good());
         assert!(
             matches!(parse(&s), Err(ConfigError::Invalid(m)) if m.contains("exceeds chain.block_time_ms"))
@@ -2329,8 +2144,8 @@ capacity_divergence_pct = 30
 
     #[test]
     fn the_volatility_term_can_be_switched_off_without_removing_it() {
-        // `0` restores the constant half-spread exactly, which is what a bisection against the
-        // simulator needs in order to attribute a change to this feature and not to the other one.
+        // `0` restores the constant half-spread exactly, so a simulator bisection can attribute
+        // a change to this feature rather than another.
         let s = format!("{}\n[spread]\nvol_coefficient = 0.0\n", good());
         let cfg = parse(&s).unwrap();
         assert_eq!(cfg.spread.params().vol_coefficient_e2, 0);
@@ -2340,17 +2155,15 @@ capacity_divergence_pct = 30
 
     #[test]
     fn the_jump_detector_shares_the_volatility_estimators_sampling_window() {
-        // What counts as a hole in the reference has to be one number, not two: the estimator
-        // re-anchors on it and the detector trips on it, and they must agree about where it is.
+        // A hole in the reference has to be one number: the estimator re-anchors on it and the
+        // detector trips on it.
         let cfg = parse(good()).unwrap();
         let p = cfg.jump.params(&cfg.skew);
         assert_eq!(p.sample_max.as_millis() as u64, cfg.skew.vol_max_sample_ms);
         assert_eq!(p.sample_min.as_millis() as u64, cfg.skew.vol_min_sample_ms);
     }
 
-    // -----------------------------------------------------------------------
-    // Venues and the quorum
-    // -----------------------------------------------------------------------
+    // --- Venues and the quorum ---
 
     #[test]
     fn a_venue_is_enabled_by_a_pair_naming_it_and_by_nothing_else() {
@@ -2394,9 +2207,8 @@ capacity_divergence_pct = 30
 
     #[test]
     fn a_misspelled_venue_is_a_hard_error_and_not_one_venue_fewer() {
-        // The failure this prevents is the whole reason `deny_unknown_fields` is on this struct:
-        // `bybbit` would leave the pair one venue short of the quorum it is written to have, and
-        // nothing at run time would say so.
+        // `bybbit` would leave the pair one venue short of the quorum it is written to have,
+        // with nothing at run time saying so.
         let s = good().replace(r#"bybit = "ETHUSDT""#, r#"bybbit = "ETHUSDT""#);
         assert!(matches!(parse(&s), Err(ConfigError::Parse(_))));
     }
@@ -2414,16 +2226,14 @@ capacity_divergence_pct = 30
 
     #[test]
     fn a_single_venue_quorum_is_refused() {
-        // One venue is the single-source oracle this whole design exists to stop being, and a
-        // config value must not be able to put it back.
+        // One venue is a single-source oracle, and no config value may reinstate it.
         let s = good().replace("venues_min = 2", "venues_min = 1");
         assert!(matches!(parse(&s), Err(ConfigError::Invalid(m)) if m.contains("at least 2")));
     }
 
     #[test]
     fn a_dispersion_limit_below_the_rejection_floor_is_refused() {
-        // Otherwise the regime gate fires on the ordinary disagreement the floor exists to
-        // tolerate, and the bot stops quoting for a reason that is purely arithmetic.
+        // Otherwise the regime gate fires on the ordinary disagreement the floor tolerates.
         let s = good().replace(
             "venues_min = 2",
             "venues_min = 2\nmad_floor_bps = 30.0\ndispersion_bps_max = 25.0",
@@ -2446,9 +2256,7 @@ capacity_divergence_pct = 30
         assert_eq!(p.dispersion_decibps_max, 250);
     }
 
-    // -----------------------------------------------------------------------
-    // Skew
-    // -----------------------------------------------------------------------
+    // --- Skew ---
 
     #[test]
     fn the_skew_section_defaults_to_the_documented_numbers() {
@@ -2467,9 +2275,8 @@ capacity_divergence_pct = 30
 
     #[test]
     fn a_looser_cap_on_the_book_lifting_direction_is_refused() {
-        // Lifting the book raises the pool's BID toward fair value, which is the pick-off
-        // direction. Capping it more loosely than the book-lowering direction inverts the whole
-        // argument in `skew::compute`.
+        // Lifting the book raises the pool's bid toward fair value, the pick-off direction, so
+        // a looser cap there inverts the argument in `skew::compute`.
         let s = good().replace(
             "[skew]\n",
             "[skew]\npositive_bps_max = 10\nnegative_bps_max = 30\n",
@@ -2530,8 +2337,7 @@ capacity_divergence_pct = 30
 
     #[test]
     fn an_unknown_field_is_a_hard_error_not_a_silent_default() {
-        // The whole point of deny_unknown_fields: this typo would otherwise quote 5 bp while
-        // its author believed it quoted 50.
+        // Without `deny_unknown_fields` this typo quotes 5 bp while its author believes 50.
         let s = good().replace(
             "half_spread_bps = 5",
             "half_spred_bps = 50\nhalf_spread_bps = 5",
@@ -2545,9 +2351,7 @@ capacity_divergence_pct = 30
 
     #[test]
     fn a_fallback_faster_than_the_block_time_is_refused() {
-        // The fallback exists to catch a dead subscription, not to race a live one. Below the
-        // block time it fires between heads and quietly becomes the primary driver again —
-        // which is the design the dedicated endpoint made unnecessary.
+        // Below the block time the fallback fires between heads and becomes the primary driver.
         let s = good().replace(
             "fallback_poll_interval_ms = 2000",
             "fallback_poll_interval_ms = 500",
@@ -2559,9 +2363,8 @@ capacity_divergence_pct = 30
 
     #[test]
     fn an_http_ws_url_is_refused_because_it_would_never_subscribe() {
-        // Measured: the HTTPS endpoint answers `notifications not supported`. The loop would
-        // then run on its fallback forever while every log line said it was configured for
-        // heads, which is exactly the silent degradation this rewrite is about.
+        // The HTTPS endpoint answers `notifications not supported`, so the loop would poll
+        // forever while every log line said it was configured for heads.
         let s = good().replace(
             r#"ws_url = "wss://giwa-sepolia.nodit.io/TESTKEY""#,
             r#"ws_url = "https://giwa-sepolia.nodit.io/TESTKEY""#,
@@ -2582,8 +2385,7 @@ capacity_divergence_pct = 30
 
     #[test]
     fn a_watchdog_window_beyond_the_halt_timer_is_refused() {
-        // Otherwise the bot withdraws quotes without the watchdog ever having said anything,
-        // and the operator diagnoses a halt with no signal explaining it.
+        // Otherwise the bot withdraws quotes with the watchdog never having said anything.
         let s = good().replace(
             "fallback_poll_interval_ms = 2000",
             "fallback_poll_interval_ms = 2000\nhead_stale_blocks = 900\nhalt_after_secs = 600",
@@ -2663,14 +2465,10 @@ capacity_divergence_pct = 30
         assert!(matches!(parse(&s), Err(ConfigError::Invalid(m)) if m.contains("must exceed")));
     }
 
-    // -----------------------------------------------------------------------
-    // The API key must not leak
-    // -----------------------------------------------------------------------
+    // --- The API key must not leak ---
 
-    /// A **fake** key with the same shape as a real Nodit one — 32 characters of base64-ish
-    /// alphabet including the `~` and `-` that appear in real ones, since those are exactly the
-    /// characters a naive URL parser mishandles. Never a real key: this file is committed, and
-    /// the whole point of `EndpointUrl` is that a credential never lands in source.
+    /// A **fake** key shaped like a real Nodit one, including the `~` and `-` a naive URL parser
+    /// mishandles. Never a real key: this file is committed.
     const KEY: &str = "EXAMPLEexample0~ExampleKey-000000";
     const KEYED: &str = "https://giwa-sepolia.nodit.io/EXAMPLEexample0~ExampleKey-000000";
 
@@ -2687,8 +2485,7 @@ capacity_divergence_pct = 30
             );
         }
         assert_eq!(displayed, "https://giwa-sepolia.nodit.io/***");
-        // ... and the host survives, because a redaction that hides which endpoint failed is
-        // useless for diagnosis.
+        // The host survives: a redaction hiding which endpoint failed is useless for diagnosis.
         assert!(displayed.contains("giwa-sepolia.nodit.io"));
         // The real value is still reachable, but only through the one accessor.
         assert_eq!(u.expose(), KEYED);
@@ -2696,8 +2493,8 @@ capacity_divergence_pct = 30
 
     #[test]
     fn redaction_covers_query_strings_and_userinfo_too() {
-        // Other providers put the key in a query parameter or in userinfo. Neither shape is
-        // used here, and both must still be safe if someone points the config at one.
+        // Other providers put the key in a query parameter or in userinfo; neither is used here,
+        // and both must be safe if someone points the config at one.
         let q = EndpointUrl::resolve("chain.rpc_url", "https://rpc.example.com/v1?apikey=SECRET")
             .unwrap();
         assert_eq!(q.to_string(), "https://rpc.example.com/***");
@@ -2743,8 +2540,8 @@ capacity_divergence_pct = 30
 
     #[test]
     fn an_empty_variable_is_refused_rather_than_expanded_to_nothing() {
-        // `.env` with a blank `NODIT_API_KEY=` is the likely mistake, and a URL with an empty
-        // key segment fails as a 401 at the first request — a much worse place to find out.
+        // A blank `NODIT_API_KEY=` yields a URL whose empty key segment 401s at the first
+        // request, which is a far worse place to find out.
         std::env::set_var("DUBU_TEST_KEY_BLANK", "   ");
         let err =
             EndpointUrl::resolve("chain.rpc_url", "https://h/${DUBU_TEST_KEY_BLANK}").unwrap_err();
@@ -2766,8 +2563,7 @@ capacity_divergence_pct = 30
             );
         let cfg = parse(&s).unwrap();
         assert!(cfg.chain.ws_url.expose().ends_with(KEY));
-        // The whole config Debug-printed — the shape a panic or a `{:?}` dump would produce —
-        // must not contain the key anywhere.
+        // The shape a panic or a `{:?}` dump produces must not contain the key anywhere.
         assert!(
             !format!("{cfg:?}").contains(KEY),
             "the key survived a Debug dump of the config"
@@ -2786,8 +2582,7 @@ capacity_divergence_pct = 30
         )
         .unwrap();
 
-        // C is already set: an operator or a systemd unit set it deliberately and the file must
-        // not silently win.
+        // C is already set deliberately, and the file must not silently win.
         std::env::set_var("DUBU_TEST_DOTENV_C", "from_env");
         std::env::remove_var("DUBU_TEST_DOTENV_A");
         std::env::remove_var("DUBU_TEST_DOTENV_B");

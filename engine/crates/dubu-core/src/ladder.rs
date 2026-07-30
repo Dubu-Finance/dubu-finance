@@ -4,34 +4,31 @@
 //! strategy wants: a reference mid, a half-spread, a width, and an inventory skew — the four
 //! numbers archi_v2 §4.3 proposes compressing into 14 bytes of calldata.
 //!
-//! The contract is absolute: **whatever comes in, what comes out passes
-//! `PropCurve.validateLadder`.** A rejected `updateQuote` is not a harmless no-op — it burns the
-//! block and leaves the previous quote to go stale, which is what turns a quoting outage into an
-//! adverse-selection event.
+//! Whatever comes in, what comes out passes `PropCurve.validateLadder`. A rejected `updateQuote`
+//! burns the block and leaves the previous quote to go stale, turning a quoting outage into an
+//! adverse-selection window.
 //!
 //! # Clamping order
 //!
-//! Deterministic, and in this order: each step's postcondition is what makes the next step's
-//! bounds well-formed (`lo <= hi` at every `clamp`).
+//! Deterministic, and in this order, because each step's postcondition is what makes the next
+//! step's bounds well-formed (`lo <= hi` at every `clamp`).
 //!
 //! 1. **Sanitise the bps knobs.** `u16`/`i16` admit values past [`BPS_E2_MAX`], and
 //!    `BPS_E2 - bps` must stay positive or the whole construction inverts.
 //! 2. **Skew the mid**, floored, then clamped to `1..=PRICE_MAX`. Positive skew pushes the book
 //!    *down* (the pool is long and wants to sell). The `>= 1` keeps a zero reference from
 //!    collapsing the row into the all-zero ladder the validator rejects.
-//! 3. **Project the four prices**, bid floored and ask ceiled — both in the pool's favour. This
-//!    is the only asymmetry between the sides: §4.3's on-chain reconstruction floors both, so if
-//!    that compressed path is ever enabled the two differ by one unit on the ask. See
-//!    [`LadderBuilder::round_ask_up`].
-//! 4. **Clamp into a monotone chain, bottom up**, each price bounded below by its predecessor
-//!    and above by `PRICE_MAX - 1` (`PRICE_MAX` for `max_ask`). One sweep subsumes the floor
-//!    clamp, the ceiling clamp and the ordering repair, which is why no later step can undo an
-//!    earlier one.
+//! 3. **Project the four prices**, bid floored and ask ceiled, both in the pool's favour. §4.3's
+//!    on-chain reconstruction floors both, so if that compressed path is ever enabled the two
+//!    differ by one unit on the ask; see [`LadderBuilder::round_ask_up`].
+//! 4. **Clamp into a monotone chain, bottom up**, each price bounded below by its predecessor and
+//!    above by `PRICE_MAX - 1` (`PRICE_MAX` for `max_ask`). One sweep subsumes the floor clamp,
+//!    the ceiling clamp and the ordering repair, so no later step can undo an earlier one.
 //! 5. **Open the book by one unit** if `max_ask == min_bid`; `validateLadder`'s `maxAsk > minBid`
 //!    is strict. Step 4 reserves the room by capping the first three prices at `PRICE_MAX - 1`.
-//! 6. **Assert, then validate.** Both, deliberately: the invariants are checked where the row is
-//!    built and again by the port of the on-chain validator, so a construction bug cannot reach
-//!    the chain by way of a validator that agrees with it.
+//! 6. **Assert, then validate.** The invariants are checked where the row is built and again by
+//!    the port of the on-chain validator, so a construction bug cannot reach the chain through a
+//!    validator that shares it.
 
 use crate::curve::{validate_ladder, Ladder, PRICE_MAX};
 use crate::error::LadderError;
@@ -40,25 +37,22 @@ use crate::math::{mul_div_ceil, mul_div_floor};
 /// Basis-point denominator.
 pub const BPS: u128 = 10_000;
 
-/// One in a hundredth of a basis point, the unit the ladder's spread and width are built in.
+/// One hundredth of a basis point, the unit the ladder's spread and width are built in.
 ///
-/// Integer basis points ran out of resolution: once sigma was scaled to the quote's real exposure
-/// window rather than the inventory's, ETH's volatility term came to 0.6 bp against an `s0` of 1,
-/// so the floor is most of the price and a whole bp is a coarse thing to set it in.
-///
-/// Nothing on chain changes. `PropPool` is handed four PRICES and `validate_ladder` checks their
-/// ordering; basis points never leave this crate.
+/// Integer basis points are too coarse: with sigma scaled to the quote's real exposure window,
+/// ETH's volatility term is 0.6 bp against an `s0` of 1. Nothing on chain changes, since `PropPool`
+/// is handed four PRICES, so basis points never leave this crate.
 pub const BPS_E2: u128 = 1_000_000;
 
-/// Largest bps value any knob may take. `10_000` would zero out a price outright and
-/// anything above it would invert the sign of `10_000 - bps`.
+/// Largest bps value any knob may take. `10_000` would zero out a price outright and anything
+/// above it would invert the sign of `10_000 - bps`.
 pub const BPS_MAX: u128 = 9_999;
 
 /// [`BPS_MAX`] in hundredths of a basis point.
 pub const BPS_E2_MAX: u128 = 999_999;
 
-// Compile-time pins on the relationships every clamp below is derived from. A silent edit to one
-// constant without the others is the way this module stops being total.
+// Compile-time pins on the relationships every clamp below is derived from: edit one constant
+// without the others and this module stops being total.
 const _: () = assert!(BPS_E2 == BPS * 100);
 const _: () = assert!(BPS_E2_MAX == BPS_MAX * 100 + 99);
 // `BPS - skew` and `BPS_E2 - bps` stay strictly positive, so no projection can invert or zero out.
@@ -66,9 +60,8 @@ const _: () = assert!(BPS_MAX < BPS);
 const _: () = assert!(BPS_E2_MAX < BPS_E2);
 // Step 5 needs one price unit of headroom under the ceiling for `max_ask > min_bid`.
 const _: () = assert!(PRICE_MAX >= 2);
-// The step-3 projections are `mul_div` over a 256-bit intermediate, but the widest factor
-// (`BPS_E2 + BPS_E2_MAX`) times `PRICE_MAX` must still be a sane u128 for the saturation in
-// [`round`] to mean "too big", not "wrapped".
+// The widest step-3 factor (`BPS_E2 + BPS_E2_MAX`) times `PRICE_MAX` must stay inside u128, so
+// that the saturation in [`round`] means "too big" rather than "wrapped".
 const _: () = assert!(PRICE_MAX < u128::MAX / (BPS_E2 + BPS_E2_MAX));
 
 /// Strategy inputs for one quote row.
@@ -78,17 +71,17 @@ pub struct LadderBuilder {
     pub reference_mid: u128,
     /// Half the bid/ask spread, in bps of the skewed mid.
     pub half_spread_bps_e2: u32,
-    /// Ladder width, in bps of the near price. The concentration knob; archi_v2 §5.2 notes
-    /// production values in the sub-basis-point range (`0.20 bp`), so expect this to be 0 for
-    /// most pairs and the width to come from [`crate::inverse`] instead.
+    /// Ladder width, in bps of the near price. The concentration knob; archi_v2 §5.2 puts
+    /// production values below one basis point, so expect 0 for most pairs and the width to come
+    /// from [`crate::inverse`] instead.
     pub width_bps_e2: u32,
     /// Inventory skew, in bps. Positive shifts the whole book down.
     pub skew_bps: i16,
-    /// The pair's absolute `minPrice` floor. Oracle-independent backstop; `minBid` is
+    /// The pair's absolute `minPrice` floor, an oracle-independent backstop. `minBid` is
     /// guaranteed at or above it.
     pub min_price: u128,
-    /// Round the ask side up rather than down. Default (`true`) is pool-favourable. Set
-    /// `false` only to reproduce the §4.3 on-chain reconstruction bit for bit.
+    /// Round the ask side up rather than down. The default `true` is pool-favourable; set `false`
+    /// only to reproduce the §4.3 on-chain reconstruction bit for bit.
     pub round_ask_up: bool,
 }
 
@@ -129,7 +122,7 @@ impl LadderBuilder {
             "a zero mid collapses the row into the all-zero ladder"
         );
         assert!(m <= PRICE_MAX);
-        // Pair assertion on the sign convention: positive skew may only push the book down.
+        // Paired statement of the sign convention: positive skew may only push the book down.
         if self.skew_bps > 0 {
             assert!(m <= self.reference_mid.max(1));
         }
@@ -143,10 +136,9 @@ impl LadderBuilder {
     ///
     /// # Errors
     /// [`LadderError::PriceOutOfRange`] if `reference_mid` exceeds [`PRICE_MAX`];
-    /// [`LadderError::InfeasibleBounds`] if `min_price` leaves no room for the strict
-    /// `maxAsk > minBid` (that is, `min_price >= PRICE_MAX`);
-    /// [`LadderError::Rejected`] never — it is the module's own assertion and its firing
-    /// would mean a proof above is wrong.
+    /// [`LadderError::InfeasibleBounds`] if `min_price >= PRICE_MAX`, leaving no room for the
+    /// strict `maxAsk > minBid`. Never [`LadderError::Rejected`]: that would mean a proof in the
+    /// clamping order above is wrong.
     pub fn build(&self) -> Result<Ladder, LadderError> {
         // Step 5 needs one unit of headroom below PRICE_MAX for max_ask to sit above min_bid.
         if self.min_price >= PRICE_MAX {
@@ -193,7 +185,7 @@ impl LadderBuilder {
         let min_ask = round(up, m, BPS_E2 + hs, BPS_E2);
         let max_ask = round(up, min_ask, BPS_E2 + w, BPS_E2);
 
-        // Ordered before any clamping, which is what makes step 4's sweep a repair of the
+        // Already ordered before any clamping, which makes step 4's sweep a repair of the
         // `min_price`/`PRICE_MAX` bounds rather than of the projection itself.
         assert!(min_bid <= max_bid);
         assert!(max_bid <= m);
@@ -239,23 +231,23 @@ fn clamp_chain(raw: Ladder, min_price: u128) -> Ladder {
 
 /// The invariants `PropCurve.validateLadder` accepts, asserted at the point of construction.
 ///
-/// Paired with [`validate_ladder`] on purpose. The validator is a port of someone else's check
-/// and could in principle drift from it; these are stated here, against the clamping order that
-/// produced them, so a row that is wrong in both places has to be wrong twice.
+/// Paired with [`validate_ladder`] deliberately: that validator is a port and could drift from the
+/// chain, so these are stated against the clamping order instead. A bad row has to be wrong in both
+/// places to reach the chain.
 fn assert_chain(l: &Ladder, min_price: u128) {
     assert!(l.min_bid >= min_price);
     assert!(l.min_bid <= l.max_bid);
     assert!(l.max_bid <= l.min_ask);
     assert!(l.min_ask <= l.max_ask);
     assert!(l.max_ask <= PRICE_MAX);
-    // The negative space: `validateLadder`'s `maxAsk > minBid` is strict, so the flat row that
-    // passes every ordering check above is still rejected on chain.
+    // Negative space: `validateLadder`'s `maxAsk > minBid` is strict, so the flat row that passes
+    // every ordering check above is still rejected on chain.
     assert!(l.max_ask > l.min_bid);
     assert!(l.max_ask != 0);
 }
 
-/// `ceil(a*b/d)` when `up`, else `floor`. Saturates at [`PRICE_MAX`] rather than failing:
-/// step 4 clamps every price into range anyway, and a saturating projection keeps `build` total.
+/// `ceil(a*b/d)` when `up`, else `floor`. Saturates at [`PRICE_MAX`] rather than failing, because
+/// step 4 clamps every price into range anyway and a saturating projection keeps `build` total.
 fn round(up: bool, a: u128, b: u128, d: u128) -> u128 {
     assert!(d != 0);
     let r = if up {
@@ -265,8 +257,8 @@ fn round(up: bool, a: u128, b: u128, d: u128) -> u128 {
     };
     let r = r.unwrap_or(PRICE_MAX).min(PRICE_MAX);
     assert!(r <= PRICE_MAX);
-    // What step 3 relies on: a factor at or above one never moves a price down, and the
-    // saturation is the only thing that can cap it.
+    // What step 3's ordering assertions rely on: a factor at or above one never moves a price
+    // down, and only the saturation can cap it.
     if b >= d {
         assert!(r >= a.min(PRICE_MAX));
     }
@@ -303,7 +295,6 @@ mod tests {
         let (a, b) = (up.build().unwrap(), down.build().unwrap());
         assert!(b.max_bid < a.max_bid);
         assert!(b.min_ask < a.min_ask);
-        // Negative skew is the mirror.
         let lifted = LadderBuilder {
             skew_bps: -50,
             ..up
@@ -328,8 +319,7 @@ mod tests {
 
     #[test]
     fn degenerate_inputs_still_produce_a_valid_row() {
-        // Zero mid, zero knobs: the all-zero ladder would be rejected by the strict
-        // maxAsk > minBid, so the builder must not produce it.
+        // Zero mid, zero knobs: the all-zero ladder fails the strict maxAsk > minBid.
         let l = LadderBuilder::new(0).build().unwrap();
         l.validate(0).unwrap();
         assert!(l.max_ask > l.min_bid);

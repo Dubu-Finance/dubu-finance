@@ -6,37 +6,28 @@ import {
   makerCanDeliver,
   quoteAmms,
   WEIGHT_DENOMINATOR,
+  type AmmQuote,
   type Leg,
   type PropRefusal,
   type VenueId,
 } from './quote.js';
-import { requestQuote, type RfqQuote } from './rfq.js';
+import { requestQuote, type RfqQuote, type RfqResult } from './rfq.js';
 import { buildRoute } from './route.js';
 
 /**
  * DuBu's DEX aggregator: one `POST /quote` that prices every venue and hands back signable
  * calldata.
  *
- * # Why an edge worker
+ * The router is a pure executor — it never compares venues, re-splits, or finds a path
+ * (`Router.sol`) — so the search happens off chain, and on a chain with a fee-ordered sequencer
+ * and no public mempool what matters is how fast a taker gets from "I want to trade" to "here is a
+ * transaction", which is why this runs in every region. It holds no key and takes no custody: a
+ * compromised replica can only quote badly, and `minAmountOut` is inside the signed calldata.
  *
- * The router is a pure executor — it never compares venues, never re-splits, never finds a path
- * (`Router.sol`). Something has to do that off chain, and on a chain with a fee-ordered sequencer
- * and no public mempool, the thing that matters is how quickly a taker gets from "I want to trade"
- * to "here is a transaction". Running in every region turns the round trip from a transcontinental
- * one into a local one, and the work itself is one multicall plus arithmetic.
- *
- * It also has to be true that a compromised region cannot steal anything, and that is a design
- * constraint rather than a hope: this service holds no key, takes no custody, and returns calldata
- * the caller decides whether to sign. The worst a hostile replica can do is quote badly, and
- * `minAmountOut` is in the calldata the caller signs.
- *
- * # What it does not do
- *
- * No multi-hop. Every market is a direct pair against mUSDC, so a hop count the venue set cannot
- * produce would be untested code. No gas-adjusted ranking either — at 0.001 gwei the difference
- * between a one-leg and a two-leg route is worth less than a rounding error on the quote, and
- * pretending to price it would be theatre. Both become real work the moment a third venue or a
- * non-mUSDC market lands.
+ * No multi-hop and no gas-adjusted ranking. Every market is a direct pair against mUSDC, so a hop
+ * count the venue set cannot produce would be untested code, and at 0.001 gwei the gas difference
+ * between one leg and two is below a rounding error on the quote. Both become real work the moment
+ * a third venue or a non-mUSDC market lands.
  */
 
 interface QuoteRequestBody {
@@ -48,18 +39,17 @@ interface QuoteRequestBody {
   deadlineSecs?: number;
 }
 
-const DEFAULT_SLIPPAGE_BPS = 50;
-const DEFAULT_DEADLINE_SECS = 120;
-const MAX_SLIPPAGE_BPS = 1_000;
+const SLIPPAGE_BPS_DEFAULT = 50;
+const DEADLINE_SECS_DEFAULT = 120;
+const SLIPPAGE_BPS_MAX = 1_000;
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
 
-    // The CORS preflight. A browser sending `POST` with `content-type: application/json` asks
-    // first, and until this existed the ask got a 404 — so every request from a page failed with
-    // an opaque "Failed to fetch" while curl worked perfectly. Returning the allow-origin header
-    // on the *response* is not enough on its own; the preflight has to be answered too.
+    // A browser sending `POST` with `content-type: application/json` preflights first, and the
+    // allow-origin header on the *response* does not answer that: an unanswered preflight is an
+    // opaque "Failed to fetch" in the page while curl works perfectly.
     if (request.method === "OPTIONS") {
       return new Response(null, {
         status: 204,
@@ -123,13 +113,18 @@ async function handleQuote(request: Request, env: Env): Promise<Response> {
   }
   if (amountIn <= 0n) return json({ error: 'amountIn must be positive' }, 400);
 
-  const slippageBps = body.slippageBps ?? DEFAULT_SLIPPAGE_BPS;
-  if (!Number.isInteger(slippageBps) || slippageBps < 0 || slippageBps > MAX_SLIPPAGE_BPS) {
-    return json({ error: `slippageBps must be an integer in 0..${MAX_SLIPPAGE_BPS}` }, 400);
+  const slippageBps = body.slippageBps ?? SLIPPAGE_BPS_DEFAULT;
+  if (!Number.isInteger(slippageBps) || slippageBps < 0 || slippageBps > SLIPPAGE_BPS_MAX) {
+    return json({ error: `slippageBps must be an integer in 0..${SLIPPAGE_BPS_MAX}` }, 400);
   }
 
   const found = findMarket(cfg.markets, tokenIn, tokenOut);
-  if (!found) return json({ error: 'no market for that token pair', markets: cfg.markets.map((m) => m.symbol) }, 400);
+  if (!found) {
+    return json(
+      { error: 'no market for that token pair', markets: cfg.markets.map((m) => m.symbol) },
+      400,
+    );
+  }
   const { market, sellingBase } = found;
 
   const client = makeClient(cfg);
@@ -142,8 +137,8 @@ async function handleQuote(request: Request, env: Env): Promise<Response> {
 
   const nowSecs = Math.floor(Date.now() / 1000);
 
-  // What the maker could actually pay out, read before its quote is trusted. Only fetched when
-  // the RFQ leg is on, so an AMM-only deployment pays nothing for it.
+  // What the maker could actually pay out, read before its quote is trusted. Fetched only when the
+  // RFQ leg is on, so an AMM-only deployment pays nothing for it.
   const canDeliver =
     cfg.rfqMakerAddress && cfg.pmmSettle
       ? await makerCanDeliver(client, tokenOut, cfg.rfqMakerAddress, cfg.pmmSettle)
@@ -158,18 +153,18 @@ async function handleQuote(request: Request, env: Env): Promise<Response> {
     nowSecs,
   });
 
-  // Whole-size comparison only. An RFQ order is signed for one `takerAmount`, so a partial fill
-  // would be a different order — splitting between RFQ and the curve means asking the maker for a
-  // quote at the split size, which is a second round trip to the maker for a gain the on-chain
-  // grid has already mostly captured. Recorded here as a limit rather than left to be inferred.
+  // Whole-size comparison only. An RFQ order is signed for one `takerAmount`, so splitting between
+  // RFQ and the curve means a second round trip to the maker at the split size, for a gain the
+  // on-chain grid has already mostly captured.
   const useRfq = rfq.quote !== null && rfq.quote.amountOut > amm.amountOut;
   const legs: Leg[] = useRfq ? [] : amm.legs;
   const chosenOut = useRfq ? (rfq.quote as RfqQuote).amountOut : amm.amountOut;
 
   if (chosenOut === 0n) return nothingRoutable(amm.propRefused, amm.solo);
 
-  const minAmountOut = (chosenOut * BigInt(WEIGHT_DENOMINATOR - slippageBps)) / BigInt(WEIGHT_DENOMINATOR);
-  const deadline = BigInt(nowSecs + (body.deadlineSecs ?? DEFAULT_DEADLINE_SECS));
+  const minAmountOut =
+    (chosenOut * BigInt(WEIGHT_DENOMINATOR - slippageBps)) / BigInt(WEIGHT_DENOMINATOR);
+  const deadline = BigInt(nowSecs + (body.deadlineSecs ?? DEADLINE_SECS_DEFAULT));
 
   let route;
   try {
@@ -201,31 +196,11 @@ async function handleQuote(request: Request, env: Env): Promise<Response> {
     slippageBps,
     deadline: deadline.toString(),
     route: { to: route.to, data: route.data, value: '0x0', venues: route.venues },
-    // The work, shown. A caller comparing us against going direct to one venue needs to see what
-    // each venue offered, and a caller wondering why RFQ is absent needs to see why it was refused
-    // rather than being told nothing.
-    detail: {
-      prop: amm.solo.prop.toString(),
-      univ2: amm.solo.univ2.toString(),
-      rfq: rfq.quote ? rfq.quote.amountOut.toString() : null,
-      rfqRejected: rfq.rejected,
-      rfqMakerReason: rfq.makerReason ?? null,
-      // Stated rather than implied: `null` means the solvency read failed and the quote was taken
-      // unverified on that axis, which is a different claim from "verified and fine".
-      rfqMakerCanDeliver: canDeliver === undefined ? null : canDeliver.toString(),
-      split: !useRfq && amm.split,
-      legs: legs.map((l) => ({
-        venue: l.venue,
-        weightBps: l.weightBps,
-        amountIn: l.amountIn.toString(),
-        amountOut: l.amountOut.toString(),
-      })),
-    },
+    detail: handleQuoteDetail(amm, rfq, canDeliver, useRfq, legs),
     approve: {
-      // The taker must approve the Router for the AMM path, and PmmSettle for the RFQ path,
-      // because PmmSettle pulls the taker leg from `msg.sender` and that is the PmmAdapter which
-      // the Router funds. Stated per-route rather than as a blanket instruction: approving the
-      // wrong one is a revert at fill time with nothing useful in the trace.
+      // The Router is the spender on every path, RFQ included: `PmmSettle` pulls the taker leg
+      // from `msg.sender`, which is the `PmmAdapter` the Router funds. Approving the wrong
+      // contract is a revert at fill time with nothing useful in the trace.
       token: tokenIn,
       spender: cfg.router,
       amountIn: amountIn.toString(),
@@ -233,20 +208,42 @@ async function handleQuote(request: Request, env: Env): Promise<Response> {
   });
 }
 
+/** What each venue offered, so a caller comparing us against going direct can see the work and a
+ *  caller wondering why RFQ is absent can see why it was refused. */
+function handleQuoteDetail(
+  amm: AmmQuote,
+  rfq: RfqResult,
+  canDeliver: bigint | undefined,
+  useRfq: boolean,
+  legs: Leg[],
+) {
+  return {
+    prop: amm.solo.prop.toString(),
+    univ2: amm.solo.univ2.toString(),
+    rfq: rfq.quote ? rfq.quote.amountOut.toString() : null,
+    rfqRejected: rfq.rejected,
+    rfqMakerReason: rfq.makerReason ?? null,
+    // `null` means the solvency read failed and the quote was taken unverified on that axis, which
+    // is a different claim from "verified and fine".
+    rfqMakerCanDeliver: canDeliver === undefined ? null : canDeliver.toString(),
+    split: !useRfq && amm.split,
+    legs: legs.map((l) => ({
+      venue: l.venue,
+      weightBps: l.weightBps,
+      amountIn: l.amountIn.toString(),
+      amountOut: l.amountOut.toString(),
+    })),
+  };
+}
+
 /**
- * The answer when no venue would fill: two different facts, which used to be one 404.
- *
- * A prop side withdrawn for a price-jump cool-off comes back on its own in tens of seconds, and
- * saying so is the whole point — a frontend told "no venue would fill that size" shows the same
- * "quote not available" it shows for a pair that does not exist, and the taker stops asking. A
- * withdrawal is a 503 because the request is worth repeating; everything else is a 404 because it
- * is not, at least not on any schedule this service can name.
- *
- * This only ever fires when *nothing* could be routed. A withdrawn prop pool on a pair UniV2 can
- * serve never reaches here: the all-UniV2 grid point wins and the route is built as usual.
- *
- * Exported so the choice between the two is testable without a chain, for the same reason
- * `chooseSplit` and `validateQuote` are.
+ * Two facts rather than one. A prop side withdrawn for a price-jump cool-off comes back on its own
+ * in tens of seconds, so it answers 503: the request is worth repeating. Everything else answers
+ * 404, because it is not, at least not on a schedule this service can name — and collapsing the
+ * two shows a frontend the same "quote not available" it shows for a pair that does not exist, so
+ * the taker stops asking. Only fires when *nothing* could be routed: a withdrawn prop pool on a
+ * pair UniV2 can serve never reaches here, because the all-UniV2 grid point wins. Exported so the
+ * choice is testable without a chain.
  */
 export function nothingRoutable(
   propRefused: PropRefusal | null,
@@ -295,8 +292,8 @@ function json(body: unknown, status = 200): Response {
       'content-type': 'application/json; charset=utf-8',
       // Read-only, no credentials, no cookies: the dashboard and any other origin may call it.
       'access-control-allow-origin': '*',
-      // A quote is worth about as long as a block. Caching it at the edge for longer would serve
-      // a price the chain has already moved past.
+      // A quote is worth about as long as a block; caching it at the edge for longer would serve a
+      // price the chain has already moved past.
       'cache-control': 'no-store',
     },
   });

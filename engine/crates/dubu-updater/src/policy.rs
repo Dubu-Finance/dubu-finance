@@ -1,68 +1,37 @@
-//! When to push, and — mostly — when not to.
+//! When to push, and mostly when not to (archi_v2 §5.3).
 //!
-//! archi_v2 §5.3 puts it plainly: the sophistication is not in landing harder, it is in
-//! deciding not to send. Every push costs gas, burns a nonce, and replaces a quote that was
-//! probably fine. The interesting output of this module is the *reason* attached to a hold.
+//! Drift is measured against the **executable top**, never `maxBid`, which is only the price at
+//! zero usage: a taker arriving mid-epoch gets `executableTopBid(minBid, maxBid, capacity, used)`.
+//! Comparing `maxBid` to `maxBid` errs both ways — it misses a move when an unchanged `maxBid`
+//! hides a collapsed width, and invents one when a lower `maxBid` and a narrower width cancel out.
 //!
-//! # Everything is measured against the executable top
-//!
-//! Not `maxBid`. `maxBid` is the price at zero usage, and once an epoch is partly consumed the
-//! pool has already walked down the ladder: a taker arriving now gets
-//! `executableTopBid(minBid, maxBid, capacity, used)`, which is what `PropCurve` computes and
-//! therefore what "our quote" actually means. Comparing `maxBid` against a new `maxBid`
-//! misjudges the drift in both directions, and both are expensive:
-//!
-//! * it **misses** a move, when the new row has a different width. A row whose `maxBid` is
-//!   unchanged but whose width collapsed is quoting a materially higher executable price at the
-//!   current usage — and the naive comparison sees no change at all and holds.
-//! * it **invents** a move, when the width changes the other way. `maxBid` drops 50 bp, the
-//!   width narrows to match, the executable top at the current usage is identical, and the
-//!   naive comparison pushes a row that changes nothing.
-//!
-//! Both are pinned by tests below. The executable top is also exactly the zero-size limit of
-//! `avg_bid_price`, so this is the same number `dubu-core` reports everywhere else.
-//!
-//! # The trigger order, and why the asymmetry runs the way it does
+//! Trigger order, first match wins:
 //!
 //! ```text
-//! 1.  NeverQuoted                  the pool has no usable ladder at all
+//! 1.  NoUsableQuote                the pool has no usable ladder at all
 //! 1b. LadderStaleWithoutCapacity   a side is at zero depth and the stored row has gone stale
 //! 2.  AdverseDrift                 the market moved AGAINST the posted quote
-//! 3.  Heartbeat                    the quote is approaching expiry
+//! 3.  Heartbeat / Cadence          the quote is approaching expiry
 //! 4.  FavourableDrift              the posted quote has merely become conservative
 //! ```
 //!
-//! The conventional arrangement makes the *chase* threshold the tighter one — follow a
-//! competitor's improvement eagerly and back away slowly. **This module inverts that,
-//! deliberately.** Chasing hard is right for a maker competing for flow, where failing to chase
-//! means losing it to somebody else and that is the dominant cost. On GIWA the prop pool is the
-//! only maker of consequence: there is nobody to lose the flow to, so being a basis point too
-//! conservative costs a little volume, while being a basis point too generous after the market
-//! has moved is a free option written to whoever notices first. So:
-//!
-//! * `adverse_drift_bps` is the tight one — our bid is now above fair, or our ask below it;
-//! * `favourable_drift_bps` is the loose one — we would quote better, and holding costs volume.
-//!
+//! The usual maker asymmetry — chase a competitor eagerly, retreat slowly — is inverted here,
+//! deliberately. On GIWA the prop pool is the only maker of consequence, so there is nobody to
+//! lose the flow to: a basis point too conservative costs a little volume, while a basis point too
+//! generous after the market has moved is a free option written to whoever notices it first. So
+//! `adverse_drift_bps` is the TIGHT threshold and `favourable_drift_bps` the LOOSE one, and
 //! [`crate::config::PairConfig::validate`] refuses a config with the two the other way round.
 //!
-//! # Pre-send gates
-//!
-//! Checked before any trigger, in this order, and every one of them is an abort rather than a
-//! delay. A gate that fires means the *state* is wrong, not that the timing is.
+//! Gates run before any trigger and abort rather than delay, because a gate firing means the state
+//! is wrong rather than the timing:
 //!
 //! ```text
 //! Halted -> ChainDown -> FeedNotLive -> ChainViewStale -> PoolPaused -> PushInFlight -> NoRow
 //! ```
 //!
-//! `JumpWithdrawn` sits alongside them but is **not** one of them, because it applies to only one
-//! of the two decisions. A pair inside a jump cool-off must not have its capacity re-armed, and
-//! must still keep its ladder current — see [`evaluate_capacity`] for the argument.
-//!
-//! `PushInFlight` deserves its own note: a pair with an unconfirmed transaction is **not**
-//! superseded. Sending a second `updateQuote` for the same pair while the first is in the
-//! mempool means two rows land in an order the sequencer picks, and the one that wins may be
-//! the older one. The pair stays blocked until the transaction confirms or
-//! [`crate::config::TxConfig::pending_timeout_secs`] elapses.
+//! `JumpWithdrawn` gates [`evaluate_capacity`] only. `PushInFlight` blocks rather than supersedes:
+//! two `updateQuote`s for one pair in the mempool land in the order the sequencer picks, and the
+//! older one may win.
 
 use dubu_core::curve::{executable_top_ask, executable_top_bid, Ladder, NO_ASK};
 use dubu_core::math::mul_div_floor;
@@ -98,28 +67,15 @@ pub enum Trigger {
     /// No ladder has ever been posted, or the stored one no longer passes the pool's own
     /// validator (which can happen after the manager raises `minPrice`).
     NoUsableQuote,
-    /// The pool has no capacity on at least one side — it is standing aside, either because
-    /// [`crate::jump`] withdrew it or because the inventory could not settle an epoch — and the
-    /// stored ladder is not the one this cycle would post.
-    ///
-    /// This exists because [`drift`] cannot see it. A side with zero capacity is skipped there
-    /// (rightly: `executable_top_ask` returns an infinity sentinel at zero capacity, and reading it
-    /// as a price would produce a drift of ~10^36 bps), so a withdrawn pool measures zero drift
-    /// however far the market has moved. Without this trigger the cool-off would end with a stale
-    /// ladder still stored, capacity would be restored first, and the pool would spend a block
-    /// quoting the *pre-jump* price with a full epoch behind it — which is the exact fill the
-    /// withdrawal was for.
+    /// The pool has no capacity on at least one side and the stored ladder is not the one this
+    /// cycle would post. Separate from [`drift`], which structurally cannot see it:
+    /// `executable_top_ask` returns an infinity sentinel at zero capacity, so a withdrawn pool
+    /// measures zero drift however far the market moved. Without it a cool-off ends with a stale
+    /// row stored and the pool spends a block quoting the pre-jump price behind a restored epoch.
     LadderStaleWithoutCapacity,
-    /// Nothing has been pushed for `push_interval_ms_max`, measured on our own clock.
-    ///
-    /// Separate from [`Self::Heartbeat`], and the separation is forced by the chain: the heartbeat
-    /// compares `quote_age_secs`, which comes from the pool's `updatedAt` field, a uint32 of
-    /// **seconds**. Sub-second staleness is not observable there at all. This measures from our own
-    /// last send instead, which is an `Instant`, so it can express a cadence shorter than a block.
-    ///
-    /// It exists to hold the posted quote's age near the interval the spread is priced for. The
-    /// drift triggers only fire when the reference has already moved; this fires when it has not,
-    /// which is the case that leaves an old quote sitting there looking fresh.
+    /// Nothing has been pushed for `push_interval_ms_max`, measured on our own clock. Separate
+    /// from [`Self::Heartbeat`] because the chain cannot express it: `quote_age_secs` comes from
+    /// `updatedAt`, a uint32 of **seconds**, so sub-second staleness is unobservable there.
     Cadence {
         /// Milliseconds since the last send for this pair.
         since_ms: u64,
@@ -165,11 +121,9 @@ impl Trigger {
         }
     }
 
-    /// Whether this trigger justifies re-posting a row identical to the one already stored.
-    ///
-    /// Only the heartbeat does: its entire purpose is to refresh `updatedAt`, and the four
-    /// prices being the same is not merely acceptable but expected. Every other trigger sending
-    /// an identical row would be a no-op transaction.
+    /// Whether this trigger justifies re-posting a row identical to the one already stored. Only
+    /// the heartbeat does: refreshing `updatedAt` is what it wants, and every other trigger
+    /// re-sending identical bytes is a no-op transaction.
     #[must_use]
     pub const fn justifies_identical_row(self) -> bool {
         matches!(self, Self::Heartbeat { .. })
@@ -183,7 +137,7 @@ pub enum Hold {
     Halted,
     /// The chain connection has been failing long enough to stop.
     ChainDown,
-    /// The feed is not live. Quoting from a stale price is the failure this prevents.
+    /// The feed is not live; quoting from a stale price is what this prevents.
     FeedNotLive(FeedStatus),
     /// The last successful poll is too old to act on.
     ChainViewStale {
@@ -192,7 +146,7 @@ pub enum Hold {
         /// Configured limit.
         limit_secs: u64,
     },
-    /// The pool or the pair is paused. Pushing a row would succeed and change nothing.
+    /// The pool or the pair is paused, so pushing a row would succeed and change nothing.
     PoolPaused,
     /// A transaction for this pair is unconfirmed.
     PushInFlight,
@@ -207,7 +161,7 @@ pub enum Hold {
     NoRow,
     /// A trigger fired but the computed row is byte-identical to the stored one.
     Unchanged,
-    /// Everything is healthy and nothing needs doing. The common case.
+    /// Everything is healthy and nothing needs doing.
     NoTrigger {
         /// Largest adverse drift seen, in deci-bps, for the log.
         adverse_bps: u128,
@@ -316,9 +270,7 @@ impl CapacityDecision {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Drift
-// ---------------------------------------------------------------------------
+// --- Drift ---
 
 /// How far the planned row's executable top has moved from the posted one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -333,29 +285,19 @@ pub struct Drift {
     pub favourable_side: Option<Side>,
 }
 
-/// Measure both sides at the current usage.
-///
-/// The two ladders are evaluated at the **same** capacity and usage — the ones on chain — for
-/// the simple reason that `updateQuote` changes neither. Anything else compares two different
-/// points on two different curves and calls the difference a price move.
-///
-/// Direction, which is the part worth being careful about:
-///
-/// * a planned bid top **below** the posted one means the market fell and our posted bid is now
-///   too high — we would overpay for base. Adverse.
-/// * a planned ask top **above** the posted one means the market rose and our posted ask is now
-///   too low — we would undersell base. Adverse.
-///
-/// A side with no capacity is skipped rather than counted as an infinite move. On the ask side
-/// that also avoids treating [`NO_ASK`] as a price, which it is not.
+/// Measure both sides at the current usage. Both ladders are evaluated at the **same** capacity
+/// and usage — the ones on chain, since `updateQuote` changes neither; anything else compares two
+/// points on two different curves and calls the difference a price move. A planned bid top below
+/// the posted one means the market fell and we would overpay; a planned ask top above it means we
+/// would undersell. A side with no capacity is skipped rather than counted as an infinite move,
+/// which on the ask side also avoids reading [`NO_ASK`] as a price.
 ///
 /// # Errors
 /// [`CurveError`] if a stored ladder is inverted, which the chain's own validator excludes.
 pub fn drift(snap: &Snap, planned: &Ladder) -> Result<Drift, CurveError> {
     let mut d = Drift::default();
-    // A zero move records no side. The distinction matters: `adverse_side: None` alongside
-    // `adverse_bps: 0` is "nothing moved", where `Some(Bid)` alongside 0 would read as "the bid
-    // moved, by nothing", and the trigger arms below pattern-match on the side being present.
+    // A zero move records no side: the trigger arms pattern-match on the side being present, so
+    // `Some(Bid)` alongside 0 bps would read as a move that did not happen.
     let note = |bps: u128, side: Side, adverse: bool, d: &mut Drift| {
         if bps == 0 {
             return;
@@ -376,8 +318,8 @@ pub fn drift(snap: &Snap, planned: &Ladder) -> Result<Drift, CurveError> {
         let posted = executable_top_bid(snap.min_bid, snap.max_bid, snap.bid_capacity, used)?;
         let want = executable_top_bid(planned.min_bid, planned.max_bid, snap.bid_capacity, used)?;
         if posted > 0 {
-            // 100_000, not 10_000: this measures deci-bps (tenths of a bps) rather than whole
-            // bps, so a threshold like 0.5 bps has something finer than 1 bp to compare against.
+            // 100_000, not 10_000: the unit is deci-bps, so a 0.5 bps threshold has something
+            // finer than a whole bp to compare against.
             let bps = mul_div_floor(posted.abs_diff(want), 100_000, posted).unwrap_or(u128::MAX);
             note(bps, Side::Bid, want < posted, &mut d);
         }
@@ -387,8 +329,8 @@ pub fn drift(snap: &Snap, planned: &Ladder) -> Result<Drift, CurveError> {
         let used = snap.ask_used();
         let posted = executable_top_ask(snap.min_ask, snap.max_ask, snap.ask_capacity, used)?;
         let want = executable_top_ask(planned.min_ask, planned.max_ask, snap.ask_capacity, used)?;
-        // `NO_ASK` is an infinity sentinel, never a price; `ask_capacity > 0` excludes it, but
-        // the guard stays because reading it as a number is a silent, enormous error.
+        // `ask_capacity > 0` already excludes the `NO_ASK` infinity sentinel; the guard stays
+        // because reading it as a number is a silent, enormous error rather than a loud one.
         if posted > 0 && posted != NO_ASK && want != NO_ASK {
             let bps = mul_div_floor(posted.abs_diff(want), 100_000, posted).unwrap_or(u128::MAX);
             note(bps, Side::Ask, want > posted, &mut d);
@@ -398,16 +340,14 @@ pub fn drift(snap: &Snap, planned: &Ladder) -> Result<Drift, CurveError> {
     Ok(d)
 }
 
-// ---------------------------------------------------------------------------
-// Evaluation
-// ---------------------------------------------------------------------------
+// --- Evaluation ---
 
-/// Everything one evaluation needs. Plain data, so both tests and the loop build it the same
-/// way and there is no mock to diverge from the real thing.
+/// Everything one evaluation needs. Plain data, so both tests and the loop build it the same way
+/// and there is no mock to diverge from the real thing.
 #[derive(Debug, Clone, Copy)]
 pub struct Context<'a> {
-    /// Block timestamp from the chain view. Quote age is measured against this, not the local
-    /// clock, because it is what `PropPool` compares to.
+    /// Block timestamp from the chain view. Quote age is measured against it rather than the
+    /// local clock, because it is what `PropPool` compares to.
     pub block_timestamp: u64,
     /// The pair's on-chain state.
     pub snap: &'a Snap,
@@ -441,22 +381,18 @@ pub struct Context<'a> {
     /// Milliseconds since this pair's last send. `None` when nothing has been sent yet, which the
     /// other triggers already cover.
     pub since_last_push_ms: Option<u64>,
-    /// Tight threshold, for a move against us, in deci-bps (tenths of a bps). Built from
-    /// [`crate::config::PairConfig::adverse_drift_decibps`], which is where the fractional-bps
-    /// config value gets fixed to this precision.
+    /// The TIGHT threshold, for a move against us, in deci-bps (tenths of a bps). Must stay below
+    /// `favourable_drift_bps`; [`crate::config::PairConfig::validate`] enforces it.
     pub adverse_drift_bps: u32,
-    /// Loose threshold, for a move in our favour, in deci-bps.
+    /// The LOOSE threshold, for a move in our favour, in deci-bps.
     pub favourable_drift_bps: u32,
     /// Capacity divergence threshold, in percent.
     pub capacity_divergence_pct: u32,
 }
 
 impl Context<'_> {
-    /// The gates, in order. `None` means everything is in a state where acting is meaningful.
-    ///
-    /// Shared by both decisions: a halted bot must not refresh capacity either, and a stale
-    /// feed must not be allowed to widen an epoch (archi_v2 §5.3 flags exactly that case — a
-    /// stale price must not be able to induce capacity churn).
+    /// The gates, in order; `None` means acting is meaningful. Shared by both decisions, because
+    /// archi_v2 §5.3 requires that a stale price cannot induce capacity churn either.
     fn gates(&self) -> Option<Hold> {
         if self.halted {
             return Some(Hold::Halted);
@@ -490,11 +426,9 @@ impl Context<'_> {
     }
 
     /// The effective heartbeat: the configured one, but never so late that the pool's own
-    /// freshness window expires first.
-    ///
-    /// `maxStaleSecs * 4 / 5` is archi_v2 §5.3's 0.8 factor. The margin is not decoration — a
-    /// heartbeat at exactly `maxStaleSecs` re-posts a quote that has already stopped being
-    /// fillable, so the pool spends the round-trip latency of every heartbeat quoting nothing.
+    /// freshness window expires first. `maxStaleSecs * 4 / 5` is archi_v2 §5.3's 0.8 factor; the
+    /// margin exists because a heartbeat at exactly `maxStaleSecs` re-posts a quote that has
+    /// already stopped being fillable, so the pool quotes nothing for one round trip each time.
     #[must_use]
     pub const fn heartbeat_limit(&self) -> u64 {
         let chain_bound = (self.snap.stale_secs_max as u64) * 4 / 5;
@@ -522,8 +456,8 @@ pub fn evaluate_quote(ctx: &Context<'_>) -> Result<Decision, CurveError> {
     let age = ctx.snap.quote_age_secs(ctx.block_timestamp);
     let limit = ctx.heartbeat_limit();
 
-    // 1. No usable quote. Also covers the case where the manager raised `minPrice` above a
-    //    stored ladder: the pool will reject every fill against it until something is pushed.
+    // 1. Also covers a manager raising `minPrice` above a stored ladder, after which the pool
+    //    rejects every fill until something is pushed.
     let unusable = ctx.snap.never_quoted() || ctx.snap.ladder().validate(ctx.min_price).is_err();
     if unusable {
         return Ok(finish(
@@ -533,11 +467,9 @@ pub fn evaluate_quote(ctx: &Context<'_>) -> Result<Decision, CurveError> {
         ));
     }
 
-    // 1b. Standing aside with a stale ladder. Deliberately **not** gated on `jump_withdrawn`:
-    //     whatever put a side's capacity at zero, the pool is quoting nothing on it, so replacing
-    //     the stored row costs a nearly-free transaction and buys the property that capacity can
-    //     be restored in one step without a block of pre-jump prices in between. `finish` still
-    //     holds `Unchanged` when the row has not actually moved, so a quiet cool-off is silent.
+    // 1b. Deliberately NOT gated on `jump_withdrawn`: the pool quotes nothing on that side
+    //     whatever put it at zero, so keeping the row current costs a nearly-free transaction and
+    //     lets capacity be restored in one step. `finish` still holds an unmoved row `Unchanged`.
     if ctx.withdrawn_on_chain() && planned != ctx.snap.ladder() {
         return Ok(finish(
             Decision::Send(Trigger::LadderStaleWithoutCapacity),
@@ -548,8 +480,8 @@ pub fn evaluate_quote(ctx: &Context<'_>) -> Result<Decision, CurveError> {
 
     let d = drift(ctx.snap, &planned)?;
 
-    // 2. Adverse drift — the tight threshold. See the module docs for why this outranks the
-    //    heartbeat: a quote that is wrong now is more urgent than a quote that expires later.
+    // 2. The tight threshold, ahead of the heartbeat: a quote that is wrong now is more urgent
+    //    than one that expires later.
     if d.adverse_bps >= u128::from(ctx.adverse_drift_bps) {
         if let Some(side) = d.adverse_side {
             let t = Trigger::AdverseDrift {
@@ -561,7 +493,6 @@ pub fn evaluate_quote(ctx: &Context<'_>) -> Result<Decision, CurveError> {
         }
     }
 
-    // 3. Heartbeat.
     if age >= limit {
         let t = Trigger::Heartbeat {
             age_secs: age,
@@ -570,10 +501,7 @@ pub fn evaluate_quote(ctx: &Context<'_>) -> Result<Decision, CurveError> {
         return Ok(finish(Decision::Send(t), ctx, &planned));
     }
 
-    // 3b. Cadence — the heartbeat the chain's second-resolution `updatedAt` cannot express.
-    //
-    // After the drift triggers, not before: a cycle where the reference actually moved should be
-    // reported as the move it was. This only fires when nothing else had anything to say.
+    // 3b. After the drift triggers, so a cycle where the reference did move is reported as a move.
     if let (Some(limit_ms), Some(since_ms)) = (ctx.push_interval_ms_max, ctx.since_last_push_ms) {
         if since_ms >= limit_ms {
             let t = Trigger::Cadence { since_ms };
@@ -581,7 +509,7 @@ pub fn evaluate_quote(ctx: &Context<'_>) -> Result<Decision, CurveError> {
         }
     }
 
-    // 4. Favourable drift — the loose threshold.
+    // 4. The loose threshold.
     if d.favourable_bps >= u128::from(ctx.favourable_drift_bps) {
         if let Some(side) = d.favourable_side {
             let t = Trigger::FavourableDrift {
@@ -600,11 +528,8 @@ pub fn evaluate_quote(ctx: &Context<'_>) -> Result<Decision, CurveError> {
     }))
 }
 
-/// Last gate: a trigger fired, but is the row actually different?
-///
-/// Split out so that the "identical row" rule is stated once. The heartbeat is exempt because
-/// refreshing `updatedAt` *is* the change it wants; every other trigger sending an identical
-/// row would spend gas to store the bytes that are already there.
+/// Last gate: a trigger fired, but is the row actually different? Split out so the identical-row
+/// rule is stated once; the heartbeat is exempt because refreshing `updatedAt` is its change.
 fn finish(decision: Decision, ctx: &Context<'_>, planned: &Ladder) -> Decision {
     let Decision::Send(t) = decision else {
         return decision;
@@ -615,34 +540,25 @@ fn finish(decision: Decision, ctx: &Context<'_>, planned: &Ladder) -> Decision {
     decision
 }
 
-/// Decide whether to post a fresh capacity epoch.
-///
-/// Separate from the quote decision because they are separate transactions against separate
-/// storage words with separate meanings: `updateQuote` is the price decision and
-/// `refreshCapacity` is the risk decision. They share the gates and nothing else.
+/// Decide whether to post a fresh capacity epoch. Separate from the quote decision because they
+/// are separate transactions against separate storage words: `updateQuote` is the price decision
+/// and `refreshCapacity` the risk decision. They share the gates and nothing else.
 #[must_use]
 pub fn evaluate_capacity(ctx: &Context<'_>) -> CapacityDecision {
     if let Some(h) = ctx.gates() {
         return CapacityDecision::Hold(h);
     }
-    // The jump gate, and it is on **this** decision only.
-    //
-    // Capacity is the thing the withdrawal actually holds down — `refreshCapacity(pair, 0, 0)`
-    // makes `PropPool._outFor` return zero from every path — so without this gate the ordinary
-    // `NoEpoch` trigger would see zero capacity and re-arm the pool on the very next cycle,
-    // undoing the withdrawal a second after it landed.
-    //
-    // `evaluate_quote` is deliberately NOT gated. A ladder pushed against a zero epoch quotes
-    // nothing and costs a nearly-free transaction, and keeping it current through the cool-off is
-    // what lets the resume be a single `refreshCapacity` rather than a window in which the pool
-    // is armed at a pre-jump price.
+    // The jump gate is on THIS decision only. The withdrawal *is* a zero epoch, so without the
+    // gate `NoEpoch` below would re-arm the pool on the next cycle. `evaluate_quote` stays ungated
+    // so the ladder tracks the market through the cool-off and the resume is one `refreshCapacity`
+    // rather than an epoch armed at a pre-jump price.
     if ctx.jump_withdrawn {
         return CapacityDecision::Hold(Hold::JumpWithdrawn {
             cooloff_remaining_ms: ctx.jump_cooloff_remaining_ms,
         });
     }
-    // A refresh that would post zero is not a refresh, it is a withdrawal, and withdrawal is
-    // the killswitch's job rather than a routine trigger's.
+    // A refresh that would post zero is a withdrawal, and withdrawal is the killswitch's job
+    // rather than a routine trigger's.
     if ctx.capacity.bid == 0 || ctx.capacity.ask == 0 {
         return CapacityDecision::Hold(Hold::NoRow);
     }
@@ -662,23 +578,16 @@ pub fn evaluate_capacity(ctx: &Context<'_>) -> CapacityDecision {
         ),
     ];
 
-    // 1. A side with no epoch at all quotes zero however good the ladder is.
+    // A side with no epoch at all quotes zero however good the ladder is.
     for (side, capacity, _, _) in sides {
         if capacity == 0 {
             return CapacityDecision::Send(CapacityTrigger::NoEpoch { side });
         }
     }
 
-    // 2. Divergence, measured against the *planned* epoch rather than the posted one, and in
-    //    **both** directions. The two mean different things and both need acting on:
-    //
-    //    * remaining far BELOW the plan — the epoch has been consumed, or the operator raised
-    //      the configured capacity. The pool is quoting less depth than intended.
-    //    * remaining far ABOVE the plan — inventory left the pool, so `plan_capacity` cut what
-    //      it can settle, and the posted epoch now offers size the pool cannot deliver. Every
-    //      aggregator polling `getAmountOut` sees a fillable quote that reverts
-    //      `ReserveFloorBreached` when taken. Only checking the first direction leaves that
-    //      standing until the next unrelated trigger happens to refresh it.
+    // Divergence against the PLANNED epoch, in BOTH directions. Below the plan the pool quotes
+    // less depth than intended; above it, inventory has left and the posted epoch offers size the
+    // pool cannot settle, so `getAmountOut` advertises a quote that reverts `ReserveFloorBreached`.
     for (side, capacity, used, planned) in sides {
         let remaining = capacity.saturating_sub(used);
         let pct = mul_div_floor(remaining, 100, planned.max(1)).unwrap_or(u128::from(u32::MAX));
@@ -703,16 +612,9 @@ pub fn evaluate_capacity(ctx: &Context<'_>) -> CapacityDecision {
 
 #[cfg(test)]
 mod tests {
-    /// The cadence must be able to express an interval the chain cannot.
-    ///
-    /// `quote_age_secs` comes from `updatedAt`, a uint32 of seconds, so a quote 330ms old and one
-    /// 0ms old are the same number there. That is the whole reason this trigger measures locally.
-    ///
-    /// Note the planned ladder differs from the stored one. It has to: the cadence is deliberately
-    /// NOT exempt from the unchanged-row guard the way the heartbeat is. The heartbeat exists to
-    /// refresh `updatedAt` and re-posting identical bytes is its whole job; the cadence exists to
-    /// get a NEW price out sooner, and firing it on an unchanged row would write the same numbers
-    /// three times a second for nothing.
+    /// The cadence must express an interval `updatedAt`'s second resolution cannot. The planned
+    /// ladder has to differ from the stored one: unlike the heartbeat, the cadence is not exempt
+    /// from the unchanged-row guard.
     #[test]
     fn cadence_fires_below_the_second_the_heartbeat_cannot_see() {
         let l = ladder(900, 1_000, 1_100, 1_200);
@@ -720,9 +622,7 @@ mod tests {
         let mut c = ctx(&s, Some(ladder(901, 1_001, 1_101, 1_201)));
         c.heartbeat_secs = 5;
         c.block_timestamp = 100; // age 0s: the heartbeat has nothing to say
-                                 // Raised past the 9 bps this planned row implies, so the drift triggers stay quiet and the
-                                 // cadence is the only thing that could fire. That is the case being tested: a fresh price
-                                 // worth posting, that no drift threshold considers urgent.
+                                 // Both thresholds raised past the 9 bps this row implies.
         c.adverse_drift_bps = 1_000;
         c.favourable_drift_bps = 1_000;
         c.push_interval_ms_max = Some(330);
@@ -791,7 +691,7 @@ mod tests {
         }
     }
 
-    /// A healthy context: nothing gated, quote fresh, row identical to what is stored.
+    /// Healthy: nothing gated, quote fresh, row identical to what is stored.
     fn ctx<'a>(s: &'a Snap, planned: Option<Ladder>) -> Context<'a> {
         Context {
             push_interval_ms_max: None,
@@ -821,19 +721,15 @@ mod tests {
         }
     }
 
-    // -----------------------------------------------------------------------
-    // Drift is measured at the current usage, not at maxBid
-    // -----------------------------------------------------------------------
+    // --- Drift is measured at the current usage, not at maxBid ---
 
     #[test]
     fn a_naive_max_bid_comparison_would_miss_this_move() {
-        // Posted: 800..1000 over 100 of capacity, half consumed. The taker arriving now gets
-        // 1000 - ceil(200 * 50 / 100) = 900.
+        // Posted 800..1000 over 100 of capacity, half consumed: a taker gets 900.
         let s = snap(ladder(800, 1_000, 1_100, 1_300), 100, 50, 1_000);
         assert_eq!(executable_top_bid(800, 1_000, 100, 50), Ok(900));
 
-        // Planned: same maxBid, zero width. The taker would get 1000 — an 11% better price than
-        // the pool is currently offering. `maxBid` is identical, so comparing it sees nothing.
+        // Same maxBid, zero width: a taker gets 1000, 11% better, and `maxBid` sees nothing.
         let planned = ladder(1_000, 1_000, 1_100, 1_300);
         assert_eq!(
             planned.max_bid, s.max_bid,
@@ -860,8 +756,7 @@ mod tests {
 
     #[test]
     fn a_naive_max_bid_comparison_would_invent_this_move() {
-        // The expensive direction: a push that changes nothing. Posted 800..1000 at 50/100 use
-        // executes at 900. Planned 850..950 at the same usage also executes at 900.
+        // A push that changes nothing: 800..1000 and 850..950 both execute at 900 at 50/100.
         let s = snap(ladder(800, 1_000, 1_100, 1_300), 100, 50, 1_000);
         let planned = ladder(850, 950, 1_150, 1_250);
         assert_eq!(executable_top_bid(850, 950, 100, 50), Ok(900));
@@ -870,8 +765,7 @@ mod tests {
             executable_top_ask(1_100, 1_300, 100, 50)
         );
 
-        // `maxBid` moved 500 bps, so the naive comparison fires; the executable top did not
-        // move at all, so this one holds.
+        // `maxBid` moved 500 bps, so the naive comparison fires; the executable top did not.
         assert_eq!(drift(&s, &planned).unwrap(), Drift::default());
         let c = ctx(&s, Some(planned));
         assert!(matches!(
@@ -912,8 +806,7 @@ mod tests {
 
     #[test]
     fn a_side_with_no_capacity_is_skipped_rather_than_read_as_a_price() {
-        // executable_top_ask returns the NO_ASK infinity sentinel at zero capacity. Reading it
-        // as a number would produce a drift of ~10^36 bps and push every cycle forever.
+        // Reading the NO_ASK sentinel as a number is ~10^36 bps of drift, every cycle forever.
         let mut s = snap(ladder(900, 1_000, 1_100, 1_200), 100, 0, 1_000);
         s.ask_capacity = 0;
         assert_eq!(executable_top_ask(s.min_ask, s.max_ask, 0, 0), Ok(NO_ASK));
@@ -924,9 +817,7 @@ mod tests {
         assert_eq!(d.favourable_bps, 0);
     }
 
-    // -----------------------------------------------------------------------
-    // Triggers firing
-    // -----------------------------------------------------------------------
+    // --- Triggers firing ---
 
     #[test]
     fn a_never_quoted_pair_is_pushed_immediately() {
@@ -940,8 +831,7 @@ mod tests {
 
     #[test]
     fn a_stored_ladder_below_a_raised_min_price_is_pushed_immediately() {
-        // The manager can raise `minPrice` after a ladder is stored. Until something is pushed
-        // the pool rejects every fill, and nothing else in this module would notice.
+        // After a raised `minPrice` the pool rejects every fill, and nothing else here notices.
         let s = snap(ladder(900, 1_000, 1_100, 1_200), 100, 0, 1_000);
         let c = Context {
             min_price: 950,
@@ -993,8 +883,7 @@ mod tests {
 
     #[test]
     fn a_sub_one_bp_threshold_fires_where_a_whole_bp_threshold_would_not() {
-        // The whole point of deci-bps resolution: 0.5 bp (5 deci-bps) and 1 bp (10 deci-bps) must
-        // be distinguishable, which integer-bps measurement could never do.
+        // Why the unit is deci-bps: 0.5 bp and 1 bp have to be distinguishable.
         let s = snap(
             ladder(1_000_000, 1_000_000, 2_000_000, 2_000_000),
             100,
@@ -1036,8 +925,7 @@ mod tests {
             0,
             1_000,
         );
-        // Bid 5 bp better than posted: favourable, under the 8 bp threshold, and the ask is
-        // unchanged so nothing is adverse. Hold — this is the case that saves the gas.
+        // Bid 5 bp better, ask unchanged: favourable, under the 8 bp threshold, so hold.
         let better = 1_000_000 + 500;
         let c = ctx(&s, Some(ladder(better, better, 2_000_000, 2_000_000)));
         let d = drift(&s, c.planned.as_ref().unwrap()).unwrap();
@@ -1115,7 +1003,7 @@ mod tests {
             Decision::Hold(Hold::NoTrigger { .. })
         ));
 
-        // At the heartbeat, identical row: send anyway. Refreshing `updatedAt` is the point.
+        // At the heartbeat, identical row: send anyway, to refresh `updatedAt`.
         let c = Context {
             block_timestamp: 1_000 + 2_400,
             ..ctx(&s, Some(l))
@@ -1131,17 +1019,14 @@ mod tests {
 
     #[test]
     fn a_trigger_on_an_identical_row_holds_unless_it_is_the_heartbeat() {
-        // Contrived but exactly the guard's job: `NoUsableQuote` on a pair whose stored ladder
-        // equals the planned one. Re-storing identical bytes buys nothing.
+        // `NoUsableQuote` on an already-identical row: re-storing identical bytes buys nothing.
         let l = ladder(0, 0, 0, 0);
         let s = snap(l, 100, 0, 0);
         let c = ctx(&s, Some(l));
         assert_eq!(evaluate_quote(&c).unwrap(), Decision::Hold(Hold::Unchanged));
     }
 
-    // -----------------------------------------------------------------------
-    // Gates
-    // -----------------------------------------------------------------------
+    // --- Gates ---
 
     #[test]
     fn every_gate_aborts_and_they_abort_in_order() {
@@ -1233,8 +1118,7 @@ mod tests {
 
     #[test]
     fn a_degraded_chain_still_quotes() {
-        // Degraded widens the spread upstream; it must not stop the loop, or a transient RPC
-        // wobble becomes a quoting outage which is the worse failure.
+        // Degraded widens the spread upstream; stopping here turns an RPC wobble into an outage.
         let s = snap(ladder(0, 0, 0, 0), 100, 0, 0);
         let c = Context {
             chain: ChainStatus::Degraded { stale_secs: 40 },
@@ -1252,8 +1136,8 @@ mod tests {
 
     #[test]
     fn a_feed_without_quorum_blocks_even_a_pair_that_has_never_quoted() {
-        // The tempting exception — "it has no quote at all, surely anything is better" — is
-        // wrong: a price nothing corroborates is how the first fill gets picked off.
+        // No exception for a never-quoted pair: an uncorroborated price is how the first fill
+        // gets picked off.
         let s = snap(ladder(0, 0, 0, 0), 100, 0, 0);
         let no_quorum = FeedStatus::NoQuorum { have: 1, need: 2 };
         let c = Context {
@@ -1268,8 +1152,8 @@ mod tests {
 
     #[test]
     fn venues_that_disagree_block_a_push_exactly_as_a_dead_feed_does() {
-        // A split cross-section is not a noisy price, it is the absence of one. Quoting the mean
-        // of two camps 60 bp apart is quoting a number no venue is showing.
+        // A split cross-section is the absence of a price: the mean of two camps 60 bp apart is
+        // a number no venue is showing.
         let l = ladder(900, 1_000, 1_100, 1_200);
         let s = snap(l, 100, 0, 1_000);
         let dispersed = FeedStatus::Dispersed {
@@ -1291,9 +1175,7 @@ mod tests {
         );
     }
 
-    // -----------------------------------------------------------------------
-    // Capacity
-    // -----------------------------------------------------------------------
+    // --- Capacity ---
 
     #[test]
     fn a_full_epoch_does_not_get_refreshed() {
@@ -1329,10 +1211,8 @@ mod tests {
 
     #[test]
     fn an_epoch_the_inventory_can_no_longer_settle_is_cut_back() {
-        // Inventory left the pool, so the plan is half the posted epoch. The posted one now
-        // offers size the pool cannot deliver: an aggregator sees a fillable quote and the swap
-        // reverts `ReserveFloorBreached`. Checking only the under-supplied direction would leave
-        // that standing until some unrelated trigger happened to refresh it.
+        // Inventory left, so the posted epoch offers size the swap reverts on. Checking only the
+        // under-supplied direction would leave that standing until some unrelated trigger fired.
         let l = ladder(900, 1_000, 1_100, 1_200);
         let s = snap(l, 1_000, 0, 1_000);
         let mut c = ctx(&s, Some(l));
@@ -1352,8 +1232,7 @@ mod tests {
             })
         ));
 
-        // Inside the threshold in that direction: hold, so a dust-sized inventory change does
-        // not churn the epoch.
+        // Inside the threshold: hold, so a dust-sized inventory change does not churn the epoch.
         c.capacity = CapacityPlan {
             bid: 1_000,
             ask: 800,
@@ -1368,8 +1247,7 @@ mod tests {
 
     #[test]
     fn a_side_with_no_epoch_is_refreshed_before_anything_else() {
-        // The chain has no ask epoch; the plan has one to post. Without this the pool quotes
-        // zero on the ask however good the ladder is.
+        // No ask epoch on chain: without this the pool quotes zero however good the ladder is.
         let l = ladder(900, 1_000, 1_100, 1_200);
         let mut s = snap(l, 1_000, 0, 1_000);
         s.ask_capacity = 0;
@@ -1388,8 +1266,7 @@ mod tests {
 
     #[test]
     fn a_superseded_usage_generation_does_not_look_like_a_consumed_epoch() {
-        // The live pool's exact shape: capGen 14, usedGen 13, a large raw ask counter. The pool
-        // reads that usage as zero, so the epoch is full and must not be refreshed.
+        // capGen 14 against usedGen 13: the pool reads that usage as zero, so the epoch is full.
         let l = ladder(900, 1_000, 1_100, 1_200);
         let mut s = snap(l, 1_000, 990, 1_000);
         s.cap_gen = 14;
@@ -1410,8 +1287,7 @@ mod tests {
 
     #[test]
     fn a_stale_feed_cannot_widen_an_epoch() {
-        // archi_v2 5.3: capacity growth only while the reference price is coherent, so a stale
-        // price cannot induce capacity churn.
+        // archi_v2 5.3: capacity grows only while the reference price is coherent.
         let l = ladder(900, 1_000, 1_100, 1_200);
         let mut s = snap(l, 1_000, 0, 1_000);
         s.bid_capacity = 0;
@@ -1450,16 +1326,12 @@ mod tests {
         assert_eq!(evaluate_capacity(&c), CapacityDecision::Hold(Hold::Halted));
     }
 
-    // -----------------------------------------------------------------------
-    // The jump withdrawal
-    // -----------------------------------------------------------------------
+    // --- The jump withdrawal ---
 
     #[test]
     fn a_jump_cooloff_holds_capacity_down_and_lets_the_ladder_keep_moving() {
-        // The whole asymmetry in one test. The withdrawal IS the zero capacity epoch, so the
-        // capacity decision must be gated or the ordinary `NoEpoch` trigger re-arms the pool one
-        // second after the withdrawal lands. The quote decision must NOT be gated, or the ladder
-        // goes stale behind the zero epoch and the resume re-arms at the pre-jump price.
+        // The withdrawal IS the zero epoch, so capacity must be gated or `NoEpoch` re-arms the
+        // pool; the quote must not be, or the resume re-arms at the pre-jump price.
         let l = ladder(1_000_000, 1_000_000, 2_000_000, 2_000_000);
         let mut s = snap(l, 1_000, 0, 1_000);
         s.bid_capacity = 0;
@@ -1469,8 +1341,7 @@ mod tests {
         let c = Context {
             jump_withdrawn: true,
             jump_cooloff_remaining_ms: 21_000,
-            // The epoch the pool *would* post: the withdrawal is a hold on this, not an absence
-            // of one, which is exactly why the gate has to be explicit.
+            // The epoch the pool would post: the withdrawal holds this rather than lacking one.
             capacity: CapacityPlan {
                 bid: 1_000,
                 ask: 1_000,
@@ -1492,9 +1363,7 @@ mod tests {
             "and the ladder must keep tracking the market behind it"
         );
 
-        // A quiet cool-off is silent: the trigger needs the row to have actually moved, so this
-        // does not become one transaction per second for thirty seconds in a market that has
-        // stopped moving.
+        // The row has to have moved, or a quiet cool-off is one transaction a second for 30 s.
         let quiet = Context {
             planned: Some(l),
             ..c
@@ -1504,8 +1373,7 @@ mod tests {
             "an unchanged row must not be re-posted"
         );
 
-        // Once the cool-off ends, the epoch comes back — in one transaction, against a ladder that
-        // is already current.
+        // The epoch comes back in one transaction, against an already-current ladder.
         let resumed = Context {
             jump_withdrawn: false,
             ..c
@@ -1518,9 +1386,8 @@ mod tests {
 
     #[test]
     fn drift_is_blind_to_a_withdrawn_pool_which_is_why_the_new_trigger_exists() {
-        // The reason `LadderStaleWithoutCapacity` is a trigger and not a special case of adverse
-        // drift: with both capacities at zero, `drift` skips both sides and reports nothing,
-        // however far the market has moved.
+        // Why the trigger is not a case of adverse drift: at zero capacity `drift` skips both
+        // sides, however far the market has moved.
         let l = ladder(1_000_000, 1_000_000, 2_000_000, 2_000_000);
         let mut s = snap(l, 1_000, 0, 1_000);
         s.bid_capacity = 0;
@@ -1539,8 +1406,7 @@ mod tests {
 
     #[test]
     fn a_halted_bot_outranks_the_jump_gate() {
-        // Precedence check: the shared gates run first, so a killswitch latch is still the reported
-        // reason rather than the cool-off. The operator needs the switch, not the symptom.
+        // The shared gates run first, so the operator reads the latch rather than the symptom.
         let l = ladder(900, 1_000, 1_100, 1_200);
         let mut s = snap(l, 1_000, 0, 1_000);
         s.bid_capacity = 0;
@@ -1554,8 +1420,8 @@ mod tests {
 
     #[test]
     fn a_zero_planned_epoch_is_not_posted_as_a_routine_refresh() {
-        // Posting (0, 0) is the withdrawal the killswitch performs, and routing it through the
-        // ordinary divergence path would let an inventory dip silently pull the pool's quotes.
+        // Posting (0, 0) is the killswitch's withdrawal; via divergence an inventory dip would
+        // silently pull the pool's quotes.
         let l = ladder(900, 1_000, 1_100, 1_200);
         let s = snap(l, 1_000, 0, 1_000);
         let mut c = ctx(&s, Some(l));
