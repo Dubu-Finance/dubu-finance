@@ -11,7 +11,6 @@ import {PmmSettle} from "../src/PmmSettle.sol";
 import {IPmmSettle} from "../src/interfaces/IPmmSettle.sol";
 import {MockERC20} from "../src/mocks/MockERC20.sol";
 
-/// @notice A token whose `approve` returns `false`. The adapter must not proceed to the fill.
 contract UnapprovableToken is MockERC20 {
     constructor() MockERC20("Unapprovable", "UNA", 18) {}
 
@@ -20,17 +19,6 @@ contract UnapprovableToken is MockERC20 {
     }
 }
 
-/*//////////////////////////////////////////////////////////////////////////////
-                                     FIXTURE
-//////////////////////////////////////////////////////////////////////////////*/
-
-/// @notice `PmmAdapter` driven through the real `Router`, not a harness.
-///
-/// @dev archi_v2 §4.6 caveat 4 is that the forked repo's adapter is outside the audit scope with
-///      zero tests. The answer to that is not "some tests" but tests through the actual call path
-///      the adapter will live on: `Router.swapExactIn` -> push -> `sellBase` -> `PmmSettle`. A
-///      harness that called `sellBase` directly would miss precisely the things that go wrong —
-///      the funding bit, the balance read, and where the leftover ends up.
 abstract contract PmmAdapterBase is Test {
     Router internal router;
     PmmAdapter internal adapter;
@@ -70,10 +58,6 @@ abstract contract PmmAdapterBase is Test {
         vm.warp(1_800_000_000);
     }
 
-    // ---------------------------------------------------------------------
-    // Orders
-    // ---------------------------------------------------------------------
-
     function _order() internal view returns (IPmmSettle.Order memory o) {
         o = IPmmSettle.Order({
             maker: maker,
@@ -90,8 +74,6 @@ abstract contract PmmAdapterBase is Test {
         });
     }
 
-    /// @dev Local, for the same reason as in `PmmSettle.t.sol`: an external call inside an armed
-    ///      cheatcode is the cheatcode's target.
     function _sign(IPmmSettle.Order memory o) internal view returns (bytes memory) {
         bytes32 structHash = keccak256(
             abi.encode(
@@ -123,16 +105,10 @@ abstract contract PmmAdapterBase is Test {
         return abi.encodePacked(r, s, v);
     }
 
-    // ---------------------------------------------------------------------
-    // Routes
-    // ---------------------------------------------------------------------
-
     function _payload(IPmmSettle.Order memory o, uint32 maxDecayPpm) internal view returns (bytes memory) {
         return adapter.encodePayload(o, _sign(o), maxDecayPpm);
     }
 
-    /// @param fundAdapter bit 254. Must be set for this venue — the whole point of the flag.
-    /// @param reverse     bit 255. Must make no difference for this venue.
     function _route(bytes memory payload, uint256 amountIn, bool fundAdapter, bool reverse)
         internal
         view
@@ -162,7 +138,6 @@ abstract contract PmmAdapterBase is Test {
         });
     }
 
-    /// @dev The invariant the contract note claims: nothing is left behind, on any path.
     function _assertAdapterIsClean() internal view {
         assertEq(takerAsset.balanceOf(address(adapter)), 0, "adapter holds taker asset");
         assertEq(makerAsset.balanceOf(address(adapter)), 0, "adapter holds maker asset");
@@ -170,10 +145,6 @@ abstract contract PmmAdapterBase is Test {
         assertEq(makerAsset.allowance(address(adapter), address(settle)), 0, "adapter left an allowance");
     }
 }
-
-/*//////////////////////////////////////////////////////////////////////////////
-                              ROUTED, END TO END
-//////////////////////////////////////////////////////////////////////////////*/
 
 contract PmmAdapterRoutingTest is PmmAdapterBase {
     function test_wholeOrderFillsThroughTheRouter() public {
@@ -191,8 +162,6 @@ contract PmmAdapterRoutingTest is PmmAdapterBase {
         _assertAdapterIsClean();
     }
 
-    /// @notice Bit 255 selects a direction this venue does not have. Both entry points must land
-    ///         on the same fill rather than one of them rejecting a executable plan.
     function test_sellQuoteIsTheSameFillAsSellBase() public {
         IPmmSettle.Order memory o = _order();
         RouteParams memory p = _route(_payload(o, type(uint32).max), TAKER_SIZE / 2, true, true);
@@ -205,7 +174,6 @@ contract PmmAdapterRoutingTest is PmmAdapterBase {
         _assertAdapterIsClean();
     }
 
-    /// @notice The router leaves nothing of its own behind either — output is a measured delta.
     function test_routerHoldsNothingAfterwards() public {
         IPmmSettle.Order memory o = _order();
         RouteParams memory p = _route(_payload(o, type(uint32).max), TAKER_SIZE, true, false);
@@ -219,13 +187,10 @@ contract PmmAdapterRoutingTest is PmmAdapterBase {
         assertEq(makerAsset.balanceOf(address(settle)), 0);
     }
 
-    /// @notice Over-funding is normal — the plan sized against a remaining amount that has since
-    ///         shrunk. The surplus must come back to the payer, not sit in the adapter.
     function test_overFundedLegRefundsTheSurplus() public {
         IPmmSettle.Order memory o = _order();
         bytes memory payload = _payload(o, type(uint32).max);
 
-        // Somebody else takes 60% of the quote first.
         address early = address(0xEA11);
         takerAsset.mint(early, 6e17);
         vm.startPrank(early);
@@ -234,7 +199,6 @@ contract PmmAdapterRoutingTest is PmmAdapterBase {
         vm.stopPrank();
         assertEq(settle.remainingTaker(o), 4e17);
 
-        // Our plan still believes the whole order is available.
         RouteParams memory p = _route(payload, TAKER_SIZE, true, false);
         uint256 payerBefore = takerAsset.balanceOf(payer);
 
@@ -242,13 +206,12 @@ contract PmmAdapterRoutingTest is PmmAdapterBase {
         uint256 out = router.swapExactIn(p, 1);
 
         assertEq(out, (MAKER_SIZE * 4e17) / TAKER_SIZE);
-        // Only the 4e17 that could actually be filled was spent; the 6e17 surplus came home.
+
         assertEq(takerAsset.balanceOf(payer), payerBefore - 4e17);
         assertEq(settle.remainingTaker(o), 0);
         _assertAdapterIsClean();
     }
 
-    /// @notice One signed quote, several routed takers. Caveat 2, through the router.
     function test_oneQuoteStreamsToSeveralRoutedTakers() public {
         IPmmSettle.Order memory o = _order();
         bytes memory payload = _payload(o, type(uint32).max);
@@ -271,8 +234,6 @@ contract PmmAdapterRoutingTest is PmmAdapterBase {
         _assertAdapterIsClean();
     }
 
-    /// @notice The plan's `quotedAmountOut` and the realised output both reach the log, which is
-    ///         where an aggregator's self-preferencing claim is answered.
     function test_routeExecutedCarriesQuotedAndRealised() public {
         IPmmSettle.Order memory o = _order();
         o.decayStart = uint64(block.timestamp);
@@ -290,9 +251,6 @@ contract PmmAdapterRoutingTest is PmmAdapterBase {
         uint256 out = router.swapExactIn(p, 1);
         assertEq(out, realised);
 
-        // Both records must be present and must disagree, at both altitudes: the leg's
-        // `OrderFilled` and the route's `RouteExecuted`. If the decay could be applied without
-        // showing up in either, it would be indistinguishable from quote spoofing.
         Vm.Log[] memory logs = vm.getRecordedLogs();
         bool sawLeg;
         bool sawRoute;
@@ -319,8 +277,6 @@ contract PmmAdapterRoutingTest is PmmAdapterBase {
         assertTrue(sawRoute, "RouteExecuted not emitted");
     }
 
-    /// @notice The leg-level decay ceiling stops the route rather than letting the aggregate
-    ///         bound absorb a decayed fill.
     function test_maxDecayPpmRejectsTheLeg() public {
         IPmmSettle.Order memory o = _order();
         o.decayStart = uint64(block.timestamp);
@@ -336,8 +292,6 @@ contract PmmAdapterRoutingTest is PmmAdapterBase {
         router.swapExactIn(p, 1);
     }
 
-    /// @notice Forget bit 254 and the tokens go to `PmmSettle` instead of the adapter, whose
-    ///         balance read then finds nothing. It must fail loudly rather than fill oddly.
     function test_missingFundAdapterBitReverts() public {
         IPmmSettle.Order memory o = _order();
         RouteParams memory p = _route(_payload(o, type(uint32).max), TAKER_SIZE, false, false);
@@ -347,7 +301,6 @@ contract PmmAdapterRoutingTest is PmmAdapterBase {
         router.swapExactIn(p, 1);
     }
 
-    /// @notice A fully consumed order is not a router error to paper over.
     function test_exhaustedOrderReverts() public {
         IPmmSettle.Order memory o = _order();
         bytes memory payload = _payload(o, type(uint32).max);
@@ -362,7 +315,6 @@ contract PmmAdapterRoutingTest is PmmAdapterBase {
         router.swapExactIn(again, 1);
     }
 
-    /// @notice The router's aggregate bound still applies on top of everything the leg does.
     function test_aggregateSlippageBoundStillBinds() public {
         IPmmSettle.Order memory o = _order();
         RouteParams memory p = _route(_payload(o, type(uint32).max), TAKER_SIZE, true, false);
@@ -372,10 +324,6 @@ contract PmmAdapterRoutingTest is PmmAdapterBase {
         router.swapExactIn(p, MAKER_SIZE + 1);
     }
 }
-
-/*//////////////////////////////////////////////////////////////////////////////
-                          DIRECT — THE ADAPTER ITSELF
-//////////////////////////////////////////////////////////////////////////////*/
 
 contract PmmAdapterDirectTest is PmmAdapterBase {
     function test_zeroSettleAddressReverts() public {
@@ -398,16 +346,12 @@ contract PmmAdapterDirectTest is PmmAdapterBase {
         adapter.sellBase(address(this), address(settle), hex"deadbeef");
     }
 
-    /// @notice `encodePayload` is the one definition of the blob; a hand-rolled `abi.encode` of
-    ///         the same values must produce the same bytes or the Rust planner and the tests are
-    ///         encoding against two specs.
     function test_encodePayloadIsPlainAbiEncode() public view {
         IPmmSettle.Order memory o = _order();
         bytes memory sig = _sign(o);
         assertEq(adapter.encodePayload(o, sig, 1234), abi.encode(o, sig, uint32(1234)));
     }
 
-    /// @notice The contract note claims no storage variables. This is that claim, checked.
     function test_adapterHasNoStorage() public {
         IPmmSettle.Order memory o = _order();
         takerAsset.mint(address(adapter), TAKER_SIZE);
@@ -420,8 +364,6 @@ contract PmmAdapterDirectTest is PmmAdapterBase {
         assertEq(makerAsset.balanceOf(receiver), MAKER_SIZE);
     }
 
-    /// @notice Called directly, the adapter clamps to the remaining size and refunds the rest to
-    ///         `to`. Through the router `to` is the router; here it is whoever asked.
     function test_directCallClampsAndRefunds() public {
         IPmmSettle.Order memory o = _order();
         takerAsset.mint(address(adapter), TAKER_SIZE * 2);
@@ -434,16 +376,11 @@ contract PmmAdapterDirectTest is PmmAdapterBase {
         _assertAdapterIsClean();
     }
 
-    /// @notice An address with no code answers `approve` successfully with empty returndata. The
-    ///         `code.length` check is what stops the adapter carrying on as if it had an
-    ///         allowance.
     function test_codelessTakerAssetRevertsOnApprove() public {
         IPmmSettle.Order memory o = _order();
         o.takerAsset = address(0xC0DE1E55);
         bytes memory payload = adapter.encodePayload(o, _sign(o), type(uint32).max);
 
-        // `balanceOf` on a codeless address returns empty data, which the decoder rejects before
-        // the approve is even reached — so the revert is the balance read, not a silent zero.
         vm.expectRevert();
         adapter.sellBase(receiver, address(settle), payload);
     }
@@ -460,8 +397,6 @@ contract PmmAdapterDirectTest is PmmAdapterBase {
         adapter.sellBase(receiver, address(settle), payload);
     }
 
-    /// @notice The adapter reads the remaining size live. A payload built when the order was
-    ///         untouched must settle against what is left, not against what the plan believed.
     function test_remainingIsReadLiveAndNeverCached() public {
         IPmmSettle.Order memory o = _order();
         bytes memory payload = _payload(o, type(uint32).max);
@@ -481,7 +416,6 @@ contract PmmAdapterDirectTest is PmmAdapterBase {
         _assertAdapterIsClean();
     }
 
-    /// @notice `IAdapter` conformance: the adapter answers the interface's exact selectors.
     function test_conformsToIAdapter() public {
         IPmmSettle.Order memory o = _order();
         takerAsset.mint(address(adapter), TAKER_SIZE);
@@ -489,8 +423,6 @@ contract PmmAdapterDirectTest is PmmAdapterBase {
         assertEq(makerAsset.balanceOf(receiver), MAKER_SIZE);
     }
 
-    /// @notice The interface the adapter needs beyond `IERC20Minimal`, exercised for real so the
-    ///         local declaration cannot rot against the tokens it is used on.
     function test_localApproveInterfaceMatchesTheToken() public {
         assertTrue(IERC20Approve(address(takerAsset)).approve(address(settle), 1));
         assertEq(takerAsset.allowance(address(this), address(settle)), 1);

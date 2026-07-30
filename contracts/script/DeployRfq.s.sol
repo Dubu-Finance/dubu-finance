@@ -9,115 +9,25 @@ import {PmmSettle} from "../src/PmmSettle.sol";
 import {PmmAdapter} from "../src/adapters/PmmAdapter.sol";
 import {MockERC20} from "../src/mocks/MockERC20.sol";
 
-/// @title DeployRfq — the RFQ leg onto GIWA Sepolia, next to the stack that is already live
-///
-/// ```
-/// make deploy-rfq-dry                                # dry run against live chain state
-/// make deploy-rfq                                    # keystore, or PRIVATE_KEY if .env sets it
-/// ```
-///
-/// ## What it deploys, and what it deliberately does not
-///
-/// Deployed: `PmmSettle` and `PmmAdapter`. Both take no constructor arguments, own nothing, and
-/// have no owner, no pause, no upgrade path and no registry to be listed in.
-///
-/// **Not** deployed or touched: `PropPool`, `Router`, the three mock tokens, the UniV2 stack.
-/// Those are live (see `DEPLOYMENTS.md`) and this script only reads their addresses out of env so
-/// it can approve against the tokens and echo the rest. In particular there is nothing to *wire*:
-/// `Router` has no adapter registry — a route names its adapter in the step word — so "deploying
-/// the RFQ leg" is two `CREATE`s and a set of ERC-20 allowances, and the allowances are the part
-/// that can be got wrong.
-///
-/// ## The two failures this script exists to catch before they are expensive
-///
-///  1. **A signer whose EIP-712 domain disagrees with the chain.** The maker signs a digest
-///     computed off chain; `PmmSettle` recomputes it and `ecrecover`s against it. If the two
-///     domains differ by one byte the recovered address is not the maker, every fill reverts
-///     `BadSignature`, and the maker sees *nothing* — no revert of their own, no log, just quotes
-///     nobody can take. So the domain separator is derived here independently of the contract,
-///     checked against a locally-instantiated `PmmSettle` before anything is broadcast, checked
-///     again against the deployed instance, and then printed in the exact shape a signer needs.
-///
-///  2. **A maker who has not approved the settler.** `PmmSettle` custodies nothing — both legs of
-///     a fill are `transferFrom` pulls — so an unapproved maker's orders also fail only at fill
-///     time, and also silently from the maker's side. The approvals are part of the deployment,
-///     not a follow-up step, and their size is argued for in the log rather than defaulted to
-///     infinity.
-///
-/// ## Resumability
-///
-/// `PMM_SETTLE` and `PMM_ADAPTER` are read from env first and only deployed when unset, matching
-/// `Deploy`. The approvals are idempotent on top of that: an allowance already at or above the
-/// target is logged as `reuse` and costs no transaction, so re-running after a half-finished run
-/// converges rather than re-approving.
 contract DeployRfq is DubuScript {
-    // ---------------------------------------------------------------------
-    // Gas
-    // ---------------------------------------------------------------------
 
-    /// @notice Conservative upper bound for the preflight, expressed in *gas limits*, not gas used.
-    ///
-    /// @dev A cold full run is 5 transactions: two `CREATE`s and three `approve`s. Measured on a
-    ///      dry run against live GIWA state: 2,228,490 gas actually consumed (PmmSettle 1,301,020,
-    ///      PmmAdapter 780,260, ~49,000 per approve), against a 2,897,037 sum of the limits forge
-    ///      sets at its default 130% multiplier — and the Makefile raises that to 200% (see the
-    ///      note there on cold-access accounting), which puts the sum of limits at ~4.46M. A node
-    ///      admits a transaction only if the sender can pay `gasLimit * gasPrice`, so the *limits*
-    ///      are what the affordability check has to be sized against. 8M is ~1.8x that, which
-    ///      leaves room for a compiler bump without making the check meaningless.
     uint256 internal constant GAS_BUDGET = 8_000_000;
 
-    // ---------------------------------------------------------------------
-    // The EIP-712 domain, derived here rather than read from the contract
-    // ---------------------------------------------------------------------
-
-    /// @dev These four constants are a deliberate second implementation of
-    ///      `PmmSettle._computeDomainSeparator`. Reading them off the contract would turn every
-    ///      assertion below into `x == x`; the whole value of the check is that two independent
-    ///      encodings of the domain agree, in the same way `test/PmmSettle.t.sol` and
-    ///      `dubu_core::rfq` are two independent encodings that agree.
     bytes32 internal constant EIP712_DOMAIN_TYPEHASH =
         keccak256("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)");
     string internal constant DOMAIN_NAME = "DuBu PmmSettle";
     string internal constant DOMAIN_VERSION = "1";
 
-    /// @notice The exact 32 bytes `dubu_core::rfq::ORDER_TYPEHASH` holds, and the value
-    ///         `test/PmmSettle.t.sol` pins from the third side.
-    /// @dev Written out rather than derived, for the same reason it is written out in both of
-    ///      those files: a reviewer has to be able to diff it by eye. Any change to a field name,
-    ///      type or position moves it, and then the Rust, the test and this script all fail at once
-    ///      instead of a signer quietly producing digests nothing can verify.
     bytes32 internal constant RUST_ORDER_TYPEHASH = 0x23e655e78a91115e92aff2d730688fc421a3773ea96b4afcd69c21acf9e8be56;
 
-    // ---------------------------------------------------------------------
-    // Maker allowances
-    // ---------------------------------------------------------------------
-
-    /// @notice Notional, in whole quote tokens, of standing allowance granted per quotable asset.
-    ///
-    /// @dev The number itself is arguable; that it is *finite* is not. `PmmSettle` holds no
-    ///      inventory, so this allowance is not a convenience — it is the maker's entire exposure
-    ///      to a bug in the settler, and it is the one trust concentration the contract's own
-    ///      header names. Sizing it to what the maker intends to quote makes the blast radius a
-    ///      number somebody chose; `type(uint256).max` makes it "everything this key will ever
-    ///      hold, forever", which is a different decision and should have to be typed out.
-    ///
-    ///      $1M matches the top of the `Demo` sweep and sits at half the curve side's $2M
-    ///      per-epoch capacity, so the RFQ leg can quote any size the rest of the demo can.
     uint256 internal constant ALLOWANCE_NOTIONAL_USD = 1_000_000;
 
-    // ---------------------------------------------------------------------
-    // Types
-    // ---------------------------------------------------------------------
-
-    /// @notice The live token set the maker will quote against. Read from env, never deployed here.
     struct Assets {
         address usdc;
         address weth;
         address wbtc;
     }
 
-    /// @notice One maker approval: the asset, and how much of it `PmmSettle` may pull.
     struct Approval {
         string symbol;
         address token;
@@ -125,17 +35,13 @@ contract DeployRfq is DubuScript {
         uint256 target;
     }
 
-    /// @notice Everything resolved before a transaction is signed.
     struct Plan {
         address maker;
         address settle;
         address adapter;
         bool deploySettle;
         bool deployAdapter;
-        /// @dev The separator `settle` must compute, derived by this script from the chain id and
-        ///      that address alone. Known before the deployment because it is a pure function of
-        ///      two things we already know — which is exactly why the signer can be configured
-        ///      before the broadcast lands.
+
         bytes32 separator;
         bool unlimited;
     }
@@ -160,14 +66,6 @@ contract DeployRfq is DubuScript {
         _report(settle, adapter, p, approvals, order, takerIn);
     }
 
-    // =====================================================================
-    // Resolution — env in, a fully determined plan out
-    // =====================================================================
-
-    /// @dev The same env var names `Deploy` writes and `script/README.md` documents, so one
-    ///      `.env` drives both scripts. A missing one is fatal and fatal *early*: the approvals
-    ///      are the substance of this deployment, and a script that deployed two contracts and
-    ///      then discovered it had nothing to approve would have to be resumed by hand.
     function _assets() internal view returns (Assets memory a) {
         a.usdc = _requireAddr("MUSDC");
         a.weth = _requireAddr("MWETH");
@@ -185,16 +83,6 @@ contract DeployRfq is DubuScript {
         }
     }
 
-    /// @dev The addresses, and — when a contract is about to be created — the address it will be
-    ///      created at.
-    ///
-    ///      Predicting rather than waiting is what lets the domain separator be asserted and
-    ///      published *before* the broadcast: a separator is a pure function of the chain id and
-    ///      the verifying contract, both of which are knowable in advance. The prediction is not
-    ///      trusted — `_report` asserts the deployed address is the predicted one — but a
-    ///      prediction that is checked is strictly better than a value that only exists afterwards,
-    ///      because it means the off-chain signer's configuration can be reviewed against this
-    ///      output before any of it is real.
     function _plan(address deployer) internal returns (Plan memory p) {
         p.maker = _envAddr("RFQ_MAKER", deployer);
         p.unlimited = _envUint("RFQ_ALLOWANCE_UNLIMITED", 0) != 0;
@@ -217,8 +105,6 @@ contract DeployRfq is DubuScript {
         p.separator = _domainSeparator(p.settle);
     }
 
-    /// @notice `keccak256(abi.encode(DOMAIN_TYPEHASH, keccak256(name), keccak256(version),
-    ///         chainId, verifyingContract))` — EIP-712 §"Definition of domainSeparator".
     function _domainSeparator(address verifying) internal view returns (bytes32) {
         return keccak256(
             abi.encode(
@@ -231,9 +117,6 @@ contract DeployRfq is DubuScript {
         );
     }
 
-    /// @dev Per-asset allowance, in that asset's smallest unit, sized to a fixed *notional* so the
-    ///      three numbers mean the same thing. Overridable per asset in whole tokens, because the
-    ///      right answer depends on the maker's inventory and this file cannot know it.
     function _approvalPlan(Assets memory a, bool unlimited) internal view returns (Approval[] memory p) {
         (, uint8 wethDec, uint8 usdcDec, uint256 wethMid) = _marketSpec(0);
         (, uint8 wbtcDec,, uint256 wbtcMid) = _marketSpec(1);
@@ -268,14 +151,6 @@ contract DeployRfq is DubuScript {
         return _envUint(key, wholeDefault) * (10 ** uint256(decimals));
     }
 
-    /// @notice One small, no-decay, no-floor order at the mWETH/mUSDC reference mid, and the slice
-    ///         of it the printed smoke test fills.
-    ///
-    /// @dev Built from `_marketSpec`, not from literals, so the smoke test quotes the same $2,000
-    ///      mid as `Deploy`, `Demo` and `test/Integration.t.sol`. The fill is a tenth of the order
-    ///      on purpose: a full fill would exercise neither the pro-rata split nor the
-    ///      remaining-amount accounting, which are the two things this contract does that the
-    ///      design it forked does not.
     function _smokeOrder(address maker, Assets memory a)
         internal
         view
@@ -283,7 +158,7 @@ contract DeployRfq is DubuScript {
     {
         (, uint8 baseDec, uint8 quoteDec, uint256 midWhole) = _marketSpec(0);
 
-        uint256 takerAmount = 10 ** (uint256(baseDec) - 2); // 0.01 mWETH
+        uint256 takerAmount = 10 ** (uint256(baseDec) - 2);
         uint256 makerAmount = (midWhole * takerAmount * (10 ** uint256(quoteDec))) / (10 ** uint256(baseDec));
         takerIn = takerAmount / 10;
 
@@ -294,10 +169,7 @@ contract DeployRfq is DubuScript {
             makerAmount: makerAmount,
             takerAmount: takerAmount,
             nonce: uint64(_envUint("RFQ_SMOKE_NONCE", 1)),
-            // Long, because the printed command is meant to survive being pasted into a terminal
-            // tomorrow. The signature is bound to this value, so re-running the script produces a
-            // different digest and the old signature stops verifying — which is the correct
-            // behaviour and worth knowing before it surprises somebody.
+
             expiry: uint64(block.timestamp + _envUint("RFQ_SMOKE_TTL", 7 days)),
             decayStart: 0,
             decayPerSec: 0,
@@ -305,10 +177,6 @@ contract DeployRfq is DubuScript {
             minFillBps: 0
         });
     }
-
-    // =====================================================================
-    // Preflight — everything checkable before a single transaction is signed
-    // =====================================================================
 
     function _preflight(
         address deployer,
@@ -344,30 +212,6 @@ contract DeployRfq is DubuScript {
         console2.log("");
     }
 
-    /// @notice The domain check, in full, before anything is broadcast.
-    ///
-    /// @dev Three separate claims, and they are separate on purpose because they fail for
-    ///      different reasons:
-    ///
-    ///        1. the deployed bytecode's `ORDER_TYPEHASH` is the one `dubu_core::rfq` pins — this
-    ///           fails when somebody edits the `Order` struct on one side only;
-    ///        2. this script's derivation of the domain separator reproduces what a real
-    ///           `PmmSettle` computes — this fails when the domain name, version or encoding moves;
-    ///        3. the smoke order prices the way this script says it does — this fails when the
-    ///           order is misshapen in a way `_checkOrderShape` rejects, which would otherwise be
-    ///           discovered by whoever pasted the printed command.
-    ///
-    ///      All three are answered by a `PmmSettle` instantiated **here, outside the broadcast
-    ///      window**. That instance is local to the script's own EVM: forge records nothing outside
-    ///      `startBroadcast`, so it costs no transaction, no gas and no nonce on the deployer. It
-    ///      is the only way to ask the real bytecode a question before the real bytecode is on
-    ///      chain, and asking it is worth far more than the simulation time.
-    ///
-    ///      Claim 2 is checked at the probe's *own* address, which is not the address that will be
-    ///      deployed. That is not a weakness: it is what makes the check a check of the derivation
-    ///      rather than of one value. A derivation that agrees with the contract at an arbitrary
-    ///      address agrees at every address, so `p.separator` — the same function evaluated at the
-    ///      address the deployment will land on — is then known to be right before it exists.
     function _checkEip712(Plan memory p, IPmmSettle.Order memory order, uint256 takerIn) internal {
         PmmSettle probe = new PmmSettle();
 
@@ -380,7 +224,6 @@ contract DeployRfq is DubuScript {
             "DeployRfq: this script's domain derivation disagrees with PmmSettle's"
         );
 
-        // Shape and price of the order the report is about to print a signing command for.
         (uint256 quoted, uint256 realised, uint256 decayPpm) = probe.previewFill(order, takerIn, order.expiry);
         uint256 expected = (order.makerAmount * takerIn) / order.takerAmount;
         require(quoted == expected, "DeployRfq: smoke order does not price pro-rata");
@@ -402,10 +245,6 @@ contract DeployRfq is DubuScript {
         );
     }
 
-    /// @dev What this deployment attaches to. None of it is written to — `Router` has no adapter
-    ///      registry and `PropPool` has no idea the RFQ leg exists — but a run against the wrong
-    ///      token set would approve the wrong contracts and print a smoke test that reverts, so the
-    ///      addresses are echoed and the tokens are asked what they are.
     function _printLiveStack(Assets memory a) internal view {
         console2.log("");
         console2.log("  Already live (read, never deployed, never modified)");
@@ -416,10 +255,6 @@ contract DeployRfq is DubuScript {
         _checkToken("mWBTC", a.wbtc, 8);
     }
 
-    /// @dev `decimals()` is checked rather than assumed because every amount this script prints —
-    ///      the allowance targets and both legs of the smoke order — is scaled by it. A token at
-    ///      the wrong address that happens to answer would otherwise produce a plausible,
-    ///      thousand-fold wrong order.
     function _checkToken(string memory symbol, address token, uint8 expectedDecimals) internal view {
         require(token.code.length != 0, string.concat("DeployRfq: ", symbol, " has no code at that address"));
         uint8 actual = MockERC20(token).decimals();
@@ -437,9 +272,6 @@ contract DeployRfq is DubuScript {
         _logStep("      ", string.concat(symbol, " (", vm.toString(uint256(actual)), ")"), token);
     }
 
-    /// @dev The role echo. There are no roles, and saying so explicitly is the point: a reader
-    ///      arriving from `Deploy`'s four-role preflight will look for the equivalent here and
-    ///      should find the answer rather than an absence.
     function _printTrustModel(address deployer, Plan memory p) internal pure {
         console2.log("");
         console2.log("  Roles and switches");
@@ -503,10 +335,6 @@ contract DeployRfq is DubuScript {
         }
     }
 
-    // =====================================================================
-    // Deployment
-    // =====================================================================
-
     function _deploy(Plan memory p) internal returns (address settle, address adapter) {
         if (p.deploySettle) {
             settle = address(new PmmSettle());
@@ -525,14 +353,6 @@ contract DeployRfq is DubuScript {
         }
     }
 
-    /// @dev Idempotent: an allowance already at or above the target is left alone. Re-approving
-    ///      would be harmless here — `MockERC20.approve` is a plain assignment — but it would cost
-    ///      a transaction per re-run and would make the log lie about what changed.
-    ///
-    ///      A USDT-shaped token that refuses a non-zero-to-non-zero `approve` would need a reset to
-    ///      zero first. Not written, because all three assets here are this repo's own `MockERC20`
-    ///      and a defence against a token we control the source of is a defence against nothing.
-    ///      A maker adding such a token to the quotable set has to add that step.
     function _approve(address settle, address maker, Approval[] memory approvals) internal {
         for (uint256 i; i < approvals.length; ++i) {
             Approval memory ap = approvals[i];
@@ -560,10 +380,6 @@ contract DeployRfq is DubuScript {
             );
         }
     }
-
-    // =====================================================================
-    // Report
-    // =====================================================================
 
     function _report(
         address settle,
@@ -601,17 +417,6 @@ contract DeployRfq is DubuScript {
         _printSmokeTest(settle, order, takerIn);
     }
 
-    /// @notice The handful of claims that could not be made earlier, because their subjects did not
-    ///         exist earlier.
-    ///
-    /// @dev Everything checkable before `vm.startBroadcast` was checked there — the domain
-    ///      derivation, the typehash, the token decimals, the order's shape and price, the gas
-    ///      budget. What remains is genuinely posterior: that the `CREATE`s landed where the nonce
-    ///      said they would, that the deployed instance computes the separator that was published
-    ///      for it, and that the allowances are in place. A nonce race — another transaction from
-    ///      the deployer between the preflight and the broadcast — is the realistic way the first
-    ///      one fails, and it is loud rather than silent because the signer configuration printed
-    ///      above would otherwise name an address with no code at it.
     function _confirm(address settle, address adapter, Plan memory p, Approval[] memory approvals) internal view {
         require(settle == p.settle, "DeployRfq: PmmSettle did not land at the predicted address (deployer nonce moved)");
         require(
@@ -637,8 +442,6 @@ contract DeployRfq is DubuScript {
         }
     }
 
-    /// @dev The two things a planner has to get right, restated at the address they now apply to,
-    ///      because both fail as `NothingToFill` rather than as anything that names the cause.
     function _printRouting(address adapter) internal pure {
         console2.log("");
         console2.log("  Routing through the Router");
@@ -662,18 +465,6 @@ contract DeployRfq is DubuScript {
         _rule();
     }
 
-    // =====================================================================
-    // Smoke test
-    // =====================================================================
-
-    /// @notice A copy-pasteable three-command fill: write the typed data, sign it, send it.
-    ///
-    /// @dev The typed-data JSON is not a convenience — it is the domain and the type, written out
-    ///      in the one format an independent tool will parse, so "does the signer agree with the
-    ///      chain" stops being a claim and becomes something a shell answers in ten seconds. If
-    ///      `cast wallet sign` produces a signature that `fillOrder` accepts, then the name, the
-    ///      version, the chain id, the verifying contract, the field order and every type width
-    ///      agree, all at once.
     function _printSmokeTest(address settle, IPmmSettle.Order memory o, uint256 takerIn) internal view {
         uint256 out = (o.makerAmount * takerIn) / o.takerAmount;
 
@@ -782,12 +573,6 @@ contract DeployRfq is DubuScript {
         console2.log("");
     }
 
-    /// @dev EIP-712 typed data, in the JSON shape `cast wallet sign --data` parses.
-    ///
-    ///      The member list under `Order` is the type string, spelled as JSON: the order of these
-    ///      eleven entries is load bearing and must match `IPmmSettle.Order`, `ORDER_TYPEHASH` and
-    ///      `dubu_core::rfq::ORDER_TYPE_STRING`. EIP-712 offers no independent canonicalisation, so
-    ///      four expressions of one ordering have to be edited together or not at all.
     function _printTypedData(address settle, IPmmSettle.Order memory o) internal view {
         console2.log("cat > /tmp/dubu-rfq-order.json <<'JSON'");
         console2.log("{");
@@ -860,7 +645,6 @@ contract DeployRfq is DubuScript {
         console2.log("JSON");
     }
 
-    /// @dev The same eleven fields in the positional form `cast send` wants for a tuple argument.
     function _orderTuple(IPmmSettle.Order memory o) internal pure returns (string memory) {
         return string.concat(
             "(",

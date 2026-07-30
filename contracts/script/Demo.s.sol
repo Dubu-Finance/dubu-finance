@@ -16,62 +16,10 @@ import {MintableToken} from "../src/mocks/MintableToken.sol";
 import {UniswapV2Pair} from "../src/reference/univ2/UniswapV2Pair.sol";
 import {UniswapV2Router02} from "../src/reference/univ2/UniswapV2Router02.sol";
 
-/// @title Demo — test/Integration.t.sol's comparison, executed on chain
-///
-/// ```
-/// make demo                                  # broadcast against GIWA Sepolia
-/// forge script script/Demo.s.sol:Demo \      # dry run against live chain state
-///   --rpc-url https://sepolia-rpc.giwa.io --sender 0x5AD1... -vvv
-/// ```
-///
-/// The pitch numbers have to be reproducible by a skeptic holding nothing but an RPC URL, not just
-/// by our own test suite. So this script rebuilds the integration test's fixture out of real
-/// deployed contracts and real transactions, using the same TVL, the same reference mid, the same
-/// 5 bp / 25 bp ladder and the same size sweep.
-///
-/// =====================================================================================
-/// HOW THE TWO VENUES ARE EQUALISED — the same five properties the test documents
-/// =====================================================================================
-///
-/// 1. **Identical inventory, not merely identical notional.** Both venues get the same token
-///    amounts: $10M of base and $10M of quote at the reference mid, $20M each. Equalising token
-///    amounts rather than a dollar figure removes any question about which price was used.
-///
-/// 2. **The V2 pair's spot price *is* the reference mid**, asserted before a single trade is sent.
-///    Seeded off-mid, the measured "V2 slippage" would silently include a mispricing that a real
-///    arbitrageur removes in one block, and the comparison would be rigged.
-///
-/// 3. **The reference mid is not the prop AMM's own quote.** It is a constant both venues are
-///    configured from — the prop ladder is built *around* it, the V2 pair is seeded *at* it.
-///
-/// 4. **Each size is measured from the same starting state.** The test brackets every measurement
-///    with `vm.snapshotState()`. On a real chain there is no such thing, so each measurement is
-///    followed by an explicit restore: `refreshCapacity` opens a fresh epoch on the prop AMM
-///    (which is what zeroes the used counters, and the only thing that does), and the V2 pair is
-///    burned back to dust and re-minted to the reference reserves exactly. Both restores are
-///    asserted, not assumed.
-///
-/// 5. **Fees are inside the number.** V2 charges 0.30% and the prop AMM charges no explicit fee —
-///    its spread *is* its fee. The metric is total cost to the taker versus the reference mid,
-///    which is the only comparison that means anything to a user and the one that flatters V2
-///    least. 30 of V2's basis points are the LP fee, at every size.
-///
-/// Every fill on both venues goes through the same `Router`, so no part of the difference is a
-/// wrapper artefact. The prop leg is additionally cross-checked against `getAmountOut` — the
-/// aggregator-facing view — so the number an integrator would have been quoted is provably the
-/// number that settled.
 contract Demo is DubuScript {
-    /// @notice Conservative upper bound for the preflight.
-    /// @dev A full two-market run against an empty env is 198 transactions; forge budgets
-    ///      49,549,721 gas for them at its default multiplier, cold deployment included. Measured
-    ///      on a fork of live GIWA state: 203 transactions and 13,655,800 gas actually consumed
-    ///      for the demo alone, against an already-deployed stack. Sized against *limits* rather
-    ///      than usage, for the reason `Deploy.GAS_BUDGET` documents. At the measured 0.001 gwei
-    ///      this whole budget is 0.00012 ETH.
+
     uint256 internal constant GAS_BUDGET = 120_000_000;
 
-    /// @dev Held in storage rather than threaded through every helper. A script's own storage
-    ///      costs nothing anybody pays for — it lives in the local EVM and is never broadcast.
     Deployment internal D;
     address internal me;
 
@@ -83,14 +31,9 @@ contract Demo is DubuScript {
         uint256[4] uniSell;
     }
 
-    /// @notice The demo sweep: $1k, $10k, $100k, $1M of notional, in whole quote tokens.
     function _sizes() internal pure returns (uint256[4] memory) {
         return [uint256(1_000), 10_000, 100_000, 1_000_000];
     }
-
-    // =====================================================================
-    // Entry point
-    // =====================================================================
 
     function run() external {
         me = msg.sender;
@@ -112,9 +55,6 @@ contract Demo is DubuScript {
         vm.stopBroadcast();
         D = d;
 
-        // Printed even when nothing was deployed: this script is the one people run, and a run
-        // that had to build its own stack is exactly the run whose addresses would otherwise be
-        // buried in a few hundred lines of transaction output.
         _printExports(d);
 
         _assertDemoRoles();
@@ -128,10 +68,6 @@ contract Demo is DubuScript {
         _caveats();
     }
 
-    /// @dev The demo drives all four roles: `deposit`/`sync` is the manager, `withdraw` is the
-    ///      owner, `updateQuote`/`refreshCapacity` is the updater. Splitting them is right for
-    ///      production and makes a single-key demo impossible, so say so precisely rather than
-    ///      failing later with `NotUpdater` half way through a sweep.
     function _assertDemoRoles() internal view {
         PropPool pool = PropPool(D.pool);
         if (pool.owner() == me && pool.manager() == me && pool.updater() == me) return;
@@ -143,10 +79,6 @@ contract Demo is DubuScript {
         _logStep("      ", "updater", pool.updater());
         revert("Demo: sender does not hold owner/manager/updater on this pool");
     }
-
-    // =====================================================================
-    // One market, end to end
-    // =====================================================================
 
     function _runMarket(uint256 i) internal {
         Market memory m = _market(i, D);
@@ -182,17 +114,13 @@ contract Demo is DubuScript {
         _printTable(m, s);
 
         vm.startBroadcast();
-        _seed(m); // back to the reference state before the routing pass
+        _seed(m);
         _resetProp(m, pairId);
         _routerSelection(m, pairId);
         vm.stopBroadcast();
 
         _printCapacityLimit(m, pairId);
     }
-
-    // ---------------------------------------------------------------------
-    // Seeding — both venues to the identical reference state
-    // ---------------------------------------------------------------------
 
     function _seed(Market memory m) internal {
         _approveMax(m.base, D.pool);
@@ -207,11 +135,6 @@ contract Demo is DubuScript {
         _setPoolReserve(m.quote, m.tvlQuote);
     }
 
-    /// @dev First seed goes through `UniswapV2Router02.addLiquidity`, which is the path anybody
-    ///      else adding liquidity to these pairs will use — and, with both reserves at zero, is
-    ///      exact: `_addLiquidity` returns the desired amounts untouched. Every later restore uses
-    ///      `_resetV2`, because the router's proportional-quote logic would land a few units off
-    ///      the target and the mid assertion is exact.
     function _seedV2(Market memory m) internal {
         (uint112 r0, uint112 r1,) = UniswapV2Pair(m.pair).getReserves();
         if (r0 != 0 || r1 != 0) {
@@ -227,13 +150,6 @@ contract Demo is DubuScript {
             );
     }
 
-    /// @notice Put the V2 pair back to exactly the reference reserves.
-    ///
-    /// @dev There is no way to take tokens *out* of a V2 pair except by burning liquidity, and no
-    ///      way to burn a precise amount of one side. So: burn everything the sender holds, which
-    ///      leaves only the `MINIMUM_LIQUIDITY` dust and leaves it proportional; mint the exact
-    ///      difference straight into the pair (both tokens are ours, so this is free); then `mint`,
-    ///      whose `_update` writes reserves = balances. The result is exact, and it is asserted.
     function _resetV2(Market memory m) internal {
         UniswapV2Pair pair = UniswapV2Pair(m.pair);
         (uint256 t0, uint256 t1) = _v2Targets(m);
@@ -257,11 +173,6 @@ contract Demo is DubuScript {
         require(uint256(r0) == t0 && uint256(r1) == t1, "Demo: V2 reset did not land on the reference reserves");
     }
 
-    /// @notice A fresh capacity epoch and a freshly stamped ladder.
-    /// @dev Both, every time. `refreshCapacity` is what makes the used counters read as zero
-    ///      again — a quote push deliberately does not, so that inducing price churn cannot
-    ///      restore the pool's risk budget. Re-pushing the ladder on top is what keeps a run that
-    ///      spans a few hundred sequential transactions from going stale mid-sweep.
     function _resetProp(Market memory m, uint16 pairId) internal {
         uint256[] memory packed = new uint256[](1);
         packed[0] = _packLadder(pairId, m.mid);
@@ -269,7 +180,6 @@ contract Demo is DubuScript {
         PropPool(D.pool).refreshCapacity(pairId, m.capacity, m.capacity);
     }
 
-    /// @dev Fairness is checked, not trusted — this is the assertion the whole comparison rests on.
     function _assertFairness(Market memory m) internal view {
         uint256 spot = (_v2Reserve(m, m.quote) * m.scale) / _v2Reserve(m, m.base);
         if (spot != m.mid) {
@@ -302,15 +212,11 @@ contract Demo is DubuScript {
         );
     }
 
-    // ---------------------------------------------------------------------
-    // The sweep
-    // ---------------------------------------------------------------------
-
     function _sweep(Market memory m, uint16 pairId) internal returns (Sweep memory s) {
         s.sizes = _sizes();
         for (uint256 i; i < 4; ++i) {
             uint256 quoteIn = s.sizes[i] * (10 ** uint256(m.quoteDecimals));
-            // Equivalent base notional, so the two directions are the same dollar size.
+
             uint256 baseIn = (quoteIn * m.scale) / m.mid;
 
             s.propBuy[i] = _buyCostE2(m, quoteIn, _propSwap(m.quote, m.base, quoteIn));
@@ -327,10 +233,6 @@ contract Demo is DubuScript {
         }
     }
 
-    /// @dev Exact-in against the prop AMM, cross-checked against the aggregator-facing view in the
-    ///      same script run. `getAmountOut` is the integration path third parties use; if it ever
-    ///      disagreed with what settles, every number in the table would be a quote rather than a
-    ///      fill, and so would every quote an aggregator ever served.
     function _propSwap(address tokenIn, address tokenOut, uint256 amountIn) internal returns (uint256 amountOut) {
         _ensureBalance(tokenIn, amountIn);
         require(amountIn <= uint256(type(int256).max), "Demo: size does not fit the signed amount");
@@ -338,17 +240,11 @@ contract Demo is DubuScript {
         uint256 quoted = PropPool(D.pool).getAmountOut(tokenIn, tokenOut, amountIn);
         require(quoted != 0, "Demo: prop AMM quoted zero (stale, paused, or over capacity)");
 
-        // casting to 'int256' is safe because of the bound asserted immediately above; a positive
-        // `specifiedAmount` is what selects the exact-input branch of `swap`.
-        // forge-lint: disable-next-line(unsafe-typecast)
         int256 specified = int256(amountIn);
         amountOut = PropPool(D.pool).swap(tokenIn, tokenOut, specified, 0, me, 0, block.timestamp + DEADLINE_SLACK);
         require(amountOut == quoted, "Demo: prop AMM settled away from its own quote");
     }
 
-    /// @dev The V2 leg, through the same `Router` and the same `UniV2Adapter` a routed trade uses,
-    ///      in one transaction. Doing it as a raw transfer-then-adapter pair would leave the pair
-    ///      holding unattributed tokens between two broadcast transactions.
     function _uniSwap(Market memory m, address tokenIn, address tokenOut, uint256 amountIn)
         internal
         returns (uint256 amountOut)
@@ -359,11 +255,6 @@ contract Demo is DubuScript {
         require(amountOut == quoted, "Demo: V2 settled away from the adapter's own quote");
     }
 
-    // ---------------------------------------------------------------------
-    // Routing
-    // ---------------------------------------------------------------------
-
-    /// @notice One venue, 100% of the input, through the production Router.
     function _route(Market memory m, address tokenIn, address tokenOut, uint256 amountIn, bool useProp, uint256 quoted)
         internal
         returns (uint256)
@@ -392,8 +283,6 @@ contract Demo is DubuScript {
         return Router(D.router).swapExactIn(p, 0);
     }
 
-    /// @dev `sellQuote` is quote -> base on the pool, so `reverse` is set when the input is the
-    ///      pair's quote token.
     function _propStep(Market memory m, address tokenIn) internal view returns (SwapStep memory) {
         return SwapStep({
             adapter: D.propAdapter,
@@ -403,8 +292,6 @@ contract Demo is DubuScript {
         });
     }
 
-    /// @dev `sellQuote` is token1 -> token0 on a V2 pair, so `reverse` follows the pair's own
-    ///      address ordering rather than our notion of base and quote.
     function _uniStep(Market memory m, address tokenIn) internal view returns (SwapStep memory) {
         return SwapStep({
             adapter: D.uniAdapter,
@@ -413,10 +300,6 @@ contract Demo is DubuScript {
         });
     }
 
-    /// @notice The router does no path finding — that is off-chain by design (archi_v2.md 6.2).
-    ///         So "the router picks the better venue" is demonstrated the way it actually works:
-    ///         quote both venues as the planner would, build the plan from the winner, execute it,
-    ///         and check the realised output against the quote the plan was built on.
     function _routerSelection(Market memory m, uint16 pairId) internal {
         console2.log("");
         console2.log("  Router venue selection (buying base with quote)");
@@ -445,8 +328,6 @@ contract Demo is DubuScript {
         console2.log("    chosen venue delivered than the other one would have, in bp.");
     }
 
-    /// @dev Split out of `_routerSelection` purely because the two together do not fit the EVM's
-    ///      16-slot stack without via-ir, and `via_ir` is off in this repo's default profile.
     function _logSelection(
         uint256 size,
         uint8 baseDecimals,
@@ -470,20 +351,11 @@ contract Demo is DubuScript {
         );
     }
 
-    // ---------------------------------------------------------------------
-    // The honest limit: capacity
-    // ---------------------------------------------------------------------
-
-    /// @notice Above the epoch's capacity the prop AMM does not quote a worse price — it quotes
-    ///         nothing and reverts. V2 fills any size. That is a different trade-off, not a
-    ///         strictly worse one, and the deck has to say so.
     function _printCapacityLimit(Market memory m, uint16 pairId) internal view {
         IPropPool.PairSnapshot memory s = PropPool(D.pool).snapshot(pairId);
         uint256 used = s.usedGen == s.capGen ? uint256(s.askUsed) : 0;
         uint256 room = uint256(s.askCapacity) - used;
-        // Ask capacity and usage are BASE units (PropCurve amendment 1), so the quote-denominated
-        // ceiling an ask `amountIn` is measured against is the cost of all the epoch's remaining
-        // base — not the capacity number itself.
+
         uint256 ceiling = PropCurve.amountInAsk(room, s.minAsk, s.maxAsk, s.askCapacity, used, s.priceScaleExp);
         uint256 over = ceiling + 1;
 
@@ -507,14 +379,6 @@ contract Demo is DubuScript {
         console2.log(string.concat("    univ2:     fills at ", _bps(_buyCostE2(m, over, uniOut)), " bp"));
     }
 
-    // ---------------------------------------------------------------------
-    // Slippage metric — identical to test/Integration.t.sol
-    // ---------------------------------------------------------------------
-
-    /// @notice Realised cost versus the reference mid, in basis points scaled by 100.
-    /// @dev Hundredths of a bp so the table shows two decimals with integer arithmetic. For a buy
-    ///      the effective price is `quoteIn * scale / baseOut` in the pool's price units and the
-    ///      cost is its excess over the mid; for a sell it is the shortfall. Both are positive.
     function _buyCostE2(Market memory m, uint256 quoteIn, uint256 baseOut) internal pure returns (uint256) {
         uint256 effective = (quoteIn * m.scale) / baseOut;
         return ((effective - m.mid) * 1_000_000) / m.mid;
@@ -524,10 +388,6 @@ contract Demo is DubuScript {
         uint256 effective = (quoteOut * m.scale) / baseIn;
         return ((m.mid - effective) * 1_000_000) / m.mid;
     }
-
-    // ---------------------------------------------------------------------
-    // Output
-    // ---------------------------------------------------------------------
 
     function _printTable(Market memory m, Sweep memory s) internal pure {
         console2.log("");
@@ -565,8 +425,6 @@ contract Demo is DubuScript {
         console2.log("=========================================================================");
     }
 
-    /// @notice The counterweights, printed here rather than only in the deck. A table that goes
-    ///         out without them is a table somebody else gets to correct in public.
     function _caveats() internal pure {
         console2.log("");
         _rule();
@@ -604,10 +462,6 @@ contract Demo is DubuScript {
         console2.log("");
     }
 
-    // ---------------------------------------------------------------------
-    // Small helpers
-    // ---------------------------------------------------------------------
-
     function _v2Reserve(Market memory m, address token) internal view returns (uint256) {
         (uint112 r0, uint112 r1,) = UniswapV2Pair(m.pair).getReserves();
         return token == UniswapV2Pair(m.pair).token0() ? uint256(r0) : uint256(r1);
@@ -617,7 +471,6 @@ contract Demo is DubuScript {
         return UniswapV2Pair(m.pair).token0() == m.base ? (m.tvlBase, m.tvlQuote) : (m.tvlQuote, m.tvlBase);
     }
 
-    /// @dev Mints the shortfall rather than a fixed float, so repeated runs do not compound.
     function _ensureBalance(address token, uint256 need) internal {
         uint256 have = MintableToken(token).balanceOf(me);
         if (have >= need) return;
@@ -629,9 +482,6 @@ contract Demo is DubuScript {
         MintableToken(token).approve(spender, type(uint256).max);
     }
 
-    /// @dev Exactly, in both directions. The prop AMM's price does not depend on its inventory —
-    ///      only on the ladder and the epoch counters — but the equal-TVL claim does, and it is
-    ///      asserted, so the sweep's drift has to be undone rather than tolerated.
     function _setPoolReserve(address token, uint256 target) internal {
         uint256 have = PropPool(D.pool).reserveOf(token);
         if (have == target) return;

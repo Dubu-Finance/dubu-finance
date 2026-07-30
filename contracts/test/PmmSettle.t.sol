@@ -7,14 +7,6 @@ import {PmmSettle} from "../src/PmmSettle.sol";
 import {IPmmSettle} from "../src/interfaces/IPmmSettle.sol";
 import {MockERC20} from "../src/mocks/MockERC20.sol";
 
-/*//////////////////////////////////////////////////////////////////////////////
-                                 TOKEN DOUBLES
-//////////////////////////////////////////////////////////////////////////////*/
-
-/// @notice USDT-shaped: `transfer`/`transferFrom` succeed and return **nothing**.
-/// @dev `SafeTransfer` treats empty returndata as success, and this is the token that proves it
-///      rather than the comment claiming it. It is also the shape that would break a naive
-///      `IERC20(t).transferFrom(...)`, which demands 32 bytes back.
 contract NoReturnToken is MockERC20 {
     constructor() MockERC20("NoReturn", "NRT", 18) {}
 
@@ -34,7 +26,6 @@ contract NoReturnToken is MockERC20 {
     }
 }
 
-/// @notice Returns `false` instead of reverting. The failure mode `SafeTransfer` exists for.
 contract FalseReturnToken is MockERC20 {
     constructor() MockERC20("False", "FLS", 18) {}
 
@@ -43,12 +34,6 @@ contract FalseReturnToken is MockERC20 {
     }
 }
 
-/// @notice Re-enters `PmmSettle.fillOrder` from inside `transferFrom`.
-///
-/// @dev A token is arbitrary code that `PmmSettle` calls with a live call frame and a signed
-///      order in scope. This is the only thing standing between "the guard is documented" and
-///      "the guard works". The re-entry is not wrapped in `try`, so the inner `Reentrancy()`
-///      bubbles all the way out and the outer call is what the test observes.
 contract ReentrantToken is MockERC20 {
     PmmSettle public settle;
     IPmmSettle.Order internal _order;
@@ -75,11 +60,6 @@ contract ReentrantToken is MockERC20 {
     }
 }
 
-/*//////////////////////////////////////////////////////////////////////////////
-                                     BASE
-//////////////////////////////////////////////////////////////////////////////*/
-
-/// @notice Shared fixture: one maker with a known key, two tokens, and an order builder.
 abstract contract PmmSettleBase is Test {
     PmmSettle internal settle;
     MockERC20 internal makerAsset;
@@ -92,18 +72,13 @@ abstract contract PmmSettleBase is Test {
     address internal taker = address(0x7A4E);
     address internal receiver = address(0x4EC0);
 
-    /// @dev `secp256k1n`. Used to build the malleable twin of a valid signature.
     uint256 internal constant CURVE_ORDER = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141;
 
     uint256 internal constant MAKER_SIZE = 3_000e6;
     uint256 internal constant TAKER_SIZE = 1e18;
-    /// @dev The smallest taker leg that buys at least one unit of the maker leg at this rate:
-    ///      `ceil(TAKER_SIZE / MAKER_SIZE)` is ~3.34e8, so 1e12 clears it with room to spare.
+
     uint256 internal constant MIN_SLICE = 1e12;
 
-    /// @dev `keccak256(ORDER_TYPE_STRING)`, written out so the test's own encoder does not read
-    ///      it from the contract under test. `PmmSettleEip712Test` checks it against both the
-    ///      type string and the contract.
     bytes32 internal constant TYPEHASH = 0x23e655e78a91115e92aff2d730688fc421a3773ea96b4afcd69c21acf9e8be56;
 
     function setUp() public virtual {
@@ -114,8 +89,6 @@ abstract contract PmmSettleBase is Test {
         makerAsset = new MockERC20("Maker", "MKR", 6);
         takerAsset = new MockERC20("Taker", "TKR", 18);
 
-        // The maker's standing allowance. This contract custodies nothing, so this approval is
-        // the funding model — see the note at the top of PmmSettle.
         makerAsset.mint(maker, 1_000_000e6);
         vm.prank(maker);
         makerAsset.approve(address(settle), type(uint256).max);
@@ -124,13 +97,8 @@ abstract contract PmmSettleBase is Test {
         vm.prank(taker);
         takerAsset.approve(address(settle), type(uint256).max);
 
-        // Deterministic, and comfortably past any `decayStart` the tests choose.
         vm.warp(1_800_000_000);
     }
-
-    // ---------------------------------------------------------------------
-    // Builders
-    // ---------------------------------------------------------------------
 
     function _order() internal view returns (IPmmSettle.Order memory o) {
         o = IPmmSettle.Order({
@@ -157,17 +125,6 @@ abstract contract PmmSettleBase is Test {
         return abi.encodePacked(r, s, v);
     }
 
-    /// @dev The digest, computed locally rather than by calling `settle.hashOrder`.
-    ///
-    ///      Not a style preference — a helper that makes a real external call cannot be used
-    ///      inside an armed `vm.prank` or `vm.expectRevert`, because Solidity evaluates call
-    ///      arguments after the cheatcode is set up and `hashOrder` would then be the call the
-    ///      cheatcode applies to. Every negative test in this file would silently degrade into
-    ///      "some other call did not revert". Computing it here keeps the arrangement legible and,
-    ///      because it is a second implementation, also means a `hashOrder` that drifted from the
-    ///      spec would break every fill test rather than none.
-    ///
-    ///      `PmmSettleEip712Test.test_hashOrderMatchesTheTestHelper` pins the two together.
     function _digest(IPmmSettle.Order memory o, address verifying) internal view returns (bytes32) {
         bytes32 structHash = keccak256(
             abi.encode(
@@ -197,7 +154,6 @@ abstract contract PmmSettleBase is Test {
         return keccak256(abi.encodePacked("\x19\x01", separator, structHash));
     }
 
-    /// @dev An address whose twenty bytes are all `b`, matching `[b; 20]` in the Rust mirror.
     function _addr(uint8 b) internal pure returns (address) {
         bytes20 out;
         for (uint256 i; i < 20; ++i) {
@@ -207,14 +163,8 @@ abstract contract PmmSettleBase is Test {
     }
 }
 
-/*//////////////////////////////////////////////////////////////////////////////
-                                    EIP-712
-//////////////////////////////////////////////////////////////////////////////*/
-
 contract PmmSettleEip712Test is PmmSettleBase {
-    /// @dev The literal every off-chain signer must reproduce. Duplicated here rather than
-    ///      imported from the contract on purpose: if it were read from `PmmSettle` this test
-    ///      would assert `x == x`.
+
     string internal constant TYPE_STRING = "Order(address maker,address makerAsset,address takerAsset,"
         "uint256 makerAmount,uint256 takerAmount,uint64 nonce,uint64 expiry,uint64 decayStart,"
         "uint32 decayPerSec,uint32 decayCap,uint16 minFillBps)";
@@ -223,9 +173,6 @@ contract PmmSettleEip712Test is PmmSettleBase {
         assertEq(settle.ORDER_TYPEHASH(), keccak256(bytes(TYPE_STRING)));
     }
 
-    /// @notice The exact 32 bytes `dubu_core::rfq::ORDER_TYPEHASH` holds.
-    /// @dev Written out rather than derived so the two files can be diffed by eye. A change to
-    ///      any field name, type or position moves this and fails on both sides at once.
     function test_typehashMatchesTheRustMirror() public view {
         assertEq(settle.ORDER_TYPEHASH(), 0x23e655e78a91115e92aff2d730688fc421a3773ea96b4afcd69c21acf9e8be56);
     }
@@ -243,7 +190,6 @@ contract PmmSettleEip712Test is PmmSettleBase {
         assertEq(settle.DOMAIN_SEPARATOR(), expected);
     }
 
-    /// @notice The cached separator must be abandoned when the chain forks under the contract.
     function test_domainSeparatorIsRederivedOnChainIdChange() public {
         bytes32 before = settle.DOMAIN_SEPARATOR();
         vm.chainId(block.chainid + 1);
@@ -264,8 +210,6 @@ contract PmmSettleEip712Test is PmmSettleBase {
         );
     }
 
-    /// @notice And an order signed before the fork must not be fillable after it — the actual
-    ///         consequence the re-derivation exists to produce.
     function test_signatureDoesNotSurviveAChainIdChange() public {
         IPmmSettle.Order memory o = _order();
         bytes memory sig = _sign(o);
@@ -277,7 +221,6 @@ contract PmmSettleEip712Test is PmmSettleBase {
         settle.fillOrder(o, sig, TAKER_SIZE, type(uint32).max, receiver);
     }
 
-    /// @notice Two deployments on one chain must not share signatures.
     function test_signatureIsBoundToTheVerifyingContract() public {
         IPmmSettle.Order memory o = _order();
         bytes memory sig = _sign(o);
@@ -295,7 +238,6 @@ contract PmmSettleEip712Test is PmmSettleBase {
         twin.fillOrder(o, sig, TAKER_SIZE, type(uint32).max, receiver);
     }
 
-    /// @notice The base fixture computes digests itself; this pins its encoder to the contract's.
     function test_hashOrderMatchesTheTestHelper() public view {
         assertEq(settle.hashOrder(_order()), _digest(_order(), address(settle)));
     }
@@ -321,19 +263,6 @@ contract PmmSettleEip712Test is PmmSettleBase {
         assertEq(settle.hashOrder(o), keccak256(abi.encodePacked("\x19\x01", settle.DOMAIN_SEPARATOR(), structHash)));
     }
 
-    // ---------------------------------------------------------------------
-    // The shared vectors
-    // ---------------------------------------------------------------------
-
-    /// @notice The five fixed vectors, byte-identical to `dubu_core::rfq::vectors::all()`.
-    ///
-    /// @dev Neither side computes these; both assert them. That is the only arrangement under
-    ///      which they are evidence rather than a tautology.
-    ///
-    ///      The digest is checked against a *literal* domain separator built from the vector's
-    ///      chain id and verifying contract rather than against `settle.DOMAIN_SEPARATOR()`,
-    ///      because the vectors deliberately name chains and addresses this test is not deployed
-    ///      on — including chain id `0` and `type(uint64).max`, which `vm.chainId` will not accept.
     function test_eip712VectorsMatchTheRustMirror() public view {
         _checkVector(
             "zero",
@@ -407,9 +336,6 @@ contract PmmSettleEip712Test is PmmSettleBase {
             0xf4a14b260933d10c42a3e7f80909e898e396b8e92accc08c1c72466797bb581e
         );
 
-        // Identical to `weth_usdc` but for one `uint16`. If the narrowest member were dropped
-        // from `encodeData` the two would collide, and the assertion below would still pass on
-        // both — which is why the collision itself is checked separately.
         _checkVector(
             "weth_usdc_min_fill",
             _vectorWethUsdc(1),
@@ -486,10 +412,6 @@ contract PmmSettleEip712Test is PmmSettleBase {
     }
 }
 
-/*//////////////////////////////////////////////////////////////////////////////
-                                  SIGNATURES
-//////////////////////////////////////////////////////////////////////////////*/
-
 contract PmmSettleSignatureTest is PmmSettleBase {
     function test_validSignatureFills() public {
         IPmmSettle.Order memory o = _order();
@@ -507,8 +429,6 @@ contract PmmSettleSignatureTest is PmmSettleBase {
         settle.fillOrder(o, _signWith(OTHER_PK, o), TAKER_SIZE, type(uint32).max, receiver);
     }
 
-    /// @notice Every signed field, one at a time. A field that fell out of `encodeData` would
-    ///         let the corresponding mutation through, and this is the test that would catch it.
     function test_everySignedFieldIsCovered() public {
         IPmmSettle.Order memory signed = _order();
         bytes memory sig = _sign(signed);
@@ -528,8 +448,7 @@ contract PmmSettleSignatureTest is PmmSettleBase {
             else tampered.minFillBps = 1;
 
             vm.prank(taker);
-            // `maker` is the recovery target, so tampering with it yields "recovered someone
-            // else" just like the rest; every mutation lands on the same error.
+
             vm.expectRevert(PmmSettle.BadSignature.selector);
             settle.fillOrder(tampered, sig, 1e17, type(uint32).max, receiver);
         }
@@ -557,15 +476,13 @@ contract PmmSettleSignatureTest is PmmSettleBase {
         settle.fillOrder(o, "", TAKER_SIZE, type(uint32).max, receiver);
     }
 
-    /// @notice The high-`s` twin of a valid signature recovers the same address and is rejected.
     function test_malleableSignatureReverts() public {
         IPmmSettle.Order memory o = _order();
         (uint8 v, bytes32 r, bytes32 s) = vm.sign(MAKER_PK, settle.hashOrder(o));
 
         bytes32 flippedS = bytes32(CURVE_ORDER - uint256(s));
         uint8 flippedV = v == 27 ? 28 : 27;
-        // Sanity: the twin really is a valid signature by the same maker. Without this the test
-        // could pass because the twin is simply garbage.
+
         assertEq(ecrecover(settle.hashOrder(o), flippedV, r, flippedS), maker);
 
         vm.prank(taker);
@@ -585,17 +502,14 @@ contract PmmSettleSignatureTest is PmmSettleBase {
         }
     }
 
-    /// @notice A signature `ecrecover` cannot resolve returns `address(0)`; it must not match.
     function test_unrecoverableSignatureReverts() public {
         IPmmSettle.Order memory o = _order();
-        // `r == 0` is not a point on the curve, so `ecrecover` yields the zero address.
+
         vm.prank(taker);
         vm.expectRevert(PmmSettle.BadSignature.selector);
         settle.fillOrder(o, abi.encodePacked(bytes32(0), bytes32(uint256(1)), uint8(27)), 1e17, 0, receiver);
     }
 
-    /// @notice Anyone may present a signature — with their own tokens. The maker is unharmed,
-    ///         which is why this is a documented property rather than a bug.
     function test_anyoneCanFillButPaysThemselves() public {
         IPmmSettle.Order memory o = _order();
         address stranger = address(0xDEAD01);
@@ -611,10 +525,6 @@ contract PmmSettleSignatureTest is PmmSettleBase {
         assertEq(takerAsset.balanceOf(maker), TAKER_SIZE);
     }
 }
-
-/*//////////////////////////////////////////////////////////////////////////////
-                              EXPIRY & CANCELLATION
-//////////////////////////////////////////////////////////////////////////////*/
 
 contract PmmSettleLifetimeTest is PmmSettleBase {
     function test_fillAtExactExpirySucceeds() public {
@@ -652,8 +562,6 @@ contract PmmSettleLifetimeTest is PmmSettleBase {
         settle.fillOrder(o, sig, TAKER_SIZE, type(uint32).max, receiver);
     }
 
-    /// @notice Cancellation kills a partly filled order too — the remaining size is forfeited,
-    ///         which is exactly what a kill switch is supposed to do.
     function test_cancelKillsAPartlyFilledOrder() public {
         IPmmSettle.Order memory o = _order();
         bytes memory sig = _sign(o);
@@ -670,16 +578,13 @@ contract PmmSettleLifetimeTest is PmmSettleBase {
         settle.fillOrder(o, sig, TAKER_SIZE / 2, type(uint32).max, receiver);
     }
 
-    /// @notice The whole point of a shared nonce: one `SSTORE` retires a streamed quote's
-    ///         siblings along with it.
     function test_cancelNonceKillsEverySiblingSharingIt() public {
         IPmmSettle.Order memory a = _order();
         IPmmSettle.Order memory b = _order();
-        b.makerAmount = MAKER_SIZE + 1; // a different order, same nonce
+        b.makerAmount = MAKER_SIZE + 1;
         bytes memory sigA = _sign(a);
         bytes memory sigB = _sign(b);
 
-        // Independent accounting while both are live.
         assertEq(settle.remainingTaker(a), TAKER_SIZE);
         assertEq(settle.remainingTaker(b), TAKER_SIZE);
 
@@ -695,7 +600,6 @@ contract PmmSettleLifetimeTest is PmmSettleBase {
         settle.fillOrder(b, sigB, 1e17, type(uint32).max, receiver);
     }
 
-    /// @notice A fully consumed order does NOT burn its nonce, precisely so its siblings live on.
     function test_fullFillDoesNotBurnTheNonce() public {
         IPmmSettle.Order memory a = _order();
         vm.prank(taker);
@@ -715,8 +619,7 @@ contract PmmSettleLifetimeTest is PmmSettleBase {
         settle.cancelNonceSlot(0, type(uint256).max);
 
         for (uint256 i; i < 256; ++i) {
-            // casting to 'uint64' is safe because the loop bound is 256
-            // forge-lint: disable-next-line(unsafe-typecast)
+
             assertTrue(settle.isNonceCancelled(maker, uint64(i)));
         }
         assertFalse(settle.isNonceCancelled(maker, 256));
@@ -733,8 +636,6 @@ contract PmmSettleLifetimeTest is PmmSettleBase {
         settle.fillOrder(o, _sign(o), TAKER_SIZE, type(uint32).max, receiver);
     }
 
-    /// @notice Idempotent, by design: a maker tripping a kill switch does not know which quotes
-    ///         are already dead, and a revert would abort the batch and leave live ones standing.
     function test_cancellingTwiceIsANoOp() public {
         vm.startPrank(maker);
         settle.cancelNonce(9);
@@ -753,10 +654,6 @@ contract PmmSettleLifetimeTest is PmmSettleBase {
     }
 }
 
-/*//////////////////////////////////////////////////////////////////////////////
-                            PARTIAL FILLS & REPLAY
-//////////////////////////////////////////////////////////////////////////////*/
-
 contract PmmSettlePartialFillTest is PmmSettleBase {
     function test_remainingStartsFullAndTracksEveryFill() public {
         IPmmSettle.Order memory o = _order();
@@ -773,8 +670,6 @@ contract PmmSettlePartialFillTest is PmmSettleBase {
         assertEq(settle.remainingTaker(o), 0);
     }
 
-    /// @notice The headline property: a sequence of partial fills sums to exactly the order size
-    ///         and **not one unit more**.
     function test_partialFillsSumToTheOrderSizeAndNotOneUnitMore() public {
         IPmmSettle.Order memory o = _order();
         bytes memory sig = _sign(o);
@@ -806,7 +701,6 @@ contract PmmSettlePartialFillTest is PmmSettleBase {
         vm.expectRevert(abi.encodeWithSelector(PmmSettle.FillExceedsRemaining.selector, 4e17 + 1, 4e17));
         settle.fillOrder(o, sig, 4e17 + 1, type(uint32).max, receiver);
 
-        // ...and the exact remainder still works, so the revert was a bound and not a fence.
         vm.prank(taker);
         settle.fillOrder(o, sig, 4e17, type(uint32).max, receiver);
     }
@@ -823,7 +717,6 @@ contract PmmSettlePartialFillTest is PmmSettleBase {
         settle.fillOrder(o, sig, TAKER_SIZE, type(uint32).max, receiver);
     }
 
-    /// @notice One quote, several takers. This is what caveat 2 asked for.
     function test_oneQuoteServesSeveralTakers() public {
         IPmmSettle.Order memory o = _order();
         bytes memory sig = _sign(o);
@@ -840,8 +733,6 @@ contract PmmSettlePartialFillTest is PmmSettleBase {
         assertEq(settle.remainingTaker(o), TAKER_SIZE - 9e17);
     }
 
-    /// @notice Two orders differing only in the nonce have independent accounting, because the
-    ///         key is the digest and the nonce is inside it.
     function test_ordersDifferingOnlyInNonceAccountSeparately() public {
         IPmmSettle.Order memory a = _order();
         IPmmSettle.Order memory b = _order();
@@ -856,14 +747,8 @@ contract PmmSettlePartialFillTest is PmmSettleBase {
         settle.fillOrder(b, _sign(b), TAKER_SIZE, type(uint32).max, receiver);
     }
 
-    /// @notice Splitting can never draw more maker asset than filling whole, and the shortfall is
-    ///         bounded by one unit per extra piece. Same statement, same bound and same direction
-    ///         as `PropCurve`'s splitting note.
     function testFuzz_splittingNeverBeatsAWholeFill(uint96 a, uint96 b, uint96 c) public {
-        // Bounded below by MIN_SLICE rather than by 1. At this rate a taker leg under
-        // `ceil(TAKER_SIZE / MAKER_SIZE)` buys zero maker units and is rejected outright by
-        // `NothingDelivered`, which is correct behaviour and simply not what this property is
-        // about; bounding is honest where a `vm.assume` on the same condition would be noise.
+
         uint256 s1 = bound(uint256(a), MIN_SLICE, TAKER_SIZE / 3);
         uint256 s2 = bound(uint256(b), MIN_SLICE, TAKER_SIZE / 3);
         uint256 s3 = bound(uint256(c), MIN_SLICE, TAKER_SIZE / 3);
@@ -884,7 +769,6 @@ contract PmmSettlePartialFillTest is PmmSettleBase {
         assertEq(settle.remainingTaker(o), TAKER_SIZE - s1 - s2 - s3);
     }
 
-    /// @notice However an order is decomposed, the maker never pays out more than `makerAmount`.
     function testFuzz_totalMakerLegNeverExceedsTheOrder(uint8 pieces, uint96 seed) public {
         uint256 n = (uint256(pieces) % 8) + 1;
         IPmmSettle.Order memory o = _order();
@@ -893,8 +777,7 @@ contract PmmSettlePartialFillTest is PmmSettleBase {
         uint256 remaining = TAKER_SIZE;
         uint256 paid;
         for (uint256 i; i < n; ++i) {
-            // Every piece is at least MIN_SLICE, and enough is held back for the pieces still to
-            // come, so the decomposition always reaches exactly `TAKER_SIZE` in exactly `n` fills.
+
             uint256 slice = i + 1 == n
                 ? remaining
                 : bound(uint256(keccak256(abi.encode(seed, i))), MIN_SLICE, remaining - (n - 1 - i) * MIN_SLICE);
@@ -908,18 +791,14 @@ contract PmmSettlePartialFillTest is PmmSettleBase {
     }
 }
 
-/*//////////////////////////////////////////////////////////////////////////////
-                                     DECAY
-//////////////////////////////////////////////////////////////////////////////*/
-
 contract PmmSettleDecayTest is PmmSettleBase {
     uint64 internal decayStart;
 
     function _decaying() internal view returns (IPmmSettle.Order memory o) {
         o = _order();
         o.decayStart = decayStart;
-        o.decayPerSec = 1_000; // 0.1% per second
-        o.decayCap = 50_000; // 5%
+        o.decayPerSec = 1_000;
+        o.decayCap = 50_000;
         o.expiry = decayStart + 3600;
     }
 
@@ -937,9 +816,6 @@ contract PmmSettleDecayTest is PmmSettleBase {
         assertEq(settle.fillOrder(o, _sign(o), TAKER_SIZE, 0, receiver), MAKER_SIZE);
     }
 
-    /// @notice Exactly at `decayStart` the decay is still zero. The boundary is `<=`, and it is
-    ///         pinned because "the quote is firm until T" and "the quote is firm before T" differ
-    ///         by one second that a maker cannot see in production.
     function test_noDecayExactlyAtStart() public {
         IPmmSettle.Order memory o = _decaying();
         assertEq(settle.decayPpmAt(o, decayStart), 0);
@@ -972,9 +848,6 @@ contract PmmSettleDecayTest is PmmSettleBase {
         assertEq(out, (MAKER_SIZE * (1e6 - 50_000)) / 1e6);
     }
 
-    /// @notice `decayPpmAt` is `pure` and takes a caller-chosen timestamp, so absurd input is
-    ///         reachable rather than hypothetical. It must answer, not panic — an aggregator
-    ///         batching previews cannot have one order take the whole multicall down.
     function test_decayPpmAtIsTotalForAbsurdTimestamps() public view {
         IPmmSettle.Order memory o = _decaying();
         assertEq(settle.decayPpmAt(o, type(uint256).max), 50_000);
@@ -1008,7 +881,6 @@ contract PmmSettleDecayTest is PmmSettleBase {
         settle.previewFill(o, TAKER_SIZE, block.timestamp);
     }
 
-    /// @notice The taker's half of caveat 1: bound the decay, or revert.
     function test_maxDecayPpmBoundsTheFill() public {
         IPmmSettle.Order memory o = _decaying();
         bytes memory sig = _sign(o);
@@ -1018,13 +890,10 @@ contract PmmSettleDecayTest is PmmSettleBase {
         vm.expectRevert(abi.encodeWithSelector(PmmSettle.DecayTooHigh.selector, 3_000, 2_999));
         settle.fillOrder(o, sig, TAKER_SIZE, 2_999, receiver);
 
-        // Equality is accepted: the bound is a ceiling, not a strict one.
         vm.prank(taker);
         settle.fillOrder(o, sig, TAKER_SIZE, 3_000, receiver);
     }
 
-    /// @notice The decay is a function of time only — it does not deepen as the order is
-    ///         consumed, so an early fill is never made worse by a later one.
     function test_decayDoesNotDependOnHowMuchIsAlreadyFilled() public {
         IPmmSettle.Order memory o = _decaying();
         bytes memory sig = _sign(o);
@@ -1037,7 +906,6 @@ contract PmmSettleDecayTest is PmmSettleBase {
         assertEq(first, second);
     }
 
-    /// @notice Rounding goes to the maker: one `floor`, applied to the result and not the cut.
     function test_decayRoundsInTheMakersFavour() public {
         IPmmSettle.Order memory o = _decaying();
         o.makerAmount = 1_001;
@@ -1045,8 +913,6 @@ contract PmmSettleDecayTest is PmmSettleBase {
         bytes memory sig = _sign(o);
         vm.warp(decayStart + 1);
 
-        // quoted = floor(1001 * 999 / 1000) = 999; realised = floor(999 * 999000 / 1e6) = 998.
-        // The alternative form, `999 - floor(999 * 1000 / 1e6)`, would give 999.
         vm.prank(taker);
         assertEq(settle.fillOrder(o, sig, 999, type(uint32).max, receiver), 998);
     }
@@ -1074,21 +940,8 @@ contract PmmSettleDecayTest is PmmSettleBase {
     }
 }
 
-/*//////////////////////////////////////////////////////////////////////////////
-                       THE SETTLEMENT FLOOR — CAVEAT 3
-//////////////////////////////////////////////////////////////////////////////*/
-
 contract PmmSettleFloorTest is PmmSettleBase {
-    /// @notice The regression test for caveat 3, written as the forked design's own numbers.
-    ///
-    /// @dev An order with a 60% floor and the maximum 5% decay. A 63% fill quotes 630 of a
-    ///      1000-unit maker leg, which clears 600 — so under the forked ordering, where the floor
-    ///      is checked before the decay, this fill is accepted and then delivers
-    ///      `floor(630 * 0.95) = 598`, i.e. 59.8% of an order advertising a 60% minimum. That is
-    ///      the "effective minimum delivery is 57%" arithmetic archi_v2 §4.6 recorded.
-    ///
-    ///      Checking after the decay rejects it. If someone hoists the floor above the decay, this
-    ///      is the test that fails and nothing else in this repo does.
+
     function test_floorIsAppliedAfterTheDecayNotBefore() public {
         IPmmSettle.Order memory o = _order();
         o.makerAmount = 1_000;
@@ -1102,8 +955,7 @@ contract PmmSettleFloorTest is PmmSettleBase {
 
         vm.warp(uint256(o.decayStart) + 1);
         (uint256 quoted, uint256 realised, uint256 decayPpm) = settle.previewFill(o, 630, block.timestamp);
-        // The pre-decay amount clears the floor and the post-decay amount does not. Without that
-        // gap the test would prove nothing about the ordering.
+
         assertEq(decayPpm, 50_000);
         assertEq(quoted, 630);
         assertEq(realised, 598);
@@ -1114,8 +966,6 @@ contract PmmSettleFloorTest is PmmSettleBase {
         settle.fillOrder(o, sig, 630, type(uint32).max, receiver);
     }
 
-    /// @notice The same order, same size, filled before the decay starts: accepted. So the revert
-    ///         above is the decay's doing and not the floor rejecting a legitimate size.
     function test_theSameFillClearsTheFloorWithNoDecay() public {
         IPmmSettle.Order memory o = _order();
         o.makerAmount = 1_000;
@@ -1141,10 +991,6 @@ contract PmmSettleFloorTest is PmmSettleBase {
         settle.fillOrder(o, _sign(o), 599, type(uint32).max, receiver);
     }
 
-    /// @notice "All of it at the price I quoted, or nothing" — and, because the check is after
-    ///         the decay, such an order genuinely becomes unfillable once the decay bites. That
-    ///         is the correct reading of a 100% floor, and the ordering the fork inherited broke
-    ///         it silently.
     function test_aFullSizeFloorIsUnfillableOnceTheDecayBites() public {
         IPmmSettle.Order memory o = _order();
         o.makerAmount = 1_000;
@@ -1168,8 +1014,6 @@ contract PmmSettleFloorTest is PmmSettleBase {
         settle.fillOrder(twin, twinSig, 1_000, type(uint32).max, receiver);
     }
 
-    /// @notice Zero disables it, which is what a streamed quote wants — the forked design's
-    ///         hard-coded 60% is precisely what made its orders one-shot.
     function test_zeroMinFillBpsPermitsDustSizedFills() public {
         IPmmSettle.Order memory o = _order();
         assertEq(o.minFillBps, 0);
@@ -1186,10 +1030,6 @@ contract PmmSettleFloorTest is PmmSettleBase {
     }
 }
 
-/*//////////////////////////////////////////////////////////////////////////////
-                        THE EVENT — THE ANTI-SPOOFING RECORD
-//////////////////////////////////////////////////////////////////////////////*/
-
 contract PmmSettleEventTest is PmmSettleBase {
     function test_orderFilledRecordsQuotedNextToRealised() public {
         IPmmSettle.Order memory o = _order();
@@ -1204,8 +1044,7 @@ contract PmmSettleEventTest is PmmSettleBase {
 
         uint256 quoted = (MAKER_SIZE * slice) / TAKER_SIZE;
         uint256 realised = (quoted * (1e6 - 12_000)) / 1e6;
-        // The gap is the whole point of the event: if these were equal the assertion would be
-        // vacuous, so the test insists there is something to record.
+
         assertGt(quoted, realised);
 
         vm.expectEmit(true, true, true, true, address(settle));
@@ -1226,8 +1065,6 @@ contract PmmSettleEventTest is PmmSettleBase {
         assertEq(settle.fillOrder(o, sig, slice, type(uint32).max, receiver), realised);
     }
 
-    /// @notice With no decay the two fields are equal, which is the baseline an indexer
-    ///         differences against.
     function test_quotedEqualsRealisedWhenNothingDecayed() public {
         IPmmSettle.Order memory o = _order();
 
@@ -1256,10 +1093,6 @@ contract PmmSettleEventTest is PmmSettleBase {
         settle.cancelNonce(5);
     }
 }
-
-/*//////////////////////////////////////////////////////////////////////////////
-                         SHAPE VALIDATION & BAD TOKENS
-//////////////////////////////////////////////////////////////////////////////*/
 
 contract PmmSettleGuardTest is PmmSettleBase {
     function test_zeroReceiverReverts() public {
@@ -1312,8 +1145,6 @@ contract PmmSettleGuardTest is PmmSettleBase {
         _expectShapeRevert(o, PmmSettle.AmountOutOfDomain.selector);
     }
 
-    /// @notice The preview and the fill must agree on which orders exist, or a taker is shown a
-    ///         price no transaction can realise.
     function test_previewRejectsExactlyWhatTheFillRejects() public {
         IPmmSettle.Order memory o = _order();
         o.makerAsset = o.takerAsset;
@@ -1332,8 +1163,6 @@ contract PmmSettleGuardTest is PmmSettleBase {
         settle.previewFill(o, uint256(type(uint128).max) + 1, block.timestamp);
     }
 
-    /// @notice A fill too small to buy one unit of the maker leg takes the taker's tokens and
-    ///         delivers nothing. It must revert instead.
     function test_aFillThatDeliversNothingReverts() public {
         IPmmSettle.Order memory o = _order();
         o.makerAmount = 1;
@@ -1354,12 +1183,6 @@ contract PmmSettleGuardTest is PmmSettleBase {
         settle.fillOrder(o, _sign(o), TAKER_SIZE, type(uint32).max, receiver);
     }
 
-    // ---------------------------------------------------------------------
-    // Tokens
-    // ---------------------------------------------------------------------
-
-    /// @notice A token that returns nothing settles, because `SafeTransfer` reads empty
-    ///         returndata as success.
     function test_usdtShapedTokenSettles() public {
         NoReturnToken quiet = new NoReturnToken();
         quiet.mint(maker, 1_000e18);
@@ -1375,7 +1198,6 @@ contract PmmSettleGuardTest is PmmSettleBase {
         assertEq(quiet.balanceOf(receiver), 500e18);
     }
 
-    /// @notice A token that returns `false` instead of reverting must not be read as success.
     function test_tokenReturningFalseReverts() public {
         FalseReturnToken liar = new FalseReturnToken();
         liar.mint(maker, 1_000e18);
@@ -1389,8 +1211,6 @@ contract PmmSettleGuardTest is PmmSettleBase {
         settle.fillOrder(o, _sign(o), TAKER_SIZE, type(uint32).max, receiver);
     }
 
-    /// @notice An address with no code answers every call successfully with empty returndata.
-    ///         Without the `extcodesize` check that would read as a settled transfer.
     function test_codelessAssetReverts() public {
         IPmmSettle.Order memory o = _order();
         o.makerAsset = address(0xC0DE1E55);
@@ -1399,10 +1219,6 @@ contract PmmSettleGuardTest is PmmSettleBase {
         vm.expectRevert(bytes4(keccak256("TransferFromFailed()")));
         settle.fillOrder(o, _sign(o), TAKER_SIZE, type(uint32).max, receiver);
     }
-
-    // ---------------------------------------------------------------------
-    // Reentrancy
-    // ---------------------------------------------------------------------
 
     function test_reentrancyThroughTheTakerAssetReverts() public {
         ReentrantToken evil = new ReentrantToken();
@@ -1437,8 +1253,6 @@ contract PmmSettleGuardTest is PmmSettleBase {
         settle.fillOrder(o, sig, TAKER_SIZE, type(uint32).max, receiver);
     }
 
-    /// @notice Disarmed, the same token settles — so the revert above is the guard and not the
-    ///         token simply being broken.
     function test_theSameTokenSettlesWhenItDoesNotReenter() public {
         ReentrantToken quiet = new ReentrantToken();
         quiet.mint(maker, 1_000e18);

@@ -10,98 +10,21 @@ import {PropPool} from "../src/PropPool.sol";
 import {IPropPool} from "../src/interfaces/IPropPool.sol";
 import {MintableToken} from "../src/mocks/MintableToken.sol";
 
-/// @title Simulate — MODE 2: the taker-flow model, against the LIVE GIWA Sepolia pool
-///
-/// ```
-/// make simulate-dry     # sends nothing, needs no key, still executes everything locally
-/// make simulate         # broadcasts; refuses to unless SIMULATE_BROADCAST=1
-/// ```
-///
-/// MODE 1 is `test/Simulation.t.sol`: a scripted reference path, an in-EVM pool, three taker
-/// populations, and markout at +1/+10/+60 seconds. It is deterministic, free, and it is the mode
-/// that belongs in CI. **Read it first — it is where the answer is.** This file is the other
-/// half: the same `FlowModel`, pointed at real deployed state.
-///
-/// **MODE 1 has a sub-second model clock; this file has no clock at all.** `FlowModel.Params.tickMs`
-/// drives MODE 1's reference path, arrivals and latencies at 200 ms, which is what lets it answer
-/// questions about flashblock-speed requoting. Nothing here is affected: a script sees exactly one
-/// block and one reference price, so it has no time axis to make finer. The `FlowModel` entry
-/// points this file uses — the sizing solvers, `edges`, `room`, `fillableRoom`, `value` — are all
-/// functions of state rather than of time, and they are the same functions at either resolution.
-/// Where a latency does show up in this file's output it is the LIVE ladder's age in whole
-/// seconds, read off `block.timestamp - updatedAt`, and that is a real chain quantity rather than
-/// a modelled one.
-///
-/// =====================================================================================
-/// WHAT THIS MODE CAN AND CANNOT DO, STATED BEFORE THE OUTPUT RATHER THAN AFTER
-/// =====================================================================================
-///
-/// **It cannot produce markout.** Markout is the fill re-marked at the reference *later*, and a
-/// script cannot see later. There is exactly one reference price available inside one script
-/// run, so every markout horizon would return the realised spread again and the column would be
-/// a decoration. It is therefore not printed. What is printed instead is a `FILL` line per
-/// execution carrying the block, the pair, both legs and the reference used, so a markout can be
-/// computed afterwards by joining against a price feed at `t+h`. That join is the honest way to
-/// get the number on chain, and it needs a database rather than a script.
-///
-/// **It cannot invent a reference.** `SIM_REF_1` / `SIM_REF_2` supply one, in cents of quote per
-/// whole base. Left unset, the script falls back to the midpoint of the pool's own ladder and
-/// says so in capital letters, because at that point every edge it reports is zero **by
-/// construction** and the run measures execution mechanics only — the exact defect
-/// `DEPLOYMENTS.md` already lists as caveat 4 on the demo table.
-///
-/// **What it does do that MODE 1 cannot:** report the free option the live pool is writing
-/// *right now*, at the operator's stated reference. That is a real measurement of real state:
-/// how stale the ladder is, how far the executable top sits from fair, how much base an
-/// arbitrageur could lift before the edge runs out, and what that is worth in dollars. If the
-/// updater bot is healthy the answer is "nothing, the quote is inside a basis point". If it has
-/// fallen over, this is the number that says how much that is costing per minute.
-///
-/// =====================================================================================
-/// WHAT IT TOUCHES
-/// =====================================================================================
-///
-/// This script is a **taker and nothing else**. It never calls `updateQuote`, `refreshCapacity`,
-/// `deposit`, `withdraw`, `pause` or `addPair`, and it needs none of the four roles. That is
-/// deliberate: `dubu-updater` may be running against this pool, and a script that reset the
-/// epoch underneath it would corrupt the very state it is trying to measure.
-///
-/// It does consume the live pool's capacity and move its inventory, which is a real side effect
-/// on a live demo. The broadcast path prints exactly what it will spend and what it will mint
-/// before it spends or mints anything, and refuses to run at all without `SIMULATE_BROADCAST=1`.
 contract Simulate is DubuScript {
-    /// @notice Conservative upper bound for the preflight, in *gas limits* rather than gas used.
-    /// @dev A full two-market run at the default 12 fills per market is ~60 transactions: two
-    ///      approvals and a mint plus a swap per fill. A swap on this pool measured 114k-151k
-    ///      (see `PropPool.addPair`'s table) and a mint is ~50k. Sized against limits at the
-    ///      Makefile's 200% multiplier, with room to raise `SIM_FILLS`.
-    uint256 internal constant GAS_BUDGET = 40_000_000;
 
-    // ---------------------------------------------------------------------
-    // The live deployment, from DEPLOYMENTS.md
-    //
-    // Hardcoded as *defaults* so `make simulate-dry` works against the real pool with no .env at
-    // all, which is the point of a dry run somebody else can reproduce. Every one is overridable
-    // by the same env var `Deploy` and `Demo` use.
-    // ---------------------------------------------------------------------
+    uint256 internal constant GAS_BUDGET = 40_000_000;
 
     address internal constant LIVE_POOL = 0xBbE55E29BbC6d71EcAb1ac011c9Ac5206aB2Fe74;
     address internal constant LIVE_MUSDC = 0xd28596C6750D87C53EA146134AfAB53de86C5155;
     address internal constant LIVE_MWETH = 0x81e46C6379498beBEB5DCcD47ab2DdFaf967d445;
     address internal constant LIVE_MWBTC = 0x3548991B5EF2D7805EFa95bEa6CeDeAee3869875;
 
-    /// @dev Held in storage for the same reason `Demo` does it: a script's own storage lives in
-    ///      the local EVM, costs nobody anything, and keeps these helpers off the stack.
     Deployment internal D;
     address internal me;
     bool internal broadcasting;
 
-    /// @notice Whether the reference came from an operator or from the pool's own book.
-    /// @dev When false, every edge below is zero by construction. Carried as state so the
-    ///      warning can be repeated next to the numbers it invalidates, not only at the top.
     bool internal refIsExternal;
 
-    /// @notice One market's live diagnosis.
     struct Live {
         uint16 pairId;
         bool quotable;
@@ -111,7 +34,6 @@ contract Simulate is DubuScript {
         uint256 scale;
     }
 
-    /// @notice Running totals for the executed flow.
     struct Tally {
         uint256 fills;
         uint256 declined;
@@ -120,10 +42,6 @@ contract Simulate is DubuScript {
         uint256 quoteToMint;
         uint256 baseToMint;
     }
-
-    // =====================================================================
-    // Entry point
-    // =====================================================================
 
     function run() external {
         me = msg.sender;
@@ -169,13 +87,6 @@ contract Simulate is DubuScript {
         _rule();
     }
 
-    // =====================================================================
-    // Resolution — read only, and it never deploys anything
-    // =====================================================================
-
-    /// @dev Deliberately NOT `DubuScript._deployStack`, which deploys whatever env leaves unset.
-    ///      A simulator that quietly stands up its own pool when it cannot find the live one
-    ///      would report a healthy book for a deployment that is down.
     function _resolveDeployment() internal view returns (Deployment memory d) {
         d.mUsdc = _envAddr("MUSDC", LIVE_MUSDC);
         d.mWeth = _envAddr("MWETH", LIVE_MWETH);
@@ -204,11 +115,6 @@ contract Simulate is DubuScript {
         );
     }
 
-    // =====================================================================
-    // One market
-    // =====================================================================
-
-    /// @return quotable whether the pool could quote this market at all.
     function _runMarket(uint256 i) internal returns (bool quotable) {
         Live memory L = _diagnose(i);
 
@@ -229,13 +135,6 @@ contract Simulate is DubuScript {
         return true;
     }
 
-    /// @notice Why the pool cannot fill, named precisely, instead of a revert three calls later.
-    ///
-    /// @dev The order mirrors `PropPool._load` plus the two conditions that live outside it
-    ///      (an exhausted epoch and an empty reserve), so the answer is the contract's own and
-    ///      not a guess. The zero-capacity arm is the one this exists for: `dubu-updater`
-    ///      withdraws capacity on shutdown, which leaves a pool that has a perfectly valid
-    ///      ladder posted and still quotes nothing.
     function _diagnose(uint256 i) internal returns (Live memory L) {
         (address base, address quote) = _tokensOf(i);
         (L.pairId,) = PropPool(D.pool).pairIdFor(base, quote);
@@ -304,21 +203,6 @@ contract Simulate is DubuScript {
         console2.log("  and a simulator that quotes its own book is measuring itself.");
     }
 
-    // ---------------------------------------------------------------------
-    // The reference
-    // ---------------------------------------------------------------------
-
-    /// @notice The reference price in the pair's own price units.
-    ///
-    /// @dev `SIM_REF_<pairId>` is read in **cents of quote per whole base**, so $1,943.82 is
-    ///      `194382`. Cents rather than whole tokens because ETH is never a round number and a
-    ///      reference rounded to the dollar is a 0.5 bp error at $2,000 — a tenth of the spread
-    ///      this whole exercise is about.
-    ///
-    ///      With it unset the fallback is the midpoint of the pool's own posted ladder, which
-    ///      makes every edge below exactly the half-spread and every "how wrong is the quote"
-    ///      answer zero **by construction**. That is not a usable measurement of adverse
-    ///      selection and the output says so wherever it matters.
     function _referenceFor(uint256 i, IPropPool.PairSnapshot memory s)
         internal
         view
@@ -333,14 +217,8 @@ contract Simulate is DubuScript {
             return (ref, true);
         }
 
-        // The ladder's own midpoint. `maxBid` and `minAsk` straddle it symmetrically for any
-        // ladder this repo's builders produce.
         return ((uint256(s.maxBid) + uint256(s.minAsk)) / 2, false);
     }
-
-    // ---------------------------------------------------------------------
-    // Section A — the free option the pool is writing right now
-    // ---------------------------------------------------------------------
 
     function _printExposure(uint256 i, Live memory L) internal view {
         (address base, address quote) = _tokensOf(i);
@@ -413,18 +291,12 @@ contract Simulate is DubuScript {
         );
     }
 
-    /// @notice What an arbitrageur could take out of this pool right now, and what it is worth.
-    ///
-    /// @dev The same solver `test/Simulation.t.sol` gives its informed population, pointed at
-    ///      live state. It is the number the whole exercise exists to produce and the only one in
-    ///      this file that could not have come from a unit test.
     function _printFreeOption(uint256 i, Live memory L, IPropPool.PairSnapshot memory s, int256 bidEdge, int256 askEdge)
         internal
         view
     {
-        uint256 costE2 = _envUint("SIM_INFORMED_COST_E2", 100); // 1.00 bp of gas + unwind
-        // The env value is bounded by a bps figure, so the sign bit is unreachable.
-        // forge-lint: disable-next-line(unsafe-typecast)
+        uint256 costE2 = _envUint("SIM_INFORMED_COST_E2", 100);
+
         int256 cost = int256(costE2);
         console2.log("");
 
@@ -461,8 +333,6 @@ contract Simulate is DubuScript {
         }
     }
 
-    /// @param give what the arbitrageur parts with, in quote units.
-    /// @param get  what it receives, valued at the reference, in quote units.
     function _logFreeOption(string memory action, uint256 q, uint8 baseDecimals, uint256 give, uint256 get)
         internal
         pure
@@ -478,20 +348,6 @@ contract Simulate is DubuScript {
         }
     }
 
-    // ---------------------------------------------------------------------
-    // Section B/C — the scripted uninformed flow
-    // ---------------------------------------------------------------------
-
-    /// @notice Plan, cost, then execute a scripted uninformed flow against the live pool.
-    ///
-    /// @dev Uninformed only, and that is a deliberate limit rather than an omission. The informed
-    ///      trade is measured and priced in `_printFreeOption` and never executed by this script.
-    ///      Executing it would add nothing: the profit figure there comes from `getAmountIn` /
-    ///      `getAmountOut`, which is the same quote the swap would settle against and which the
-    ///      demo already cross-checks against a real fill. What it *would* do is drain a live
-    ///      demo's epoch and move money from one of our own pockets to another. If somebody
-    ///      genuinely wants the fill on chain, the honest way is to take it from a third-party
-    ///      address, not to add a flag here that makes the pool's own script pick the pool off.
     function _runFlow(uint256 i, Live memory L) internal {
         uint256 n = _envUint("SIM_FILLS", 12);
         if (n == 0) return;
@@ -515,7 +371,7 @@ contract Simulate is DubuScript {
         }
 
         for (uint256 k; k < n; ++k) {
-            uint256 raw = FlowModel.drawNotional(r) * 1e6; // whole dollars -> 6-decimal quote
+            uint256 raw = FlowModel.drawNotional(r) * 1e6;
             bool buysBase = FlowModel.next(r) % 2 == 0;
             _oneFill(i, L, tally, k, raw, buysBase);
         }
@@ -526,13 +382,10 @@ contract Simulate is DubuScript {
         _printTally(i, tally);
     }
 
-    /// @notice One planned fill, gathered into memory.
-    /// @dev A struct rather than nine arguments, for the reason `FlowModel.Solve` documents: the
-    ///      legacy code generator's 16-slot stack limit, and `via_ir` off in the default profile.
     struct FillLog {
         uint256 k;
         bool buysBase;
-        /// @dev The drawn notional, in raw quote units.
+
         uint256 raw;
         uint256 amountIn;
         uint256 amountOut;
@@ -567,7 +420,7 @@ contract Simulate is DubuScript {
             .swap(
                 tokenIn,
                 tokenOut,
-                // forge-lint: disable-next-line(unsafe-typecast)
+
                 int256(f.amountIn),
                 quoted,
                 me,
@@ -582,7 +435,7 @@ contract Simulate is DubuScript {
         f.baseQty = f.buysBase ? f.amountOut : f.amountIn;
         f.quoteQty = f.buysBase ? f.amountIn : f.amountOut;
         f.notional = FlowModel.value(f.baseQty, L.ref, L.exp);
-        // `isBid` is from the POOL's side, so it is the negation of the taker buying base.
+
         f.pnl = FlowModel.fillPnl(!f.buysBase, f.baseQty, f.quoteQty, L.ref, L.exp);
 
         tally.fills += 1;
@@ -612,8 +465,7 @@ contract Simulate is DubuScript {
                 " bp"
             )
         );
-        // The machine-readable line a later markout join keys on. Everything the join needs and
-        // nothing it does not: block, pair, both legs, and the reference this run priced against.
+
         string memory head = string.concat(
             "    FILL block=",
             vm.toString(block.number),
@@ -672,10 +524,6 @@ contract Simulate is DubuScript {
         console2.log("    FILL`). MODE 1 has markout directly, because it owns the clock.");
     }
 
-    // =====================================================================
-    // Small helpers
-    // =====================================================================
-
     function _tokensOf(uint256 i) internal view returns (address base, address quote) {
         return (i == 0 ? D.mWeth : D.mWbtc, D.mUsdc);
     }
@@ -694,7 +542,6 @@ contract Simulate is DubuScript {
         }
     }
 
-    /// @dev `_bps` on `DubuScript` is unsigned; every edge here has a sign that is the point.
     function _bpsSigned(int256 e2) internal pure returns (string memory) {
         if (e2 == type(int256).min) return "n/a";
         return FlowModel.sbps(e2);

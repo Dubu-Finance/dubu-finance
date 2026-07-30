@@ -4,20 +4,14 @@ pragma solidity ^0.8.28;
 import {Test} from "forge-std/Test.sol";
 import {SafeTransfer} from "../src/libraries/SafeTransfer.sol";
 
-/*//////////////////////////////////////////////////////////////////////////////
-                                    HARNESS
-//////////////////////////////////////////////////////////////////////////////*/
-
 interface ITestToken {
     function mint(address to, uint256 amount) external;
     function approve(address spender, uint256 amount) external returns (bool);
     function balanceOf(address who) external view returns (uint256);
 }
 
-/// @notice Wraps the internal library so tests can observe reverts across a call boundary, and
-///         exposes memory probes that read 0x40/0x60 in the same frame that runs the assembly.
 contract Harness {
-    /// @dev Byte length of the canary buffers the probes allocate on either side of a transfer.
+
     uint256 private constant PROBE_LEN = 96;
 
     struct MemProbe {
@@ -52,7 +46,6 @@ contract Harness {
         ITestToken(token).approve(spender, amount);
     }
 
-    /// @notice `to` is handed to the library with its upper 96 bits deliberately dirty.
     function doTransferDirtyTo(address token, uint256 dirtyTo, uint256 amount) external {
         address to;
         assembly {
@@ -61,7 +54,6 @@ contract Harness {
         SafeTransfer.safeTransfer(token, to, amount);
     }
 
-    /// @notice `from` and `to` are handed to the library with their upper 96 bits dirty.
     function doTransferFromDirty(address token, uint256 dirtyFrom, uint256 dirtyTo, uint256 amount) external {
         address from;
         address to;
@@ -72,10 +64,6 @@ contract Harness {
         SafeTransfer.safeTransferFrom(token, from, to, amount);
     }
 
-    /// @notice Allocate a canary, run a SUCCEEDING `safeTransfer`, allocate another canary.
-    /// @dev The success path is the only path on which the caller can observe the reserved region
-    ///      at all: every failure path terminates the frame, so its memory is discarded. That is
-    ///      why the failure path is pinned by payload + gas (see `probeFailingTransfer`) instead.
     function probeTransferMemory(address token, address to, uint256 amount) external returns (MemProbe memory p) {
         bytes memory pre = _fill(0xAB);
         uint256 preStart;
@@ -109,7 +97,6 @@ contract Harness {
         p.canariesIntact = _check(pre, 0xAB) && _check(post, 0xCD);
     }
 
-    /// @notice Same probe around a succeeding `safeTransferFrom` (the control implementation).
     function probeTransferFromMemory(address token, address from, address to, uint256 amount)
         external
         returns (MemProbe memory p)
@@ -146,11 +133,6 @@ contract Harness {
         p.canariesIntact = _check(pre, 0xAB) && _check(post, 0xCD);
     }
 
-    /// @notice Allocate a canary, run a FAILING `safeTransfer` under a gas cap, allocate another.
-    /// @dev Reports the bubbled payload and the gas the failing frame actually consumed. The bug
-    ///      this file regression-tests made the payload empty and the gas consumption total,
-    ///      because the failure path read a free-memory pointer it had already overwritten and fed
-    ///      the result to `returndatacopy`.
     function probeFailingTransfer(address token, address to, uint256 amount, uint256 budget)
         external
         returns (FailProbe memory p)
@@ -181,7 +163,6 @@ contract Harness {
         p.canariesIntact = _check(pre, 0xAB) && _check(post, 0xCD);
     }
 
-    /// @notice Same, for the control implementation.
     function probeFailingTransferFrom(address token, address from, address to, uint256 amount, uint256 budget)
         external
         returns (FailProbe memory p)
@@ -227,11 +208,6 @@ contract Harness {
     }
 }
 
-/*//////////////////////////////////////////////////////////////////////////////
-                              ADVERSARIAL MOCKS
-//////////////////////////////////////////////////////////////////////////////*/
-
-/// @notice Book-keeping shared by the mocks that actually move balances.
 abstract contract Ledger {
     mapping(address => uint256) public balanceOf;
     mapping(address => mapping(address => uint256)) public allowance;
@@ -259,7 +235,6 @@ abstract contract Ledger {
     }
 }
 
-/// @notice Convention (2): returns a 32-byte `true`.
 contract TrueToken is Ledger {
     function transfer(address to, uint256 amount) external returns (bool) {
         _move(msg.sender, to, amount);
@@ -273,7 +248,6 @@ contract TrueToken is Ledger {
     }
 }
 
-/// @notice Convention (1): returns nothing at all, USDT style.
 contract SilentToken is Ledger {
     function transfer(address to, uint256 amount) external {
         _move(msg.sender, to, amount);
@@ -285,7 +259,6 @@ contract SilentToken is Ledger {
     }
 }
 
-/// @notice Convention (3): returns a 32-byte `false` instead of reverting, and moves nothing.
 contract FalseToken is Ledger {
     function transfer(address, uint256) external pure returns (bool) {
         return false;
@@ -296,7 +269,6 @@ contract FalseToken is Ledger {
     }
 }
 
-/// @notice Returns exactly 32 bytes that are neither 0 nor 1.
 contract GarbageWordToken {
     fallback() external {
         assembly {
@@ -306,8 +278,6 @@ contract GarbageWordToken {
     }
 }
 
-/// @notice Returns fewer than 32 bytes, so the first word of the output buffer is only partly
-///         overwritten and still holds the library's own selector constant in its tail.
 contract ShortReturnToken {
     uint256 public immutable len;
 
@@ -324,7 +294,6 @@ contract ShortReturnToken {
     }
 }
 
-/// @notice Returns 96 bytes; the first word is whatever the constructor was given.
 contract OverlongToken {
     uint256 public immutable firstWord;
 
@@ -343,7 +312,6 @@ contract OverlongToken {
     }
 }
 
-/// @notice Reverts with a custom error carrying arguments.
 contract CustomErrorToken {
     error Boom(address caller, uint256 amount, bytes32 tag);
 
@@ -356,7 +324,6 @@ contract CustomErrorToken {
     }
 }
 
-/// @notice Reverts with a long `Error(string)`.
 contract LongStringToken {
     string private reason;
 
@@ -370,7 +337,6 @@ contract LongStringToken {
     }
 }
 
-/// @notice Reverts with no return data at all.
 contract NoDataToken {
     fallback() external {
         assembly {
@@ -379,7 +345,6 @@ contract NoDataToken {
     }
 }
 
-/// @notice Reverts with a large payload of a deterministic pattern: word `i` holds `i + 1`.
 contract BombToken {
     uint256 public immutable size;
 
@@ -397,7 +362,6 @@ contract BombToken {
     }
 }
 
-/// @notice Consumes every unit of gas forwarded to it and returns no data.
 contract GasBurnerToken {
     fallback() external {
         assembly {
@@ -406,7 +370,6 @@ contract GasBurnerToken {
     }
 }
 
-/// @notice Reports how much gas the caller forwarded, then succeeds.
 contract GasReporterToken {
     uint256 public seen;
 
@@ -419,8 +382,6 @@ contract GasReporterToken {
     }
 }
 
-/// @notice Returns a 32-byte `true` for anything, keeping no books. Used where the point of the
-///         test is the caller's memory rather than the token's accounting.
 contract AlwaysOkToken {
     fallback() external {
         assembly {
@@ -430,7 +391,6 @@ contract AlwaysOkToken {
     }
 }
 
-/// @notice Skims a fee: reports success while delivering less than requested.
 contract FeeToken is Ledger {
     uint256 public constant FEE_BPS = 100;
 
@@ -450,8 +410,6 @@ contract FeeToken is Ledger {
     }
 }
 
-/// @notice Calls back into the harness mid-transfer, so the outer frame is suspended with its
-///         free-memory-pointer word clobbered while a second `safeTransfer` runs in a new frame.
 contract ReenteringToken is Ledger {
     Harness private immutable harness;
     address private inner;
@@ -475,17 +433,12 @@ contract ReenteringToken is Ledger {
     }
 }
 
-/*//////////////////////////////////////////////////////////////////////////////
-                                     TESTS
-//////////////////////////////////////////////////////////////////////////////*/
-
 contract SafeTransferTest is Test {
     Harness internal h;
 
     address internal alice = address(0xA11CE);
     address internal bob = address(0xB0B);
 
-    /// @dev An address that has never been deployed to: the `extcodesize` case.
     address internal codeless = address(0xDeAD0000000000000000000000000000000beef1);
 
     string internal longReason;
@@ -502,16 +455,12 @@ contract SafeTransferTest is Test {
         longReason = string(buf);
     }
 
-    // ------------------------------------------------------------------ helpers
-
-    /// @dev Byte-for-byte assertion that a failing `safeTransfer` produced exactly `expected`.
     function _assertTransferRevertsVerbatim(address token, bytes memory expected) internal {
         (bool ok, bytes memory ret) = address(h).call(abi.encodeCall(Harness.doTransfer, (token, bob, AMOUNT)));
         assertFalse(ok, "safeTransfer should have failed");
         assertEq(ret, expected, "revert payload was not bubbled verbatim");
     }
 
-    /// @dev Same, for `safeTransferFrom`.
     function _assertTransferFromRevertsVerbatim(address token, bytes memory expected) internal {
         (bool ok, bytes memory ret) =
             address(h).call(abi.encodeCall(Harness.doTransferFrom, (token, alice, bob, AMOUNT)));
@@ -526,11 +475,6 @@ contract SafeTransferTest is Test {
         }
     }
 
-    // =====================================================================
-    // Revert bubbling — the property the free-memory-pointer bug destroyed
-    // =====================================================================
-
-    /// @notice A custom error with arguments must arrive at the caller unaltered.
     function test_SafeTransfer_BubblesCustomErrorVerbatim() public {
         CustomErrorToken t = new CustomErrorToken();
         _assertTransferRevertsVerbatim(
@@ -547,8 +491,6 @@ contract SafeTransferTest is Test {
         );
     }
 
-    /// @notice A 600-character `Error(string)` is far longer than one word, so the bubble has to
-    ///         expand memory at the cached pointer rather than assume a fixed buffer.
     function test_SafeTransfer_BubblesLongStringVerbatim() public {
         LongStringToken t = new LongStringToken(longReason);
         _assertTransferRevertsVerbatim(address(t), abi.encodeWithSignature("Error(string)", longReason));
@@ -559,8 +501,6 @@ contract SafeTransferTest is Test {
         _assertTransferFromRevertsVerbatim(address(t), abi.encodeWithSignature("Error(string)", longReason));
     }
 
-    /// @notice 8 KiB of revert data still arrives whole. `returndatacopy` is unbounded by design:
-    ///         "verbatim" and "bounded" cannot both hold, and this library chose verbatim.
     function test_SafeTransfer_BubblesOversizedPayloadVerbatim() public {
         uint256 size = 8192;
         BombToken t = new BombToken(size);
@@ -573,9 +513,6 @@ contract SafeTransferTest is Test {
         _assertTransferFromRevertsVerbatim(address(t), _bombPayload(size));
     }
 
-    /// @notice A data-less revert bubbles as a data-less revert. This is the one failure mode the
-    ///         library cannot make diagnosable, and it is indistinguishable from the callee running
-    ///         out of gas (see `test_GasBurner_IsIndistinguishableFromADataLessRevert`).
     function test_SafeTransfer_BubblesDataLessRevertAsEmpty() public {
         NoDataToken t = new NoDataToken();
         _assertTransferRevertsVerbatim(address(t), bytes(""));
@@ -586,8 +523,6 @@ contract SafeTransferTest is Test {
         _assertTransferFromRevertsVerbatim(address(t), bytes(""));
     }
 
-    /// @notice The amount is what lands on top of the free-memory pointer, so the bubble has to
-    ///         hold for every amount — not just the one a hand-written test happens to pick.
     function testFuzz_SafeTransfer_BubblesVerbatimForAnyAmount(uint256 amount) public {
         CustomErrorToken t = new CustomErrorToken();
         (bool ok, bytes memory ret) = address(h).call(abi.encodeCall(Harness.doTransfer, (address(t), bob, amount)));
@@ -599,11 +534,6 @@ contract SafeTransferTest is Test {
         );
     }
 
-    /// @notice Why the defect survived review: at `amount == 0` the clobber writes zeros over the
-    ///         pointer's high bytes, which is exactly what the old restore did, so the corrupted
-    ///         pointer read back as the correct `0x80` and the bubble worked by accident. Any
-    ///         non-zero amount broke it. Pinned so a future refactor cannot re-introduce a fix
-    ///         that only holds at zero.
     function test_SafeTransfer_BubblesVerbatimAtZeroAndAtOne() public {
         CustomErrorToken t = new CustomErrorToken();
         for (uint256 i; i < 2; ++i) {
@@ -617,11 +547,6 @@ contract SafeTransferTest is Test {
         }
     }
 
-    // =====================================================================
-    // Return-data conventions
-    // =====================================================================
-
-    /// @notice Convention (1): no return data plus code at the address is success.
     function test_SafeTransfer_AcceptsSilentToken() public {
         SilentToken t = new SilentToken();
         t.mint(address(h), AMOUNT);
@@ -629,7 +554,6 @@ contract SafeTransferTest is Test {
         assertEq(t.balanceOf(bob), AMOUNT, "silent token should still have moved the balance");
     }
 
-    /// @notice Convention (2): 32 bytes of exactly 1 is success.
     function test_SafeTransfer_AcceptsExplicitTrue() public {
         TrueToken t = new TrueToken();
         t.mint(address(h), AMOUNT);
@@ -637,7 +561,6 @@ contract SafeTransferTest is Test {
         assertEq(t.balanceOf(bob), AMOUNT);
     }
 
-    /// @notice Convention (3): 32 bytes of 0 must revert, not silently pass.
     function test_SafeTransfer_RejectsFalse() public {
         FalseToken t = new FalseToken();
         t.mint(address(h), AMOUNT);
@@ -655,7 +578,6 @@ contract SafeTransferTest is Test {
         h.doTransferFrom(address(t), alice, bob, AMOUNT);
     }
 
-    /// @notice 32 bytes of anything other than 1 is garbage, not success.
     function test_SafeTransfer_RejectsGarbageWord() public {
         GarbageWordToken t = new GarbageWordToken();
         vm.expectRevert(SafeTransfer.TransferFailed.selector);
@@ -668,10 +590,6 @@ contract SafeTransferTest is Test {
         h.doTransferFrom(address(t), alice, bob, AMOUNT);
     }
 
-    /// @notice A return shorter than a word must be rejected. The `gt(returndatasize(), 31)` guard
-    ///         is what stops the library from decoding its own selector constant as a return value:
-    ///         the `call` only overwrites the first `returndatasize()` bytes of the output buffer,
-    ///         and the rest of that word still holds `0xa9059cbb` from the calldata build.
     function test_SafeTransfer_RejectsShortReturn() public {
         uint256[3] memory lengths = [uint256(1), 4, 31];
         for (uint256 i; i < lengths.length; ++i) {
@@ -690,15 +608,11 @@ contract SafeTransferTest is Test {
         }
     }
 
-    /// @notice An over-long return whose first word is `true` is accepted — trailing bytes are
-    ///         ignored, which is what a strict ABI decoder does too.
     function test_SafeTransfer_AcceptsOverlongReturnWhoseFirstWordIsTrue() public {
         OverlongToken t = new OverlongToken(1);
         h.doTransfer(address(t), bob, AMOUNT);
     }
 
-    /// @notice An over-long return whose first word is not `true` is still a failure. Length alone
-    ///         must never be taken as evidence of success.
     function test_SafeTransfer_RejectsOverlongReturnWhoseFirstWordIsNotTrue() public {
         OverlongToken t = new OverlongToken(2);
         vm.expectRevert(SafeTransfer.TransferFailed.selector);
@@ -718,13 +632,6 @@ contract SafeTransferTest is Test {
         h.doTransferFrom(address(bad), alice, bob, AMOUNT);
     }
 
-    // =====================================================================
-    // extcodesize — a typo'd token address must not silently "succeed"
-    // =====================================================================
-
-    /// @notice A `call` to an account with no code returns success with empty return data, which is
-    ///         byte-identical to convention (1). Without the code check this would move nothing and
-    ///         report success.
     function test_SafeTransfer_RejectsCodelessAddress() public {
         assertEq(codeless.code.length, 0, "fixture must really have no code");
         vm.expectRevert(SafeTransfer.TransferFailed.selector);
@@ -736,29 +643,17 @@ contract SafeTransferTest is Test {
         h.doTransferFrom(codeless, alice, bob, AMOUNT);
     }
 
-    /// @notice A precompile is the sharpest form of the same trap: it succeeds, it returns data,
-    ///         and `extcodesize` is 0. `identity` (0x04) echoes our calldata back, so the return is
-    ///         68 bytes whose first word is the padded recipient — not `true`. Rejected twice over.
     function test_SafeTransfer_RejectsPrecompile() public {
         vm.expectRevert(SafeTransfer.TransferFailed.selector);
         h.doTransfer(address(0x04), bob, AMOUNT);
     }
 
-    /// @notice An EOA with a balance is codeless too.
     function test_SafeTransfer_RejectsFundedEoa() public {
         vm.deal(alice, 1 ether);
         vm.expectRevert(SafeTransfer.TransferFailed.selector);
         h.doTransfer(alice, bob, AMOUNT);
     }
 
-    // =====================================================================
-    // Memory discipline below 0x80
-    // =====================================================================
-
-    /// @notice `safeTransfer` lays its calldata across 0x00..0x53, and 0x40..0x53 is the high 20
-    ///         bytes of the free-memory pointer. With live memory on both sides of the call, the
-    ///         pointer must come back byte-identical, the zero slot at 0x60 must still be zero, and
-    ///         a buffer allocated afterwards must not land on top of one allocated before.
     function test_SafeTransfer_RestoresFreeMemoryPointerExactly() public {
         AlwaysOkToken t = new AlwaysOkToken();
         Harness.MemProbe memory p = h.probeTransferMemory(address(t), bob, AMOUNT);
@@ -769,7 +664,6 @@ contract SafeTransferTest is Test {
         assertTrue(p.canariesIntact, "canary bytes were overwritten");
     }
 
-    /// @notice The control implementation, which additionally borrows the zero slot at 0x60.
     function test_SafeTransferFrom_RestoresFreeMemoryPointerAndZeroSlot() public {
         AlwaysOkToken t = new AlwaysOkToken();
         Harness.MemProbe memory p = h.probeTransferFromMemory(address(t), alice, bob, AMOUNT);
@@ -780,8 +674,6 @@ contract SafeTransferTest is Test {
         assertTrue(p.canariesIntact, "canary bytes were overwritten");
     }
 
-    /// @notice The clobbered bytes are bytes 12..31 of `amount`, so pointer restoration has to hold
-    ///         across the whole range — including amounts whose high bits are set.
     function testFuzz_SafeTransfer_RestoresFreeMemoryPointerForAnyAmount(uint256 amount) public {
         AlwaysOkToken t = new AlwaysOkToken();
         Harness.MemProbe memory p = h.probeTransferMemory(address(t), bob, amount);
@@ -801,9 +693,6 @@ contract SafeTransferTest is Test {
         assertTrue(p.canariesIntact, "canary bytes were overwritten");
     }
 
-    /// @notice The reserved region is clobbered for the whole duration of the `call`. A token that
-    ///         re-enters us runs in a fresh frame with its own memory, so the outer frame's pointer
-    ///         survives — this pins that the assumption holds rather than merely looking plausible.
     function test_SafeTransfer_SurvivesReentrancyDuringTheCall() public {
         ReenteringToken outer = new ReenteringToken(h);
         TrueToken inner = new TrueToken();
@@ -822,15 +711,6 @@ contract SafeTransferTest is Test {
         assertEq(inner.balanceOf(alice), 3e18, "re-entrant transfer did not settle");
     }
 
-    /// @notice Regression pin for the bug this file exists for. A failing `safeTransfer` with live
-    ///         memory on both sides must (a) bubble the token's reason verbatim, (b) not disturb the
-    ///         caller's memory, and (c) not consume the frame's gas.
-    ///
-    ///         (c) is the part that has to be measured rather than inspected: every failure path
-    ///         terminates the frame, so the reverting frame's own pointer cannot be read back.
-    ///         Feeding a corrupted pointer to `returndatacopy` costs the entire remaining gas via
-    ///         `InvalidOperandOOG`, so consumption is a faithful proxy — under the bug this frame
-    ///         burned essentially the whole budget and returned nothing.
     function test_Regression_FailingTransferKeepsReasonAndDoesNotBurnTheFrame() public {
         CustomErrorToken t = new CustomErrorToken();
         uint256 budget = 2_000_000;
@@ -848,7 +728,6 @@ contract SafeTransferTest is Test {
         assertTrue(p.canariesIntact, "canary bytes were overwritten across the failing call");
     }
 
-    /// @notice The same pin on the control implementation, so the two stay symmetric.
     function test_Regression_FailingTransferFromKeepsReasonAndDoesNotBurnTheFrame() public {
         CustomErrorToken t = new CustomErrorToken();
         uint256 budget = 2_000_000;
@@ -864,8 +743,6 @@ contract SafeTransferTest is Test {
         assertTrue(p.canariesIntact, "canary bytes were overwritten across the failing call");
     }
 
-    /// @notice The corrupted pointer was `(amount << 96) | 0x80`, so its blast radius scaled with
-    ///         the amount. Fuzzed so no single amount can hide a partial fix.
     function testFuzz_Regression_FailingTransferDoesNotBurnTheFrame(uint256 amount) public {
         CustomErrorToken t = new CustomErrorToken();
         uint256 budget = 2_000_000;
@@ -880,14 +757,6 @@ contract SafeTransferTest is Test {
         assertLt(p.gasUsed, budget / 4, "the failing frame burned its gas budget");
     }
 
-    // =====================================================================
-    // Dirty argument bits
-    // =====================================================================
-
-    /// @notice `mstore(0x14, to)` writes the full 32-byte word, so a dirty `to` would spill its
-    ///         upper bits into 0x14..0x1f — which is the recipient argument's ABI padding. The
-    ///         selector store lands afterwards and re-zeroes that range, so the token still sees a
-    ///         clean address.
     function test_SafeTransfer_MasksDirtyRecipientHighBits() public {
         SilentToken t = new SilentToken();
         t.mint(address(h), AMOUNT);
@@ -898,8 +767,6 @@ contract SafeTransferTest is Test {
         assertEq(t.balanceOf(bob), AMOUNT, "dirty high bits changed the recipient");
     }
 
-    /// @notice Same for `safeTransferFrom`, where `from` is placed with `shl(96, from)` (which
-    ///         shifts dirty bits out) and `to`'s padding is re-zeroed by the `from` store.
     function test_SafeTransferFrom_MasksDirtyHighBits() public {
         SilentToken t = new SilentToken();
         t.mint(alice, AMOUNT);
@@ -914,13 +781,6 @@ contract SafeTransferTest is Test {
         assertEq(t.balanceOf(alice), 0);
     }
 
-    // =====================================================================
-    // Gas
-    // =====================================================================
-
-    /// @notice No stipend or artificial cap: the token gets the 63/64 the EVM allows. Tokens with
-    ///         transfer hooks depend on this, so a future "gas safety" cap would be a behaviour
-    ///         change, not a hardening.
     function test_SafeTransfer_ForwardsAllAvailableGas() public {
         GasReporterToken t = new GasReporterToken();
 
@@ -931,15 +791,6 @@ contract SafeTransferTest is Test {
         assertGt(t.seen(), (spent * 60) / 64, "the token was handed materially less than 63/64");
     }
 
-    /// @notice A token that eats every forwarded unit of gas is observationally identical to one
-    ///         that reverts with no data: `call` returns 0 and `returndatasize()` is 0 in both
-    ///         cases, so the bubble is empty either way.
-    ///
-    ///         This is a property of `CALL`, not a defect in the library, and it is the residual
-    ///         after the pointer fix: `TransferFailed()` cannot be substituted for the empty bubble
-    ///         without giving up the documented "bubble verbatim" contract. The consequence worth
-    ///         knowing is the 63/64 rule — a caller wrapping the pool in `try/catch` resumes with
-    ///         only 1/64 of the gas it had, so the griefing vector is the gas, not the ambiguity.
     function test_GasBurner_IsIndistinguishableFromADataLessRevert() public {
         GasBurnerToken burner = new GasBurnerToken();
         NoDataToken silent = new NoDataToken();
@@ -951,17 +802,9 @@ contract SafeTransferTest is Test {
         assertEq(reverted.reason.length, 0, "a data-less revert yields no return data");
         assertEq(burned.reason, reverted.reason, "the two are byte-identical to the caller");
 
-        // The distinguishing signal is gas, and only the caller can see it.
         assertGt(burned.gasUsed, reverted.gasUsed * 4, "the burner should have consumed its budget");
     }
 
-    // =====================================================================
-    // Documented non-goals
-    // =====================================================================
-
-    /// @notice Fee-on-transfer is out of scope by design: the library reports success/failure, not
-    ///         the amount delivered. Pinned so the gap stays a decision instead of a surprise —
-    ///         `PropPool` must not list such a token.
     function test_SafeTransfer_ReportsSuccessForFeeOnTransferToken_ByDesign() public {
         FeeToken t = new FeeToken();
         t.mint(address(h), AMOUNT);
@@ -983,9 +826,6 @@ contract SafeTransferTest is Test {
         assertLt(t.balanceOf(bob), AMOUNT, "fixture is not actually skimming");
     }
 
-    /// @notice A contract whose fallback swallows unknown selectors is indistinguishable from USDT:
-    ///         both return no data and both have code. There is no signal left to check, so this is
-    ///         a listing-time concern, not something the primitive can catch.
     function test_SafeTransfer_CannotDetectAFallbackThatSwallowsTheCall() public {
         SwallowingFallback t = new SwallowingFallback();
         h.doTransfer(address(t), bob, AMOUNT);
@@ -993,7 +833,6 @@ contract SafeTransferTest is Test {
     }
 }
 
-/// @notice Has code, accepts anything, returns nothing, moves nothing.
 contract SwallowingFallback {
     fallback() external {}
 }

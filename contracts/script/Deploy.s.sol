@@ -6,45 +6,8 @@ import {console2} from "forge-std/console2.sol";
 import {DubuScript, Deployment, Market, Roles} from "./DubuScript.sol";
 import {PropPool} from "../src/PropPool.sol";
 
-/// @title Deploy — the whole DuBu stack onto GIWA Sepolia
-///
-/// ```
-/// make deploy                                    # keystore, or PRIVATE_KEY if .env sets it
-/// forge script script/Deploy.s.sol:Deploy \      # dry run against live chain state
-///   --rpc-url https://sepolia-rpc.giwa.io --sender 0x5AD1... -vvv
-/// ```
-///
-/// ## What it deploys, and what it deliberately does not
-///
-/// Deployed: three mintable tokens, a UniswapV2 factory + Router02 + one pair per comparison
-/// market, the PropPool, the aggregation Router, and both adapters.
-///
-/// **Not** deployed: Permit2, Multicall3, WETH9 and Pyth. All four are genesis pre-installs on
-/// GIWA at the addresses in `DubuScript`, and `Router.PERMIT2` is already a compile-time constant
-/// pointing at the canonical one. Redeploying any of them would produce a second, unused copy and
-/// a router that silently disagrees with every other integrator on the chain.
-///
-/// Both sides of every pair are our own `MintableToken`. That is not laziness: GIWA Sepolia has no
-/// canonical stablecoin — Circle publishes no CCTP domain for chain 91342 and every "USDC" on the
-/// explorer is somebody's mock — and the only asset that arrives honestly is ETH, capped at
-/// 0.015/day by the faucet. A demo built on bridged assets tops out at a few dollars of TVL, which
-/// makes every slippage curve we want to show meaningless.
-///
-/// ## Resumability
-///
-/// Every address is read from env first and only deployed when unset, and `addPair` is skipped
-/// when the pair already exists. A run that dies half way through is resumed by pasting the export
-/// block this script prints and running it again. That property is worth more here than elegance:
-/// the alternative is a partially-configured pool and a manual reconciliation.
 contract Deploy is DubuScript {
-    /// @notice Conservative upper bound for the preflight, expressed in *gas limits*, not gas used.
-    ///
-    /// @dev A cold full deployment is 13 transactions. Measured on a fork of live GIWA state:
-    ///      22,756,498 gas actually consumed, against a 30,199,577 sum of the limits forge sets at
-    ///      its default 130% multiplier — and the Makefile raises that to 200% (see the note there
-    ///      on cold-access accounting), which puts the sum of limits near 46M. A node admits a
-    ///      transaction only if the sender can pay `gasLimit * gasPrice`, so the *limits* are what
-    ///      the affordability check has to be sized against. 60M leaves margin for a compiler bump.
+
     uint256 internal constant GAS_BUDGET = 60_000_000;
 
     function run() external returns (Deployment memory d) {
@@ -62,10 +25,6 @@ contract Deploy is DubuScript {
 
         _report(d, r, deployer, ok);
     }
-
-    // ---------------------------------------------------------------------
-    // Preflight — everything checkable before a single transaction is signed
-    // ---------------------------------------------------------------------
 
     function _preflight(address deployer, Roles memory r) internal view {
         _rule();
@@ -97,10 +56,6 @@ contract Deploy is DubuScript {
         console2.log("");
     }
 
-    /// @dev Prints the resolved role set and, when they collapse onto one key, says plainly what
-    ///      that costs. The split is the security model: the updater signs many times a minute
-    ///      from a hot process and must be assumed to leak, which is only survivable because it
-    ///      can move no funds. One key holding all four gives that property up entirely.
     function _printRoles(Roles memory r, address deployer) internal pure {
         console2.log("");
         console2.log("  PropPool roles");
@@ -132,9 +87,6 @@ contract Deploy is DubuScript {
         }
     }
 
-    /// @dev The `priceScaleExp` derivation, printed with the numbers it was derived from, because
-    ///      it is immutable per pair and picking it wrong is a redeploy rather than a config
-    ///      change.
     function _printMarketPlan() internal view {
         console2.log("");
         console2.log("  Markets");
@@ -164,10 +116,6 @@ contract Deploy is DubuScript {
         console2.log("    an 8x move in the reference price without a new pair id. Larger exp = finer");
         console2.log("    prices and fewer bisection steps in the two inverted directions.");
     }
-
-    // ---------------------------------------------------------------------
-    // Report
-    // ---------------------------------------------------------------------
 
     function _report(Deployment memory d, Roles memory r, address deployer, bool ok) internal view {
         console2.log("");
