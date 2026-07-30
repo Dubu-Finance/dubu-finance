@@ -32,13 +32,13 @@
 //! 4.  FavourableDrift              the posted quote has merely become conservative
 //! ```
 //!
-//! archi_v2 §5.3 lifts a chase/retreat pair from a competing maker where the *chase* threshold is the
-//! tighter one — you follow a competitor's improvement eagerly and back away slowly. **This
-//! module inverts that, deliberately.** Such a maker is one among many, so failing
-//! to chase means losing the flow to someone else, and that is the dominant cost. On GIWA the
-//! prop pool is the only maker of consequence: there is nobody to lose the flow to, so being a
-//! basis point too conservative costs a little volume, while being a basis point too generous
-//! after the market has moved is a free option written to whoever notices first. So:
+//! The conventional arrangement makes the *chase* threshold the tighter one — follow a
+//! competitor's improvement eagerly and back away slowly. **This module inverts that,
+//! deliberately.** Chasing hard is right for a maker competing for flow, where failing to chase
+//! means losing it to somebody else and that is the dominant cost. On GIWA the prop pool is the
+//! only maker of consequence: there is nobody to lose the flow to, so being a basis point too
+//! conservative costs a little volume, while being a basis point too generous after the market
+//! has moved is a free option written to whoever notices first. So:
 //!
 //! * `adverse_drift_bps` is the tight one — our bid is now above fair, or our ask below it;
 //! * `favourable_drift_bps` is the loose one — we would quote better, and holding costs volume.

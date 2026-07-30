@@ -73,10 +73,9 @@
 //!
 //! # 4. Widest safe width
 //!
-//! `W` is free — it is the *concentration* knob (a `width_bps` around
-//! 0.20, i.e. the price decays 0.2 bp across the entire posted depth). Wider is better for the
-//! pool: the same top-of-book price is offered with more depth behind it before the price walks.
-//! Two bounds constrain it.
+//! `W` is free — it is the *concentration* knob: a `width_bps` around 0.20 means the price decays
+//! 0.2 bp across the entire posted depth. Wider is better for the pool: the same top-of-book price
+//! is offered with more depth behind it before the price walks. Two bounds constrain it.
 //!
 //! Two elementary lemmas do all the work. For integers `a >= 1`, `d >= 1`, `N >= 0`:
 //!

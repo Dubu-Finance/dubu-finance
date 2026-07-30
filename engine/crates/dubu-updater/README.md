@@ -502,12 +502,12 @@ zero drift however far the market has moved. The same reasoning reverses the sen
 pool is already offering no depth, the **quote goes first** and capacity follows, because
 capacity-first would restore a full epoch behind whatever ladder is stored.
 
-The asymmetry **inverts archi_v2 §5.3's chase/retreat pair on purpose.** A maker competing for flow chases eagerly
-and retreats slowly because it is one maker among many and losing the flow is the dominant cost.
-On GIWA the prop pool is the only maker of consequence: there is nobody to lose the flow to, so
-being a basis point too conservative costs a little volume, while being a basis point too
-generous after the market has moved is a free option written to whoever notices first. The
-config validator refuses a config with the two the other way round.
+The asymmetry **inverts the conventional chase/retreat pair on purpose.** A maker competing for
+flow chases eagerly and retreats slowly, because losing the flow is the dominant cost. On GIWA the
+prop pool is the only maker of consequence: there is nobody to lose the flow to, so being a basis
+point too conservative costs a little volume, while being a basis point too generous after the
+market has moved is a free option written to whoever notices first. The config validator refuses a
+config with the two the other way round.
 
 `PushInFlight` matters more than it looks: a pair with an unconfirmed transaction is **not**
 superseded. Two `updateQuote`s in flight are ordered by a sequencer that sorts on fee, and the
