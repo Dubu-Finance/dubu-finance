@@ -52,11 +52,12 @@
 //! *confidently* wrong produces a ladder nothing catches. Losing a venue is an explicit logged
 //! event, a majority disagreeing stops quoting outright, and neither is ever a silent absence.
 //!
-//! The on-chain deviation bound is still **Pyth's** job, later. Pyth is live on GIWA and
-//! `PropPool` is designed to grow a deviation check against it — but if this bot also priced from
-//! Pyth, that check would be comparing a value against itself and would catch nothing. The two
-//! must stay independent, and the cross-venue filter is not a substitute: an error correlated
-//! across every venue is invisible to it.
+//! The on-chain deviation bound is still **Pyth's** job, later, and it needs a reference derived
+//! independently of Pyth or it compares a value against one of its own inputs. That independence
+//! now holds for every pair **except** mAAPL and mTSLA, which price partly from [`feed::pyth`]
+//! because their one HIP-3 book is dark about a quarter of the time; `updater.toml` argues that
+//! trade where it is made. Nothing else is a substitute for the bound either — an error correlated
+//! across every venue is invisible to the cross-venue filter.
 //!
 //! Every market-data connection is read-only: no API key, no account endpoint, no order entry,
 //! and no way to add one without a signing step that does not exist here. The book is unhedged

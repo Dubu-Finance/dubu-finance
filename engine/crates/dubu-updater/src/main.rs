@@ -36,7 +36,7 @@ use dubu_updater::config::{Config, KeySource};
 use dubu_updater::fair_value::{self, Reference, VenueQuote};
 use dubu_updater::feed::ws::MarketFeed;
 use dubu_updater::feed::{
-    binance, bybit, coinbase, hyperliquid, okx, FeedStatus, VenueFeeds, VenueId, VenueWatch,
+    binance, bybit, coinbase, hyperliquid, okx, pyth, FeedStatus, VenueFeeds, VenueId, VenueWatch,
 };
 use dubu_updater::hedge;
 use dubu_updater::jump;
@@ -460,12 +460,15 @@ fn spawn_feeds(
             !symbols.is_empty(),
             "a venue in `venues()` is named by some pair"
         );
-        let client: Box<dyn MarketFeed> = match venue {
-            VenueId::Binance => Box::new(binance::Client::new(&symbols)),
-            VenueId::Okx => Box::new(okx::Client::new(&symbols)),
-            VenueId::Bybit => Box::new(bybit::Client::new(&symbols)),
-            VenueId::Coinbase => Box::new(coinbase::Client::new(&symbols)),
-            VenueId::Hyperliquid => Box::new(hyperliquid::Client::new(&symbols)),
+        // `None` is the polled venue: the websocket driver cannot carry it, and everything else —
+        // the shared state, the staleness window, the backoff — is the same.
+        let client: Option<Box<dyn MarketFeed>> = match venue {
+            VenueId::Binance => Some(Box::new(binance::Client::new(&symbols))),
+            VenueId::Okx => Some(Box::new(okx::Client::new(&symbols))),
+            VenueId::Bybit => Some(Box::new(bybit::Client::new(&symbols))),
+            VenueId::Coinbase => Some(Box::new(coinbase::Client::new(&symbols))),
+            VenueId::Hyperliquid => Some(Box::new(hyperliquid::Client::new(&symbols))),
+            VenueId::Pyth => None,
         };
         let Some(shared) = feeds.venue(*venue) else {
             continue;
@@ -480,13 +483,23 @@ fn spawn_feeds(
             url = %cfg.feed.urls.get(*venue), symbols = %mapping,
             "market data venue configured"
         );
-        tasks.push(tokio::spawn(dubu_updater::feed::ws::run(
-            cfg.feed.clone(),
-            cfg.feed.urls.get(*venue).to_string(),
-            client,
-            shared,
-            shutdown_rx.clone(),
-        )));
+        let url = cfg.feed.urls.get(*venue).to_string();
+        tasks.push(match client {
+            Some(c) => tokio::spawn(dubu_updater::feed::ws::run(
+                cfg.feed.clone(),
+                url,
+                c,
+                shared,
+                shutdown_rx.clone(),
+            )),
+            None => tokio::spawn(dubu_updater::feed::pyth::run(
+                cfg.feed.clone(),
+                url,
+                pyth::Client::new(&symbols),
+                shared,
+                shutdown_rx.clone(),
+            )),
+        });
     }
     assert_eq!(tasks.len(), venues.len(), "every venue got a task");
     (feeds, tasks)
@@ -2326,6 +2339,7 @@ async fn run_cycle(
                     pair.pair_id,
                     r,
                     &snaps,
+                    &quotes,
                     shift,
                     vol,
                     block_work,
@@ -2935,12 +2949,15 @@ async fn run_cycle(
 ///
 /// The whole cross-section including rejections, because "which venue was dropped and how far out
 /// was it" is asked after the fact and there is nowhere else to get it. `bound` says whether the
-/// MAD or the floor set the rejection threshold: fast-market regime or calm one.
+/// MAD or the floor set the rejection threshold: fast-market regime or calm one. `spreads` is each
+/// venue's own top of book, and is where Pyth's confidence interval surfaces.
+#[allow(clippy::too_many_arguments)]
 fn log_reference(
     symbol: &str,
     pair_id: u16,
     r: &Reference,
     snaps: &[(VenueId, dubu_updater::feed::FeedSnapshot)],
+    quotes: &[VenueQuote],
     shift: i32,
     vol: &Volatility,
     loud: bool,
@@ -2955,6 +2972,7 @@ fn log_reference(
         venues_configured = snaps.len(),
         venues_rejected = r.rejected.len(),
         detail = %r.venue_summary(),
+        spreads = %fair_value::spread_summary(quotes),
         dispersion_decibps = r.dispersion_decibps,
         threshold_decibps = r.threshold_decibps,
         bound = r.bound.label(),

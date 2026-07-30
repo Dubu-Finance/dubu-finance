@@ -198,8 +198,9 @@ pub async fn run(
     }
 }
 
-/// Double the retry delay, up to the ceiling.
-fn backoff(delay: Duration, max: Duration) -> Duration {
+/// Double the retry delay, up to the ceiling. Shared with [`super::pyth`], which reconnects on the
+/// same schedule over a different transport.
+pub(super) fn backoff(delay: Duration, max: Duration) -> Duration {
     assert!(!delay.is_zero(), "a zero backoff never grows");
     assert!(delay <= max);
     let next = (delay * 2).min(max);

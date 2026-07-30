@@ -225,9 +225,12 @@ view_stale_secs = 20
 # cross-section to reject against.
 #
 # The endpoints are NOT listed here. Each venue has a built-in public default
-# (feed::VenueId::default_ws_url); add a `[feed.urls]` table only to override
+# (feed::VenueId::default_url); add a `[feed.urls]` table only to override
 # one. A venue is enabled by a pair naming a symbol for it below, and by
 # nothing else — two switches for one venue is two places for them to disagree.
+#
+# Five of the six are websockets. `pyth` is HTTP and is polled, so its endpoint
+# is `https://` and the validator holds it to that rather than to `wss://`.
 # ---------------------------------------------------------------------------
 
 # A symbol with no accepted tick for this long is stale ON THAT VENUE, and a stale venue
@@ -240,8 +243,13 @@ reconnect_max_ms = 30000
 
 # Every venue here either pushes continuously or answers a keepalive every 20s, so a socket with
 # no frame at all for this long is dead whatever TCP thinks. Must be >= stale_after_ms or the
-# staleness window is never observable.
+# staleness window is never observable. Websocket venues only.
 read_timeout_ms = 45000
+
+# How often the polled venue (pyth) is read. Measured 2026-07-31, its equity feeds advance
+# `publish_time` about once a second, so asking more often returns prices that do not exist yet.
+# Refused above stale_after_ms, where the venue would be stale between its own polls.
+poll_interval_ms = 1000
 
 # THE QUORUM. Below this many surviving venues there is no reference price and the bot quotes
 # nothing, logging `no_quorum`. Refused below 2 at startup: one venue is the single-source oracle
@@ -960,7 +968,7 @@ bybit   = "SOLUSDT"
 
 
 # ---------------------------------------------------------------------------
-# EQUITIES -- pairs 6-9, quoted from ONE venue
+# EQUITIES -- pairs 6-9, at a quorum of ONE
 #
 # These four run at a quorum of one, and that is the only thing about them worth reading carefully.
 # Everywhere else in this file a price has to survive a cross-venue median before the pool will
@@ -973,6 +981,14 @@ bybit   = "SOLUSDT"
 # than a quorum of one: it fails silently instead of loudly. SKHY and SPCX have no second builder
 # at any open interest.
 #
+# PYTH IS NOW A SECOND SOURCE ON AAPL AND TSLA, AND venues_min STAYS 1. Raising it to 2 would make
+# both venues necessary rather than either sufficient, and each is available about 76% of the time:
+# 0.76^2 = 58% against 76% today. Two venues buy availability at a quorum of one and buy a
+# cross-check only at a quorum of two, and the availability is what the measurement said was
+# missing -- the `xyz` book is dark ~24% of the time, which alone produced 241 no-reference events
+# per pair, a step-function reference, and jump withdrawals on the catch-up move. A quorum of two
+# waits for a third source. Pyth lists neither SKHY nor SPCX, so those two are unchanged.
+#
 # THE SPREAD BELOW IS NOT A VOLATILITY NUMBER. Sampled over 10s during regular hours, these are
 # CALMER than the crypto pairs -- converted to the same 300s horizon the skew section measures ETH
 # at: AAPL 3.2 bps, SPCX 4.1, TSLA 10.9 against ETH's 10. On vol alone they would quote tighter
@@ -982,8 +998,12 @@ bybit   = "SOLUSDT"
 #   2. 16:00 ET. The underlying stops printing and the perp keeps trading; overnight and weekend
 #      gaps arrive as a jump the pool cannot have seen coming. The jump detector is armed at a
 #      15 bp floor for exactly that, which is double what the crypto pairs use.
-#   3. Funding basis. These are perps against spot tokens, and the basis is NOT corrected --
-#      see `feed/hyperliquid.rs`. The reference is a few bp off the underlying by construction.
+#   3. Funding basis. The Hyperliquid leg is a perp against spot tokens and the basis is NOT
+#      corrected -- see `feed/hyperliquid.rs`. Pyth is the spot price and carries no basis, so on
+#      AAPL and TSLA the reference is the mean of the two while both are live and steps by half
+#      the basis when one drops out. Measured 2026-07-31 the two sat 3.9 bp (AAPL) and 4.1 bp
+#      (TSLA) apart, a 2 bp cross-venue MAD against a 25 bp dispersion gate and a 15 bp jump floor,
+#      so neither the gate nor the detector fires on it.
 #
 # Sizing is bounded by the SHARED quote token, not by each pair's own inventory. The pool holds
 # ~$10M of each equity but only ~$12M of mUSDC across all nine pairs, and the five crypto pairs
@@ -1029,6 +1049,8 @@ jump_group = "equity"
 
 [pairs.venues]
 hyperliquid = "xyz:AAPL"
+# The second source. See the block above pair 6 on why this is added and why venues_min stays 1.
+pyth = "Equity.US.AAPL/USD"
 
 
 [[pairs]]
@@ -1067,6 +1089,8 @@ jump_group = "equity"
 
 [pairs.venues]
 hyperliquid = "xyz:TSLA"
+# The second source. See the block above pair 6 on why this is added and why venues_min stays 1.
+pyth = "Equity.US.TSLA/USD"
 
 
 [[pairs]]

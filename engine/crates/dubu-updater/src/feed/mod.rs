@@ -21,11 +21,11 @@
 //! ladder and its own sanity limits derive from the same number, so a feed that is *confidently
 //! wrong* — a bad parse, a socket that stays open and serves stale data, an exchange printing
 //! garbage mid-outage — produces a ladder nothing downstream can catch. Several independent
-//! venues give the combiner in [`crate::fair_value`] a cross-section to reject against, which is
-//! the only defence available until the on-chain Pyth deviation bound exists.
+//! venues give the combiner in [`crate::fair_value`] a cross-section to reject against.
 //!
-//! Each venue is its own socket, its own reconnect loop and its own [`FeedShared`]. Nothing is
-//! shared between them but the clock, so one venue failing cannot take another down.
+//! Each venue is its own connection, its own reconnect loop and its own [`FeedShared`]. Nothing is
+//! shared between them but the clock, so one venue failing cannot take another down. Five are
+//! websockets driven by [`ws::run`]; [`pyth`] is HTTP and polls, and the difference stops there.
 //!
 //! # Two statuses, deliberately
 //!
@@ -51,11 +51,24 @@ pub mod bybit;
 pub mod coinbase;
 pub mod hyperliquid;
 pub mod okx;
+pub mod pyth;
 pub mod ws;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
+
+/// How a venue is read.
+///
+/// Not a detail of the endpoint string: it decides which driver runs the venue, and it is what
+/// stops the config validator refusing a correct `https://` endpoint for asking it to be `wss://`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Transport {
+    /// The venue pushes down a socket; [`ws::run`] drives it.
+    WebSocket,
+    /// The venue answers requests; [`pyth::run`] polls it.
+    Http,
+}
 
 /// One market-data venue.
 ///
@@ -71,18 +84,21 @@ pub enum VenueId {
     Bybit,
     /// Coinbase Exchange, `ticker`.
     Coinbase,
-    /// Hyperliquid `l2Book`, including HIP-3 builder books. The only venue here carrying equities.
+    /// Hyperliquid `l2Book`, including HIP-3 builder books. Carries all four equity pairs.
     Hyperliquid,
+    /// Pyth Hermes, the aggregate publisher price. Carries the two equities Pyth lists.
+    Pyth,
 }
 
 impl VenueId {
     /// Every venue this crate can speak to, in a stable order.
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
         Self::Binance,
         Self::Okx,
         Self::Bybit,
         Self::Coinbase,
         Self::Hyperliquid,
+        Self::Pyth,
     ];
 
     /// Short stable string for structured logs and config keys.
@@ -94,18 +110,31 @@ impl VenueId {
             Self::Bybit => "bybit",
             Self::Coinbase => "coinbase",
             Self::Hyperliquid => "hyperliquid",
+            Self::Pyth => "pyth",
+        }
+    }
+
+    /// Which driver reads this venue, and therefore which URL scheme its endpoint takes.
+    #[must_use]
+    pub const fn transport(self) -> Transport {
+        match self {
+            Self::Binance | Self::Okx | Self::Bybit | Self::Coinbase | Self::Hyperliquid => {
+                Transport::WebSocket
+            }
+            Self::Pyth => Transport::Http,
         }
     }
 
     /// The public endpoint, used when the config does not override it.
     #[must_use]
-    pub const fn default_ws_url(self) -> &'static str {
+    pub const fn default_url(self) -> &'static str {
         match self {
             Self::Binance => "wss://stream.binance.com:9443/stream",
             Self::Okx => "wss://ws.okx.com:8443/ws/v5/public",
             Self::Bybit => "wss://stream.bybit.com/v5/public/spot",
             Self::Coinbase => "wss://ws-feed.exchange.coinbase.com",
             Self::Hyperliquid => "wss://api.hyperliquid.xyz/ws",
+            Self::Pyth => "https://hermes.pyth.network",
         }
     }
 }

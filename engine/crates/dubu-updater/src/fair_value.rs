@@ -177,6 +177,25 @@ impl VenueQuote {
     }
 }
 
+/// `hyperliquid:0.5 pyth:9.1` — each live venue's own top-of-book spread, in bps to one decimal.
+///
+/// This is where [`crate::feed::pyth`]'s confidence interval reaches the log: that venue publishes
+/// a price and a confidence rather than a book, and the confidence is exactly the half-width of the
+/// synthetic one. Reading it against the pair's own `half_spread_bps` answers the question the
+/// field on [`VenueQuote`] is documented for — whether the pool is quoting inside its reference.
+#[must_use]
+pub fn spread_summary(quotes: &[VenueQuote]) -> String {
+    quotes
+        .iter()
+        .map(|q| {
+            let mid = (q.bid / 2).saturating_add(q.ask / 2);
+            let d = mul_div_floor(q.ask.saturating_sub(q.bid), DECIBPS, mid).unwrap_or(0);
+            format!("{}:{}.{}", q.venue, d / 10, d % 10)
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// The MAD filter's knobs, already converted out of the config's decimal-bps form.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MadParams {
@@ -601,6 +620,26 @@ mod tests {
             book_spread_bps: 0,
             age_ms: 10,
         }
+    }
+
+    /// The summary is deci-bps rendered to one decimal, which is the resolution the rest of the
+    /// reference log line uses. Whole bps would print Hyperliquid's 0.6 bp book as `0`, and that
+    /// venue against Pyth's confidence interval is the comparison the field exists for.
+    #[test]
+    fn the_spread_summary_keeps_a_sub_bp_book_visible() {
+        let live = |venue, bid, ask| VenueQuote::new(venue, &tick(bid, 100, ask, 100), 0).unwrap();
+        let quotes = [
+            // Hyperliquid, measured: 338.92 / 338.94, a 0.6 bp book.
+            live(VenueId::Hyperliquid, 33_892_000_000, 33_894_000_000),
+            // Pyth, measured: 332.2375 +/- a 0.15272 confidence.
+            live(
+                VenueId::Pyth,
+                33_223_750_000 - 15_272_000,
+                33_223_750_000 + 15_272_000,
+            ),
+        ];
+        assert_eq!(spread_summary(&quotes), "hyperliquid:0.5 pyth:9.1");
+        assert_eq!(spread_summary(&[]), "");
     }
 
     /// Live-shaped parameters: k = 4.0, floor 2 bp, dispersion limit 25 bp, quorum 2.

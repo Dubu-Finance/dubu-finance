@@ -19,7 +19,7 @@ use alloy_primitives::Address;
 use serde::Deserialize;
 
 use crate::fair_value::MadParams;
-use crate::feed::VenueId;
+use crate::feed::{Transport, VenueId};
 use crate::skew::{SkewParams, VolConfig};
 use crate::units::{self, UnitsError};
 
@@ -861,9 +861,9 @@ impl ChainConfig {
 
 // --- Feed ---
 
-/// Per-venue endpoint overrides, all optional; the defaults are [`VenueId::default_ws_url`].
+/// Per-venue endpoint overrides, all optional; the defaults are [`VenueId::default_url`].
 ///
-/// No key or secret field for any venue, because none of these public streams has one. A venue is
+/// No key or secret field for any venue, because none of these public feeds has one. A venue is
 /// enabled by a pair naming a symbol for it in [`PairVenues`], not by appearing here.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -880,9 +880,13 @@ pub struct VenueUrls {
     /// Coinbase Exchange feed endpoint.
     #[serde(default)]
     pub coinbase: Option<String>,
-    /// Override for Hyperliquid's websocket. See [`VenueId::default_ws_url`].
+    /// Override for Hyperliquid's websocket. See [`VenueId::default_url`].
     #[serde(default)]
     pub hyperliquid: Option<String>,
+    /// Pyth Hermes base URL, **`https://`**: this is the one polled venue and the paths are
+    /// appended to it. See [`VenueId::transport`].
+    #[serde(default)]
+    pub pyth: Option<String>,
 }
 
 impl VenueUrls {
@@ -895,8 +899,9 @@ impl VenueUrls {
             VenueId::Bybit => &self.bybit,
             VenueId::Coinbase => &self.coinbase,
             VenueId::Hyperliquid => &self.hyperliquid,
+            VenueId::Pyth => &self.pyth,
         };
-        over.as_deref().unwrap_or_else(|| venue.default_ws_url())
+        over.as_deref().unwrap_or_else(|| venue.default_url())
     }
 }
 
@@ -926,9 +931,16 @@ pub struct FeedConfig {
     pub reconnect_max_ms: u64,
     /// No frame at all, not even a keepalive answer, for this long forces a reconnect. These venues
     /// push continuously or answer a ping every 20s, so a silent socket is dead well before TCP
-    /// notices.
+    /// notices. Websocket venues only; the polled ones have nothing to time out on.
     #[serde(default = "d_read_timeout_ms")]
     pub read_timeout_ms: u64,
+    /// How often a polled venue is read. Applies to [`VenueId::Pyth`], the only one; see
+    /// [`crate::feed::Transport`].
+    ///
+    /// Must not exceed `stale_after_ms`, or the venue is stale between its own polls by
+    /// construction and never contributes to a cross-section.
+    #[serde(default = "d_poll_interval_ms")]
+    pub poll_interval_ms: u64,
     /// **The quorum**: venues that must survive the MAD filter for a reference price to exist at
     /// all. Below it the bot quotes nothing and says `no_quorum`. Must be at least 2, because one
     /// venue is a single-source oracle.
@@ -961,6 +973,11 @@ fn d_reconnect_max_ms() -> u64 {
 }
 fn d_read_timeout_ms() -> u64 {
     45_000
+}
+/// Pyth's equity feeds publish about once a second, measured; matching that keeps the reference as
+/// fresh as the venue can make it without asking for prices that do not exist yet.
+fn d_poll_interval_ms() -> u64 {
+    1_000
 }
 fn d_venues_min() -> u8 {
     2
@@ -1010,14 +1027,33 @@ impl FeedConfig {
     fn validate(&self) -> Result<(), ConfigError> {
         for venue in VenueId::ALL {
             let url = self.urls.get(venue);
-            if !(url.starts_with("wss://") || url.starts_with("ws://")) {
+            // The scheme follows the venue's transport, not a house rule: a `wss://` check against
+            // the polled venue would refuse its only correct endpoint.
+            let (ok, want) = match venue.transport() {
+                Transport::WebSocket => (
+                    url.starts_with("wss://") || url.starts_with("ws://"),
+                    "ws(s)",
+                ),
+                Transport::Http => (
+                    url.starts_with("https://") || url.starts_with("http://"),
+                    "http(s)",
+                ),
+            };
+            if !ok {
                 return Err(invalid(format!(
-                    "feed.urls.{venue}: must be a ws(s) URL, got `{url}`"
+                    "feed.urls.{venue}: must be a {want} URL, got `{url}`"
                 )));
             }
         }
         if !(100..=600_000).contains(&self.stale_after_ms) {
             return Err(invalid("feed.stale_after_ms: must be 100..=600000"));
+        }
+        if self.poll_interval_ms == 0 || self.poll_interval_ms > self.stale_after_ms {
+            return Err(invalid(format!(
+                "feed.poll_interval_ms ({}) must be non-zero and <= feed.stale_after_ms ({}); \
+                 a venue polled less often than its own staleness window is stale between polls",
+                self.poll_interval_ms, self.stale_after_ms
+            )));
         }
         if self.reconnect_initial_ms == 0 || self.reconnect_max_ms < self.reconnect_initial_ms {
             return Err(invalid(
@@ -1687,6 +1723,12 @@ pub struct PairVenues {
     /// value, not a route — see [`HedgePair::dex`].
     #[serde(default)]
     pub hyperliquid: Option<String>,
+    /// This pair's Pyth symbol, in full: `Equity.US.AAPL/USD`. Resolved to a feed id at runtime,
+    /// so the id never appears in configuration and cannot drift from the symbol it names.
+    ///
+    /// The `.PRE` / `.ON` / `.POST` variants are refused; see [`crate::feed::pyth`].
+    #[serde(default)]
+    pub pyth: Option<String>,
 }
 
 impl PairVenues {
@@ -1699,6 +1741,7 @@ impl PairVenues {
             VenueId::Bybit => self.bybit.as_deref(),
             VenueId::Coinbase => self.coinbase.as_deref(),
             VenueId::Hyperliquid => self.hyperliquid.as_deref(),
+            VenueId::Pyth => self.pyth.as_deref(),
         }
     }
 
@@ -1907,6 +1950,18 @@ impl PairConfig {
             if symbol.trim().is_empty() {
                 return Err(invalid(format!(
                     "pairs[{id}].venues.{venue}: must not be empty"
+                )));
+            }
+        }
+        if let Some(pyth) = self.venues.pyth.as_deref() {
+            if let Some(suffix) = crate::feed::pyth::DEPRECATED_SUFFIXES
+                .iter()
+                .find(|s| pyth.ends_with(**s))
+            {
+                return Err(invalid(format!(
+                    "pairs[{id}].venues.pyth (`{pyth}`) names a `{suffix}` feed, which Pyth marks \
+                     DEPRECATED FEED; it covers one session outside regular hours and is dark \
+                     while the market is open. Drop the suffix"
                 )));
             }
         }
@@ -2203,6 +2258,82 @@ capacity_divergence_pct = 30
             "wss://ws.okx.com:8443/ws/v5/public",
             "one override must not disturb the rest"
         );
+    }
+
+    /// The scheme check follows [`VenueId::transport`]. A blanket `wss://` rule would refuse the
+    /// polled venue's only correct endpoint, and an `http(s)` one would let a websocket venue be
+    /// pointed at an endpoint that can never subscribe.
+    #[test]
+    fn the_url_scheme_each_venue_is_held_to_is_the_one_it_speaks() {
+        let cfg = parse(good()).unwrap();
+        assert_eq!(
+            cfg.feed.urls.get(VenueId::Pyth),
+            "https://hermes.pyth.network"
+        );
+
+        let s = format!(
+            "{}\n[feed.urls]\npyth = \"https://hermes.example.test\"\n",
+            good()
+        );
+        assert_eq!(
+            parse(&s).unwrap().feed.urls.get(VenueId::Pyth),
+            "https://hermes.example.test"
+        );
+
+        let s = format!(
+            "{}\n[feed.urls]\npyth = \"wss://hermes.example.test\"\n",
+            good()
+        );
+        assert!(matches!(parse(&s), Err(ConfigError::Invalid(m)) if m.contains("http(s)")));
+        let s = format!(
+            "{}\n[feed.urls]\nbybit = \"https://example.test\"\n",
+            good()
+        );
+        assert!(matches!(parse(&s), Err(ConfigError::Invalid(m)) if m.contains("ws(s)")));
+    }
+
+    /// Pyth's `.PRE` / `.ON` / `.POST` feeds are marked DEPRECATED FEED and cover the sessions the
+    /// live feed does not, so one named here would be dark whenever the market is open.
+    #[test]
+    fn a_deprecated_pyth_session_feed_is_refused_at_startup() {
+        let base = good().replace(
+            r#"venues = { binance = "ETHUSDT", okx = "ETH-USDT", bybit = "ETHUSDT" }"#,
+            r#"venues = { binance = "ETHUSDT", okx = "ETH-USDT", pyth = "PYTHSYM" }"#,
+        );
+        for bad in [
+            "Equity.US.AAPL/USD.PRE",
+            "Equity.US.AAPL/USD.ON",
+            "Equity.US.AAPL/USD.POST",
+        ] {
+            let s = base.replace("PYTHSYM", bad);
+            assert!(
+                matches!(parse(&s), Err(ConfigError::Invalid(m)) if m.contains("DEPRECATED FEED")),
+                "`{bad}` was accepted"
+            );
+        }
+        let s = base.replace("PYTHSYM", "Equity.US.AAPL/USD");
+        assert_eq!(
+            parse(&s).unwrap().venue_symbols(VenueId::Pyth),
+            vec![("Equity.US.AAPL/USD".to_string(), "ETHUSDT".to_string())]
+        );
+    }
+
+    /// A venue polled less often than its own staleness window is stale between polls, which reads
+    /// as a venue that is barely there rather than as the misconfiguration it is.
+    #[test]
+    fn a_poll_interval_past_the_staleness_window_is_refused() {
+        let s = good().replace(
+            "venues_min = 2",
+            "venues_min = 2\nstale_after_ms = 5000\npoll_interval_ms = 6000",
+        );
+        assert!(
+            matches!(parse(&s), Err(ConfigError::Invalid(m)) if m.contains("stale between polls"))
+        );
+        let s = good().replace(
+            "venues_min = 2",
+            "venues_min = 2\nstale_after_ms = 5000\npoll_interval_ms = 1000",
+        );
+        assert_eq!(parse(&s).unwrap().feed.poll_interval_ms, 1_000);
     }
 
     #[test]
