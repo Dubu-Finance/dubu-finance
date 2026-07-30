@@ -66,6 +66,7 @@ use dubu_updater::jump;
 use dubu_updater::ladder::{self, RowInputs};
 use dubu_updater::maker;
 use dubu_updater::markout::{self, Markout};
+use dubu_updater::notify::{self, Notifier};
 use dubu_updater::now_unix;
 use dubu_updater::policy::{self, CapacityDecision, Context, Decision};
 use dubu_updater::quoting;
@@ -88,6 +89,16 @@ macro_rules! trace_at {
         if $loud { tracing::info!($($arg)*) } else { tracing::debug!($($arg)*) }
     };
 }
+
+/// How long the exit path waits for the alerting task to get its last message out.
+///
+/// The events worth waking somebody for — a killswitch trip, every group latched — are all
+/// followed within milliseconds by `EXIT_HALTED`, so without a bounded wait here the batch dies
+/// inside its window with the process and the operator learns nothing. That is the 2026-07-29
+/// shape exactly: the log said everything, the process was gone, and it was 59 minutes before a
+/// human noticed. Two seconds, because it is spent only while shutting down and it is shorter
+/// than a systemd restart delay.
+const NOTIFY_FLUSH: Duration = Duration::from_secs(2);
 
 /// Exit code when the bot stops because a killswitch latched or the chain went away.
 const EXIT_HALTED: i32 = 2;
@@ -275,6 +286,11 @@ struct Runtime {
     /// order draw on one balance. Normally false — `PmmSettle` pulls from the maker, and the two
     /// are separate balance sheets whose commitments must not be netted against each other.
     rfq_shares_pool_inventory: bool,
+    /// Pushes fills and anything that went wrong to Telegram. Disabled and inert when the
+    /// credentials are absent; see [`dubu_updater::notify`] for why nothing here may ever wait on
+    /// it, and why it is a `Notifier` rather than an `Option<Notifier>` — the disabled state is a
+    /// no-op, so no call site has to remember the difference.
+    notify: Notifier,
 }
 
 /// Why this cycle is running. Logged on every cycle, because "the fallback timer has been the
@@ -718,6 +734,13 @@ async fn run(args: &Args) -> Result<i32, Box<dyn std::error::Error>> {
               "DRY RUN: rows will be computed and decisions logged, nothing will be broadcast");
     }
 
+    // Started here rather than beside the other tasks below, because the first thing worth
+    // reporting — a group that came up already latched — happens on the next few lines, before
+    // there is a feed, a subscription or a cycle. Absent credentials leave it inert; see
+    // `notify::Notifier::from_env`, which is the whole of "a missing alerting credential must
+    // never be able to stop a live trading system".
+    let notify = Notifier::from_env();
+
     // Stay-down. A restart is the first thing an operator does, and it must not resume a book
     // that a killswitch took down.
     let latched: Vec<&String> = kills
@@ -730,6 +753,14 @@ async fn run(args: &Args) -> Result<i32, Box<dyn std::error::Error>> {
             error!(target: "risk", event = "stay_down_group", group = %g,
                    reason = kills[*g].halt_reason().unwrap_or("(unrecorded)"),
                    "this group is latched from a previous run; its pairs will not quote");
+            // Pushed as well as logged. This one is a *partial* book — the other groups quote on,
+            // so nothing about the process looks wrong from outside, and a group that is silently
+            // absent from a running bot is precisely the fourteen-hour failure.
+            notify.send(notify::Event::StayDown {
+                group: (*g).clone(),
+                reason: kills[*g].halt_reason().unwrap_or("(unrecorded)").into(),
+                exiting: false,
+            });
         }
     }
 
@@ -785,6 +816,13 @@ async fn run(args: &Args) -> Result<i32, Box<dyn std::error::Error>> {
                         !kill.is_halted(),
                         "a group logged as resumed that is still latched would exit below anyway"
                     );
+                    // For the same reason the log line above is at `error!`: a killswitch clearing
+                    // itself with no human in the loop is a thing the operator has to be told
+                    // happened, not a thing they should have to go and find.
+                    notify.send(notify::Event::LatchCleared {
+                        group: group.clone(),
+                        reason: reason.clone(),
+                    });
                 }
             }
             // Which pool fell short is in the `liveness_probe_failed` line immediately above this
@@ -809,7 +847,17 @@ async fn run(args: &Args) -> Result<i32, Box<dyn std::error::Error>> {
             "killswitch is latched from a previous run; re-asserting the withdrawal and exiting. \
              Clear the state file deliberately to resume."
         );
+        // The 2026-07-29 outage, said out loud. This branch is where six restarts in a row went,
+        // and each of them logged exactly this and then exited into a process nobody was watching.
+        notify.send(notify::Event::StayDown {
+            group: "all".into(),
+            reason: kill.halt_reason().unwrap_or("(unrecorded)").into(),
+            exiting: true,
+        });
         withdraw_quotes(&cfg, &rpc, &mut sender).await;
+        // Before the return, and it is the reason `flush` exists: the process is about to be gone,
+        // and a batch still inside its window would go with it.
+        notify.flush(NOTIFY_FLUSH).await;
         return Ok(EXIT_HALTED);
     }
 
@@ -925,6 +973,7 @@ async fn run(args: &Args) -> Result<i32, Box<dyn std::error::Error>> {
         markout: Markout::new(),
         rfq_shares_pool_inventory: rfq_maker == cfg_pool,
         rfq: rfq_shared,
+        notify,
     };
 
     wait_for_feed(&rt).await;
@@ -995,6 +1044,10 @@ async fn run(args: &Args) -> Result<i32, Box<dyn std::error::Error>> {
         let _ = tokio::time::timeout(Duration::from_secs(3), task).await;
     }
     let _ = tokio::time::timeout(Duration::from_secs(3), heads_task).await;
+    // Every path out of the loop lands here — a killswitch, a signal, `--cycles` — and each of
+    // them has just logged the reason it is leaving. Bounded, and best-effort in every direction:
+    // this must not be able to delay a shutdown that is already under way.
+    rt.notify.flush(NOTIFY_FLUSH).await;
     Ok(code)
 }
 
@@ -1212,6 +1265,13 @@ async fn quote_loop(
                    stall = stall.label(), best_block,
                    heads = head.status.label(),
                    "chain liveness is gone; halting and withdrawing quotes");
+            // One message for the whole book rather than one per group, because chain liveness is
+            // not a per-group fact and the groups would all carry the identical reason string.
+            rt.notify.send(notify::Event::Halt {
+                group: "all".into(),
+                switch: halt.label(),
+                reason: halt.to_string(),
+            });
             // Chain liveness is not a per-group fact, so every group latches.
             for k in rt.kills.values_mut() {
                 let _ = k.halt(&halt, now_unix());
@@ -1437,10 +1497,20 @@ async fn withdraw_pair(rt: &mut Runtime, pair_id: u16, why: &str) {
             elapsed_ms = started.elapsed().as_millis(),
             "quotes withdrawn: capacity epoch set to zero"
         ),
-        Err(e) => error!(
-            target: "tx", event = "withdraw_failed", pair_id, why, error = %e,
-            "COULD NOT WITHDRAW QUOTES; the next cycle will re-assert it"
-        ),
+        Err(e) => {
+            error!(
+                target: "tx", event = "withdraw_failed", pair_id, why, error = %e,
+                "COULD NOT WITHDRAW QUOTES; the next cycle will re-assert it"
+            );
+            // The same coalescing as the quote path, and it matters more here: this is the fast
+            // lane's withdrawal, which the next cycle re-asserts, so a persistent send failure
+            // reproduces itself every ~200ms against a pool that is still armed into a jump.
+            rt.notify.send(notify::Event::SendFailed {
+                pair_id: Some(pair_id),
+                kind: "withdraw",
+                error: e.to_string(),
+            });
+        }
     }
 }
 
@@ -1925,7 +1995,11 @@ async fn scan_fills(rt: &mut Runtime, head: &heads::HeadSnapshot, view: &ChainVi
         } else {
             log.amount_in
         };
-        let ref_at_fill = match rt.markout.reference_at(log.pair_id, log.at_secs) {
+        // Kept, rather than consumed by the `match` below, because whether a *real* reference
+        // existed is itself information — see `fill_alert`, which must not report an edge computed
+        // against the fill's own execution price.
+        let reference = rt.markout.reference_at(log.pair_id, log.at_secs);
+        let ref_at_fill = match reference {
             Some(r) => r,
             None => {
                 let scale = 10u128.pow(u32::from(meta.price_scale_exp));
@@ -1947,6 +2021,13 @@ async fn scan_fills(rt: &mut Runtime, head: &heads::HeadSnapshot, view: &ChainVi
             block = log.block_number, at_secs = log.at_secs, tx = %log.tx_hash,
             "fill observed"
         );
+
+        // The same event, pushed. Third-party volume is zero today and the flow simulator is about
+        // to make it not be, so this is the message that will arrive in bursts; the batching in
+        // `notify` is sized for that rather than for the current quiet.
+        if let Some(fill) = fill_alert(rt, view, log, &meta, base, quote, reference) {
+            rt.notify.send(notify::Event::Fill(fill));
+        }
 
         // The hedge is NOT told about this fill, and that is deliberate. It reads the pool's balance
         // and the venue's position directly -- see `hedge::Bands` -- so a fill it never hears about
@@ -1989,6 +2070,80 @@ async fn scan_fills(rt: &mut Runtime, head: &heads::HeadSnapshot, view: &ChainVi
             "markout scoreboard"
         );
     }
+}
+
+/// Turn one observed fill into the alert a human reads on a phone.
+///
+/// `None` when the fill cannot be described honestly — an unknown pair, a price that will not
+/// convert — rather than a message with a placeholder in it. An alert nobody can act on is worse
+/// than no alert, because it trains the reader to skim.
+///
+/// # What is in scope here and what is not, because the difference is not obvious
+///
+/// **Markout is not.** A markout is the fill's value at +1s, +10s and +60s measured against a
+/// later reference, and at the instant a fill is observed none of those references exists. It
+/// arrives about a minute later out of `Markout::settle`, as the `marked` event a few lines below
+/// the call site. Reporting a zero, or the fill-time reference twice, would be a number that looks
+/// like a measurement and is not one, so this carries no markout field at all.
+///
+/// **The skew is not.** It is computed per pair inside `run_cycle` from that cycle's inventory and
+/// volatility and is not stored anywhere this can reach; the closest honest substitute is the
+/// inventory the skew is derived from, which is what goes out instead.
+///
+/// **The inventory is, with a caveat that is in the wording.** `view.balances` is the pool's
+/// balance as of the reader task's last poll — up to ~330ms old, and read at a block that may be
+/// later than the fill's, since this scan runs behind the confirmed head. So it is the inventory
+/// *now*, not the inventory this fill produced, and the message says "inventory now" for that
+/// reason. Reconstructing a per-fill position would mean replaying every fill in the block against
+/// a balance nobody sampled at that block, which is a measurement this does not have.
+fn fill_alert(
+    rt: &Runtime,
+    view: &ChainView,
+    log: &dubu_updater::chain::swaps::SwapLog,
+    meta: &dubu_updater::chain::PairMeta,
+    base: u128,
+    quote: u128,
+    reference: Option<u128>,
+) -> Option<notify::Fill> {
+    // The pair's feed symbol, which is what an operator calls it. `pair_id` alone is a number
+    // whose meaning lives in a config file they would have to go and open.
+    let symbol = rt
+        .cfg
+        .pairs
+        .iter()
+        .find(|p| p.pair_id == log.pair_id)?
+        .symbol
+        .clone();
+
+    // Both prices are converted through the pair's own shift rather than assembled from the raw
+    // amounts here. `units` is the only place in this crate where a decimal scale is decided, and
+    // a second derivation of the same conversion is how the two quietly stop agreeing.
+    let shift = units::price_shift(
+        meta.price_scale_exp,
+        meta.base_decimals,
+        meta.quote_decimals,
+    );
+    let scale = dubu_core::math::pow10(meta.price_scale_exp)?;
+    let executed = quote.checked_mul(scale)?.checked_div(base.max(1))?;
+    let price_e8 = units::from_pool_price(executed, shift)?;
+
+    Some(notify::Fill {
+        pair_id: log.pair_id,
+        symbol,
+        is_bid: log.is_bid,
+        base_amount: base,
+        base_decimals: meta.base_decimals,
+        quote_amount: quote,
+        quote_decimals: meta.quote_decimals,
+        price_e8,
+        // `reference`, not `ref_at_fill`. The latter falls back to the fill's own execution price
+        // when nothing was in tolerance, and handing that over as a reference would render every
+        // such fill at exactly zero edge — see `notify::Fill::reference_e8`.
+        reference_e8: reference.and_then(|r| units::from_pool_price(r, shift)),
+        inventory_base: view.balances.get(&meta.base).copied(),
+        inventory_quote: view.balances.get(&meta.quote).copied(),
+        tx: log.tx_hash.to_string(),
+    })
 }
 
 /// One evaluation over every pair. Returns `true` if a killswitch latched.
@@ -2814,6 +2969,14 @@ block_work,
                         error!(target: "risk", event = "halt", group = %g, switch = h.label(),
                                reason = %h, pairs = ids.len(),
                                "KILLSWITCH TRIPPED for this group; its pairs stop quoting");
+                        // The fourteen-hour silence. This trip only ever produced one line in a
+                        // stream that emits several a second, and the group went on not quoting
+                        // until somebody happened to look at the state file.
+                        rt.notify.send(notify::Event::Halt {
+                            group: g.clone(),
+                            switch: h.label(),
+                            reason: h.to_string(),
+                        });
                     }
                 }
                 Err(e) => {
@@ -2907,10 +3070,21 @@ async fn emit(rt: &mut Runtime, intent: Intent) {
                 tx = %hash, nonce, "transaction broadcast"
             );
         }
-        Err(e) => error!(
-            target: "tx", event = "send_failed", pair_id = intent.pair_id(), kind = intent.label(),
-            error = %e, "could not send"
-        ),
+        Err(e) => {
+            error!(
+                target: "tx", event = "send_failed", pair_id = intent.pair_id(), kind = intent.label(),
+                error = %e, "could not send"
+            );
+            // Coalesced by class on the other side, not sent one-for-one. This is the quote path,
+            // so a node answering `-32003 txpool is full` refuses every send for as long as the
+            // condition lasts — at 5-6 cycles a second across every pair, one message per
+            // occurrence would be thousands. See `notify::ErrorLedger`.
+            rt.notify.send(notify::Event::SendFailed {
+                pair_id: Some(intent.pair_id()),
+                kind: intent.label(),
+                error: e.to_string(),
+            });
+        }
     }
 }
 

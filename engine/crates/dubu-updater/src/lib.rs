@@ -143,6 +143,7 @@ pub mod jump;
 pub mod ladder;
 pub mod maker;
 pub mod markout;
+pub mod notify;
 pub mod policy;
 pub mod quoting;
 pub mod risk;
