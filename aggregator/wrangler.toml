@@ -6,7 +6,20 @@ compatibility_date = "2026-07-01"
 # than only as defaults in config.ts so that repointing at a redeployed contract is a config change
 # with a diff, not a code change.
 [vars]
-RPC_URL = "https://sepolia-rpc.giwa.io"
+# RPC_URL is a SECRET, not a var, for the same reason PROP_QUOTE_URL is: it points at a cloudflared
+# tunnel onto the box's own reth, and that hostname changes every time the tunnel restarts. Absent,
+# `config.ts` falls back to DEFAULT_RPC, which is the flashblocks endpoint.
+#
+# Why the box node at all: the public endpoint answers a laptop 12/12 but failed ~17% of this
+# Worker's requests, and each failure is a `could not read the chain` refusal the user sees as no
+# quote. A Worker's egress IPs are shared with the whole of Cloudflare, so it hits a public RPC's
+# per-IP limits in a way a single laptop never does.
+#
+# Both public endpoints stay behind it as REAL fallbacks. Before this they did not exist: RPC_URL
+# was the plain public endpoint and FALLBACK_RPC_URLS defaulted to the same string, so viem's
+# `fallback` transport deduplicated to one URL and had nothing to fall back to. Flashblocks first
+# because it is a second fresher; the sealed endpoint last because stale beats absent.
+FALLBACK_RPC_URLS = "https://sepolia-rpc-flashblocks.giwa.io,https://sepolia-rpc.giwa.io"
 ROUTER = "0x2B10D0b50ca3A7c0C7CCaBc969615b4Db3fb9471"
 PROP_POOL = "0xBbE55E29BbC6d71EcAb1ac011c9Ac5206aB2Fe74"
 PROP_ADAPTER = "0x16C5A0df5Ad0c8b0A450eDaa67c56593B02D19e2"
