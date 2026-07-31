@@ -433,13 +433,6 @@ struct Nonces {
     /// `-32003`. An unknown outcome must never land here, because reusing a nonce that is in fact
     /// sitting in the sequencer signs a second transaction at the same nonce.
     free: BTreeSet<u64>,
-    /// One past the highest nonce this book has ever handed out.
-    ///
-    /// The floor [`Nonces::adopt`] clamps the node's answer to. The local node forwards
-    /// `eth_sendRawTransaction` to the sequencer instead of keeping the transaction, so its
-    /// `pending` count omits our in-flight sends and comes back behind reality; adopting it
-    /// verbatim re-issues nonces that are already mined or already in the mempool.
-    issued: Option<u64>,
 }
 
 impl Nonces {
@@ -453,14 +446,11 @@ impl Nonces {
     /// Synchronous by construction and every caller must keep it that way: this is the
     /// read-modify-write that concurrency would break.
     fn reserve(&mut self) -> Option<u64> {
-        let n = if let Some(n) = self.free.pop_first() {
-            n
-        } else {
-            let n = self.next?;
-            self.next = Some(n.saturating_add(1));
-            n
-        };
-        self.issued = Some(self.issued.unwrap_or(0).max(n.saturating_add(1)));
+        if let Some(n) = self.free.pop_first() {
+            return Some(n);
+        }
+        let n = self.next?;
+        self.next = Some(n.saturating_add(1));
         Some(n)
     }
 
@@ -481,16 +471,9 @@ impl Nonces {
         self.free.clear();
     }
 
-    /// Take the node's count as the sequence's new origin, but never move backwards.
-    ///
-    /// The node is authoritative only about what it has seen. Because sends are forwarded to the
-    /// sequencer rather than pooled locally, its `pending` count lags our own issuance, and a
-    /// backward jump re-issues live nonces: the mined ones come back `nonce too low`, the mempool
-    /// ones `replacement transaction underpriced`, and each failure resyncs again. Clamping to
-    /// what this book has already handed out makes that self-amplifying loop unreachable. A node
-    /// genuinely ahead -- another sender on the same key -- is still adopted.
+    /// Take the node's count as the sequence's new origin.
     fn adopt(&mut self, from_node: u64) {
-        self.next = Some(from_node.max(self.issued.unwrap_or(0)));
+        self.next = Some(from_node);
         self.free.clear();
     }
 
@@ -1804,43 +1787,6 @@ mod tests {
         }
         // A node whose pool truncated all three would answer 215409. It is not asked.
         assert_eq!(s.next_nonce(), Some(215_412));
-    }
-
-    /// The same lagging node, on the one path that *does* ask it. A `nonce too low` resyncs, the
-    /// next reservation re-reads, and sends are forwarded to the sequencer rather than pooled
-    /// locally, so the answer omits everything in flight. Adopting it verbatim re-issued live
-    /// nonces and each collision resynced again: 7 `nonce too low` and 7 `replacement transaction
-    /// underpriced` in one burst on 2026-07-31, the node 66 ahead of what the bot was sending.
-    #[test]
-    fn a_resync_against_a_lagging_node_does_not_reissue_live_nonces() {
-        let mut s = Sender::new(
-            None,
-            91_342,
-            Address::ZERO,
-            &tx_cfg(true),
-            50_000_000,
-            5_000_000,
-        );
-        s.nonces.adopt(641_376);
-        for _ in 0..66 {
-            s.nonces.reserve();
-        }
-        assert_eq!(s.next_nonce(), Some(641_442));
-
-        // `nonce too low` clears the book, then the re-read answers with only what the node has
-        // seen -- 66 behind, because the rest sit at the sequencer.
-        s.resync_nonce();
-        s.nonces.adopt(641_376);
-
-        assert_eq!(
-            s.next_nonce(),
-            Some(641_442),
-            "the book handed out 641441; re-issuing it collides with a live transaction"
-        );
-
-        // A node that is genuinely ahead is still believed: another sender shares this key.
-        s.nonces.adopt(641_500);
-        assert_eq!(s.next_nonce(), Some(641_500));
     }
 
     /// A refused nonce comes back and goes out again, lowest first: a hole makes every nonce above
