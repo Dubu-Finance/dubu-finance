@@ -629,10 +629,18 @@ async fn run(args: &Args) -> Result<i32, Box<dyn std::error::Error>> {
     // Sends bypass `rpc_url` when a submit endpoint is configured. A local node that forwards to
     // the sequencer can accept a transaction, return its hash and never deliver it, and no failover
     // catches that because nothing reported a failure.
+    //
+    // `rpc_url` sits behind it rather than the sequencer standing alone, because the sequencer is
+    // remote and the local node is not: without this a network blip there stops every send, which
+    // is a worse failure than the forwarding it replaced. The pool's own rule makes this safe on a
+    // transmit path -- only an endpoint fault steps to the next endpoint, while a node-level
+    // refusal returns as-is, so a rejected transaction is never broadcast twice.
     if let Some(url) = cfg.chain.submit_rpc_url.as_ref() {
-        sender.set_submit_rpc(Rpc::new("submit", url, &cfg.chain)?);
+        let urls = [url.clone(), cfg.chain.rpc_url.clone()];
+        sender.set_submit_rpc(Rpc::pooled("submit", &urls, Selection::Pin, &cfg.chain)?);
         info!(
             target: "startup", event = "submit_endpoint", url = %url,
+            fallback = %cfg.chain.rpc_url,
             "eth_sendRawTransaction goes here; nonce and receipt stay on rpc_url"
         );
     }
