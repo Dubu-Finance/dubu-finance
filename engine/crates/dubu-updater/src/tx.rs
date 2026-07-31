@@ -598,7 +598,28 @@ pub struct Sender {
     /// Set this to the sequencer. Nonce and receipt stay on the ordinary endpoint, because a
     /// sequencer serves neither. See `ChainConfig::submit_rpc_url` for the failure this exists for.
     submit: Option<SubmitRpc>,
+    /// The highest fee already bid at a nonce this book intends to send again.
+    ///
+    /// A nonce comes back here only from [`Self::sweep_timeouts`], where the chain has shown the
+    /// transaction did not land. Re-sending the same nonce at the same price is refused as
+    /// `replacement transaction underpriced` -- the upstream may still be holding the earlier
+    /// attempt -- so the retry has to outbid it. Cleared once the nonce lands.
+    escalate: BTreeMap<u64, Fees>,
 }
+
+/// How far a retry must outbid the attempt it replaces.
+///
+/// Geth and reth both require a strict 10% increase on both fee fields; 12.5% clears that with room
+/// for the integer division to round down without landing exactly on the boundary.
+const REPLACE_BUMP_NUM: u128 = 9;
+const REPLACE_BUMP_DEN: u128 = 8;
+
+/// The most a retry may escalate before the book stops raising it.
+///
+/// Compounding 12.5% is a geometric series, so an unbounded retry loop reaches absurd fees in a few
+/// dozen attempts and would drain the key. At the ceiling the retry still goes out, at the ceiling
+/// price: a transaction that cannot be replaced at 64x the configured fee is not a pricing problem.
+const REPLACE_ESCALATION_MAX: u128 = 64;
 
 /// An [`Rpc`] that can sit inside a `Debug` type without printing its URL.
 ///
@@ -642,6 +663,7 @@ impl Sender {
             backpressure: None,
             staged_episode: None,
             submit: None,
+            escalate: BTreeMap::new(),
         }
     }
 
@@ -731,6 +753,9 @@ impl Sender {
     /// backwards would re-block settled sends.
     pub fn observe_landed(&mut self, confirmed_nonce: u64) {
         self.landed_nonce = self.landed_nonce.max(confirmed_nonce);
+        // A nonce the chain has executed can never need replacing, so the escalation it accumulated
+        // must not outlive it and reprice an unrelated intent that reuses the number later.
+        self.escalate.retain(|n, _| *n >= self.landed_nonce);
     }
 
     /// The pending transaction for a pair, if any.
@@ -802,13 +827,42 @@ impl Sender {
         self.envelope_with_fees(intent, nonce, None)
     }
 
-    /// Build the envelope, optionally overriding the fees for this one transaction.
-    #[must_use]
-    pub fn envelope_with_fees(&self, intent: Intent, nonce: u64, fees: Option<Fees>) -> Eip1559 {
-        let f = fees.unwrap_or(Fees {
+    /// What was last bid at a nonce, for a retry to outbid. The configured fee when this book has
+    /// not escalated the nonce before.
+    fn last_fees(&self, nonce: u64) -> Fees {
+        self.escalate.get(&nonce).copied().unwrap_or(Fees {
+            max_fee: self.max_fee,
+            max_priority_fee: self.max_priority_fee,
+        })
+    }
+
+    /// The fee to sign a nonce at: the configured one, unless this nonce is being retried after the
+    /// chain showed the last attempt did not land, in which case it must outbid that attempt.
+    fn fees_for(&self, nonce: u64, fees: Option<Fees>) -> Fees {
+        let base = fees.unwrap_or(Fees {
             max_fee: self.max_fee,
             max_priority_fee: self.max_priority_fee,
         });
+        let Some(prev) = self.escalate.get(&nonce) else {
+            return base;
+        };
+        let bump = |v: u128| v.saturating_mul(REPLACE_BUMP_NUM) / REPLACE_BUMP_DEN;
+        // The ceiling is measured against the configured fee, not the previous bid, so a long retry
+        // chain converges on it instead of compounding away from it.
+        Fees {
+            max_fee: bump(prev.max_fee).min(base.max_fee.saturating_mul(REPLACE_ESCALATION_MAX)),
+            max_priority_fee: bump(prev.max_priority_fee)
+                .min(base.max_priority_fee.saturating_mul(REPLACE_ESCALATION_MAX)),
+        }
+    }
+
+    /// Build the envelope, optionally overriding the fees for this one transaction.
+    ///
+    /// A nonce this book is retrying after a timeout is signed above whatever was already bid at
+    /// it, whether or not `fees` is given: an equal-priced replacement is refused outright.
+    #[must_use]
+    pub fn envelope_with_fees(&self, intent: Intent, nonce: u64, fees: Option<Fees>) -> Eip1559 {
+        let f = self.fees_for(nonce, fees);
         Eip1559 {
             chain_id: self.chain_id,
             nonce,
@@ -1261,9 +1315,21 @@ impl Sender {
             // Everything behind a timed-out transaction goes with it: a nonce that never lands is a
             // gap, and every nonce after it is unexecutable however healthy its transaction looks.
             self.pending.remove(&pair_id);
-            // The abandoned nonce may or may not have been consumed, and re-reading is the only way
-            // to find out. Guessing produces a stuck queue.
-            self.resync_nonce();
+
+            // `landed_nonce` is the chain's own count of what executed, so it is the one answer
+            // about this transaction that the endpoint which lost it cannot get wrong. Asking the
+            // node instead is what let a swallowed send sit forever: it kept reporting the
+            // transaction as pending, the sequence never moved, and nothing was ever re-sent.
+            if p.nonce >= self.landed_nonce {
+                // Unexecuted, so the hole is real and this book still owns it. Put it back to be
+                // re-signed and re-sent rather than re-reading a count that cannot see the gap.
+                self.escalate.insert(p.nonce, self.last_fees(p.nonce));
+                self.nonces.release(p.nonce);
+            } else {
+                // The chain is past it, so the nonce is spent and the local sequence is what is
+                // wrong. This is the case re-reading was written for.
+                self.resync_nonce();
+            }
         }
         settled
     }
@@ -1681,6 +1747,200 @@ mod tests {
             .label(),
             "refreshCapacity"
         );
+    }
+
+    /// The failure of 2026-07-31, in miniature: a transaction is submitted, the chain never executes
+    /// it, and the endpoint that lost it keeps calling it pending. The book must reclaim the nonce
+    /// from what the CHAIN says, not from what that endpoint says, or the hole is never filled.
+    #[test]
+    fn a_send_the_chain_never_executed_is_reclaimed_and_sent_again() {
+        let mut s = Sender::new(
+            None,
+            91_342,
+            Address::ZERO,
+            &tx_cfg(true),
+            50_000_000,
+            5_000_000,
+        );
+        s.nonces.adopt(912_698);
+        let nonce = s.nonces.reserve().unwrap();
+        assert_eq!(nonce, 912_698);
+        assert_eq!(s.next_nonce(), Some(912_699));
+
+        let now = Instant::now();
+        s.track(
+            &Reserved {
+                intent: Intent::RefreshCapacity {
+                    pair_id: 2,
+                    bid: 1,
+                    ask: 1,
+                },
+                nonce,
+                hash: B256::ZERO,
+                raw: Vec::new(),
+            },
+            now,
+        );
+
+        // The chain has not passed it: `landed_nonce` is still behind, which is the honest signal.
+        assert!(nonce >= s.landed_nonce);
+        let settled = s.sweep_timeouts(now + Duration::from_secs(3_600));
+        assert_eq!(settled.len(), 1, "the stuck send must be reported");
+
+        // Reclaimed, not resynced: the very next reservation refills the hole.
+        assert_eq!(
+            s.nonces.reserve(),
+            Some(912_698),
+            "the gap nonce must come back out, or every nonce above it is unexecutable"
+        );
+    }
+
+    /// The mirror: the chain DID execute it, so the nonce is spent and re-issuing it would collide.
+    #[test]
+    fn a_send_the_chain_executed_is_not_reclaimed() {
+        let mut s = Sender::new(
+            None,
+            91_342,
+            Address::ZERO,
+            &tx_cfg(true),
+            50_000_000,
+            5_000_000,
+        );
+        s.nonces.adopt(500);
+        let nonce = s.nonces.reserve().unwrap();
+        let now = Instant::now();
+        s.track(
+            &Reserved {
+                intent: Intent::RefreshCapacity {
+                    pair_id: 1,
+                    bid: 1,
+                    ask: 1,
+                },
+                nonce,
+                hash: B256::ZERO,
+                raw: Vec::new(),
+            },
+            now,
+        );
+        s.observe_landed(nonce + 1); // the chain is past it
+
+        s.sweep_timeouts(now + Duration::from_secs(3_600));
+        assert!(
+            !s.nonces.free.contains(&nonce),
+            "a nonce the chain consumed must never be handed out again"
+        );
+    }
+
+    /// A retry at the same price is refused as `replacement transaction underpriced`, so a reclaimed
+    /// nonce has to outbid the attempt it replaces -- and must not compound without limit.
+    #[test]
+    fn a_reclaimed_nonce_outbids_its_own_previous_attempt_up_to_a_ceiling() {
+        let mut s = Sender::new(
+            None,
+            91_342,
+            Address::ZERO,
+            &tx_cfg(true),
+            50_000_000,
+            5_000_000,
+        );
+        let base = s.envelope(
+            Intent::RefreshCapacity {
+                pair_id: 1,
+                bid: 1,
+                ask: 1,
+            },
+            77,
+        );
+        assert_eq!(base.max_priority_fee_per_gas, 5_000_000);
+
+        let mut last = 5_000_000u128;
+        for _ in 0..3 {
+            s.escalate.insert(
+                77,
+                Fees {
+                    max_fee: 50_000_000,
+                    max_priority_fee: last,
+                },
+            );
+            let e = s.envelope(
+                Intent::RefreshCapacity {
+                    pair_id: 1,
+                    bid: 1,
+                    ask: 1,
+                },
+                77,
+            );
+            assert!(
+                e.max_priority_fee_per_gas > last,
+                "a replacement at or below the previous bid is refused outright"
+            );
+            last = e.max_priority_fee_per_gas;
+        }
+
+        // Escalation is bounded, or a retry loop drains the key.
+        s.escalate.insert(
+            77,
+            Fees {
+                max_fee: u128::MAX,
+                max_priority_fee: u128::MAX,
+            },
+        );
+        let capped = s.envelope(
+            Intent::RefreshCapacity {
+                pair_id: 1,
+                bid: 1,
+                ask: 1,
+            },
+            77,
+        );
+        assert_eq!(
+            capped.max_priority_fee_per_gas,
+            5_000_000 * REPLACE_ESCALATION_MAX
+        );
+        assert_eq!(capped.max_fee_per_gas, 50_000_000 * REPLACE_ESCALATION_MAX);
+
+        // An unrelated nonce is untouched.
+        let other = s.envelope(
+            Intent::RefreshCapacity {
+                pair_id: 1,
+                bid: 1,
+                ask: 1,
+            },
+            78,
+        );
+        assert_eq!(other.max_priority_fee_per_gas, 5_000_000);
+    }
+
+    /// Escalation must not outlive the nonce it belonged to, or a later intent reusing that number
+    /// is priced by a race it had nothing to do with.
+    #[test]
+    fn escalation_is_forgotten_once_the_chain_passes_the_nonce() {
+        let mut s = Sender::new(
+            None,
+            91_342,
+            Address::ZERO,
+            &tx_cfg(true),
+            50_000_000,
+            5_000_000,
+        );
+        s.escalate.insert(
+            900,
+            Fees {
+                max_fee: 99_999,
+                max_priority_fee: 88_888,
+            },
+        );
+        s.observe_landed(901);
+        assert!(s.escalate.is_empty(), "a spent nonce carries no escalation");
+        let e = s.envelope(
+            Intent::RefreshCapacity {
+                pair_id: 1,
+                bid: 1,
+                ask: 1,
+            },
+            900,
+        );
+        assert_eq!(e.max_priority_fee_per_gas, 5_000_000);
     }
 
     /// A `ChainConfig` sufficient to build an [`Rpc`]. Only the client and limiter fields matter
