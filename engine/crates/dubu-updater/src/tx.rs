@@ -827,6 +827,18 @@ impl Sender {
         self.envelope_with_fees(intent, nonce, None)
     }
 
+    /// Hand a nonce back to be sent again, priced above whatever was already offered at it.
+    ///
+    /// Every path that returns a nonce goes through here, not just the timeout. A refusal proves
+    /// the upstream did not *accept* the transaction, which is not the same as proving it never saw
+    /// it -- and if it is holding the earlier attempt, an identically priced reissue is refused as
+    /// `replacement transaction underpriced`. That was 77 of 90 failures in three minutes once the
+    /// send rate went up. Escalating a nonce that genuinely never left costs a few wei.
+    fn release_for_retry(&mut self, nonce: u64) {
+        self.escalate.insert(nonce, self.last_fees(nonce));
+        self.nonces.release(nonce);
+    }
+
     /// What was last bid at a nonce, for a retry to outbid. The configured fee when this book has
     /// not escalated the nonce before.
     fn last_fees(&self, nonce: u64) -> Fees {
@@ -1155,10 +1167,10 @@ impl Sender {
             });
         }
         if e.is_txpool_full() {
-            self.nonces.release(r.nonce);
+            self.release_for_retry(r.nonce);
             self.open_or_extend_episode(now);
         } else if e.never_sent() {
-            self.nonces.release(r.nonce);
+            self.release_for_retry(r.nonce);
         } else if e.is_nonce_too_low() {
             self.resync_nonce();
         } else {
@@ -1323,8 +1335,7 @@ impl Sender {
             if p.nonce >= self.landed_nonce {
                 // Unexecuted, so the hole is real and this book still owns it. Put it back to be
                 // re-signed and re-sent rather than re-reading a count that cannot see the gap.
-                self.escalate.insert(p.nonce, self.last_fees(p.nonce));
-                self.nonces.release(p.nonce);
+                self.release_for_retry(p.nonce);
             } else {
                 // The chain is past it, so the nonce is spent and the local sequence is what is
                 // wrong. This is the case re-reading was written for.
@@ -1941,6 +1952,51 @@ mod tests {
             900,
         );
         assert_eq!(e.max_priority_fee_per_gas, 5_000_000);
+    }
+
+    /// A refusal is not proof the upstream never saw the transaction, so a reissue has to outbid
+    /// the attempt it may be replacing. Every release path, not only the timeout.
+    #[test]
+    fn a_nonce_returned_by_a_refusal_is_reissued_above_its_own_price() {
+        let mut s = Sender::new(
+            None,
+            91_342,
+            Address::ZERO,
+            &tx_cfg(true),
+            50_000_000,
+            5_000_000,
+        );
+        s.nonces.adopt(400);
+        let n = s.nonces.reserve().unwrap();
+        let before = s.envelope(
+            Intent::RefreshCapacity {
+                pair_id: 1,
+                bid: 1,
+                ask: 1,
+            },
+            n,
+        );
+
+        s.release_for_retry(n);
+
+        assert_eq!(
+            s.nonces.reserve(),
+            Some(n),
+            "the nonce comes back so the sequence has no gap"
+        );
+        let after = s.envelope(
+            Intent::RefreshCapacity {
+                pair_id: 1,
+                bid: 1,
+                ask: 1,
+            },
+            n,
+        );
+        assert!(
+            after.max_priority_fee_per_gas > before.max_priority_fee_per_gas,
+            "an identically priced reissue is refused as underpriced"
+        );
+        assert!(after.max_fee_per_gas > before.max_fee_per_gas);
     }
 
     /// A `ChainConfig` sufficient to build an [`Rpc`]. Only the client and limiter fields matter
