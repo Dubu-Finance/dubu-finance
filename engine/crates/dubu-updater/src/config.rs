@@ -590,6 +590,23 @@ pub struct ChainConfig {
     /// rather than `Rotate`: consecutive calls here must reach the same node's view of our nonce.
     #[serde(default)]
     pub write_rpc_urls: Vec<EndpointUrl>,
+    /// Where `eth_sendRawTransaction` alone is sent. Nonce and receipt keep using
+    /// [`Self::rpc_url`].
+    ///
+    /// Set this to the sequencer. A local op-reth started with `--rollup.sequencer-http` forwards
+    /// sends rather than gossiping them, and on 2026-07-31 it accepted four transactions, returned
+    /// their hashes, held them in its own pool as `pending` and never delivered them. Everything
+    /// behind that gap queued, the account wedged, and the pool stopped quoting for hours.
+    ///
+    /// No failover could have caught it, which is the reason this exists rather than another
+    /// fallback URL: the node reported success. Submitting to the sequencer directly removes the
+    /// hop that can swallow a transaction while claiming to have taken it.
+    ///
+    /// Sends only, because that is all a sequencer endpoint serves: GIWA's answers 403 to
+    /// `eth_getTransactionCount` and `eth_getTransactionReceipt`. Unset, sends go to `rpc_url` as
+    /// before.
+    #[serde(default)]
+    pub submit_rpc_url: Option<EndpointUrl>,
     /// EIP-155 chain id. 91342 for GIWA Sepolia.
     pub chain_id: u64,
     /// `PropPool` address.

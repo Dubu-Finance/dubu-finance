@@ -593,6 +593,24 @@ pub struct Sender {
     backpressure: Option<Backpressure>,
     /// An episode transition waiting to be logged. Drained by [`Sender::take_episode`].
     staged_episode: Option<Episode>,
+    /// Where `eth_sendRawTransaction` goes, when it is not the endpoint everything else uses.
+    ///
+    /// Set this to the sequencer. Nonce and receipt stay on the ordinary endpoint, because a
+    /// sequencer serves neither. See `ChainConfig::submit_rpc_url` for the failure this exists for.
+    submit: Option<SubmitRpc>,
+}
+
+/// An [`Rpc`] that can sit inside a `Debug` type without printing its URL.
+///
+/// `Rpc` deliberately has no `Debug`, because an endpoint carries its API key as a path segment and
+/// every error is written to name the endpoint rather than address it. Deriving `Debug` on it to
+/// satisfy `Sender` would undo that everywhere at once.
+struct SubmitRpc(Rpc);
+
+impl std::fmt::Debug for SubmitRpc {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SubmitRpc(<redacted>)")
+    }
 }
 
 impl Sender {
@@ -623,7 +641,24 @@ impl Sender {
             landed_nonce: 0,
             backpressure: None,
             staged_episode: None,
+            submit: None,
         }
+    }
+
+    /// Route `eth_sendRawTransaction` to `rpc` instead of the endpoint used for nonce and receipt.
+    pub fn set_submit_rpc(&mut self, rpc: Rpc) {
+        self.submit = Some(SubmitRpc(rpc));
+    }
+
+    /// Whether sends bypass the ordinary endpoint.
+    #[must_use]
+    pub const fn submits_directly(&self) -> bool {
+        self.submit.is_some()
+    }
+
+    /// The endpoint a send goes to: the dedicated one if configured, else the caller's.
+    fn submit_to<'a>(&'a self, fallback: &'a Rpc) -> &'a Rpc {
+        self.submit.as_ref().map_or(fallback, |s| &s.0)
     }
 
     /// The address transactions are signed as, if a key is loaded.
@@ -822,7 +857,8 @@ impl Sender {
         let Some(r) = reserved.pop() else {
             return Err(TxError::NoNonce);
         };
-        let out = rpc
+        let out = self
+            .submit_to(rpc)
             .call("eth_sendRawTransaction", json!([hex0x(&r.raw)]))
             .await;
         self.settle_broadcast(&r, out, Instant::now())
@@ -904,12 +940,13 @@ impl Sender {
 
         // The raw bytes are hex-encoded up front so each future owns its payload and borrows
         // nothing but the client.
+        let submit = self.submit_to(rpc);
         let mut flight: FuturesUnordered<_> = reserved
             .iter()
             .enumerate()
             .map(|(i, r)| {
                 let raw = hex0x(&r.raw);
-                async move { (i, rpc.call("eth_sendRawTransaction", json!([raw])).await) }
+                async move { (i, submit.call("eth_sendRawTransaction", json!([raw])).await) }
             })
             .collect();
         let mut outcomes: BTreeMap<usize, Result<serde_json::Value, RpcError>> = BTreeMap::new();
@@ -1643,6 +1680,120 @@ mod tests {
             }
             .label(),
             "refreshCapacity"
+        );
+    }
+
+    /// A `ChainConfig` sufficient to build an [`Rpc`]. Only the client and limiter fields matter
+    /// here; the rest are placeholders.
+    fn chain_cfg() -> crate::config::ChainConfig {
+        let url = |s: &str| crate::config::EndpointUrl::resolve("chain.rpc_url", s).unwrap();
+        crate::config::ChainConfig {
+            ws_url: url("ws://127.0.0.1:8546"),
+            rpc_url: url("http://127.0.0.1:8545"),
+            flashblocks_rpc_url: url("http://127.0.0.1:8545"),
+            read_rpc_urls: Vec::new(),
+            write_rpc_urls: Vec::new(),
+            submit_rpc_url: None,
+            chain_id: 91_342,
+            pool: Address::ZERO,
+            multicall3: Address::ZERO,
+            block_time_ms: 1_000,
+            head_stale_blocks: 10,
+            ws_reconnect_initial_ms: 500,
+            ws_reconnect_max_ms: 30_000,
+            fallback_poll_interval_ms: 2_000,
+            quote_interval_ms: 200,
+            request_timeout_ms: 5_000,
+            requests_per_sec: 200.0,
+            request_burst: 400.0,
+            rate_limit_backoff_initial_ms: 100,
+            rate_limit_backoff_max_ms: 5_000,
+            degraded_after_secs: 30,
+            halt_after_secs: 120,
+            view_stale_secs: 10,
+            degraded_extra_half_spread_bps: 25,
+        }
+    }
+
+    /// Sends must leave by the submit endpoint while nonce and receipt stay on the ordinary one.
+    ///
+    /// The split is the whole point: GIWA's sequencer answers 403 to everything except
+    /// `eth_sendRawTransaction`, so routing the write path wholesale would break the nonce read,
+    /// and leaving sends on the local node is what let four transactions be accepted, hashed and
+    /// never delivered on 2026-07-31.
+    #[test]
+    fn a_configured_submit_endpoint_takes_sends_and_nothing_else() {
+        let mut s = Sender::new(
+            None,
+            91_342,
+            Address::ZERO,
+            &tx_cfg(true),
+            50_000_000,
+            5_000_000,
+        );
+        assert!(
+            !s.submits_directly(),
+            "unset by default, so sends go to rpc_url as before"
+        );
+
+        let chain = chain_cfg();
+        let ordinary = Rpc::new(
+            "rpc",
+            &crate::config::EndpointUrl::resolve("chain.rpc_url", "http://127.0.0.1:8545").unwrap(),
+            &chain,
+        )
+        .unwrap();
+        let sequencer = Rpc::new(
+            "submit",
+            &crate::config::EndpointUrl::resolve(
+                "chain.submit_rpc_url",
+                "https://sequencer.example",
+            )
+            .unwrap(),
+            &chain,
+        )
+        .unwrap();
+
+        // Unset: a send would go wherever the caller points.
+        assert!(std::ptr::eq(s.submit_to(&ordinary), &ordinary));
+
+        s.set_submit_rpc(sequencer);
+        assert!(s.submits_directly());
+        // Set: the caller's endpoint is ignored for the send, and only for the send.
+        assert!(!std::ptr::eq(s.submit_to(&ordinary), &ordinary));
+    }
+
+    /// The endpoint carries an API key in its path, so it must not be printable through `Sender`.
+    #[test]
+    fn the_submit_endpoint_never_reaches_a_debug_line() {
+        let mut s = Sender::new(
+            None,
+            91_342,
+            Address::ZERO,
+            &tx_cfg(true),
+            50_000_000,
+            5_000_000,
+        );
+        s.set_submit_rpc(
+            Rpc::new(
+                "submit",
+                &crate::config::EndpointUrl::resolve(
+                    "chain.submit_rpc_url",
+                    "https://sequencer.example/v1/SUPERSECRETKEY",
+                )
+                .unwrap(),
+                &chain_cfg(),
+            )
+            .unwrap(),
+        );
+        let rendered = format!("{s:?}");
+        assert!(
+            !rendered.contains("SUPERSECRETKEY"),
+            "the key leaked: {rendered}"
+        );
+        assert!(
+            !rendered.contains("sequencer.example"),
+            "the host leaked: {rendered}"
         );
     }
 

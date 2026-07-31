@@ -626,11 +626,23 @@ async fn run(args: &Args) -> Result<i32, Box<dyn std::error::Error>> {
         cfg.tx.max_priority_fee_wei()?,
     );
 
+    // Sends bypass `rpc_url` when a submit endpoint is configured. A local node that forwards to
+    // the sequencer can accept a transaction, return its hash and never deliver it, and no failover
+    // catches that because nothing reported a failure.
+    if let Some(url) = cfg.chain.submit_rpc_url.as_ref() {
+        sender.set_submit_rpc(Rpc::new("submit", url, &cfg.chain)?);
+        info!(
+            target: "startup", event = "submit_endpoint", url = %url,
+            "eth_sendRawTransaction goes here; nonce and receipt stay on rpc_url"
+        );
+    }
+
     // Every URL here is an `EndpointUrl`, whose `Display` is redacted: the API key is a path
     // segment, and there is no spelling of this line that would print it.
     info!(
         target: "startup",
         event = "configured",
+        submits_directly = sender.submits_directly(),
         transmit_allowed = cfg.tx.transmit_allowed,
         pool = %cfg.chain.pool,
         chain_id = cfg.chain.chain_id,
