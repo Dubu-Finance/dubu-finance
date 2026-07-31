@@ -44,6 +44,24 @@ struct Level {
     sz: String,
 }
 
+/// `activeAssetCtx.ctx`, the fields this reads.
+#[derive(Debug, Deserialize)]
+struct Ctx {
+    /// The externally derived price. Not `markPx` or `midPx`: those are the perp's own traded
+    /// level and carry its funding basis, and the pool quotes spot.
+    #[serde(rename = "oraclePx")]
+    oracle_px: String,
+    /// `[bid, ask]` at the venue's configured notional. Absent on a market with no depth.
+    #[serde(rename = "impactPxs")]
+    impact_pxs: Option<Vec<String>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CtxData {
+    coin: String,
+    ctx: Ctx,
+}
+
 #[derive(Debug, Deserialize)]
 struct BookData {
     coin: String,
@@ -63,6 +81,8 @@ struct Frame {
 pub struct Client {
     /// Venue symbol (`xyz:AAPL`) -> canonical symbol (`AAPL`).
     symbols: BTreeMap<String, String>,
+    /// Monotone id for `activeAssetCtx` frames, which carry no sequence of their own.
+    ctx_seq: u64,
 }
 
 impl Client {
@@ -82,6 +102,7 @@ impl Client {
         }
         let client = Self {
             symbols: symbols.iter().cloned().collect(),
+            ctx_seq: 0,
         };
         debug_assert_eq!(
             client.symbols.len(),
@@ -89,6 +110,67 @@ impl Client {
             "two pairs claim the same hyperliquid coin, so one is silently unsubscribed"
         );
         client
+    }
+}
+
+impl Client {
+    /// One `activeAssetCtx` frame into a top of book centred on the oracle.
+    ///
+    /// This is the channel the venue is obliged to publish on: HIP-3 requires the deployer to call
+    /// `setOracle` every three seconds whether or not anything moved, so it ticks about once a
+    /// second with no gaps. `l2Book` carries the same market but only when the book itself changes,
+    /// which overnight is once every five seconds -- measured 2026-07-31 as 16 gaps past the
+    /// staleness window in 90 seconds, which read downstream as the venue being dead for a quarter
+    /// of the day.
+    ///
+    /// `oraclePx` is the centre rather than `midPx` or `markPx`. Those are where the perp trades
+    /// and carry its funding basis; the oracle is derived from the underlying equity venues, which
+    /// is what a spot pool wants. Sizes are equal so the size-weighted micro-price lands exactly on
+    /// it, and the width comes from `impactPxs`, the venue's own two-sided quote at depth.
+    fn parse_ctx(&mut self, data: serde_json::Value) -> Result<Option<Update>, String> {
+        let Ok(payload) = serde_json::from_value::<CtxData>(data) else {
+            return Err("activeAssetCtx payload did not decode".to_string());
+        };
+        let Some(symbol) = self.symbols.get(&payload.coin) else {
+            return Ok(None);
+        };
+        let px = |field: &str, v: &str| -> Result<u128, String> {
+            units::parse_fixed(v, FEED_SCALE).map_err(|e| format!("{field}: {e}"))
+        };
+
+        let oracle = px("oraclePx", &payload.ctx.oracle_px)?;
+        if oracle == 0 {
+            // A zero centre would make the whole book zero, which reads downstream as a price
+            // rather than as the absence of one.
+            return Ok(None);
+        }
+
+        // Half the venue's own impact spread, or one unit when it publishes none. `micro_price`
+        // requires bid < ask strictly, so the floor is what keeps a zero-width quote representable.
+        let half = match payload.ctx.impact_pxs.as_deref() {
+            Some([bid, ask]) => {
+                let (b, a) = (px("impact bid", bid)?, px("impact ask", ask)?);
+                a.saturating_sub(b) / 2
+            }
+            _ => 0,
+        }
+        .max(1);
+
+        self.ctx_seq = self.ctx_seq.saturating_add(1);
+        Ok(Some(Update {
+            symbol: symbol.clone(),
+            tick: BookTick {
+                // The frame carries no sequence of its own, so this counter is one. It never shares
+                // an id space with `l2Book`'s millisecond timestamps, because `subscribe_frames`
+                // asks for this channel alone.
+                update_id: self.ctx_seq,
+                bid: oracle.saturating_sub(half),
+                bid_qty: 1,
+                ask: oracle.saturating_add(half),
+                ask_qty: 1,
+            },
+            reset: false,
+        }))
     }
 }
 
@@ -109,7 +191,7 @@ impl MarketFeed for Client {
             .keys()
             .map(|s| {
                 format!(
-                    r#"{{"method":"subscribe","subscription":{{"type":"l2Book","coin":"{s}"}}}}"#
+                    r#"{{"method":"subscribe","subscription":{{"type":"activeAssetCtx","coin":"{s}"}}}}"#
                 )
             })
             .collect();
@@ -125,6 +207,7 @@ impl MarketFeed for Client {
             return Ok(None);
         };
         match frame.channel.as_str() {
+            "activeAssetCtx" => return self.parse_ctx(frame.data),
             "l2Book" => {}
             // A rejected subscription otherwise looks exactly like a market with nothing to say,
             // and the pair silently sits below quorum forever.
@@ -181,6 +264,63 @@ mod tests {
 
     /// Captured verbatim from `wss://api.hyperliquid.xyz/ws` on 2026-07-28.
     const LIVE: &str = r#"{"channel":"l2Book","data":{"coin":"xyz:AAPL","time":1785263000123,"levels":[[{"px":"338.92","sz":"2.951","n":3},{"px":"338.90","sz":"11.2","n":5}],[{"px":"338.94","sz":"20.806","n":7},{"px":"338.96","sz":"4.1","n":2}]]}}"#;
+
+    /// Captured verbatim from `wss://api.hyperliquid.xyz/ws` on 2026-07-31, overnight.
+    const CTX: &str = r#"{"channel":"activeAssetCtx","data":{"coin":"xyz:AAPL","ctx":{"funding":"0.0000074304","openInterest":"221413.164","prevDayPx":"337.34","dayNtlVlm":"172946726.7845301032","premium":"0.0002355392","oraclePx":"312.05","markPx":"312.12","midPx":"312.12","impactPxs":["312.094","312.153"],"dayBaseVlm":"534571.812"}}}"#;
+
+    #[test]
+    fn the_ctx_frame_centres_the_book_on_the_oracle_not_the_perp() {
+        let u = client().parse(CTX).unwrap().unwrap();
+        assert_eq!(u.symbol, "AAPL");
+        // impact spread is 312.153 - 312.094 = 0.059, so half is 0.0295 -> 2_950_000 at 8 dp.
+        assert_eq!(u.tick.bid, 31_205_000_000 - 2_950_000);
+        assert_eq!(u.tick.ask, 31_205_000_000 + 2_950_000);
+        // Equal sizes, so the size-weighted micro-price is the midpoint, which is the oracle.
+        assert_eq!(u.tick.bid_qty, u.tick.ask_qty);
+        assert_eq!((u.tick.bid + u.tick.ask) / 2, 31_205_000_000);
+        // Deliberately NOT markPx or midPx: both are 312.12 and carry the perp's funding basis,
+        // which is 2.2 bp away from the oracle here and would bias a spot pool by that much.
+        assert_ne!((u.tick.bid + u.tick.ask) / 2, 31_212_000_000);
+    }
+
+    #[test]
+    fn the_ctx_id_advances_so_a_repeated_price_is_still_a_new_tick() {
+        let mut c = client();
+        let a = c.parse(CTX).unwrap().unwrap().tick.update_id;
+        let b = c.parse(CTX).unwrap().unwrap().tick.update_id;
+        // The oracle republishes every three seconds whether or not the price moved. Reusing an id
+        // would have the feed drop the frame as out of order and the venue would look dead again.
+        assert!(b > a, "an unchanged oracle must still count as a tick");
+    }
+
+    #[test]
+    fn a_market_with_no_impact_quote_still_yields_a_representable_book() {
+        let no_impact = CTX.replace(r#""impactPxs":["312.094","312.153"],"#, "");
+        let u = client().parse(&no_impact).unwrap().unwrap();
+        // `micro_price` requires bid < ask strictly, so a missing width floors at one unit rather
+        // than collapsing the book to a point.
+        assert!(u.tick.bid < u.tick.ask);
+        assert_eq!(u.tick.ask - u.tick.bid, 2);
+    }
+
+    #[test]
+    fn a_coin_we_did_not_subscribe_to_is_ignored() {
+        let other = CTX.replace("xyz:AAPL", "xyz:NVDA");
+        assert!(client().parse(&other).unwrap().is_none());
+    }
+
+    #[test]
+    fn the_subscription_asks_for_the_channel_that_does_not_gap() {
+        let frames = client().subscribe_frames();
+        assert_eq!(frames.len(), 2);
+        for f in &frames {
+            assert!(f.contains("activeAssetCtx"), "{f}");
+            assert!(
+                !f.contains("l2Book"),
+                "l2Book gaps for five seconds overnight: {f}"
+            );
+        }
+    }
 
     fn client() -> Client {
         Client::new(&[
