@@ -174,6 +174,13 @@ function buildRouteCalldata(args: BuildArgs, steps: SwapStep[]): Hex {
 const UNIV2_PAIRS: Record<number, Address> = {
   1: getAddress('0x94f0033BABBa0bEC1C17B808E0980ECFd3B35b4C'),
   2: getAddress('0xd6d0f9F9536590b2C0FDC76Fab5FE415F59C0bED'),
+  3: getAddress('0x008997B212771a705d6520008d01c3EFedEd3ce4'),
+  4: getAddress('0x946a3035cF34F36f5702B4a65F13eE2DD5dDae30'),
+  5: getAddress('0x36Dde52071C5c2E2e29baa7f5666435D62143441'),
+  6: getAddress('0x87b3ee110f32233Be1dE7504efb00D014087241D'),
+  7: getAddress('0x4682bf45F062F2F68539b98e50FF882459803ba9'),
+  8: getAddress('0xC7aD621c721b48dE595aC145EA0B46f2C840884B'),
+  9: getAddress('0x027b1618c0C927684B4a4026368f0c6E1f77E314'),
 };
 
 export function univ2Pair(_cfg: Config, market: Market): Address {

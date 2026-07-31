@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { decodeFunctionData, getAddress } from 'viem';
 
 import { ROUTER_ABI } from '../src/abi.js';
-import { loadConfig, MARKETS, type Env } from '../src/config.js';
+import { loadConfig, MARKETS, type Env, type Market } from '../src/config.js';
 import { chooseSplit, SPLIT_GRID, WEIGHT_DENOMINATOR } from '../src/quote.js';
 import { buildRoute, packStep, univ2Pair } from '../src/route.js';
 
@@ -187,29 +187,36 @@ describe('slippage', () => {
 });
 
 /**
- * The two tables are allowed to disagree, and used to be asserted not to.
+ * Every market now has a UniV2 pool, and did not always.
  *
- * The pool quotes nine pairs; UniV2 has liquidity for two. Requiring a pool for every market meant
- * the market list could only ever be the intersection, which is why a taker asking for mSOL was
- * told the pair did not exist while the maker was quoting it. What actually has to hold is
- * narrower: a market with no UniV2 pool must still route, on the prop leg alone.
+ * The pool quotes nine pairs; UniV2 had liquidity for two, so a taker asking for mSOL was told the
+ * pair did not exist while the maker was quoting it. The seven missing pools were created on
+ * 2026-07-31 and the table in `route.ts` lists all nine.
+ *
+ * The behaviour that mattered then still has to hold, because a market can always be listed before
+ * its pool exists: it must still route on the prop leg alone, and the split search must never hand
+ * UniV2 a leg it cannot pack. Those are driven from a synthetic market below rather than from
+ * whichever real pair happens to be missing a pool, so the guard survives a complete deployment.
  */
 describe('markets without a UniV2 pool', () => {
-  const withPool = MARKETS.filter((m) => !throws(() => univ2Pair(cfg, m)));
-  const withoutPool = MARKETS.filter((m) => throws(() => univ2Pair(cfg, m)));
-
-  it('is not the empty set, or this file is asserting nothing', () => {
-    expect(withPool.length).toBeGreaterThan(0);
-    expect(withoutPool.length).toBeGreaterThan(0);
+  it('is no longer any real market', () => {
+    const withoutPool = MARKETS.filter((m) => throws(() => univ2Pair(cfg, m)));
+    expect(withoutPool).toEqual([]);
+    expect(MARKETS.length).toBeGreaterThan(0);
   });
 
-  it.each(withoutPool)('still builds an all-prop route for $symbol', (m) => {
+  // A pairId the table cannot know about, which is the state a newly listed market is in.
+  const template = MARKETS[0];
+  if (!template) throw new Error('MARKETS is empty');
+  const unlisted: Market = { ...template, pairId: 9999, symbol: 'mNEW/mUSDC' };
+
+  it('still builds an all-prop route', () => {
     const route = buildRoute({
       cfg,
-      market: m,
+      market: unlisted,
       sellingBase: false,
-      tokenIn: m.quote,
-      tokenOut: m.base,
+      tokenIn: unlisted.quote,
+      tokenOut: unlisted.base,
       receiver: RECEIVER,
       amountIn: 1_000_000n,
       legs: [{ venue: 'prop', weightBps: WEIGHT_DENOMINATOR, amountIn: 1_000_000n, amountOut: 1n }],
@@ -221,11 +228,10 @@ describe('markets without a UniV2 pool', () => {
     expect(route.venues).toEqual(['prop']);
   });
 
-  // The throw itself is the guard: it fires only if the split search ever hands UniV2 a leg on a
-  // market with no pool, which would otherwise pack the zero address as the pool and settle into
-  // nothing.
-  it.each(withoutPool)('refuses to pack a UniV2 leg for $symbol', (m) => {
-    expect(() => univ2Pair(cfg, m)).toThrow();
+  // The throw is the guard: it fires only if the split search ever hands UniV2 a leg on a market
+  // with no pool, which would otherwise pack the zero address as the pool and settle into nothing.
+  it('refuses to pack a UniV2 leg', () => {
+    expect(() => univ2Pair(cfg, unlisted)).toThrow();
   });
 });
 
