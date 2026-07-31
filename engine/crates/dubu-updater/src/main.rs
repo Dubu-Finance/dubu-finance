@@ -1293,8 +1293,27 @@ async fn quote_loop(
     }
 
     info!(target: "loop", event = "shutdown", "shutdown signal received; withdrawing quotes");
+    // Before the quotes go: the window that has been accumulating since the last digest is only in
+    // memory, and a deploy is a shutdown. At an hourly cadence a book that restarts more often than
+    // that would never send a digest at all and would lose every fill it had recorded.
+    flush_pnl(rt).await;
     withdraw_quotes(&rt.cfg, &rt.rpc, &mut rt.sender).await;
     0
+}
+
+/// Push whatever the current profit-and-loss window holds, if it holds anything.
+///
+/// Reads the balance even when there is nothing to report so the next window does not attribute two
+/// windows of gas to one; see the call in [`run_cycle`].
+async fn flush_pnl(rt: &mut Runtime) {
+    let since = rt.pnl_at.elapsed();
+    rt.pnl_at = Instant::now();
+    let empty = rt.pnl.is_empty();
+    let balance = sender_balance(rt).await;
+    let pnl = rt.pnl.take(since.as_secs(), balance);
+    if !empty {
+        rt.notify.send(notify::Event::Pnl(pnl));
+    }
 }
 
 /// The fast lane: sample the reference on every pair, decide whether it jumped, and withdraw
@@ -2883,22 +2902,11 @@ async fn run_cycle(
     // preconfirmed fills rather than blocks it has already seen.
     scan_fills(rt, head, view).await;
 
-    // The profit-and-loss digest. Hourly, and only when something filled: an idle window pushed on
-    // a timer trains the reader to ignore the channel.
+    // The profit-and-loss digest. Hourly, and [`flush_pnl`] sends only when something filled: an
+    // idle window pushed on a timer trains the reader to ignore the channel.
     const PNL_EVERY: Duration = Duration::from_secs(3_600);
-    let since = rt.pnl_at.elapsed();
-    if since >= PNL_EVERY {
-        rt.pnl_at = Instant::now();
-        if rt.pnl.is_empty() {
-            // Nothing to report, but the balance still has to roll forward or the next window
-            // would attribute two windows of gas to one.
-            let balance = sender_balance(rt).await;
-            let _ = rt.pnl.take(since.as_secs(), balance);
-        } else {
-            let balance = sender_balance(rt).await;
-            rt.notify
-                .send(notify::Event::Pnl(rt.pnl.take(since.as_secs(), balance)));
-        }
+    if rt.pnl_at.elapsed() >= PNL_EVERY {
+        flush_pnl(rt).await;
     }
 
     // The killswitches. A group is skipped when any pair IN THAT GROUP has no fair value, because
