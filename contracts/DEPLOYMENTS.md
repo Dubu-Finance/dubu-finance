@@ -4,9 +4,15 @@
 
 Deployed 2026-07-27 from `0x5AD176eBb13CAbE62Ee7c07F52a67b4A48CbEf83`, nonce 0.
 
-The original 11 contracts are verified on Blockscout. **`PropPool`, `PmmSettle` and `PmmAdapter`
-below are not** — they were deployed in a later pass with verification deliberately skipped, and
-the source is in this repo at the commit that deployed them.
+Every contract below is verified on Blockscout, `PropPool`, `PmmSettle` and `PmmAdapter` included —
+they were deployed in a later pass with verification skipped at the time, and verified afterwards.
+
+The six Dubu contracts are a **partial** match, not a full one: `bytecode_hash = "none"` and
+`cbor_metadata = false` in `foundry.toml` mean the compiler emits no metadata hash, so the runtime
+bytecode carries nothing that could pin it to one particular source file. The explorer therefore
+still renders the source it was given at verification time, which is the commented version from
+before `24943f2` stripped the comments. Re-verifying does not replace it: Blockscout refuses a
+second verification of an already-verified address.
 
 | contract | address |
 |---|---|
