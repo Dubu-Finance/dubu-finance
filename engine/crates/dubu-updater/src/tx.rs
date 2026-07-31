@@ -356,6 +356,9 @@ pub struct Pending {
     pub nonce: u64,
     /// When it was submitted.
     pub submitted_at: Instant,
+    /// What the envelope was signed at, so a timeout escalates from the real previous bid rather
+    /// than from the configured tier.
+    pub fees: Fees,
     /// Whether it was a withdrawal — a zero capacity epoch, per [`Intent::is_withdrawal`].
     ///
     /// Recorded rather than re-derived: `kind` cannot answer it, since a withdrawal and a routine
@@ -491,6 +494,10 @@ struct Reserved {
     nonce: u64,
     hash: B256,
     raw: Vec<u8>,
+    /// What this envelope was actually signed at. A withdrawal is priced a hundred times the
+    /// ordinary tier, so escalating from the configured fee instead would start a replacement two
+    /// orders of magnitude below what it has to beat and never catch up.
+    fees: Fees,
 }
 
 /// How an in-progress `-32003` episode is doing.
@@ -604,7 +611,19 @@ pub struct Sender {
     /// transaction did not land. Re-sending the same nonce at the same price is refused as
     /// `replacement transaction underpriced` -- the upstream may still be holding the earlier
     /// attempt -- so the retry has to outbid it. Cleared once the nonce lands.
-    escalate: BTreeMap<u64, Fees>,
+    escalate: BTreeMap<u64, Escalation>,
+}
+
+/// One nonce's retry pricing.
+///
+/// `origin` anchors the ceiling and `last` is what to beat. Both are needed because the two tiers
+/// differ by a hundred times: a withdrawal's first bid is already above 64x the ordinary configured
+/// fee, so a ceiling measured from the config would clamp its replacement *below* the attempt it is
+/// replacing and every retry would come back underpriced.
+#[derive(Debug, Clone, Copy)]
+struct Escalation {
+    origin: Fees,
+    last: Fees,
 }
 
 /// How far a retry must outbid the attempt it replaces.
@@ -834,18 +853,15 @@ impl Sender {
     /// it -- and if it is holding the earlier attempt, an identically priced reissue is refused as
     /// `replacement transaction underpriced`. That was 77 of 90 failures in three minutes once the
     /// send rate went up. Escalating a nonce that genuinely never left costs a few wei.
-    fn release_for_retry(&mut self, nonce: u64) {
-        self.escalate.insert(nonce, self.last_fees(nonce));
+    fn release_for_retry(&mut self, nonce: u64, sent_at: Fees) {
+        self.escalate
+            .entry(nonce)
+            .and_modify(|e| e.last = sent_at)
+            .or_insert(Escalation {
+                origin: sent_at,
+                last: sent_at,
+            });
         self.nonces.release(nonce);
-    }
-
-    /// What was last bid at a nonce, for a retry to outbid. The configured fee when this book has
-    /// not escalated the nonce before.
-    fn last_fees(&self, nonce: u64) -> Fees {
-        self.escalate.get(&nonce).copied().unwrap_or(Fees {
-            max_fee: self.max_fee,
-            max_priority_fee: self.max_priority_fee,
-        })
     }
 
     /// The fee to sign a nonce at: the configured one, unless this nonce is being retried after the
@@ -855,16 +871,19 @@ impl Sender {
             max_fee: self.max_fee,
             max_priority_fee: self.max_priority_fee,
         });
-        let Some(prev) = self.escalate.get(&nonce) else {
+        let Some(e) = self.escalate.get(&nonce) else {
             return base;
         };
         let bump = |v: u128| v.saturating_mul(REPLACE_BUMP_NUM) / REPLACE_BUMP_DEN;
-        // The ceiling is measured against the configured fee, not the previous bid, so a long retry
-        // chain converges on it instead of compounding away from it.
+        // The ceiling is anchored to what this nonce was FIRST sent at, not to the configured fee.
+        // Compounding still converges, but a tier that legitimately starts high is not clamped
+        // below the attempt it has to replace.
+        let ceiling = |v: u128| v.saturating_mul(REPLACE_ESCALATION_MAX);
         Fees {
-            max_fee: bump(prev.max_fee).min(base.max_fee.saturating_mul(REPLACE_ESCALATION_MAX)),
-            max_priority_fee: bump(prev.max_priority_fee)
-                .min(base.max_priority_fee.saturating_mul(REPLACE_ESCALATION_MAX)),
+            max_fee: bump(e.last.max_fee).min(ceiling(e.origin.max_fee.max(base.max_fee))),
+            max_priority_fee: bump(e.last.max_priority_fee).min(ceiling(
+                e.origin.max_priority_fee.max(base.max_priority_fee),
+            )),
         }
     }
 
@@ -1096,12 +1115,21 @@ impl Sender {
                 .iter()
                 .zip(&nonces)
                 .map(|(intent, &nonce)| {
-                    let (hash, raw) = self.envelope_with_fees(*intent, nonce, fees).sign(signer)?;
+                    let env = self.envelope_with_fees(*intent, nonce, fees);
+                    // Read the price back off the envelope rather than recomputing it: a second
+                    // pass through the escalation would be a second bump, and the ledger has to
+                    // hold what was signed, not one step past it.
+                    let signed_at = Fees {
+                        max_fee: env.max_fee_per_gas,
+                        max_priority_fee: env.max_priority_fee_per_gas,
+                    };
+                    let (hash, raw) = env.sign(signer)?;
                     Ok(Reserved {
                         intent: *intent,
                         nonce,
                         hash,
                         raw,
+                        fees: signed_at,
                     })
                 })
                 .collect()
@@ -1167,10 +1195,10 @@ impl Sender {
             });
         }
         if e.is_txpool_full() {
-            self.release_for_retry(r.nonce);
+            self.release_for_retry(r.nonce, r.fees);
             self.open_or_extend_episode(now);
         } else if e.never_sent() {
-            self.release_for_retry(r.nonce);
+            self.release_for_retry(r.nonce, r.fees);
         } else if e.is_nonce_too_low() {
             self.resync_nonce();
         } else {
@@ -1189,6 +1217,7 @@ impl Sender {
                 kind: r.intent.label(),
                 nonce: r.nonce,
                 submitted_at: now,
+                fees: r.fees,
                 withdrawal: r.intent.is_withdrawal(),
             });
     }
@@ -1335,7 +1364,7 @@ impl Sender {
             if p.nonce >= self.landed_nonce {
                 // Unexecuted, so the hole is real and this book still owns it. Put it back to be
                 // re-signed and re-sent rather than re-reading a count that cannot see the gap.
-                self.release_for_retry(p.nonce);
+                self.release_for_retry(p.nonce, p.fees);
             } else {
                 // The chain is past it, so the nonce is spent and the local sequence is what is
                 // wrong. This is the case re-reading was written for.
@@ -1368,6 +1397,10 @@ mod tests {
                 kind: "updateQuote",
                 nonce: 500,
                 submitted_at: Instant::now() - Duration::from_secs(30),
+                fees: Fees {
+                    max_fee: 50_000_000,
+                    max_priority_fee: 5_000_000,
+                },
                 withdrawal: false,
             }],
         );
@@ -1404,6 +1437,10 @@ mod tests {
             kind: "updateQuote",
             nonce: n,
             submitted_at: Instant::now(),
+            fees: Fees {
+                max_fee: 50_000_000,
+                max_priority_fee: 5_000_000,
+            },
             withdrawal: false,
         };
         s.pending.insert(1, vec![p(1, 10), p(2, 11)]);
@@ -1468,6 +1505,10 @@ mod tests {
             kind: "refreshCapacity",
             nonce: n,
             submitted_at: Instant::now(),
+            fees: Fees {
+                max_fee: 50_000_000,
+                max_priority_fee: 5_000_000,
+            },
             withdrawal,
         };
 
@@ -1507,6 +1548,10 @@ mod tests {
                     kind: "updateQuote",
                     nonce: 10,
                     submitted_at: Instant::now(),
+                    fees: Fees {
+                        max_fee: 50_000_000,
+                        max_priority_fee: 5_000_000,
+                    },
                     withdrawal: false,
                 },
                 Pending {
@@ -1514,6 +1559,10 @@ mod tests {
                     kind: "refreshCapacity",
                     nonce: 11,
                     submitted_at: Instant::now(),
+                    fees: Fees {
+                        max_fee: 50_000_000,
+                        max_priority_fee: 5_000_000,
+                    },
                     withdrawal: false,
                 },
             ],
@@ -1530,6 +1579,10 @@ mod tests {
                 kind: "refreshCapacity",
                 nonce: 12,
                 submitted_at: Instant::now() - Duration::from_secs(30),
+                fees: Fees {
+                    max_fee: 50_000_000,
+                    max_priority_fee: 5_000_000,
+                },
                 withdrawal: true,
             }],
         );
@@ -1561,6 +1614,10 @@ mod tests {
                 kind: "updateQuote",
                 nonce: 20,
                 submitted_at: Instant::now(),
+                fees: Fees {
+                    max_fee: 50_000_000,
+                    max_priority_fee: 5_000_000,
+                },
                 withdrawal: false,
             }],
         );
@@ -1789,6 +1846,10 @@ mod tests {
                 nonce,
                 hash: B256::ZERO,
                 raw: Vec::new(),
+                fees: Fees {
+                    max_fee: 50_000_000,
+                    max_priority_fee: 5_000_000,
+                },
             },
             now,
         );
@@ -1830,6 +1891,10 @@ mod tests {
                 nonce,
                 hash: B256::ZERO,
                 raw: Vec::new(),
+                fees: Fees {
+                    max_fee: 50_000_000,
+                    max_priority_fee: 5_000_000,
+                },
             },
             now,
         );
@@ -1842,8 +1907,9 @@ mod tests {
         );
     }
 
-    /// A retry at the same price is refused as `replacement transaction underpriced`, so a reclaimed
-    /// nonce has to outbid the attempt it replaces -- and must not compound without limit.
+    /// A retry at the same price is refused as `replacement transaction underpriced`, so a
+    /// reclaimed nonce has to outbid the attempt it replaces. It must also stop: compounding is a
+    /// geometric series and an uncapped loop would drain the key.
     #[test]
     fn a_reclaimed_nonce_outbids_its_own_previous_attempt_up_to_a_ceiling() {
         let mut s = Sender::new(
@@ -1854,72 +1920,46 @@ mod tests {
             50_000_000,
             5_000_000,
         );
-        let base = s.envelope(
-            Intent::RefreshCapacity {
-                pair_id: 1,
-                bid: 1,
-                ask: 1,
-            },
-            77,
-        );
-        assert_eq!(base.max_priority_fee_per_gas, 5_000_000);
+        let origin = Fees {
+            max_fee: 50_000_000,
+            max_priority_fee: 5_000_000,
+        };
+        let intent = Intent::RefreshCapacity {
+            pair_id: 1,
+            bid: 1,
+            ask: 1,
+        };
+        assert_eq!(s.envelope(intent, 77).max_priority_fee_per_gas, 5_000_000);
 
-        let mut last = 5_000_000u128;
-        for _ in 0..3 {
-            s.escalate.insert(
-                77,
-                Fees {
-                    max_fee: 50_000_000,
-                    max_priority_fee: last,
-                },
-            );
-            let e = s.envelope(
-                Intent::RefreshCapacity {
-                    pair_id: 1,
-                    bid: 1,
-                    ask: 1,
-                },
-                77,
-            );
+        // Every refusal reissues above the last bid.
+        let mut last = origin;
+        for _ in 0..4 {
+            s.release_for_retry(77, last);
+            let e = s.envelope(intent, 77);
             assert!(
-                e.max_priority_fee_per_gas > last,
+                e.max_priority_fee_per_gas > last.max_priority_fee,
                 "a replacement at or below the previous bid is refused outright"
             );
-            last = e.max_priority_fee_per_gas;
+            last = Fees {
+                max_fee: e.max_fee_per_gas,
+                max_priority_fee: e.max_priority_fee_per_gas,
+            };
         }
 
-        // Escalation is bounded, or a retry loop drains the key.
-        s.escalate.insert(
-            77,
-            Fees {
-                max_fee: u128::MAX,
-                max_priority_fee: u128::MAX,
-            },
-        );
-        let capped = s.envelope(
-            Intent::RefreshCapacity {
-                pair_id: 1,
-                bid: 1,
-                ask: 1,
-            },
-            77,
-        );
-        assert_eq!(
-            capped.max_priority_fee_per_gas,
-            5_000_000 * REPLACE_ESCALATION_MAX
-        );
-        assert_eq!(capped.max_fee_per_gas, 50_000_000 * REPLACE_ESCALATION_MAX);
+        // And it converges on a multiple of what this nonce was FIRST sent at, not on infinity.
+        for _ in 0..200 {
+            s.release_for_retry(77, last);
+            let e = s.envelope(intent, 77);
+            last = Fees {
+                max_fee: e.max_fee_per_gas,
+                max_priority_fee: e.max_priority_fee_per_gas,
+            };
+        }
+        assert_eq!(last.max_priority_fee, 5_000_000 * REPLACE_ESCALATION_MAX);
+        assert_eq!(last.max_fee, 50_000_000 * REPLACE_ESCALATION_MAX);
 
         // An unrelated nonce is untouched.
-        let other = s.envelope(
-            Intent::RefreshCapacity {
-                pair_id: 1,
-                bid: 1,
-                ask: 1,
-            },
-            78,
-        );
-        assert_eq!(other.max_priority_fee_per_gas, 5_000_000);
+        assert_eq!(s.envelope(intent, 78).max_priority_fee_per_gas, 5_000_000);
     }
 
     /// Escalation must not outlive the nonce it belonged to, or a later intent reusing that number
@@ -1936,9 +1976,15 @@ mod tests {
         );
         s.escalate.insert(
             900,
-            Fees {
-                max_fee: 99_999,
-                max_priority_fee: 88_888,
+            Escalation {
+                origin: Fees {
+                    max_fee: 99_999,
+                    max_priority_fee: 88_888,
+                },
+                last: Fees {
+                    max_fee: 99_999,
+                    max_priority_fee: 88_888,
+                },
             },
         );
         s.observe_landed(901);
@@ -1977,7 +2023,13 @@ mod tests {
             n,
         );
 
-        s.release_for_retry(n);
+        s.release_for_retry(
+            n,
+            Fees {
+                max_fee: 50_000_000,
+                max_priority_fee: 5_000_000,
+            },
+        );
 
         assert_eq!(
             s.nonces.reserve(),
@@ -1997,6 +2049,47 @@ mod tests {
             "an identically priced reissue is refused as underpriced"
         );
         assert!(after.max_fee_per_gas > before.max_fee_per_gas);
+    }
+
+    /// A withdrawal is priced a hundred times the ordinary tier. Escalating its nonce from the
+    /// CONFIGURED fee rather than from what actually went out would start the replacement two
+    /// orders of magnitude below what it has to beat, and every retry would come back underpriced
+    /// forever. That was 79 of 115 failures in a four minute window.
+    #[test]
+    fn a_reissue_escalates_from_what_was_sent_not_from_the_configured_tier() {
+        let mut s = Sender::new(
+            None,
+            91_342,
+            Address::ZERO,
+            &tx_cfg(true),
+            50_000_000,
+            5_000_000,
+        );
+        s.nonces.adopt(700);
+        let n = s.nonces.reserve().unwrap();
+
+        // What a withdrawal costs: the toml prices those at 2.0 / 0.5 gwei against 0.05 / 0.005.
+        let withdrawal = Fees {
+            max_fee: 2_000_000_000,
+            max_priority_fee: 500_000_000,
+        };
+        s.release_for_retry(n, withdrawal);
+
+        let reissued = s.envelope(
+            Intent::RefreshCapacity {
+                pair_id: 1,
+                bid: 0,
+                ask: 0,
+            },
+            n,
+        );
+        assert!(
+            reissued.max_priority_fee_per_gas > withdrawal.max_priority_fee,
+            "reissued at {} which does not beat the {} already at that nonce",
+            reissued.max_priority_fee_per_gas,
+            withdrawal.max_priority_fee
+        );
+        assert!(reissued.max_fee_per_gas > withdrawal.max_fee);
     }
 
     /// A `ChainConfig` sufficient to build an [`Rpc`]. Only the client and limiter fields matter
@@ -2159,6 +2252,10 @@ mod tests {
                 kind: "updateQuote",
                 nonce: 3,
                 submitted_at: Instant::now(),
+                fees: Fees {
+                    max_fee: 50_000_000,
+                    max_priority_fee: 5_000_000,
+                },
                 withdrawal: false,
             }],
         );
@@ -2186,6 +2283,10 @@ mod tests {
             kind: "updateQuote",
             nonce: n,
             submitted_at: Instant::now(),
+            fees: Fees {
+                max_fee: 50_000_000,
+                max_priority_fee: 5_000_000,
+            },
             withdrawal: false,
         };
         s.pending.insert(1, vec![p(3)]);
@@ -2211,6 +2312,10 @@ mod tests {
             kind: "updateQuote",
             nonce: n,
             submitted_at: Instant::now(),
+            fees: Fees {
+                max_fee: 50_000_000,
+                max_priority_fee: 5_000_000,
+            },
             withdrawal: false,
         };
         s.pending.insert(1, vec![p(3), p(4)]);
