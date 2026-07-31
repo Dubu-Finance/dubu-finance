@@ -917,6 +917,13 @@ async fn run(args: &Args) -> Result<i32, Box<dyn std::error::Error>> {
         pnl_at: Instant::now(),
     };
 
+    // The gas in a digest is a fall in the sender's balance across the window, so the first window
+    // needs a reading to fall from. Without it the first digest reports no gas at all, and after a
+    // restart the first digest is often the only one.
+    if let Some(balance) = sender_balance(&rt).await {
+        rt.pnl.open(balance);
+    }
+
     wait_for_feed(&rt).await;
     wait_for_first_head(&rt).await;
 

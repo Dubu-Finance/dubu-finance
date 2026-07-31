@@ -901,7 +901,11 @@ async fn deliver(
     assert!(!text.is_empty(), "a non-empty batch renders to something");
 
     match post(http, creds, &text).await {
-        Outcome::Sent => {}
+        // Logged so a delivered push is visible in the log at all. Only failures were recorded
+        // before, which made "the alerts are working" and "nothing has happened worth alerting on"
+        // the same observation. The text is not logged: it is already in the events it came from.
+        Outcome::Sent => info!(target: "notify", event = "delivered", chars = text.len(),
+                               "Telegram accepted this batch"),
         Outcome::RateLimited(after) => {
             let after = after.min(RATE_LIMIT_BACKOFF_MAX);
             *quiet_until = Some(Instant::now() + after);
