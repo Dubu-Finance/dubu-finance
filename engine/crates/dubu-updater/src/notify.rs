@@ -112,6 +112,102 @@ pub struct Fill {
     pub tx: String,
 }
 
+/// One window's realised profit and loss.
+///
+/// Realised means the spread actually captured on fills that happened, not a mark on inventory.
+/// The engine's own `cumulative_trade_loss` cannot be used for this: both groups take a share of
+/// one shared quote balance, so a crypto swap is booked to the equity group with the opposite sign
+/// and the two mirror each other. Fill edge has no such coupling.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Pnl {
+    /// How long the window covered, in seconds.
+    pub window_secs: u64,
+    /// Fills counted.
+    pub fills: u32,
+    /// Fills whose edge could not be scored, because no reference was inside tolerance.
+    pub unscored: u32,
+    /// Total quote-leg notional, in the quote token's smallest unit.
+    pub volume_quote: u128,
+    /// Spread captured, in the quote token's smallest unit. Signed: negative is being picked off.
+    pub edge_quote: i128,
+    /// Wei spent on gas over the window, from the sender's balance. `None` when it could not be
+    /// read at both ends, which is reported rather than shown as zero.
+    pub gas_wei: Option<u128>,
+    /// Decimals of the quote token, for rendering.
+    pub quote_decimals: u8,
+}
+
+/// Accumulates fills into a [`Pnl`].
+///
+/// Volume and edge come from the same fills the alerts are built from, so the digest and the
+/// individual lines can never disagree.
+#[derive(Debug, Default)]
+pub struct PnlWindow {
+    fills: u32,
+    unscored: u32,
+    volume_quote: u128,
+    edge_quote: i128,
+    quote_decimals: u8,
+    gas_start_wei: Option<u128>,
+}
+
+impl PnlWindow {
+    /// Fold one fill in.
+    pub fn record(&mut self, fill: &Fill) {
+        self.fills = self.fills.saturating_add(1);
+        self.volume_quote = self.volume_quote.saturating_add(fill.quote_amount);
+        self.quote_decimals = fill.quote_decimals;
+        let Some(reference) = fill.reference_e8 else {
+            self.unscored = self.unscored.saturating_add(1);
+            return;
+        };
+        let Some(edge) = edge_e2(fill.price_e8, reference, fill.is_bid) else {
+            self.unscored = self.unscored.saturating_add(1);
+            return;
+        };
+        // `edge` is hundredths of a basis point, so a notional times it over 1e6 is the quote the
+        // spread earned on that fill.
+        let captured =
+            i128::try_from(fill.quote_amount).unwrap_or(i128::MAX) / 1_000_000 * i128::from(edge);
+        self.edge_quote = self.edge_quote.saturating_add(captured);
+    }
+
+    /// Note the sender's balance at the window's start, so gas is a difference rather than a guess.
+    pub const fn open(&mut self, balance_wei: u128) {
+        self.gas_start_wei = Some(balance_wei);
+    }
+
+    /// Whether anything has been recorded, so an idle window can be skipped rather than pushed.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.fills == 0
+    }
+
+    /// Close the window and start a new one. `balance_wei` is the sender's balance now.
+    pub fn take(&mut self, window_secs: u64, balance_wei: Option<u128>) -> Pnl {
+        let gas_wei = match (self.gas_start_wei, balance_wei) {
+            // Only a fall is gas. A rise means the key was topped up mid-window, and subtracting
+            // that would report a refund.
+            (Some(start), Some(now)) if start >= now => Some(start - now),
+            _ => None,
+        };
+        let out = Pnl {
+            window_secs,
+            fills: self.fills,
+            unscored: self.unscored,
+            volume_quote: self.volume_quote,
+            edge_quote: self.edge_quote,
+            gas_wei,
+            quote_decimals: self.quote_decimals,
+        };
+        let decimals = self.quote_decimals;
+        *self = Self::default();
+        self.quote_decimals = decimals;
+        self.gas_start_wei = balance_wei;
+        out
+    }
+}
+
 /// Something worth pushing to a phone.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
@@ -143,6 +239,8 @@ pub enum Event {
         /// alert that must survive that exit; see [`Notifier::flush`].
         exiting: bool,
     },
+    /// A periodic profit-and-loss digest. See [`PnlWindow`].
+    Pnl(Pnl),
     /// A transaction could not be sent. Coalesced by class; see [`ErrorLedger`].
     SendFailed {
         /// The pair, when the failure belongs to one.
@@ -562,8 +660,51 @@ fn render_alert(event: &Event) -> String {
         // rather than `unreachable!` because a panic in the alerting task is the one way this
         // module could take the process down.
         Event::Fill(fill) => render_fill(fill),
+        Event::Pnl(pnl) => render_pnl(pnl),
         Event::SendFailed { kind, error, .. } => format!("TX FAILED {kind}: {error}"),
     }
+}
+
+/// The periodic profit-and-loss digest.
+///
+/// Spread and gas are shown separately and never netted into one figure without both being
+/// visible: they answer different questions, and a single number hides which one moved.
+fn render_pnl(p: &Pnl) -> String {
+    let mins = p.window_secs / 60;
+    let mut out = format!(
+        "PNL {}m — {} fills, {} volume",
+        mins.max(1),
+        p.fills,
+        format_fixed(p.volume_quote, p.quote_decimals)
+    );
+    if p.unscored > 0 {
+        // Named, because an unscored fill is missing from the edge line rather than counted as zero.
+        out.push_str(&format!(" ({} unscored)", p.unscored));
+    }
+
+    let sign = if p.edge_quote < 0 { "-" } else { "+" };
+    let magnitude = p.edge_quote.unsigned_abs();
+    out.push_str(&format!(
+        "\n  spread  {sign}{}",
+        format_fixed(magnitude, p.quote_decimals)
+    ));
+    if p.volume_quote > 0 {
+        // The realised half-spread, which is the number to compare against what is posted.
+        let bps = p.edge_quote.saturating_mul(10_000)
+            / i128::try_from(p.volume_quote).unwrap_or(i128::MAX).max(1);
+        out.push_str(&format!(" ({bps} bp realised)"));
+    }
+
+    match p.gas_wei {
+        Some(wei) => {
+            let eth = format_fixed(wei, 18);
+            out.push_str(&format!("\n  gas     -{eth} ETH"));
+        }
+        // Stated rather than shown as zero: a balance that could not be read at both ends is not a
+        // window that spent nothing.
+        None => out.push_str("\n  gas     not measured this window"),
+    }
+    out
 }
 
 /// One fill line.
@@ -823,6 +964,86 @@ async fn post(http: &reqwest::Client, creds: &Credentials, text: &str) -> Outcom
 
 #[cfg(test)]
 mod tests {
+
+    /// A window of fills becomes one digest, and the realised edge is the volume-weighted spread.
+    #[test]
+    fn a_window_folds_fills_into_a_realised_spread() {
+        let mut w = PnlWindow::default();
+        // 1000 quote at +2 bp, then 1000 quote at -1 bp: net +1 bp over 2000 of volume.
+        let bid = |quote: u128, price: u128, reference: u128| Fill {
+            pair_id: 1,
+            symbol: "ETHUSDT".into(),
+            is_bid: true,
+            base_amount: 1,
+            base_decimals: 18,
+            quote_amount: quote,
+            quote_decimals: 6,
+            price_e8: price,
+            reference_e8: Some(reference),
+            inventory_base: None,
+            inventory_quote: None,
+            tx: "0x".into(),
+        };
+        // The pool buys, so a price BELOW the reference is edge to us.
+        w.record(&bid(1_000_000_000, 99_980_000, 100_000_000)); // -2 bp on price = +2 bp to us
+        w.record(&bid(1_000_000_000, 100_010_000, 100_000_000)); // +1 bp on price = -1 bp to us
+        let p = w.take(3_600, None);
+        assert_eq!(p.fills, 2);
+        assert_eq!(p.volume_quote, 2_000_000_000);
+        assert!(p.edge_quote > 0, "net edge was positive: {}", p.edge_quote);
+        assert_eq!(
+            p.gas_wei, None,
+            "no balance at either end is unmeasured, not zero"
+        );
+    }
+
+    /// A fill with no reference inside tolerance is counted but not scored, because scoring it
+    /// against its own execution price would report a structural zero as a measurement.
+    #[test]
+    fn an_unscored_fill_is_counted_separately_rather_than_as_zero_edge() {
+        let mut w = PnlWindow::default();
+        w.record(&Fill {
+            pair_id: 1,
+            symbol: "ETHUSDT".into(),
+            is_bid: true,
+            base_amount: 1,
+            base_decimals: 18,
+            quote_amount: 5_000_000,
+            quote_decimals: 6,
+            price_e8: 100_000_000,
+            reference_e8: None,
+            inventory_base: None,
+            inventory_quote: None,
+            tx: "0x".into(),
+        });
+        let p = w.take(60, None);
+        assert_eq!(p.fills, 1);
+        assert_eq!(p.unscored, 1);
+        assert_eq!(p.edge_quote, 0);
+        assert!(render_pnl(&p).contains("unscored"));
+    }
+
+    /// Gas is a fall in the balance. A rise means the key was topped up, and subtracting it would
+    /// report a refund.
+    #[test]
+    fn a_top_up_is_not_reported_as_negative_gas() {
+        let mut w = PnlWindow::default();
+        w.open(1_000);
+        assert_eq!(w.take(60, Some(600)).gas_wei, Some(400));
+        w.open(1_000);
+        assert_eq!(w.take(60, Some(5_000)).gas_wei, None);
+    }
+
+    /// The window rolls: closing one starts the next from the balance just read, so two windows
+    /// never claim the same gas.
+    #[test]
+    fn closing_a_window_carries_the_balance_into_the_next() {
+        let mut w = PnlWindow::default();
+        w.open(1_000);
+        assert_eq!(w.take(60, Some(900)).gas_wei, Some(100));
+        assert_eq!(w.take(60, Some(850)).gas_wei, Some(50));
+    }
+
     use super::*;
 
     fn fill() -> Fill {

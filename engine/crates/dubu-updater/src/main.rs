@@ -243,6 +243,9 @@ struct Runtime {
     /// `Option<Notifier>` so the disabled state is a no-op no call site has to remember; nothing
     /// here may ever wait on it.
     notify: Notifier,
+    /// Realised profit and loss since the last digest, and when that digest was.
+    pnl: notify::PnlWindow,
+    pnl_at: Instant,
 }
 
 /// One killswitch per correlation group, each latching to its own file so an operator clears one
@@ -910,6 +913,8 @@ async fn run(args: &Args) -> Result<i32, Box<dyn std::error::Error>> {
         rfq_shares_pool_inventory: rfq_maker == cfg_pool,
         rfq: rfq_shared,
         notify,
+        pnl: notify::PnlWindow::default(),
+        pnl_at: Instant::now(),
     };
 
     wait_for_feed(&rt).await;
@@ -2012,6 +2017,9 @@ async fn scan_fills(rt: &mut Runtime, head: &heads::HeadSnapshot, view: &ChainVi
 
         // The same event, pushed. This arrives in bursts, and `notify`'s batching is sized for it.
         if let Some(fill) = fill_alert(rt, view, log, &meta, base, quote, reference) {
+            // Folded in before the alert is moved, so the digest is built from exactly the fills
+            // that were reported and the two can never disagree.
+            rt.pnl.record(&fill);
             rt.notify.send(notify::Event::Fill(fill));
         }
 
@@ -2875,6 +2883,24 @@ async fn run_cycle(
     // preconfirmed fills rather than blocks it has already seen.
     scan_fills(rt, head, view).await;
 
+    // The profit-and-loss digest. Hourly, and only when something filled: an idle window pushed on
+    // a timer trains the reader to ignore the channel.
+    const PNL_EVERY: Duration = Duration::from_secs(3_600);
+    let since = rt.pnl_at.elapsed();
+    if since >= PNL_EVERY {
+        rt.pnl_at = Instant::now();
+        if rt.pnl.is_empty() {
+            // Nothing to report, but the balance still has to roll forward or the next window
+            // would attribute two windows of gas to one.
+            let balance = sender_balance(rt).await;
+            let _ = rt.pnl.take(since.as_secs(), balance);
+        } else {
+            let balance = sender_balance(rt).await;
+            rt.notify
+                .send(notify::Event::Pnl(rt.pnl.take(since.as_secs(), balance)));
+        }
+    }
+
     // The killswitches. A group is skipped when any pair IN THAT GROUP has no fair value, because
     // marking inventory against a price we do not have invents a NAV. The completeness test is
     // scoped to the group, NOT to `cfg.pairs`: a halted group `continue`s before its reference is
@@ -2963,6 +2989,23 @@ async fn run_cycle(
     }
 
     false
+}
+
+/// The sender's ETH balance, for the gas leg of the digest.
+///
+/// Read rather than accumulated from receipts: a balance difference counts every transaction that
+/// actually settled, including any this process did not send and any whose receipt was never seen.
+/// `None` on a failed read, which the digest reports as unmeasured rather than as zero spend.
+async fn sender_balance(rt: &Runtime) -> Option<u128> {
+    let address = rt.sender.address()?;
+    rt.rpc
+        .quantity(
+            "eth_getBalance",
+            serde_json::json!([address.to_string(), "latest"]),
+        )
+        .await
+        .ok()
+        .map(u128::from)
 }
 
 /// One line per pair per cycle saying how the reference price was reached.
